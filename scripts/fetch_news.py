@@ -38,6 +38,7 @@ SOURCES = [
     {
         "name": "LINUX DO · 444",
         "url": "https://linux.do/tag/444-tag.rss",
+        "fallback_urls": ["https://www.bing.com/news/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29&format=rss"],
         "headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
@@ -180,6 +181,20 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         })
     return items
 
+def fetch_source(source: dict) -> list[dict]:
+    errors = []
+    for url in (source["url"], *source.get("fallback_urls", [])):
+        try:
+            entries = parse_feed(fetch(url, source.get("headers")), source)
+            if entries:
+                return entries
+        except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError) as error:
+            errors.append(f"{url}: {error}")
+    if errors:
+        raise urllib.error.URLError("; ".join(errors))
+    return []
+
+
 
 def classify(text: str, hint: str | None = None) -> str:
     lowered = text.casefold()
@@ -244,7 +259,7 @@ def main() -> int:
     collected: list[dict] = []
     successful_sources: list[dict] = []
     with ThreadPoolExecutor(max_workers=min(8, len(SOURCES))) as pool:
-        futures = {pool.submit(lambda entry: parse_feed(fetch(entry["url"], entry.get("headers")), entry), source): source for source in SOURCES}
+        futures = {pool.submit(fetch_source, source): source for source in SOURCES}
         for future in as_completed(futures):
             source = futures[future]
             try:
