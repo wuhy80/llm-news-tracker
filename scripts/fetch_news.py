@@ -38,6 +38,10 @@ SOURCES = [
     {
         "name": "LINUX DO · 444",
         "url": "https://linux.do/tag/444-tag/444.rss",
+        "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+        },
         "domain": "linux.do",
         "official": False,
     },
@@ -137,8 +141,11 @@ def parse_date(value: str) -> datetime:
     return date.astimezone(timezone.utc)
 
 
-def fetch(url: str) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"})
+def fetch(url: str, extra_headers: dict[str, str] | None = None) -> bytes:
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}
+    if extra_headers:
+        headers.update(extra_headers)
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=12) as response:
         return response.read()
 
@@ -237,7 +244,7 @@ def main() -> int:
     collected: list[dict] = []
     successful_sources: list[dict] = []
     with ThreadPoolExecutor(max_workers=min(8, len(SOURCES))) as pool:
-        futures = {pool.submit(lambda entry: parse_feed(fetch(entry["url"]), entry), source): source for source in SOURCES}
+        futures = {pool.submit(lambda entry: parse_feed(fetch(entry["url"], entry.get("headers")), entry), source): source for source in SOURCES}
         for future in as_completed(futures):
             source = futures[future]
             try:
