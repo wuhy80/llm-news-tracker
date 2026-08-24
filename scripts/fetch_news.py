@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
-USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/)"
+USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker; by /u/wuhy80)"
 
 SOURCES = [
     {"name": "OpenAI", "url": "https://openai.com/news/rss.xml", "domain": "openai.com", "official": True},
@@ -29,6 +29,18 @@ SOURCES = [
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
     {"name": "VentureBeat AI", "url": "https://venturebeat.com/category/ai/feed/", "domain": "venturebeat.com", "official": False},
+    {
+        "name": "Reddit · LocalLLaMA",
+        "url": "https://www.reddit.com/r/LocalLLaMA/new/.rss?limit=100",
+        "domain": "reddit.com",
+        "official": False,
+    },
+    {
+        "name": "LINUX DO · 444",
+        "url": "https://linux.do/tag/444-tag/444.rss",
+        "domain": "linux.do",
+        "official": False,
+    },
     {
         "name": "全球大模型动态",
         "url": "https://news.google.com/rss/search?q=%22large+language+model%22+OR+LLM+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen",
