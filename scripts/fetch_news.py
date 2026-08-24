@@ -38,7 +38,7 @@ SOURCES = [
     {
         "name": "LINUX DO · 444",
         "url": "https://linux.do/tag/444-tag.rss",
-        "fallback_urls": ["https://r.jina.ai/http://linux.do/tag/444-tag/444", "https://www.bing.com/news/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29&format=rss"],
+        "fallback_urls": ["https://news.google.com/rss/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29+when%3A30d&hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans", "https://www.bing.com/news/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29&format=rss"],
         "headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
