@@ -24,13 +24,13 @@ USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker; by /u/
 
 def indexed_source(
     name: str,
-    site: str,
+    query: str,
     domain: str,
     hint: str,
     official: bool = True,
 ) -> dict:
-    google_query = urllib.parse.quote_plus(f"site:{site} when:30d")
-    bing_query = urllib.parse.quote_plus(f"site:{site}")
+    google_query = urllib.parse.quote_plus(f"{query} when:30d")
+    bing_query = urllib.parse.quote_plus(query)
     return {
         "name": name,
         "url": f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US%3Aen",
@@ -48,11 +48,16 @@ SOURCES = [
     {"name": "Hugging Face", "url": "https://huggingface.co/blog/feed.xml", "domain": "huggingface.co", "official": True},
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
-    indexed_source("Anthropic News", "anthropic.com/news", "anthropic.com", "release"),
-    indexed_source("Mistral AI News", "mistral.ai/news", "mistral.ai", "release"),
-    indexed_source("xAI News", "x.ai/news", "x.ai", "release"),
-    indexed_source("LMArena", "lmarena.ai/blog", "lmarena.ai", "benchmark"),
-    indexed_source("Artificial Analysis", "artificialanalysis.ai", "artificialanalysis.ai", "benchmark"),
+    indexed_source("Anthropic News", "site:anthropic.com/news", "anthropic.com", "release"),
+    indexed_source("Mistral AI News", "site:mistral.ai/news", "mistral.ai", "release"),
+    indexed_source("xAI News", "site:x.ai/news", "x.ai", "release"),
+    indexed_source("LMArena", '"LMArena" OR "Chatbot Arena" benchmark', "lmarena.ai", "benchmark", False),
+    indexed_source(
+        "Artificial Analysis",
+        "site:artificialanalysis.ai/articles",
+        "artificialanalysis.ai",
+        "benchmark",
+    ),
     {
         "name": "LangGraph Releases",
         "url": "https://github.com/langchain-ai/langgraph/releases.atom",
