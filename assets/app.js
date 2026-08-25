@@ -13,6 +13,7 @@ const state = {
   period: "day",
   anchor: new Date(),
   category: "all",
+  source: "all",
   query: "",
   sort: "hot",
   visible: Number.POSITIVE_INFINITY,
@@ -77,7 +78,7 @@ function shiftRange(direction) {
   render();
 }
 function resetVisible() {
-  state.visible = state.category === "all" && !state.query.trim()
+  state.visible = state.category === "all" && state.source === "all" && !state.query.trim()
     ? Number.POSITIVE_INFINITY
     : PAGE_SIZE;
 }
@@ -110,8 +111,9 @@ function filteredItems() {
   const query = state.query.trim().toLocaleLowerCase();
   const filtered = rangeItems().filter((item) => {
     const categoryMatch = state.category === "all" || item.category === state.category;
+    const sourceMatch = state.source === "all" || item.source === state.source;
     const haystack = [item.title, item.summary, item.source, ...(item.tags || [])].join(" ").toLocaleLowerCase();
-    return categoryMatch && (!query || haystack.includes(query));
+    return categoryMatch && sourceMatch && (!query || haystack.includes(query));
   });
   return filtered.sort((a, b) => state.sort === "latest"
     ? new Date(b.publishedAt) - new Date(a.publishedAt)
@@ -241,16 +243,37 @@ function renderSources() {
   state.items.forEach((item) => counts.set(item.source, (counts.get(item.source) || 0) + 1));
   const sources = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7);
   el.sourceList.replaceChildren();
+
+  const allSources = document.createElement("button");
+  allSources.type = "button";
+  allSources.className = "source-row source-row-all";
+  allSources.classList.toggle("active", state.source === "all");
+  allSources.setAttribute("aria-pressed", state.source === "all");
+  allSources.innerHTML = `<span class="source-all-mark" aria-hidden="true"></span><span>全部来源</span><small>${state.items.length} 条</small>`;
+  allSources.addEventListener("click", () => selectSource("all"));
+  el.sourceList.append(allSources);
+
   sources.forEach(([name, count]) => {
     const item = state.items.find((entry) => entry.source === name);
-    const row = document.createElement("div");
+    const row = document.createElement("button");
+    row.type = "button";
     row.className = "source-row";
+    row.classList.toggle("active", state.source === name);
+    row.setAttribute("aria-pressed", state.source === name);
     row.innerHTML = `<img alt="" width="20" height="20"><span></span><small>${count} 条</small>`;
     row.querySelector("img").src = favicon(item);
     row.querySelector("img").addEventListener("error", (event) => { event.currentTarget.hidden = true; }, { once: true });
     row.querySelector("span").textContent = name;
+    row.addEventListener("click", () => selectSource(state.source === name ? "all" : name));
     el.sourceList.append(row);
   });
+}
+function selectSource(source) {
+  state.source = source;
+  resetVisible();
+  renderSources();
+  render();
+  document.querySelector(".feed").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function render() {
   updateRangeLabel();
