@@ -57,7 +57,7 @@ def is_chinese(value: str) -> bool:
     return bool(letters) and len(chinese) / len(letters) >= 0.35
 
 
-def translate_to_chinese(value: str, attempts: int = 3) -> str:
+def translate_to_chinese(value: str, attempts: int = 1) -> str:
     if is_chinese(value):
         return value
     query = urllib.parse.urlencode({
