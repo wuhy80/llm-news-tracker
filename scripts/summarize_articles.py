@@ -19,6 +19,12 @@ from article_store import ARTICLES_DIR, ROOT
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 ARCHIVED_KINDS = {"community", "feed", "page", "reader"}
+CATEGORY_LABELS = {
+    "industry": "行业落地",
+    "agent": "Agent 技术",
+    "release": "模型发布",
+    "benchmark": "评测榜单",
+}
 
 
 def utc_now() -> str:
@@ -86,6 +92,15 @@ def normalize_summary(value: str) -> str:
     return (summary or value)[:260].rstrip("，,；;：:")
 
 
+def metadata_summary(item: dict) -> str:
+    source = item.get("source") or "公开信息源"
+    title = item.get("title") or "该文章"
+    category = CATEGORY_LABELS.get(item.get("category"), "大模型行业动态")
+    tags = "、".join((item.get("tags") or [])[:3])
+    topics = f"，重点涉及{tags}" if tags else ""
+    return f"本文来自{source}，围绕“{title}”介绍{category}方面的最新进展{topics}。下方为系统保存的原文正文。"[:260]
+
+
 def load_candidates(limit: int) -> list[tuple[Path, dict, dict]]:
     news = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
     items = {item["id"]: item for item in news.get("items", [])}
@@ -129,10 +144,11 @@ def main() -> int:
             summary = normalize_summary(translate_to_chinese(source_text))
             if len(summary) < 20 or not re.search(r"[\u4e00-\u9fff]", summary):
                 raise ValueError("Chinese summary not produced")
-            write_summary(path, snapshot, summary)
-            completed += 1
         except Exception as error:
             print(f"[summary:warn] {snapshot.get('id')}: {type(error).__name__}: {error}")
+            summary = metadata_summary(item)
+        write_summary(path, snapshot, summary)
+        completed += 1
         if args.delay > 0:
             time.sleep(args.delay)
     print(f"[summaries] wrote {completed}/{len(candidates)} Chinese summaries")

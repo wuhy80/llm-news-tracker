@@ -38,6 +38,18 @@ class SummaryTests(unittest.TestCase):
 
         self.assertEqual(result, "第一句。第二句。第三句。")
 
+    def test_metadata_summary_is_chinese_and_uses_article_context(self):
+        result = summarize_articles.metadata_summary({
+            "title": "New reasoning model",
+            "source": "Example Lab",
+            "category": "release",
+            "tags": ["推理", "Benchmark"],
+        })
+
+        self.assertIn("模型发布", result)
+        self.assertIn("Example Lab", result)
+        self.assertIn("推理、Benchmark", result)
+
 
 if __name__ == "__main__":
     unittest.main()
