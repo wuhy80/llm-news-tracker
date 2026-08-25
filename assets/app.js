@@ -5,6 +5,7 @@ const CATEGORY = {
   benchmark: { label: "评测榜单", color: "var(--amber)" }
 };
 const PERIOD_LABEL = { day: "日", week: "周", month: "月" };
+const PAGE_SIZE = 8;
 const state = {
   items: [],
   sources: [],
@@ -14,7 +15,7 @@ const state = {
   category: "all",
   query: "",
   sort: "hot",
-  visible: 8,
+  visible: Number.POSITIVE_INFINITY,
   saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]"))
 };
 const el = Object.fromEntries([
@@ -72,8 +73,13 @@ function shiftRange(direction) {
   if (state.period === "week") next.setDate(next.getDate() + direction * 7);
   if (state.period === "month") next.setMonth(next.getMonth() + direction);
   state.anchor = next;
-  state.visible = 8;
+  resetVisible();
   render();
+}
+function resetVisible() {
+  state.visible = state.category === "all" && !state.query.trim()
+    ? Number.POSITIVE_INFINITY
+    : PAGE_SIZE;
 }
 function relativeTime(value) {
   const date = new Date(value);
@@ -216,7 +222,7 @@ function renderTrends(items) {
       el.searchPanel.hidden = false;
       el.searchInput.value = topic;
       state.query = topic;
-      state.visible = 8;
+      resetVisible();
       render();
       window.scrollTo({ top: el.searchPanel.offsetTop - 110, behavior: "smooth" });
     });
@@ -255,13 +261,13 @@ function closeSearch() {
   state.query = "";
   el.searchInput.value = "";
   el.searchPanel.hidden = true;
-  state.visible = 8;
+  resetVisible();
   render();
 }
 function setupEvents() {
   document.querySelectorAll("[data-period]").forEach((button) => button.addEventListener("click", () => {
     state.period = button.dataset.period;
-    state.visible = 8;
+    resetVisible();
     document.querySelectorAll("[data-period]").forEach((item) => {
       const active = item === button;
       item.classList.toggle("active", active);
@@ -271,23 +277,28 @@ function setupEvents() {
   }));
   document.querySelectorAll("[data-category]").forEach((button) => button.addEventListener("click", () => {
     state.category = button.dataset.category;
-    state.visible = 8;
+    if (state.category === "all") {
+      state.query = "";
+      el.searchInput.value = "";
+      el.searchPanel.hidden = true;
+    }
+    resetVisible();
     document.querySelectorAll("[data-category]").forEach((item) => item.classList.toggle("active", item === button));
     render();
   }));
   el.previousRange.addEventListener("click", () => shiftRange(-1));
   el.nextRange.addEventListener("click", () => shiftRange(1));
-  el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); state.visible = 8; render(); });
-  el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; state.visible = 8; render(); });
+  el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); render(); });
+  el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; resetVisible(); render(); });
   el.searchButton.addEventListener("click", openSearch);
   el.mobileSearch.addEventListener("click", openSearch);
   el.closeSearch.addEventListener("click", closeSearch);
-  el.searchInput.addEventListener("input", () => { state.query = el.searchInput.value; state.visible = 8; render(); });
+  el.searchInput.addEventListener("input", () => { state.query = el.searchInput.value; resetVisible(); render(); });
   document.addEventListener("keydown", (event) => {
     if (event.key === "/" && document.activeElement?.tagName !== "INPUT") { event.preventDefault(); openSearch(); }
     if (event.key === "Escape" && !el.searchPanel.hidden) closeSearch();
   });
-  el.loadMore.addEventListener("click", () => { state.visible += 8; renderFeed(filteredItems()); });
+  el.loadMore.addEventListener("click", () => { state.visible += PAGE_SIZE; renderFeed(filteredItems()); });
   el.themeButton.addEventListener("click", () => {
     const dark = document.documentElement.dataset.theme !== "dark";
     document.documentElement.dataset.theme = dark ? "dark" : "light";
