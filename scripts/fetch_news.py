@@ -51,7 +51,13 @@ SOURCES = [
     indexed_source("Anthropic News", "site:anthropic.com/news", "anthropic.com", "release"),
     indexed_source("Mistral AI News", "site:mistral.ai/news", "mistral.ai", "release"),
     indexed_source("xAI News", "site:x.ai/news", "x.ai", "release"),
-    indexed_source("LMArena", '"LMArena" OR "Chatbot Arena" benchmark', "lmarena.ai", "benchmark", False),
+    indexed_source(
+        "LMArena",
+        '"LMArena" benchmark OR "Chatbot Arena" benchmark',
+        "news.google.com",
+        "benchmark",
+        False,
+    ),
     indexed_source(
         "Artificial Analysis",
         "site:artificialanalysis.ai/articles",
