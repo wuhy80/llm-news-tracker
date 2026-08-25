@@ -32,7 +32,7 @@ def needs_archive(item: dict, now: datetime) -> bool:
         return True
     if snapshot.get("contentKind") != "summary":
         return False
-    if "reader:" not in snapshot.get("note", ""):
+    if snapshot.get("archiveVersion", 0) < 2:
         return True
     try:
         published = datetime.fromisoformat(item["publishedAt"].replace("Z", "+00:00"))
@@ -46,6 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=int(os.getenv("ARTICLE_FETCH_LIMIT", "300")))
     parser.add_argument("--workers", type=int, default=int(os.getenv("ARTICLE_FETCH_WORKERS", "12")))
+    parser.add_argument("--reader-limit", type=int, default=int(os.getenv("ARTICLE_READER_LIMIT", "30")))
     args = parser.parse_args()
     data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
     now = datetime.now(timezone.utc)
@@ -58,10 +59,18 @@ def main() -> int:
     resolved_urls = resolve_google_news_urls([item["url"] for item in candidates])
     resolved_count = sum(resolved_urls.get(item["url"]) != item["url"] for item in candidates)
     print(f"[articles] resolved {resolved_count} Google News links")
+    reader_ids = {
+        item["id"] for item in candidates[:max(0, args.reader_limit)]
+    }
     counts = {"community": 0, "page": 0, "reader": 0, "summary": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(candidates)))) as pool:
         futures = {
-            pool.submit(archive_item, item, resolved_urls.get(item["url"])): item
+            pool.submit(
+                archive_item,
+                item,
+                resolved_urls.get(item["url"]),
+                item["id"] in reader_ids,
+            ): item
             for item in candidates
         }
         for future in as_completed(futures):

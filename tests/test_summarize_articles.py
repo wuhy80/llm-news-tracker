@@ -1,24 +1,42 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from summarize_articles import parse_model_response
+import summarize_articles
 
 
-class SummaryResponseTests(unittest.TestCase):
-    def test_parses_fenced_json_and_keeps_chinese_summary(self):
-        result = parse_model_response(
-            '```json\n{"0123456789ab":"文章发布了一款新的推理模型，并公布了关键评测结果。其重点是降低部署成本。"}\n```'
-        )
+class SummaryTests(unittest.TestCase):
+    def test_extracts_three_informative_sentences(self):
+        snapshot = {
+            "title": "Model release",
+            "body": (
+                "Short.\n\nThe company released a new reasoning model with lower serving cost. "
+                "It scored 82 points on the published benchmark. "
+                "Developers can deploy it through the existing API. "
+                "This fourth sentence should not be included."
+            ),
+        }
 
-        self.assertIn("0123456789ab", result)
+        result = summarize_articles.extract_summary_text(snapshot, {})
 
-    def test_discards_non_chinese_or_too_short_values(self):
-        result = parse_model_response('{"one":"English only summary", "two":"太短"}')
+        self.assertIn("lower serving cost", result)
+        self.assertIn("82 points", result)
+        self.assertNotIn("fourth sentence", result)
 
-        self.assertEqual(result, {})
+    def test_chinese_text_does_not_call_translation_service(self):
+        with patch("summarize_articles.urllib.request.urlopen") as urlopen:
+            result = summarize_articles.translate_to_chinese("该模型发布了新的推理版本，并公布了基准测试结果。")
+
+        self.assertIn("基准测试", result)
+        urlopen.assert_not_called()
+
+    def test_normalizes_to_three_chinese_sentences(self):
+        result = summarize_articles.normalize_summary("第一句。第二句。第三句。第四句。")
+
+        self.assertEqual(result, "第一句。第二句。第三句。")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import json
 import socket
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -112,6 +113,16 @@ class GoogleNewsTests(unittest.TestCase):
         resolved = article_store.resolve_google_news_urls([source])
 
         self.assertEqual(resolved[source], target)
+
+    @patch("article_store.validate_public_url")
+    def test_bing_redirect_url_decodes_without_network(self, validate):
+        target = "https://example.com/direct-article"
+        source = "https://www.bing.com/news/apiclick.aspx?url=" + urllib.parse.quote(target)
+
+        resolved = article_store.resolve_google_news_urls([source])
+
+        self.assertEqual(resolved[source], target)
+        validate.assert_called_once_with(target)
 
 
 class PublicUrlTests(unittest.TestCase):

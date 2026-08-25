@@ -7,8 +7,11 @@ import base64
 import html
 import ipaddress
 import json
+import os
 import re
 import socket
+import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -22,6 +25,9 @@ MAX_DOWNLOAD_BYTES = 2_500_000
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
 READER_PREFIX = "https://r.jina.ai/"
+READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
+READER_LOCK = threading.Lock()
+READER_LAST_REQUEST = 0.0
 
 BLOCK_TAGS = {
     "address", "article", "blockquote", "br", "div", "figcaption", "h1", "h2", "h3",
@@ -180,6 +186,7 @@ def write_snapshot(
         "resolvedUrl": resolved_url or item["url"],
         "fetchedAt": utc_now(),
         "contentKind": content_kind,
+        "archiveVersion": 2,
         "body": body.strip()[:MAX_BODY_CHARS],
     }
     if error:
@@ -293,6 +300,16 @@ def resolve_google_news_urls(values: list[str], batch_size: int = 80) -> dict[st
     resolved = {value: value for value in values}
     pending: list[tuple[str, str]] = []
     for value in dict.fromkeys(values):
+        parsed = urllib.parse.urlparse(value)
+        if parsed.hostname in {"bing.com", "www.bing.com"}:
+            target = urllib.parse.parse_qs(parsed.query).get("url", [None])[0]
+            if target:
+                try:
+                    validate_public_url(target)
+                    resolved[value] = target
+                    continue
+                except ValueError:
+                    pass
         token = _google_news_token(value)
         if not token:
             continue
@@ -381,17 +398,25 @@ def fetch_page_text(url: str) -> tuple[str, str]:
 
 
 def fetch_reader_text(url: str) -> tuple[str, str]:
+    global READER_LAST_REQUEST
     validate_public_url(url)
     reader_url = f"{READER_PREFIX}{url}"
     request = urllib.request.Request(
         reader_url,
         headers={"User-Agent": USER_AGENT, "Accept": "text/plain,text/markdown;q=0.9"},
     )
-    with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=25) as response:
-        payload = response.read(MAX_DOWNLOAD_BYTES + 1)
-        if len(payload) > MAX_DOWNLOAD_BYTES:
-            payload = payload[:MAX_DOWNLOAD_BYTES]
-        charset = response.headers.get_content_charset() or "utf-8"
+    with READER_LOCK:
+        delay = READER_DELAY_SECONDS - (time.monotonic() - READER_LAST_REQUEST)
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=35) as response:
+                payload = response.read(MAX_DOWNLOAD_BYTES + 1)
+                if len(payload) > MAX_DOWNLOAD_BYTES:
+                    payload = payload[:MAX_DOWNLOAD_BYTES]
+                charset = response.headers.get_content_charset() or "utf-8"
+        finally:
+            READER_LAST_REQUEST = time.monotonic()
     body = text_from_reader(payload.decode(charset, errors="replace"))
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("reader body not found")
@@ -403,7 +428,7 @@ def error_note(stage: str, error: Exception) -> str:
     return f"{stage}:{type(error).__name__}{':' + message if message else ''}"[:120]
 
 
-def archive_item(item: dict, fetch_url: str | None = None) -> tuple[str, str]:
+def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = True) -> tuple[str, str]:
     target_url = fetch_url or item["url"]
     errors = []
     if community_api_url(target_url):
@@ -419,7 +444,7 @@ def archive_item(item: dict, fetch_url: str | None = None) -> tuple[str, str]:
         return item["id"], "page"
     except Exception as error:
         errors.append(error_note("page", error))
-    if urllib.parse.urlparse(target_url).hostname != "news.google.com":
+    if allow_reader:
         try:
             body, resolved_url = fetch_reader_text(target_url)
             write_snapshot(item, body, "reader", resolved_url=resolved_url)

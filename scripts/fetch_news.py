@@ -35,8 +35,8 @@ def indexed_source(
     bing_query = urllib.parse.quote_plus(query)
     return {
         "name": name,
-        "url": f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US%3Aen",
-        "fallback_urls": [f"https://www.bing.com/news/search?q={bing_query}&format=rss"],
+        "url": f"https://www.bing.com/news/search?q={bing_query}&format=rss",
+        "fallback_urls": [f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US%3Aen"],
         "domain": domain,
         "official": official,
         "hint": hint,
