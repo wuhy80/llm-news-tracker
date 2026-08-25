@@ -18,7 +18,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-from article_store import store_feed_snapshot
+from article_store import resolve_google_news_urls, snapshot_kind, store_feed_snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
@@ -352,6 +352,15 @@ def main() -> int:
                 print(f"[warn] {source['name']}: {error}", file=sys.stderr)
 
     merged = {item.get("id"): item for item in load_previous() if item.get("id")}
+    resolved_urls = resolve_google_news_urls([raw["url"] for raw in collected])
+    resolved_count = 0
+    for raw in collected:
+        resolved_url = resolved_urls.get(raw["url"], raw["url"])
+        if resolved_url != raw["url"]:
+            raw["url"] = resolved_url
+            raw["sourceDomain"] = urllib.parse.urlparse(resolved_url).hostname or raw["sourceDomain"]
+            resolved_count += 1
+    print(f"[links] resolved {resolved_count} Google News links")
     seen_titles: set[str] = set()
     feed_snapshots = 0
     for raw in sorted(collected, key=lambda item: item["published"], reverse=True):
@@ -366,6 +375,12 @@ def main() -> int:
 
     items = list(merged.values())
     items.sort(key=lambda item: (item.get("publishedAt", ""), item.get("score", 0)), reverse=True)
+    for item in items:
+        kind = snapshot_kind(item.get("id", ""))
+        if kind and kind != "summary":
+            item["articleKind"] = kind
+        else:
+            item.pop("articleKind", None)
     if not items:
         print("[error] no news items available", file=sys.stderr)
         return 1

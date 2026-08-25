@@ -5,14 +5,16 @@ const CATEGORY_LABEL = {
   benchmark: "评测榜单"
 };
 const SNAPSHOT_LABEL = {
+  community: "社区正文",
   feed: "Feed 正文",
   page: "网页快照",
+  reader: "Reader 正文",
   summary: "摘要回退"
 };
 
 const elements = Object.fromEntries([
-  "articleBody", "articleCategory", "articleSource", "articleSourceIcon", "articleTime",
-  "articleTitle", "originalLink", "readerNotice", "readerStatus", "snapshotKind", "themeButton"
+  "articleBody", "articleCategory", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
+  "articleTitle", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "themeButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 function favicon(item) {
@@ -44,6 +46,13 @@ function renderBody(body) {
   });
 }
 
+function fallbackSummary(item) {
+  const category = CATEGORY_LABEL[item.category] || "大模型行业动态";
+  const topics = (item.tags || []).slice(0, 3).join("、");
+  const topicText = topics ? `，重点涉及${topics}` : "";
+  return `本文来自${item.source}，围绕“${item.title}”介绍${category}方面的最新进展${topicText}。以下为系统保存的原文正文。`;
+}
+
 function renderArticle(item, snapshot) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
@@ -56,6 +65,7 @@ function renderArticle(item, snapshot) {
   elements.articleSourceIcon.src = favicon(item);
   elements.articleSourceIcon.addEventListener("error", () => { elements.articleSourceIcon.hidden = true; }, { once: true });
   elements.snapshotKind.textContent = SNAPSHOT_LABEL[kind] || "内部快照";
+  elements.articleSummary.textContent = snapshot?.summaryZh || fallbackSummary(item);
   elements.originalLink.href = item.url;
   elements.readerStatus.textContent = kind === "summary" ? "正文快照暂未取得" : "内部阅读已就绪";
   elements.readerNotice.hidden = kind !== "summary";

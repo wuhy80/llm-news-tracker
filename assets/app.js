@@ -141,7 +141,13 @@ function renderFeed(items) {
     article.style.setProperty("--index", index);
     const link = fragment.querySelector("h3 a");
     link.textContent = item.title;
-    link.href = `article.html?id=${encodeURIComponent(item.id)}`;
+    if (["community", "feed", "page", "reader"].includes(item.articleKind)) {
+      link.href = `article.html?id=${encodeURIComponent(item.id)}`;
+    } else {
+      const title = document.createElement("span");
+      title.textContent = item.title;
+      link.replaceWith(title);
+    }
     fragment.querySelector(".category-label").textContent = CATEGORY[item.category]?.label || "行业动态";
     const time = fragment.querySelector("time");
     time.dateTime = item.publishedAt;

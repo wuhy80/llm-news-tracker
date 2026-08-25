@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import tempfile
@@ -40,6 +41,17 @@ class ArticleTextTests(unittest.TestCase):
         self.assertNotIn("window.secret", body)
         self.assertNotIn("Footer text", body)
 
+    def test_reader_markdown_removes_metadata_and_links(self):
+        body = article_store.text_from_reader(
+            "Title: Example\n\nURL Source: https://example.com\n\nMarkdown Content:\n\n"
+            "## Main heading\n\nA detailed paragraph with a [source link](https://example.com/source) "
+            "and enough useful article content to remain in the internal reader."
+        )
+
+        self.assertNotIn("URL Source", body)
+        self.assertNotIn("https://example.com/source", body)
+        self.assertIn("source link", body)
+
 
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_schema(self):
@@ -60,8 +72,61 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["body"], "Body text")
         self.assertIn("fetchedAt", snapshot)
 
+    @patch("article_store.fetch_reader_text")
+    @patch("article_store.fetch_page_text")
+    def test_archive_uses_reader_after_page_failure(self, fetch_page, fetch_reader):
+        fetch_page.side_effect = ValueError("blocked")
+        fetch_reader.return_value = ("Reader body " * 40, "https://example.com/article")
+        item = {
+            "id": "0123456789ab",
+            "title": "Example article",
+            "source": "Example",
+            "url": "https://example.com/article",
+            "summary": "Summary",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                _, kind = article_store.archive_item(item)
+                snapshot = json.loads(article_store.snapshot_path(item["id"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(kind, "reader")
+        self.assertEqual(snapshot["contentKind"], "reader")
+
+    def test_news_archive_markers_match_snapshot_files(self):
+        news = json.loads((article_store.ROOT / "data" / "news.json").read_text(encoding="utf-8"))
+        marked = [item for item in news["items"] if item.get("articleKind")]
+
+        self.assertGreater(len(marked), 0)
+        for item in marked:
+            self.assertEqual(article_store.snapshot_kind(item["id"]), item["articleKind"])
+            self.assertNotEqual(item["articleKind"], "summary")
+
+
+class GoogleNewsTests(unittest.TestCase):
+    def test_legacy_google_news_url_decodes_without_network(self):
+        target = "https://example.com/a-model-release"
+        payload = b"\x08\x13\x22" + bytes([len(target)]) + target.encode() + b"\xd2\x01\x00"
+        token = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        source = f"https://news.google.com/rss/articles/{token}?oc=5"
+
+        resolved = article_store.resolve_google_news_urls([source])
+
+        self.assertEqual(resolved[source], target)
+
 
 class PublicUrlTests(unittest.TestCase):
+    def test_community_urls_use_structured_endpoints(self):
+        reddit = article_store.community_api_url(
+            "https://www.reddit.com/r/LocalLLaMA/comments/abc123/example/"
+        )
+        linux_do = article_store.community_api_url("https://linux.do/t/topic-name/12345")
+
+        self.assertEqual(
+            reddit,
+            "https://www.reddit.com/r/LocalLLaMA/comments/abc123/example.json?raw_json=1",
+        )
+        self.assertEqual(linux_do, "https://linux.do/t/topic-name/12345.json")
+
     @patch("article_store.socket.getaddrinfo")
     def test_http_uses_port_80(self, getaddrinfo):
         getaddrinfo.return_value = [
