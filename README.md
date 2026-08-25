@@ -21,7 +21,7 @@ scripts/fetch_news.py
 抓取 -> 清洗 -> 去重 -> 分类 -> 评分
           |
           v
-data/news.json (历史永久累积)
+data/news.json + data/articles/ (历史永久累积)
           |
           v
 Vanilla HTML / CSS / JS -> GitHub Pages
@@ -38,6 +38,8 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 - 发布、评测、开源等高价值关键词提升信号分
 - 通过规范化标题去除同一事件的重复报道
 - 历史记录只追加和去重，不按时间或条数清理
+- 文章默认在站内阅读，优先保存 Feed 公开正文，否则提取原文的纯文本主体
+- 每次更新最多补抓 80 篇尚未存档的文章，失败时站内阅读页回退到摘要
 
 ## 本地运行
 

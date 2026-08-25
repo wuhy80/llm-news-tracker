@@ -18,6 +18,8 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
+from article_store import store_feed_snapshot
+
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker; by /u/wuhy80)"
@@ -183,6 +185,15 @@ def find_text(node: ET.Element, names: tuple[str, ...]) -> str:
     return ""
 
 
+def find_rich_text(node: ET.Element) -> str:
+    candidates = []
+    for child in node.iter():
+        local = child.tag.rsplit("}", 1)[-1].lower()
+        if local in {"content", "description", "encoded", "summary"} and child.text:
+            candidates.append(child.text.strip())
+    return max(candidates, key=len, default="")
+
+
 def find_link(node: ET.Element) -> str:
     for child in node.iter():
         if child.tag.rsplit("}", 1)[-1].lower() != "link":
@@ -228,7 +239,8 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         url = find_link(node)
         if not title or not url:
             continue
-        summary = strip_html(find_text(node, ("description", "summary", "content")))
+        reader_html = find_rich_text(node)
+        summary = strip_html(reader_html)
         published = parse_date(find_text(node, ("pubdate", "published", "updated", "date")))
         source_name = source["name"]
         source_domain = source["domain"]
@@ -246,6 +258,7 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
             "sourceDomain": source_domain,
             "official": source.get("official", False),
             "hint": source.get("hint"),
+            "readerHtml": reader_html,
         })
     return items
 
@@ -340,6 +353,7 @@ def main() -> int:
 
     merged = {item.get("id"): item for item in load_previous() if item.get("id")}
     seen_titles: set[str] = set()
+    feed_snapshots = 0
     for raw in sorted(collected, key=lambda item: item["published"], reverse=True):
         key = normalized_title(raw["title"])
         if not key or key in seen_titles:
@@ -347,6 +361,8 @@ def main() -> int:
         seen_titles.add(key)
         item = finalize(raw, now)
         merged[item["id"]] = item
+        if store_feed_snapshot(item, raw.get("readerHtml", "")):
+            feed_snapshots += 1
 
     items = list(merged.values())
     items.sort(key=lambda item: (item.get("publishedAt", ""), item.get("score", 0)), reverse=True)
@@ -362,6 +378,7 @@ def main() -> int:
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"[articles] stored {feed_snapshots} feed snapshots")
     print(f"[done] wrote {len(items)} items to {OUTPUT.relative_to(ROOT)}")
     return 0
 

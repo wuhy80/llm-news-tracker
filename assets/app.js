@@ -141,7 +141,7 @@ function renderFeed(items) {
     article.style.setProperty("--index", index);
     const link = fragment.querySelector("h3 a");
     link.textContent = item.title;
-    link.href = item.url;
+    link.href = `article.html?id=${encodeURIComponent(item.id)}`;
     fragment.querySelector(".category-label").textContent = CATEGORY[item.category]?.label || "行业动态";
     const time = fragment.querySelector("time");
     time.dateTime = item.publishedAt;
@@ -161,6 +161,7 @@ function renderFeed(items) {
       chip.textContent = tag;
       tags.append(chip);
     });
+    fragment.querySelector(".external-link").href = item.url;
     const bookmark = fragment.querySelector(".bookmark");
     bookmark.classList.toggle("saved", state.saved.has(item.id));
     bookmark.setAttribute("aria-label", state.saved.has(item.id) ? "取消收藏" : "收藏");
