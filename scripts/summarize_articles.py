@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -50,7 +51,7 @@ def is_chinese(value: str) -> bool:
     return bool(letters) and len(chinese) / len(letters) >= 0.35
 
 
-def translate_to_chinese(value: str) -> str:
+def translate_to_chinese(value: str, attempts: int = 3) -> str:
     if is_chinese(value):
         return value
     query = urllib.parse.urlencode({
@@ -64,8 +65,16 @@ def translate_to_chinese(value: str) -> str:
         f"{TRANSLATE_ENDPOINT}?{query}",
         headers={"User-Agent": "LLM-Pulse/1.0"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    for attempt in range(max(1, attempts)):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt + 1 >= max(1, attempts):
+                raise
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else 5 * (attempt + 1))
     translated = "".join(part[0] for part in payload[0] if part and part[0])
     return re.sub(r"\s+", " ", translated).strip()
 
@@ -107,7 +116,7 @@ def write_summary(path: Path, snapshot: dict, summary: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=int(os.getenv("ARTICLE_SUMMARY_LIMIT", "60")))
-    parser.add_argument("--delay", type=float, default=float(os.getenv("ARTICLE_SUMMARY_DELAY", "0.35")))
+    parser.add_argument("--delay", type=float, default=float(os.getenv("ARTICLE_SUMMARY_DELAY", "1.5")))
     args = parser.parse_args()
     candidates = load_candidates(args.limit)
     if not candidates:
