@@ -27,6 +27,7 @@ class ArticleTextTests(unittest.TestCase):
         page = (
             "<nav>Navigation text that should never appear in the snapshot.</nav>"
             f"<article><h1>Release notes</h1><p>{article_text}</p>"
+            "<p>Sponsored by Example, an advertisement that should not enter the reader.</p>"
             "<script>window.secret = true;</script></article>"
             "<footer>Footer text that should never appear in the snapshot.</footer>"
         )
@@ -35,6 +36,7 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertIn("useful model release detail", body)
         self.assertNotIn("Navigation text", body)
+        self.assertNotIn("Sponsored by", body)
         self.assertNotIn("window.secret", body)
         self.assertNotIn("Footer text", body)
 

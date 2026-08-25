@@ -31,7 +31,7 @@ SKIP_TAGS = {
 }
 NOISE_PATTERNS = (
     "accept cookies", "all rights reserved", "cookie policy", "enable javascript",
-    "privacy policy", "sign in", "sign up", "subscribe to", "terms of use",
+    "privacy policy", "sign in", "sign up", "sponsored by", "subscribe to", "terms of use",
     "use cookies", "版权所有", "登录后", "隐私政策",
 )
 
