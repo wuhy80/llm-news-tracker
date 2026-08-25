@@ -67,6 +67,8 @@ python -m http.server 8000
 - `domain`：用于展示站点图标
 - `official`：是否为官方来源
 - `hint`：可选的默认分类
+- `fallback_urls`：主来源失败时按顺序尝试的备用 RSS / Atom
+- `extract_embedded_source`：对新闻索引 Feed 提取原始发布方名称
 
 ## 许可
 

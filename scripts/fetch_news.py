@@ -22,12 +22,69 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker; by /u/wuhy80)"
 
+def indexed_source(
+    name: str,
+    site: str,
+    domain: str,
+    hint: str,
+    official: bool = True,
+) -> dict:
+    google_query = urllib.parse.quote_plus(f"site:{site} when:30d")
+    bing_query = urllib.parse.quote_plus(f"site:{site}")
+    return {
+        "name": name,
+        "url": f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US%3Aen",
+        "fallback_urls": [f"https://www.bing.com/news/search?q={bing_query}&format=rss"],
+        "domain": domain,
+        "official": official,
+        "hint": hint,
+        "extract_embedded_source": True,
+    }
+
+
 SOURCES = [
     {"name": "OpenAI", "url": "https://openai.com/news/rss.xml", "domain": "openai.com", "official": True},
     {"name": "Google AI", "url": "https://blog.google/technology/ai/rss/", "domain": "blog.google", "official": True},
     {"name": "Hugging Face", "url": "https://huggingface.co/blog/feed.xml", "domain": "huggingface.co", "official": True},
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
+    indexed_source("Anthropic News", "anthropic.com/news", "anthropic.com", "release"),
+    indexed_source("Mistral AI News", "mistral.ai/news", "mistral.ai", "release"),
+    indexed_source("xAI News", "x.ai/news", "x.ai", "release"),
+    indexed_source("LMArena", "lmarena.ai/blog", "lmarena.ai", "benchmark"),
+    indexed_source("Artificial Analysis", "artificialanalysis.ai", "artificialanalysis.ai", "benchmark"),
+    {
+        "name": "LangGraph Releases",
+        "url": "https://github.com/langchain-ai/langgraph/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "agent",
+    },
+    {
+        "name": "MCP Specification Releases",
+        "url": "https://github.com/modelcontextprotocol/specification/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "agent",
+    },
+    {
+        "name": "Simon Willison",
+        "url": "https://simonwillison.net/atom/everything/",
+        "domain": "simonwillison.net",
+        "official": False,
+    },
+    {
+        "name": "Interconnects",
+        "url": "https://www.interconnects.ai/feed",
+        "domain": "interconnects.ai",
+        "official": False,
+    },
+    {
+        "name": "量子位",
+        "url": "https://www.qbitai.com/feed",
+        "domain": "qbitai.com",
+        "official": False,
+    },
     {"name": "VentureBeat AI", "url": "https://venturebeat.com/category/ai/feed/", "domain": "venturebeat.com", "official": False},
     {
         "name": "Reddit · LocalLLaMA",
@@ -165,7 +222,7 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         source_name = source["name"]
         source_domain = source["domain"]
         embedded_source = find_text(node, ("source",))
-        if source["domain"] == "news.google.com" and embedded_source:
+        if (source["domain"] == "news.google.com" or source.get("extract_embedded_source")) and embedded_source:
             source_name = embedded_source
             if " - " + embedded_source in title:
                 title = title.rsplit(" - " + embedded_source, 1)[0].strip()
