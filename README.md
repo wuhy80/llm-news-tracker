@@ -39,7 +39,7 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 
 推荐使用 Google Gemini 免费额度。在仓库 **Settings > Secrets and variables > Actions** 中添加以下任意一个 Repository secret：
 
-- `GEMINI_API_KEY`：首选，默认调用 `gemini-2.5-flash-lite`
+- `GEMINI_API_KEY`：首选，默认从 `gemini-3.7-flash` 开始尝试；若当前免费层不开放或额度不足，会依次降级到 3.6、3.5 Flash-Lite、3.1 Flash-Lite 和 2.5 Flash-Lite
 - `OPENROUTER_API_KEY`：备用，默认调用 OpenRouter 的 `openrouter/free` 免费路由
 
 同时配置两个密钥时优先使用 Gemini。也可以通过 Repository variables 设置：
@@ -47,7 +47,7 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 - `AI_REVIEW_PROVIDER`：`gemini`、`openrouter` 或留空自动选择
 - `AI_REVIEW_MODEL`：覆盖默认模型名称
 
-每轮只审核尚未处理的文章，审核结果按版本写入 `data/news.json`，不会重复消耗额度。模型限流、密钥缺失或输出异常时，任务继续使用原有关键词分类与评分，不会阻断新闻更新。
+每轮只审核尚未处理的文章，审核结果按版本写入 `data/news.json`，不会重复消耗额度。最终实际采用的模型记录在 `data/news.json` 的 `aiReview.model` 字段中。模型限流、密钥缺失或输出异常时，任务继续使用原有关键词分类与评分，不会阻断新闻更新。
 
 分类和评分均为可审查的本地规则：
 

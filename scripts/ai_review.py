@@ -19,7 +19,13 @@ from article_store import ARTICLES_DIR, ROOT
 NEWS_FILE = ROOT / "data" / "news.json"
 DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_MODELS = (
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+)
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
 REVIEW_VERSION = "ai-editor-v1"
 CATEGORIES = {"industry", "agent", "release", "benchmark"}
@@ -155,6 +161,14 @@ def model_credentials(requested_provider: str = "auto") -> tuple[str, str] | Non
     return None
 
 
+def model_candidates(provider: str, configured_model: str = "") -> list[str]:
+    if configured_model.strip():
+        return [configured_model.strip()]
+    if provider == "gemini":
+        return list(DEFAULT_GEMINI_MODELS)
+    return [DEFAULT_OPENROUTER_MODEL]
+
+
 def model_content(provider: str, payload: dict) -> object:
     if provider == "gemini":
         return "".join(part.get("text", "") for part in payload["candidates"][0]["content"]["parts"])
@@ -214,6 +228,27 @@ def request_reviews(provider: str, endpoint: str, token: str, model: str, items:
     return []
 
 
+def request_reviews_with_fallback(
+    provider: str,
+    endpoint: str,
+    token: str,
+    models: list[str],
+    items: list[dict],
+) -> tuple[list[dict], str]:
+    last_error: Exception | None = None
+    for index, model in enumerate(models):
+        try:
+            return request_reviews(provider, endpoint, token, model, items), model
+        except Exception as error:
+            last_error = error
+            if provider != "gemini" or index + 1 >= len(models):
+                raise
+            print(f"[ai:warn] {model} unavailable ({type(error).__name__}); trying {models[index + 1]}")
+    if last_error:
+        raise last_error
+    raise ValueError("no AI review model candidates are configured")
+
+
 def apply_reviews(items: list[dict], raw_reviews: list[dict], provider: str, model: str, reviewed_at: str) -> int:
     by_id = {item.get("id"): item for item in items}
     completed = 0
@@ -251,9 +286,9 @@ def main() -> int:
 
     provider, token = credentials
     default_endpoint = DEFAULT_GEMINI_ENDPOINT if provider == "gemini" else DEFAULT_OPENROUTER_ENDPOINT
-    default_model = DEFAULT_GEMINI_MODEL if provider == "gemini" else DEFAULT_OPENROUTER_MODEL
     endpoint = os.getenv("AI_REVIEW_ENDPOINT") or default_endpoint
-    model = os.getenv("AI_REVIEW_MODEL") or default_model
+    models = model_candidates(provider, os.getenv("AI_REVIEW_MODEL", ""))
+    model = models[0]
     data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
     items = data.get("items", [])
     candidates = select_candidates(items, args.limit, args.force)
@@ -267,7 +302,13 @@ def main() -> int:
     for start in range(0, len(candidates), batch_size):
         batch = candidates[start:start + batch_size]
         try:
-            raw_reviews = request_reviews(provider, endpoint, token, model, batch)
+            model_index = models.index(model)
+            raw_reviews, selected_model = request_reviews_with_fallback(
+                provider, endpoint, token, models[model_index:], batch
+            )
+            if selected_model != model:
+                print(f"[ai] selected fallback model {selected_model}")
+                model = selected_model
             reviewed_at = utc_now()
             reviewed = apply_reviews(items, raw_reviews, provider, model, reviewed_at)
             completed += reviewed
