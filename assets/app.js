@@ -5,6 +5,13 @@ const CATEGORY = {
   benchmark: { label: "评测榜单", color: "var(--amber)" }
 };
 const PERIOD_LABEL = { day: "日", week: "周", month: "月" };
+const IMPORTANCE_LABEL = {
+  5: "必须关注",
+  4: "值得精读",
+  3: "建议浏览",
+  2: "参考信息",
+  1: "可以略过"
+};
 const PAGE_SIZE = 8;
 const state = {
   items: [],
@@ -14,6 +21,7 @@ const state = {
   anchor: new Date(),
   aiMode: "curated",
   category: "all",
+  importance: "all",
   source: "all",
   query: "",
   sort: "hot",
@@ -21,8 +29,8 @@ const state = {
   saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]"))
 };
 const el = Object.fromEntries([
-  "feedList", "feedItemTemplate", "itemCount", "signalCount", "orgCount", "topTopic", "topTopicMeta",
-  "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "trendRadar",
+  "feedList", "feedItemTemplate", "itemCount", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
+  "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "importanceSelect", "trendRadar",
   "trendList", "watchTags", "sourceList", "updateStatus", "sourceStatus", "searchPanel", "searchInput",
   "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink"
 ].map((id) => [id, document.getElementById(id)]));
@@ -122,10 +130,28 @@ function itemSummary(item) {
   return review(item)?.summaryZh || item.summary;
 }
 function itemScore(item) {
-  return Number.isFinite(review(item)?.relevanceScore) ? review(item).relevanceScore : (item.score || 0);
+  const itemReview = review(item);
+  if (Number.isFinite(itemReview?.importanceScore)) return itemReview.importanceScore;
+  if (Number.isFinite(itemReview?.relevanceScore)) return itemReview.relevanceScore;
+  return item.score || 0;
+}
+function levelForScore(score) {
+  if (score >= 85) return 5;
+  if (score >= 70) return 4;
+  if (score >= 50) return 3;
+  if (score >= 30) return 2;
+  return 1;
+}
+function itemLevel(item) {
+  return Number.isInteger(review(item)?.importanceLevel)
+    ? Math.max(1, Math.min(5, review(item).importanceLevel))
+    : levelForScore(itemScore(item));
 }
 function aiModeMatch(item) {
-  return state.aiMode === "all" || review(item)?.isRelevant !== false;
+  return state.aiMode === "all" || (review(item)?.isRelevant !== false && itemLevel(item) >= 3);
+}
+function importanceMatch(item) {
+  return state.importance === "all" || itemLevel(item) >= Number(state.importance);
 }
 function filteredItems() {
   const query = state.query.trim().toLocaleLowerCase();
@@ -134,11 +160,11 @@ function filteredItems() {
     const sourceMatch = state.source === "all" || item.source === state.source;
     const itemReview = review(item);
     const haystack = [item.title, itemSummary(item), item.source, itemReview?.reasonZh, ...itemTags(item)].join(" ").toLocaleLowerCase();
-    return aiModeMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
+    return aiModeMatch(item) && importanceMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
   });
   return filtered.sort((a, b) => state.sort === "latest"
     ? new Date(b.publishedAt) - new Date(a.publishedAt)
-    : itemScore(b) - itemScore(a) || new Date(b.publishedAt) - new Date(a.publishedAt));
+    : itemLevel(b) - itemLevel(a) || itemScore(b) - itemScore(a) || new Date(b.publishedAt) - new Date(a.publishedAt));
 }
 function saveBookmarks() {
   localStorage.setItem("llm-pulse-saved", JSON.stringify([...state.saved]));
@@ -162,7 +188,9 @@ function renderFeed(items) {
     const article = fragment.querySelector(".feed-item");
     const category = itemCategory(item);
     const itemReview = review(item);
+    const level = itemLevel(item);
     article.dataset.category = category;
+    article.dataset.level = level;
     article.style.setProperty("--index", index);
     const link = fragment.querySelector("h3 a");
     link.textContent = item.title;
@@ -178,9 +206,7 @@ function renderFeed(items) {
     time.dateTime = item.publishedAt;
     time.textContent = relativeTime(item.publishedAt);
     const badge = fragment.querySelector(".signal-badge");
-    badge.textContent = itemReview
-      ? (itemReview.isRelevant ? `AI ${itemScore(item)}` : "AI 低相关")
-      : item.signal === "high" ? "高信号" : item.signal === "medium" ? "关注" : "";
+    badge.textContent = level + "级 · " + IMPORTANCE_LABEL[level] + " · " + itemScore(item) + "分";
     if (itemReview?.reasonZh) {
       badge.title = itemReview.reasonZh;
       badge.setAttribute("aria-label", `${badge.textContent}：${itemReview.reasonZh}`);
@@ -222,7 +248,10 @@ function topicCounts(items) {
 function renderMetrics(items) {
   const topics = topicCounts(items);
   el.itemCount.textContent = items.length;
-  el.signalCount.textContent = items.filter((item) => itemScore(item) >= 82).length;
+  el.signalCount.textContent = items.filter((item) => itemLevel(item) === 5).length;
+  el.levelDistribution.textContent = [5, 4, 3, 2, 1]
+    .map((level) => level + "级 " + items.filter((item) => itemLevel(item) === level).length)
+    .join(" · ");
   el.orgCount.textContent = new Set(items.map((item) => item.source)).size;
   el.topTopic.textContent = topics[0]?.[0] || "暂无";
   el.topTopicMeta.textContent = topics[0] ? `出现 ${topics[0][1]} 次 · ${PERIOD_LABEL[state.period]}度信号` : "等待更多数据";
@@ -358,6 +387,7 @@ function setupEvents() {
   el.nextRange.addEventListener("click", () => shiftRange(1));
   el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); render(); });
   el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; resetVisible(); render(); });
+  el.importanceSelect.addEventListener("change", () => { state.importance = el.importanceSelect.value; resetVisible(); render(); });
   el.searchButton.addEventListener("click", openSearch);
   el.mobileSearch.addEventListener("click", openSearch);
   el.closeSearch.addEventListener("click", closeSearch);

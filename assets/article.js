@@ -4,6 +4,13 @@ const CATEGORY_LABEL = {
   release: "模型发布",
   benchmark: "评测榜单"
 };
+const IMPORTANCE_LABEL = {
+  5: "必须关注",
+  4: "值得精读",
+  3: "建议浏览",
+  2: "参考信息",
+  1: "可以略过"
+};
 const SNAPSHOT_LABEL = {
   community: "社区正文",
   feed: "Feed 正文",
@@ -14,6 +21,7 @@ const SNAPSHOT_LABEL = {
 
 const elements = Object.fromEntries([
   "articleBody", "articleCategory", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
+  "articleImportance", "articleReason", "articleReview",
   "articleTitle", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "themeButton"
 ].map((id) => [id, document.getElementById(id)]));
 
@@ -53,6 +61,23 @@ function fallbackSummary(item) {
   return `本文来自${item.source}，围绕“${item.title}”介绍${category}方面的最新进展${topicText}。以下为系统保存的原文正文。`;
 }
 
+function importanceScore(item) {
+  const itemReview = item.aiReview;
+  if (Number.isFinite(itemReview?.importanceScore)) return itemReview.importanceScore;
+  if (Number.isFinite(itemReview?.relevanceScore)) return itemReview.relevanceScore;
+  return item.score || 0;
+}
+
+function importanceLevel(item) {
+  if (Number.isInteger(item.aiReview?.importanceLevel)) return Math.max(1, Math.min(5, item.aiReview.importanceLevel));
+  const score = importanceScore(item);
+  if (score >= 85) return 5;
+  if (score >= 70) return 4;
+  if (score >= 50) return 3;
+  if (score >= 30) return 2;
+  return 1;
+}
+
 function renderArticle(item, snapshot) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
@@ -66,6 +91,11 @@ function renderArticle(item, snapshot) {
   elements.articleSourceIcon.src = favicon(item);
   elements.articleSourceIcon.addEventListener("error", () => { elements.articleSourceIcon.hidden = true; }, { once: true });
   elements.snapshotKind.textContent = SNAPSHOT_LABEL[kind] || "内部快照";
+  const level = importanceLevel(item);
+  elements.articleImportance.textContent = level + "级 · " + IMPORTANCE_LABEL[level] + " · " + importanceScore(item) + "分";
+  elements.articleImportance.dataset.level = level;
+  elements.articleReason.textContent = item.aiReview?.reasonZh || "";
+  elements.articleReview.hidden = !item.aiReview;
   elements.articleSummary.textContent = snapshot?.summaryZh || item.aiReview?.summaryZh || fallbackSummary(item);
   elements.originalLink.href = item.url;
   elements.readerStatus.textContent = kind === "summary" ? "正文快照暂未取得" : "内部阅读已就绪";
