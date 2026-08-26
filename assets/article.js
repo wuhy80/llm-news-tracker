@@ -47,8 +47,8 @@ function renderBody(body) {
 }
 
 function fallbackSummary(item) {
-  const category = CATEGORY_LABEL[item.category] || "大模型行业动态";
-  const topics = (item.tags || []).slice(0, 3).join("、");
+  const category = CATEGORY_LABEL[item.aiReview?.category || item.category] || "大模型行业动态";
+  const topics = (item.aiReview?.tags || item.tags || []).slice(0, 3).join("、");
   const topicText = topics ? `，重点涉及${topics}` : "";
   return `本文来自${item.source}，围绕“${item.title}”介绍${category}方面的最新进展${topicText}。以下为系统保存的原文正文。`;
 }
@@ -56,16 +56,17 @@ function fallbackSummary(item) {
 function renderArticle(item, snapshot) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
+  const category = item.aiReview?.category || item.category;
   document.title = `${item.title} · 模型脉动`;
   elements.articleTitle.textContent = item.title;
-  elements.articleCategory.textContent = CATEGORY_LABEL[item.category] || "行业动态";
+  elements.articleCategory.textContent = CATEGORY_LABEL[category] || "行业动态";
   elements.articleTime.dateTime = item.publishedAt;
   elements.articleTime.textContent = formatDate(item.publishedAt);
   elements.articleSource.textContent = item.source;
   elements.articleSourceIcon.src = favicon(item);
   elements.articleSourceIcon.addEventListener("error", () => { elements.articleSourceIcon.hidden = true; }, { once: true });
   elements.snapshotKind.textContent = SNAPSHOT_LABEL[kind] || "内部快照";
-  elements.articleSummary.textContent = snapshot?.summaryZh || fallbackSummary(item);
+  elements.articleSummary.textContent = snapshot?.summaryZh || item.aiReview?.summaryZh || fallbackSummary(item);
   elements.originalLink.href = item.url;
   elements.readerStatus.textContent = kind === "summary" ? "正文快照暂未取得" : "内部阅读已就绪";
   elements.readerNotice.hidden = kind !== "summary";

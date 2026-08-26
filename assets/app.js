@@ -12,6 +12,7 @@ const state = {
   generatedAt: null,
   period: "day",
   anchor: new Date(),
+  aiMode: "curated",
   category: "all",
   source: "all",
   query: "",
@@ -107,17 +108,37 @@ function rangeItems() {
   const range = getRange();
   return state.items.filter((item) => inRange(item, range));
 }
+function review(item) {
+  return item.aiReview && typeof item.aiReview === "object" ? item.aiReview : null;
+}
+function itemCategory(item) {
+  return review(item)?.category || item.category;
+}
+function itemTags(item) {
+  const tags = review(item)?.tags;
+  return Array.isArray(tags) && tags.length ? tags : (item.tags || []);
+}
+function itemSummary(item) {
+  return review(item)?.summaryZh || item.summary;
+}
+function itemScore(item) {
+  return Number.isFinite(review(item)?.relevanceScore) ? review(item).relevanceScore : (item.score || 0);
+}
+function aiModeMatch(item) {
+  return state.aiMode === "all" || review(item)?.isRelevant !== false;
+}
 function filteredItems() {
   const query = state.query.trim().toLocaleLowerCase();
   const filtered = rangeItems().filter((item) => {
-    const categoryMatch = state.category === "all" || item.category === state.category;
+    const categoryMatch = state.category === "all" || itemCategory(item) === state.category;
     const sourceMatch = state.source === "all" || item.source === state.source;
-    const haystack = [item.title, item.summary, item.source, ...(item.tags || [])].join(" ").toLocaleLowerCase();
-    return categoryMatch && sourceMatch && (!query || haystack.includes(query));
+    const itemReview = review(item);
+    const haystack = [item.title, itemSummary(item), item.source, itemReview?.reasonZh, ...itemTags(item)].join(" ").toLocaleLowerCase();
+    return aiModeMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
   });
   return filtered.sort((a, b) => state.sort === "latest"
     ? new Date(b.publishedAt) - new Date(a.publishedAt)
-    : (b.score || 0) - (a.score || 0) || new Date(b.publishedAt) - new Date(a.publishedAt));
+    : itemScore(b) - itemScore(a) || new Date(b.publishedAt) - new Date(a.publishedAt));
 }
 function saveBookmarks() {
   localStorage.setItem("llm-pulse-saved", JSON.stringify([...state.saved]));
@@ -139,7 +160,9 @@ function renderFeed(items) {
   items.slice(0, state.visible).forEach((item, index) => {
     const fragment = el.feedItemTemplate.content.cloneNode(true);
     const article = fragment.querySelector(".feed-item");
-    article.dataset.category = item.category;
+    const category = itemCategory(item);
+    const itemReview = review(item);
+    article.dataset.category = category;
     article.style.setProperty("--index", index);
     const link = fragment.querySelector("h3 a");
     link.textContent = item.title;
@@ -150,21 +173,27 @@ function renderFeed(items) {
       title.textContent = item.title;
       link.replaceWith(title);
     }
-    fragment.querySelector(".category-label").textContent = CATEGORY[item.category]?.label || "行业动态";
+    fragment.querySelector(".category-label").textContent = CATEGORY[category]?.label || "行业动态";
     const time = fragment.querySelector("time");
     time.dateTime = item.publishedAt;
     time.textContent = relativeTime(item.publishedAt);
     const badge = fragment.querySelector(".signal-badge");
-    badge.textContent = item.signal === "high" ? "高信号" : item.signal === "medium" ? "关注" : "";
+    badge.textContent = itemReview
+      ? (itemReview.isRelevant ? `AI ${itemScore(item)}` : "AI 低相关")
+      : item.signal === "high" ? "高信号" : item.signal === "medium" ? "关注" : "";
+    if (itemReview?.reasonZh) {
+      badge.title = itemReview.reasonZh;
+      badge.setAttribute("aria-label", `${badge.textContent}：${itemReview.reasonZh}`);
+    }
     badge.hidden = !badge.textContent;
-    fragment.querySelector(".item-summary").textContent = item.summary || "打开原文查看详情。";
+    fragment.querySelector(".item-summary").textContent = itemSummary(item) || "打开原文查看详情。";
     const sourceImg = fragment.querySelector(".source-identity img");
     sourceImg.src = favicon(item);
     sourceImg.alt = `${item.source} 图标`;
     sourceImg.addEventListener("error", () => { sourceImg.hidden = true; }, { once: true });
     fragment.querySelector(".source-identity span").textContent = item.source;
     const tags = fragment.querySelector(".item-tags");
-    (item.tags || []).slice(0, 4).forEach((tag) => {
+    itemTags(item).slice(0, 4).forEach((tag) => {
       const chip = document.createElement("span");
       chip.textContent = tag;
       tags.append(chip);
@@ -185,24 +214,23 @@ function renderFeed(items) {
 }
 function topicCounts(items) {
   const counts = new Map();
-  items.forEach((item) => (item.tags || []).forEach((tag) => {
+  items.forEach((item) => itemTags(item).forEach((tag) => {
     if (tag.length > 1) counts.set(tag, (counts.get(tag) || 0) + 1);
   }));
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 function renderMetrics(items) {
-  const range = rangeItems();
-  const topics = topicCounts(range);
+  const topics = topicCounts(items);
   el.itemCount.textContent = items.length;
-  el.signalCount.textContent = range.filter((item) => item.signal === "high").length;
-  el.orgCount.textContent = new Set(range.map((item) => item.source)).size;
+  el.signalCount.textContent = items.filter((item) => itemScore(item) >= 82).length;
+  el.orgCount.textContent = new Set(items.map((item) => item.source)).size;
   el.topTopic.textContent = topics[0]?.[0] || "暂无";
   el.topTopicMeta.textContent = topics[0] ? `出现 ${topics[0][1]} 次 · ${PERIOD_LABEL[state.period]}度信号` : "等待更多数据";
 }
 function renderTrends(items) {
   const counts = Object.keys(CATEGORY).map((category) => ({
     category,
-    count: items.filter((item) => item.category === category).length
+    count: items.filter((item) => itemCategory(item) === category).length
   }));
   const max = Math.max(1, ...counts.map((entry) => entry.count));
   el.trendRadar.replaceChildren();
@@ -280,7 +308,7 @@ function render() {
   const items = filteredItems();
   renderFeed(items);
   renderMetrics(items);
-  renderTrends(rangeItems());
+  renderTrends(rangeItems().filter(aiModeMatch));
 }
 function openSearch() {
   el.searchPanel.hidden = false;
@@ -295,6 +323,16 @@ function closeSearch() {
   render();
 }
 function setupEvents() {
+  document.querySelectorAll("[data-ai-mode]").forEach((button) => button.addEventListener("click", () => {
+    state.aiMode = button.dataset.aiMode;
+    resetVisible();
+    document.querySelectorAll("[data-ai-mode]").forEach((item) => {
+      const active = item === button;
+      item.classList.toggle("active", active);
+      item.setAttribute("aria-pressed", active);
+    });
+    render();
+  }));
   document.querySelectorAll("[data-period]").forEach((button) => button.addEventListener("click", () => {
     state.period = button.dataset.period;
     resetVisible();

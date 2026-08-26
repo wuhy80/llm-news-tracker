@@ -373,6 +373,9 @@ def main() -> int:
             continue
         seen_titles.add(key)
         item = finalize(raw, now)
+        previous = merged.get(item["id"])
+        if isinstance(previous, dict) and isinstance(previous.get("aiReview"), dict):
+            item["aiReview"] = previous["aiReview"]
         merged[item["id"]] = item
         if store_feed_snapshot(item, raw.get("readerHtml", "")):
             feed_snapshots += 1

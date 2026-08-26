@@ -11,7 +11,7 @@
 
 ## 设计
 
-本项目借鉴了 [Horizon](https://github.com/Thysrael/Horizon) 的多源聚合与去重思路，以及 [AI-Search](https://github.com/Jackychen-12/AI-Search) 的静态归档与零成本部署方式。代码为独立实现，不需要 LLM API Key 或数据库。
+本项目借鉴了 [Horizon](https://github.com/Thysrael/Horizon) 的多源聚合与去重思路，以及 [AI-Search](https://github.com/Jackychen-12/AI-Search) 的静态归档与零成本部署方式。代码为独立实现，不需要数据库；配置免费模型密钥后可启用 AI 精选、分类、评分与中文摘要，未配置时自动使用本地规则。
 
 ```text
 RSS / Atom / Google News
@@ -19,6 +19,10 @@ RSS / Atom / Google News
           v
 scripts/fetch_news.py
 抓取 -> 清洗 -> 去重 -> 分类 -> 评分
+          |
+          v
+scripts/fetch_articles.py -> scripts/ai_review.py
+正文归档 -> AI 相关性判断 / 分类 / 评分 / 中文摘要
           |
           v
 data/news.json + data/articles/ (历史永久累积)
@@ -29,7 +33,21 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 
 ## 自动更新
 
-`.github/workflows/update-news.yml` 每天北京时间 12:15 和 20:15 运行，更新 `data/news.json`。更新提交会自动触发 Pages 部署。
+`.github/workflows/update-news.yml` 每天北京时间 08:00 和 15:00 运行，更新 `data/news.json`。GitHub 的定时任务可能延迟数十分钟；更新提交会自动触发 Pages 部署。
+
+### 免费模型配置
+
+推荐使用 Google Gemini 免费额度。在仓库 **Settings > Secrets and variables > Actions** 中添加以下任意一个 Repository secret：
+
+- `GEMINI_API_KEY`：首选，默认调用 `gemini-2.5-flash-lite`
+- `OPENROUTER_API_KEY`：备用，默认调用 OpenRouter 的 `openrouter/free` 免费路由
+
+同时配置两个密钥时优先使用 Gemini。也可以通过 Repository variables 设置：
+
+- `AI_REVIEW_PROVIDER`：`gemini`、`openrouter` 或留空自动选择
+- `AI_REVIEW_MODEL`：覆盖默认模型名称
+
+每轮只审核尚未处理的文章，审核结果按版本写入 `data/news.json`，不会重复消耗额度。模型限流、密钥缺失或输出异常时，任务继续使用原有关键词分类与评分，不会阻断新闻更新。
 
 分类和评分均为可审查的本地规则：
 
@@ -51,6 +69,9 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 
 ```bash
 python scripts/fetch_news.py
+python scripts/fetch_articles.py
+# 配置 GEMINI_API_KEY 或 OPENROUTER_API_KEY 后可选运行
+python scripts/ai_review.py
 python -m http.server 8000
 ```
 
