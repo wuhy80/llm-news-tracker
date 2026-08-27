@@ -73,6 +73,30 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["body"], "Body text")
         self.assertIn("fetchedAt", snapshot)
 
+    def test_snapshot_redacts_access_tokens(self):
+        secrets = [
+            "hf_" + "a" * 34,
+            "github_pat_" + "b" * 40,
+            "ghp_" + "c" * 36,
+            "sk-" + "d" * 40,
+            "AIza" + "e" * 35,
+            "AKIA" + "F" * 16,
+        ]
+        item = {
+            "id": "0123456789ab",
+            "title": "Example article",
+            "source": "Example",
+            "url": "https://example.com/article",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                path = article_store.write_snapshot(item, " ".join(secrets), "page")
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+
+        for secret in secrets:
+            self.assertNotIn(secret, snapshot["body"])
+        self.assertEqual(snapshot["body"].count("[REDACTED]"), len(secrets))
+
     @patch("article_store.fetch_reader_text")
     @patch("article_store.fetch_page_text")
     def test_archive_uses_reader_after_page_failure(self, fetch_page, fetch_reader):

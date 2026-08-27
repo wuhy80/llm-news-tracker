@@ -43,9 +43,32 @@ NOISE_PATTERNS = (
     "use cookies", "版权所有", "登录后", "隐私政策",
 )
 
+SECRET_PATTERNS = (
+    (re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"), "hf_[REDACTED]"),
+    (re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])"), "github_pat_[REDACTED]"),
+    (re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"), "gh_[REDACTED]"),
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"), "sk-[REDACTED]"),
+    (re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"), "AIza[REDACTED]"),
+    (re.compile(r"(?<![A-Z0-9])AKIA[A-Z0-9]{16}(?![A-Z0-9])"), "AKIA[REDACTED]"),
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def redact_secrets(value: str) -> str:
+    redacted = value or ""
+    for pattern, replacement in SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def redact_snapshot(snapshot: dict) -> dict:
+    return {
+        key: redact_secrets(value) if isinstance(value, str) else value
+        for key, value in snapshot.items()
+    }
 
 
 class ReadableTextParser(HTMLParser):
@@ -178,7 +201,7 @@ def write_snapshot(
     error: str | None = None,
 ) -> Path:
     path = snapshot_path(item["id"])
-    payload = {
+    payload = redact_snapshot({
         "id": item["id"],
         "title": item["title"],
         "source": item["source"],
@@ -188,9 +211,9 @@ def write_snapshot(
         "contentKind": content_kind,
         "archiveVersion": 2,
         "body": body.strip()[:MAX_BODY_CHARS],
-    }
+    })
     if error:
-        payload["note"] = error[:180]
+        payload["note"] = redact_secrets(error[:180])
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
