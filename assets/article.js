@@ -37,6 +37,36 @@ function formatDate(value) {
   }).format(date);
 }
 
+function parseTags(text) {
+  const match = text.match(/^(?:tags?|标签)\s*[:：]\s*(.+)$/i);
+  if (!match) return [];
+  return match[1]
+    .split(/\s*[,，]\s*/)
+    .map((tag) => tag.replace(/^#+/, "").trim())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function renderTags(tags) {
+  const section = document.createElement("section");
+  section.className = "reader-tags";
+  section.setAttribute("aria-label", "文章相关标签");
+
+  const label = document.createElement("strong");
+  label.className = "reader-tags-label";
+  label.textContent = "相关标签";
+
+  const list = document.createElement("div");
+  list.className = "reader-tag-list";
+  tags.forEach((tag) => {
+    const chip = document.createElement("span");
+    chip.textContent = tag;
+    list.append(chip);
+  });
+  section.append(label, list);
+  return section;
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
   const paragraphs = String(body || "").split(/\n\s*\n/).map((text) => text.trim()).filter(Boolean);
@@ -48,6 +78,11 @@ function renderBody(body) {
     return;
   }
   paragraphs.forEach((text) => {
+    const tags = parseTags(text);
+    if (tags.length) {
+      elements.articleBody.append(renderTags(tags));
+      return;
+    }
     const paragraph = document.createElement("p");
     paragraph.textContent = text;
     elements.articleBody.append(paragraph);
@@ -97,6 +132,7 @@ function renderArticle(item, snapshot) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
   const category = item.aiReview?.category || item.category;
+  elements.articleTitle.closest(".reader-article").dataset.category = category;
   document.title = `${item.title} · 模型脉动`;
   elements.articleTitle.textContent = item.title;
   elements.articleCategory.textContent = CATEGORY_LABEL[category] || "行业动态";
