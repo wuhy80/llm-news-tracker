@@ -178,15 +178,26 @@ def text_from_reader(value: str) -> str:
     return "\n\n".join(clean_blocks(blocks))[:MAX_BODY_CHARS].strip()
 
 
-def snapshot_path(article_id: str) -> Path:
-    if not re.fullmatch(r"[0-9a-f]{12}", article_id or ""):
-        raise ValueError("invalid article id")
-    return ARTICLES_DIR / f"{article_id}.json"
-
-
-def snapshot_kind(article_id: str) -> str | None:
+def publication_path(published_at: str) -> Path:
+    if not isinstance(published_at, str):
+        raise ValueError("invalid publishedAt")
     try:
-        snapshot = json.loads(snapshot_path(article_id).read_text(encoding="utf-8"))
+        published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("invalid publishedAt") from error
+    return Path(f"{published.year:04d}") / f"{published.month:02d}" / f"{published.day:02d}"
+
+
+def snapshot_path(item: dict) -> Path:
+    article_id = item.get("id", "")
+    if not re.fullmatch(r"[0-9a-f]{12}", article_id):
+        raise ValueError("invalid article id")
+    return ARTICLES_DIR / publication_path(item.get("publishedAt")) / f"{article_id}.json"
+
+
+def snapshot_kind(item: dict) -> str | None:
+    try:
+        snapshot = json.loads(snapshot_path(item).read_text(encoding="utf-8"))
     except (ValueError, OSError, json.JSONDecodeError):
         return None
     kind = snapshot.get("contentKind")
@@ -200,7 +211,7 @@ def write_snapshot(
     resolved_url: str | None = None,
     error: str | None = None,
 ) -> Path:
-    path = snapshot_path(item["id"])
+    path = snapshot_path(item)
     payload = redact_snapshot({
         "id": item["id"],
         "title": item["title"],
@@ -227,7 +238,7 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
     body = text_from_html(feed_html)
     if len(body) < MIN_BODY_CHARS:
         return False
-    path = snapshot_path(item["id"])
+    path = snapshot_path(item)
     if path.exists():
         try:
             current = json.loads(path.read_text(encoding="utf-8"))

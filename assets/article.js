@@ -129,6 +129,20 @@ function renderFailure(message) {
   elements.originalLink.hidden = true;
 }
 
+function snapshotPath(item) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T|$)/.exec(item?.publishedAt || "");
+  if (!match || !/^[0-9a-f]{12}$/.test(item?.id || "")) throw new Error("文章发布日期无效");
+  const [, year, month, day] = match;
+  const date = new Date(`${year}-${month}-${day}T00:00:00Z`);
+  if (
+    Number.isNaN(date.getTime())
+    || date.getUTCFullYear() !== Number(year)
+    || date.getUTCMonth() + 1 !== Number(month)
+    || date.getUTCDate() !== Number(day)
+  ) throw new Error("文章发布日期无效");
+  return `data/articles/${year}/${month}/${day}/${item.id}.json`;
+}
+
 async function loadArticle() {
   const articleId = new URLSearchParams(window.location.search).get("id") || "";
   if (!/^[0-9a-f]{12}$/.test(articleId)) {
@@ -143,7 +157,7 @@ async function loadArticle() {
     if (!item) throw new Error("未找到该文章");
     let snapshot = null;
     try {
-      const snapshotResponse = await fetch(`data/articles/${articleId}.json`, { cache: "no-store" });
+      const snapshotResponse = await fetch(snapshotPath(item), { cache: "no-store" });
       if (snapshotResponse.ok) snapshot = await snapshotResponse.json();
     } catch (error) {
       console.warn("Article snapshot unavailable", error);

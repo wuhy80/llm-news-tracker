@@ -23,7 +23,7 @@ NEWS_FILE = ROOT / "data" / "news.json"
 
 
 def needs_archive(item: dict, now: datetime) -> bool:
-    path = snapshot_path(item.get("id", ""))
+    path = snapshot_path(item)
     if not path.exists():
         return True
     try:
@@ -91,7 +91,7 @@ def main() -> int:
         f"{counts['reader']} reader copies, {counts['summary']} summaries"
     )
     for item in data.get("items", []):
-        kind = snapshot_kind(item.get("id", ""))
+        kind = snapshot_kind(item)
         if kind and kind != "summary":
             item["articleKind"] = kind
         else:

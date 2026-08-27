@@ -383,7 +383,7 @@ def main() -> int:
     items = list(merged.values())
     items.sort(key=lambda item: (item.get("publishedAt", ""), item.get("score", 0)), reverse=True)
     for item in items:
-        kind = snapshot_kind(item.get("id", ""))
+        kind = snapshot_kind(item)
         if kind and kind != "summary":
             item["articleKind"] = kind
         else:

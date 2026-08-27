@@ -105,7 +105,7 @@ def load_candidates(limit: int) -> list[tuple[Path, dict, dict]]:
     news = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
     items = {item["id"]: item for item in news.get("items", [])}
     candidates = []
-    for path in ARTICLES_DIR.glob("*.json"):
+    for path in ARTICLES_DIR.rglob("*.json"):
         try:
             snapshot = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

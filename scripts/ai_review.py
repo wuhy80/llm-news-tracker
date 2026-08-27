@@ -14,7 +14,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from article_store import ARTICLES_DIR, ROOT
+from article_store import ROOT, snapshot_path
 
 NEWS_FILE = ROOT / "data" / "news.json"
 DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -160,8 +160,11 @@ def normalize_glossary(value: object, importance_level: int) -> list[dict[str, s
     return glossary
 
 
-def load_snapshot(item_id: str) -> tuple[Path, dict] | None:
-    path = ARTICLES_DIR / f"{item_id}.json"
+def load_snapshot(item: dict) -> tuple[Path, dict] | None:
+    try:
+        path = snapshot_path(item)
+    except ValueError:
+        return None
     try:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -171,7 +174,7 @@ def load_snapshot(item_id: str) -> tuple[Path, dict] | None:
 
 def item_for_model(item: dict) -> dict:
     excerpt = compact_text(item.get("summary"), 700)
-    loaded = load_snapshot(item.get("id", ""))
+    loaded = load_snapshot(item)
     if loaded:
         _, snapshot = loaded
         if snapshot.get("contentKind") in READABLE_KINDS:
@@ -394,7 +397,7 @@ def apply_reviews(items: list[dict], raw_reviews: list[dict], provider: str, mod
             continue
         review = normalize_review(raw, item, provider, model, reviewed_at)
         item["aiReview"] = review
-        loaded = load_snapshot(item["id"])
+        loaded = load_snapshot(item)
         if loaded and review["summaryZh"]:
             path, snapshot = loaded
             if snapshot.get("contentKind") in READABLE_KINDS:

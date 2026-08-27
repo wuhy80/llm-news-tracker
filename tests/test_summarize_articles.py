@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,30 @@ import summarize_articles
 
 
 class SummaryTests(unittest.TestCase):
+    def test_load_candidates_discovers_nested_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            news_file = root / "news.json"
+            articles = root / "articles"
+            snapshot_path = articles / "2026/08/27/0123456789ab.json"
+            snapshot_path.parent.mkdir(parents=True)
+            news_file.write_text(json.dumps({
+                "items": [{"id": "0123456789ab", "publishedAt": "2026-08-27T00:00:00Z"}],
+            }), encoding="utf-8")
+            snapshot_path.write_text(json.dumps({
+                "id": "0123456789ab",
+                "contentKind": "page",
+                "fetchedAt": "2026-08-27T01:00:00Z",
+                "body": "Readable article body",
+            }), encoding="utf-8")
+
+            with patch.object(summarize_articles, "NEWS_FILE", news_file), patch.object(
+                summarize_articles, "ARTICLES_DIR", articles
+            ):
+                candidates = summarize_articles.load_candidates(10)
+
+            self.assertEqual([entry[0] for entry in candidates], [snapshot_path])
+
     def test_extracts_three_informative_sentences(self):
         snapshot = {
             "title": "Model release",

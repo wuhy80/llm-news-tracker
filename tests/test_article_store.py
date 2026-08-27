@@ -61,6 +61,7 @@ class SnapshotTests(unittest.TestCase):
             "title": "Example article",
             "source": "Example",
             "url": "https://example.com/article",
+            "publishedAt": "2026-08-27T03:10:20Z",
         }
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
@@ -72,6 +73,15 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["originalUrl"], item["url"])
         self.assertEqual(snapshot["body"], "Body text")
         self.assertIn("fetchedAt", snapshot)
+        self.assertEqual(path.relative_to(directory).as_posix(), "2026/08/27/0123456789ab.json")
+
+    def test_snapshot_path_rejects_missing_or_invalid_publication_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                with self.assertRaisesRegex(ValueError, "invalid publishedAt"):
+                    article_store.snapshot_path({"id": "0123456789ab"})
+                with self.assertRaisesRegex(ValueError, "invalid publishedAt"):
+                    article_store.snapshot_path({"id": "0123456789ab", "publishedAt": "2026-02-30"})
 
     def test_snapshot_redacts_access_tokens(self):
         secrets = [
@@ -87,6 +97,7 @@ class SnapshotTests(unittest.TestCase):
             "title": "Example article",
             "source": "Example",
             "url": "https://example.com/article",
+            "publishedAt": "2026-08-27T03:10:20Z",
         }
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
@@ -108,11 +119,12 @@ class SnapshotTests(unittest.TestCase):
             "source": "Example",
             "url": "https://example.com/article",
             "summary": "Summary",
+            "publishedAt": "2026-08-27T03:10:20Z",
         }
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
                 _, kind = article_store.archive_item(item)
-                snapshot = json.loads(article_store.snapshot_path(item["id"]).read_text(encoding="utf-8"))
+                snapshot = json.loads(article_store.snapshot_path(item).read_text(encoding="utf-8"))
 
         self.assertEqual(kind, "reader")
         self.assertEqual(snapshot["contentKind"], "reader")
@@ -123,7 +135,7 @@ class SnapshotTests(unittest.TestCase):
 
         self.assertGreater(len(marked), 0)
         for item in marked:
-            self.assertEqual(article_store.snapshot_kind(item["id"]), item["articleKind"])
+            self.assertEqual(article_store.snapshot_kind(item), item["articleKind"])
             self.assertNotEqual(item["articleKind"], "summary")
 
 

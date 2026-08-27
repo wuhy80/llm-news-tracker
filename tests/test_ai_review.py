@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import ai_review
+import article_store
 
 
 class AIReviewTests(unittest.TestCase):
@@ -77,20 +78,23 @@ class AIReviewTests(unittest.TestCase):
     def test_apply_reviews_updates_item_and_readable_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             articles = Path(directory)
-            snapshot_path = articles / "abc123.json"
+            article_id = "abc123abc123"
+            snapshot_path = articles / "2026/01/02" / f"{article_id}.json"
+            snapshot_path.parent.mkdir(parents=True)
             snapshot_path.write_text(json.dumps({
-                "id": "abc123",
+                "id": article_id,
                 "contentKind": "page",
                 "body": "Article body",
             }), encoding="utf-8")
             items = [{
-                "id": "abc123",
+                "id": article_id,
+                "publishedAt": "2026-01-02T00:00:00Z",
                 "category": "industry",
                 "score": 55,
                 "tags": [],
             }]
             raw = [{
-                "id": "abc123",
+                "id": article_id,
                 "isRelevant": True,
                 "category": "release",
                 "dimensions": {
@@ -110,7 +114,7 @@ class AIReviewTests(unittest.TestCase):
                 "duplicateKey": "new-model",
             }]
 
-            with patch.object(ai_review, "ARTICLES_DIR", articles):
+            with patch.object(article_store, "ARTICLES_DIR", articles):
                 completed = ai_review.apply_reviews(items, raw, "gemini", "example/model", "2026-01-01T00:00:00Z")
 
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
