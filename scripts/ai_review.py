@@ -27,7 +27,7 @@ DEFAULT_GEMINI_MODELS = (
     "gemini-2.5-flash-lite",
 )
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
-REVIEW_VERSION = "ai-editor-v2"
+REVIEW_VERSION = "ai-editor-v3"
 CATEGORIES = {"industry", "agent", "release", "benchmark"}
 READABLE_KINDS = {"community", "feed", "page", "reader"}
 DIMENSION_LIMITS = {
@@ -50,8 +50,12 @@ credibility 0-15, usefulness 0-10, and timeliness 0-10. Use the full range and d
 Return one JSON object only: {"reviews": [...]}. Each review must contain exactly these fields:
 id, isRelevant (boolean), category (industry|agent|release|benchmark), dimensions (object containing all six integer scores),
 evidenceLevel (clear|partial|none), informationType (original|analysis|rehash|rumor),
-tags (up to 5 short strings), reasonZh (one concise Chinese sentence explaining importance), summaryZh (2-3 concise Chinese sentences),
-duplicateKey (short normalized event key).
+tags (up to 5 short strings), reasonZh (one concise Chinese sentence explaining importance), summaryZh, glossary, and
+duplicateKey (short normalized event key). For items whose six dimension scores total 70 or more, summaryZh must be a
+detailed Chinese summary of 120-180 Chinese characters and glossary must contain 4-8 useful English technical terms
+found in the supplied title or excerpt. Each glossary entry is {"term": "English term", "explanationZh": "concise Chinese explanation in this article's context"}.
+For items below 70 points, use 2-3 concise Chinese sentences and return glossary as an empty array. Do not include generic
+company or product names unless understanding the term itself helps readers understand the article.
 Scoring rules: off-topic items are negligible; rehashes with no new facts are at most low value; unverified rumors
 cannot be high importance; top importance requires impact >=20 and clear evidence. Community posts need code, data,
 primary documents, or reproducible evidence to be high importance. Official origin alone never makes an item important.
@@ -114,6 +118,46 @@ def compact_text(value: object, limit: int) -> str:
 
 def contains_chinese(value: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", value))
+
+
+def visible_length(value: str) -> int:
+    return len(re.sub(r"\s+", "", value))
+
+
+def ensure_long_summary(summary: str, item: dict, reason: str, importance_level: int) -> str:
+    if importance_level < 4 or visible_length(summary) >= 100:
+        return summary
+    title = compact_text(item.get("title"), 180)
+    source = compact_text(item.get("source"), 60) or "原始信息源"
+    original_summary = compact_text(item.get("summary"), 360)
+    parts = [summary.rstrip("。； ")]
+    if original_summary and original_summary not in summary:
+        parts.append(f"原始信息显示：{original_summary.rstrip('。； ')}")
+    parts.append(f"该消息由{source}发布，主题为“{title}”")
+    if reason and reason not in summary:
+        parts.append(f"其重要性主要体现在：{reason.rstrip('。； ')}")
+    parts.append("建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响")
+    return compact_text("。".join(part for part in parts if part) + "。", 700)
+
+
+def normalize_glossary(value: object, importance_level: int) -> list[dict[str, str]]:
+    if importance_level < 4 or not isinstance(value, list):
+        return []
+    glossary = []
+    seen = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        term = compact_text(entry.get("term"), 60)
+        explanation = compact_text(entry.get("explanationZh"), 180)
+        key = term.casefold()
+        if not re.search(r"[A-Za-z]", term) or not contains_chinese(explanation) or key in seen:
+            continue
+        seen.add(key)
+        glossary.append({"term": term, "explanationZh": explanation})
+        if len(glossary) >= 8:
+            break
+    return glossary
 
 
 def load_snapshot(item_id: str) -> tuple[Path, dict] | None:
@@ -203,11 +247,13 @@ def normalize_review(raw: dict, item: dict, provider: str, model: str, reviewed_
     if not tags:
         tags = [compact_text(tag, 24) for tag in (item.get("tags") or [])[:5] if compact_text(tag, 24)]
     reason = compact_text(raw.get("reasonZh"), 180)
-    summary = compact_text(raw.get("summaryZh"), 320)
+    summary = compact_text(raw.get("summaryZh"), 700)
     if not contains_chinese(reason):
         reason = "模型未提供有效的中文推荐理由。"
     if not contains_chinese(summary):
         summary = ""
+    summary = ensure_long_summary(summary, item, reason, importance_level)
+    glossary = normalize_glossary(raw.get("glossary"), importance_level)
     return {
         "version": REVIEW_VERSION,
         "provider": provider,
@@ -225,6 +271,7 @@ def normalize_review(raw: dict, item: dict, provider: str, model: str, reviewed_
         "tags": tags[:5],
         "reasonZh": reason,
         "summaryZh": summary,
+        "glossary": glossary,
         "duplicateKey": compact_text(raw.get("duplicateKey"), 100),
     }
 
@@ -279,7 +326,7 @@ def request_reviews(provider: str, endpoint: str, token: str, model: str, items:
             "contents": [{"role": "user", "parts": [{"text": input_json}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 5000,
+                "maxOutputTokens": 8000,
                 "responseMimeType": "application/json",
             },
         }
@@ -296,7 +343,7 @@ def request_reviews(provider: str, endpoint: str, token: str, model: str, items:
                 {"role": "user", "content": input_json},
             ],
             "temperature": 0,
-            "max_tokens": 5000,
+            "max_tokens": 8000,
         }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(endpoint, data=body, method="POST", headers=headers)

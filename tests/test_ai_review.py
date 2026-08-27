@@ -48,8 +48,16 @@ class AIReviewTests(unittest.TestCase):
             "tags": ["Agent", "Agent", "tools"],
             "reasonZh": "这是一篇重要的智能体技术文章。",
             "summaryZh": "文章介绍了新的工具调用方法。它降低了智能体执行失败率。",
+            "glossary": [
+                {"term": "tool calling", "explanationZh": "模型根据任务主动调用外部工具的能力。"},
+                {"term": "Tool Calling", "explanationZh": "重复术语。"},
+                {"term": "Agent", "explanationZh": "能够规划并执行多步任务的智能体。"},
+            ],
             "duplicateKey": " Agent tools ",
-        }, {"category": "agent", "score": 60, "tags": []}, "gemini", "example/model", "2026-01-01T00:00:00Z")
+        }, {
+            "category": "agent", "score": 60, "tags": [], "source": "Example AI", "title": "Agent tool calling",
+            "summary": "该方法通过结构化接口连接检索、计算和业务系统，并在执行前检查参数与权限。",
+        }, "gemini", "example/model", "2026-01-01T00:00:00Z")
 
         self.assertEqual(result["category"], "agent")
         self.assertEqual(result["dimensions"]["relevance"], 25)
@@ -58,6 +66,8 @@ class AIReviewTests(unittest.TestCase):
         self.assertEqual(result["tags"], ["Agent", "tools"])
         self.assertEqual(result["provider"], "gemini")
         self.assertEqual(result["model"], "example/model")
+        self.assertGreaterEqual(ai_review.visible_length(result["summaryZh"]), 100)
+        self.assertEqual([entry["term"] for entry in result["glossary"]], ["tool calling", "Agent"])
 
     def test_credentials_prefer_gemini_and_support_openrouter(self):
         with patch.dict(ai_review.os.environ, {"GEMINI_API_KEY": "gemini", "OPENROUTER_API_KEY": "router"}, clear=True):
@@ -96,6 +106,7 @@ class AIReviewTests(unittest.TestCase):
                 "tags": ["模型发布"],
                 "reasonZh": "该文章发布了新的大模型。",
                 "summaryZh": "该公司发布了新的大模型，并公布了部署方式。",
+                "glossary": [{"term": "inference", "explanationZh": "模型根据输入生成输出的推理过程。"}],
                 "duplicateKey": "new-model",
             }]
 
@@ -106,7 +117,8 @@ class AIReviewTests(unittest.TestCase):
             self.assertEqual(completed, 1)
             self.assertEqual(items[0]["aiReview"]["importanceScore"], 88)
             self.assertEqual(items[0]["aiReview"]["importanceLevel"], 5)
-            self.assertEqual(snapshot["summaryZh"], raw[0]["summaryZh"])
+            self.assertTrue(snapshot["summaryZh"].startswith(raw[0]["summaryZh"].rstrip("。")))
+            self.assertGreaterEqual(ai_review.visible_length(snapshot["summaryZh"]), 100)
             self.assertEqual(snapshot["summaryModel"], "gemini:example/model")
 
     def test_editorial_ceiling_limits_off_topic_and_unverified_items(self):
@@ -150,6 +162,26 @@ class AIReviewTests(unittest.TestCase):
         result = ai_review.normalize_review(raw, item, "gemini", "model", "2026-01-01T00:00:00Z")
 
         self.assertEqual((result["importanceScore"], result["importanceLevel"]), (69, 3))
+
+    def test_glossary_is_removed_below_level_four(self):
+        raw = {
+            "isRelevant": True,
+            "category": "industry",
+            "dimensions": {"relevance": 15, "impact": 8, "novelty": 7, "credibility": 9, "usefulness": 5, "timeliness": 6},
+            "evidenceLevel": "clear",
+            "informationType": "analysis",
+            "tags": [],
+            "reasonZh": "这是一条普通的行业参考信息。",
+            "summaryZh": "文章介绍了一项行业动态。",
+            "glossary": [{"term": "benchmark", "explanationZh": "用于比较模型能力的标准化测试。"}],
+            "duplicateKey": "ordinary-event",
+        }
+
+        result = ai_review.normalize_review(raw, {"category": "industry", "tags": []}, "gemini", "model", "2026-01-01T00:00:00Z")
+
+        self.assertEqual(result["importanceLevel"], 3)
+        self.assertEqual(result["glossary"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

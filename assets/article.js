@@ -20,9 +20,9 @@ const SNAPSHOT_LABEL = {
 };
 
 const elements = Object.fromEntries([
-  "articleBody", "articleCategory", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
+  "articleBody", "articleCategory", "articleGlossary", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
   "articleImportance", "articleReason", "articleReview",
-  "articleTitle", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "themeButton"
+  "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "themeButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 function favicon(item) {
@@ -78,6 +78,21 @@ function importanceLevel(item) {
   return 1;
 }
 
+function renderGlossary(item, level) {
+  elements.glossaryList.replaceChildren();
+  const entries = level >= 4 && Array.isArray(item.aiReview?.glossary)
+    ? item.aiReview.glossary.filter((entry) => entry?.term && entry?.explanationZh).slice(0, 8)
+    : [];
+  entries.forEach((entry) => {
+    const term = document.createElement("dt");
+    term.textContent = entry.term;
+    const explanation = document.createElement("dd");
+    explanation.textContent = entry.explanationZh;
+    elements.glossaryList.append(term, explanation);
+  });
+  elements.articleGlossary.hidden = entries.length === 0;
+}
+
 function renderArticle(item, snapshot) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
@@ -97,6 +112,7 @@ function renderArticle(item, snapshot) {
   elements.articleReason.textContent = item.aiReview?.reasonZh || "";
   elements.articleReview.hidden = !item.aiReview;
   elements.articleSummary.textContent = snapshot?.summaryZh || item.aiReview?.summaryZh || fallbackSummary(item);
+  renderGlossary(item, level);
   elements.originalLink.href = item.url;
   elements.readerStatus.textContent = kind === "summary" ? "正文快照暂未取得" : "内部阅读已就绪";
   elements.readerNotice.hidden = kind !== "summary";
