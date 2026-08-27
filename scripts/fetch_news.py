@@ -339,6 +339,16 @@ def load_previous() -> list[dict]:
         return []
 
 
+def preserve_archive_metadata(item: dict, previous: dict | None) -> dict:
+    if not isinstance(previous, dict):
+        return item
+    if previous.get("publishedAt"):
+        item["publishedAt"] = previous["publishedAt"]
+    if isinstance(previous.get("aiReview"), dict):
+        item["aiReview"] = previous["aiReview"]
+    return item
+
+
 def main() -> int:
     now = datetime.now(timezone.utc)
     collected: list[dict] = []
@@ -374,8 +384,7 @@ def main() -> int:
         seen_titles.add(key)
         item = finalize(raw, now)
         previous = merged.get(item["id"])
-        if isinstance(previous, dict) and isinstance(previous.get("aiReview"), dict):
-            item["aiReview"] = previous["aiReview"]
+        preserve_archive_metadata(item, previous)
         merged[item["id"]] = item
         if store_feed_snapshot(item, raw.get("readerHtml", "")):
             feed_snapshots += 1
