@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from article_store import ARTICLES_DIR, ROOT
+from news_store import load_news, save_news
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
@@ -102,7 +103,7 @@ def metadata_summary(item: dict) -> str:
 
 
 def load_candidates(limit: int) -> list[tuple[Path, dict, dict]]:
-    news = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
+    news = load_news(NEWS_FILE)
     items = {item["id"]: item for item in news.get("items", [])}
     candidates = []
     for path in ARTICLES_DIR.rglob("*.json"):
@@ -152,6 +153,7 @@ def main() -> int:
         if args.delay > 0:
             time.sleep(args.delay)
     print(f"[summaries] wrote {completed}/{len(candidates)} Chinese summaries")
+    save_news(load_news(NEWS_FILE), NEWS_FILE)
     return 0
 
 

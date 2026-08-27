@@ -129,40 +129,40 @@ function renderFailure(message) {
   elements.originalLink.hidden = true;
 }
 
-function snapshotPath(item) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T|$)/.exec(item?.publishedAt || "");
-  if (!match || !/^[0-9a-f]{12}$/.test(item?.id || "")) throw new Error("文章发布日期无效");
-  const [, year, month, day] = match;
-  const date = new Date(`${year}-${month}-${day}T00:00:00Z`);
-  if (
-    Number.isNaN(date.getTime())
-    || date.getUTCFullYear() !== Number(year)
-    || date.getUTCMonth() + 1 !== Number(month)
-    || date.getUTCDate() !== Number(day)
-  ) throw new Error("文章发布日期无效");
-  return `data/articles/${year}/${month}/${day}/${item.id}.json`;
+function articlePath(articleId, location) {
+  if (!/^[0-9a-f]{12}$/.test(articleId) || !/^\d{4}\/\d{2}\/\d{2}$/.test(location)) {
+    throw new Error("文章位置无效");
+  }
+  return `data/articles/${location}/${articleId}.json`;
+}
+
+async function fetchRecord(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
+  return response.json();
 }
 
 async function loadArticle() {
-  const articleId = new URLSearchParams(window.location.search).get("id") || "";
+  const params = new URLSearchParams(window.location.search);
+  const articleId = params.get("id") || "";
   if (!/^[0-9a-f]{12}$/.test(articleId)) {
     renderFailure("文章链接无效，请返回情报流重新选择。");
     return;
   }
   try {
-    const newsResponse = await fetch("data/news.json", { cache: "no-store" });
-    if (!newsResponse.ok) throw new Error(`news HTTP ${newsResponse.status}`);
-    const news = await newsResponse.json();
-    const item = news.items?.find((entry) => entry.id === articleId);
-    if (!item) throw new Error("未找到该文章");
-    let snapshot = null;
-    try {
-      const snapshotResponse = await fetch(snapshotPath(item), { cache: "no-store" });
-      if (snapshotResponse.ok) snapshot = await snapshotResponse.json();
-    } catch (error) {
-      console.warn("Article snapshot unavailable", error);
+    const date = params.get("date") || "";
+    let record = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      record = await fetchRecord(articlePath(articleId, date.replaceAll("-", "/")));
     }
-    renderArticle(item, snapshot);
+    if (!record) {
+      const locator = await fetchRecord(`data/article-index/${articleId.slice(0, 2)}.json`);
+      const location = locator?.[articleId];
+      if (location) record = await fetchRecord(articlePath(articleId, location));
+    }
+    if (!record || record.id !== articleId) throw new Error("未找到该文章");
+    renderArticle(record, record);
   } catch (error) {
     console.error("Unable to load article", error);
     renderFailure("无法加载该文章的本地记录，请稍后重试。");

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from article_store import ROOT, snapshot_path
+from news_store import load_news, save_news
 
 NEWS_FILE = ROOT / "data" / "news.json"
 DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -398,15 +399,16 @@ def apply_reviews(items: list[dict], raw_reviews: list[dict], provider: str, mod
         review = normalize_review(raw, item, provider, model, reviewed_at)
         item["aiReview"] = review
         loaded = load_snapshot(item)
-        if loaded and review["summaryZh"]:
+        if loaded:
             path, snapshot = loaded
-            if snapshot.get("contentKind") in READABLE_KINDS:
+            snapshot["aiReview"] = review
+            if review["summaryZh"]:
                 snapshot["summaryZh"] = review["summaryZh"]
                 snapshot["summaryGeneratedAt"] = reviewed_at
                 snapshot["summaryModel"] = f"{provider}:{model}"
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                temporary.replace(path)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(path)
         completed += 1
     return completed
 
@@ -428,7 +430,7 @@ def main() -> int:
     endpoint = os.getenv("AI_REVIEW_ENDPOINT") or default_endpoint
     models = model_candidates(provider, os.getenv("AI_REVIEW_MODEL", ""))
     model = models[0]
-    data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
+    data = load_news(NEWS_FILE)
     items = data.get("items", [])
     candidates = select_candidates(items, args.limit, args.force)
     if not candidates:
@@ -470,9 +472,7 @@ def main() -> int:
             "lastRunAt": utc_now(),
             "reviewedThisRun": completed,
         }
-        temporary = NEWS_FILE.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(NEWS_FILE)
+        save_news(data, NEWS_FILE)
     print(f"[ai] completed {completed}/{len(candidates)} candidate reviews")
     return 0
 

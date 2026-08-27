@@ -25,7 +25,7 @@ scripts/fetch_articles.py -> scripts/ai_review.py
 正文归档 -> AI 相关性判断 / 分类 / 评分 / 中文摘要
           |
           v
-data/news.json + data/articles/ (历史永久累积)
+data/news/ + data/articles/YYYY/MM/DD/ (历史永久累积)
           |
           v
 Vanilla HTML / CSS / JS -> GitHub Pages
@@ -33,7 +33,20 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 
 ## 自动更新
 
-`.github/workflows/update-news.yml` 每天北京时间 08:00 和 15:00 运行，更新 `data/news.json`。GitHub 的定时任务可能延迟数十分钟；更新提交会自动触发 Pages 部署。
+`.github/workflows/update-news.yml` 每天北京时间 08:00 和 15:00 运行，更新分片数据。GitHub 的定时任务可能延迟数十分钟；更新提交会自动触发 Pages 部署。
+
+### 数据目录
+
+数据按用途拆分，避免单个 JSON 随历史增长而持续膨胀：
+
+```text
+data/news.json                         # 小型清单：日期、数量、来源
+data/news/YYYY/MM/DD.json              # 首页使用的每日轻量索引
+data/articles/YYYY/MM/DD/<id>.json     # 完整文章：元数据、正文、摘要、AI 审阅、重点词
+data/article-index/<id前两位>.json     # 兼容不带日期的历史文章链接
+```
+
+首页只加载当前日、周或月涉及的每日索引，文章页只加载一篇完整记录。可运行 `python scripts/build_news_data.py` 重建索引，运行 `python scripts/validate_data.py` 检查清单、分片、文章与定位表是否一致。
 
 ### 重要等级
 
@@ -61,7 +74,7 @@ AI 审核会从相关性、影响力、新颖性、可信度、实用性和时�
 - `AI_REVIEW_PROVIDER`：`gemini`、`openrouter` 或留空自动选择
 - `AI_REVIEW_MODEL`：覆盖默认模型名称
 
-每轮只审核尚未处理的文章，审核结果按版本写入 `data/news.json`，不会重复消耗额度。最终实际采用的模型记录在 `data/news.json` 的 `aiReview.model` 字段中。模型限流、密钥缺失或输出异常时，任务继续使用原有关键词分类与评分，不会阻断新闻更新。
+每轮只审核尚未处理的文章，审核结果按版本写入对应的单篇文章 JSON，不会重复消耗额度。最终实际采用的模型记录在文章记录的 `aiReview.model` 字段中。模型限流、密钥缺失或输出异常时，任务继续使用原有关键词分类与评分，不会阻断新闻更新。
 
 分类和评分均为可审查的本地规则：
 

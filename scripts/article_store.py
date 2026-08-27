@@ -51,6 +51,10 @@ SECRET_PATTERNS = (
     (re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"), "AIza[REDACTED]"),
     (re.compile(r"(?<![A-Z0-9])AKIA[A-Z0-9]{16}(?![A-Z0-9])"), "AKIA[REDACTED]"),
 )
+SNAPSHOT_ITEM_FIELDS = (
+    "id", "title", "summary", "url", "source", "sourceDomain", "publishedAt",
+    "category", "tags", "score", "signal", "aiReview",
+)
 
 
 def utc_now() -> str:
@@ -64,11 +68,14 @@ def redact_secrets(value: str) -> str:
     return redacted
 
 
-def redact_snapshot(snapshot: dict) -> dict:
-    return {
-        key: redact_secrets(value) if isinstance(value, str) else value
-        for key, value in snapshot.items()
-    }
+def redact_snapshot(value):
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {key: redact_snapshot(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_snapshot(item) for item in value]
+    return value
 
 
 class ReadableTextParser(HTMLParser):
@@ -212,17 +219,21 @@ def write_snapshot(
     error: str | None = None,
 ) -> Path:
     path = snapshot_path(item)
-    payload = redact_snapshot({
-        "id": item["id"],
-        "title": item["title"],
-        "source": item["source"],
+    payload = {
+        "schemaVersion": 3,
+        **{
+            field: item[field]
+            for field in SNAPSHOT_ITEM_FIELDS
+            if field in item
+        },
         "originalUrl": item["url"],
         "resolvedUrl": resolved_url or item["url"],
         "fetchedAt": utc_now(),
         "contentKind": content_kind,
         "archiveVersion": 2,
         "body": body.strip()[:MAX_BODY_CHARS],
-    })
+    }
+    payload = redact_snapshot(payload)
     if error:
         payload["note"] = redact_secrets(error[:180])
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -9,12 +9,13 @@ import re
 from pathlib import Path
 
 from article_store import ARTICLES_DIR, ROOT, publication_path
+from news_store import load_news
 
 NEWS_FILE = ROOT / "data" / "news.json"
 
 
 def build_move_plan(news_file: Path, articles_dir: Path) -> tuple[list[tuple[Path, Path]], int]:
-    news = json.loads(news_file.read_text(encoding="utf-8"))
+    news = load_news(news_file, articles_dir, hydrate=False)
     published_by_id = {
         item["id"]: item.get("publishedAt")
         for item in news.get("items", [])

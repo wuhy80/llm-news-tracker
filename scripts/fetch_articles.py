@@ -18,6 +18,7 @@ from article_store import (
     snapshot_kind,
     snapshot_path,
 )
+from news_store import load_news, save_news
 
 NEWS_FILE = ROOT / "data" / "news.json"
 
@@ -48,7 +49,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=int(os.getenv("ARTICLE_FETCH_WORKERS", "12")))
     parser.add_argument("--reader-limit", type=int, default=int(os.getenv("ARTICLE_READER_LIMIT", "30")))
     args = parser.parse_args()
-    data = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
+    data = load_news(NEWS_FILE)
     now = datetime.now(timezone.utc)
     candidates = [item for item in data.get("items", []) if needs_archive(item, now)][:max(0, args.limit)]
     if not candidates:
@@ -96,9 +97,7 @@ def main() -> int:
             item["articleKind"] = kind
         else:
             item.pop("articleKind", None)
-    temporary = NEWS_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(NEWS_FILE)
+    save_news(data, NEWS_FILE)
     return 0
 
 

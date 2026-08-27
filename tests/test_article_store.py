@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import article_store
+from news_store import load_news
 
 
 class ArticleTextTests(unittest.TestCase):
@@ -98,6 +99,7 @@ class SnapshotTests(unittest.TestCase):
             "source": "Example",
             "url": "https://example.com/article",
             "publishedAt": "2026-08-27T03:10:20Z",
+            "aiReview": {"reasonZh": secrets[0], "glossary": [{"term": secrets[1]}]},
         }
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
@@ -107,6 +109,8 @@ class SnapshotTests(unittest.TestCase):
         for secret in secrets:
             self.assertNotIn(secret, snapshot["body"])
         self.assertEqual(snapshot["body"].count("[REDACTED]"), len(secrets))
+        self.assertNotIn(secrets[0], snapshot["aiReview"]["reasonZh"])
+        self.assertNotIn(secrets[1], snapshot["aiReview"]["glossary"][0]["term"])
 
     @patch("article_store.fetch_reader_text")
     @patch("article_store.fetch_page_text")
@@ -130,7 +134,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["contentKind"], "reader")
 
     def test_news_archive_markers_match_snapshot_files(self):
-        news = json.loads((article_store.ROOT / "data" / "news.json").read_text(encoding="utf-8"))
+        news = load_news(article_store.ROOT / "data" / "news.json")
         marked = [item for item in news["items"] if item.get("articleKind")]
 
         self.assertGreater(len(marked), 0)

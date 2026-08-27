@@ -19,6 +19,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from article_store import resolve_google_news_urls, snapshot_kind, store_feed_snapshot
+from news_store import load_news, save_news
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
@@ -334,7 +335,7 @@ def load_previous() -> list[dict]:
     if not OUTPUT.exists():
         return []
     try:
-        return json.loads(OUTPUT.read_text(encoding="utf-8")).get("items", [])
+        return load_news(OUTPUT).get("items", [])
     except (json.JSONDecodeError, OSError):
         return []
 
@@ -407,8 +408,7 @@ def main() -> int:
         "sources": successful_sources,
         "items": items,
     }
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    save_news(payload, OUTPUT)
     print(f"[articles] stored {feed_snapshots} feed snapshots")
     print(f"[done] wrote {len(items)} items to {OUTPUT.relative_to(ROOT)}")
     return 0

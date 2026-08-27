@@ -17,6 +17,9 @@ const state = {
   items: [],
   sources: [],
   generatedAt: null,
+  manifest: null,
+  shardCache: new Map(),
+  loadVersion: 0,
   period: "day",
   anchor: new Date(),
   aiMode: "curated",
@@ -25,7 +28,7 @@ const state = {
   source: "all",
   query: "",
   sort: "hot",
-  visible: Number.POSITIVE_INFINITY,
+  visible: PAGE_SIZE,
   saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]"))
 };
 const el = Object.fromEntries([
@@ -84,12 +87,10 @@ function shiftRange(direction) {
   if (state.period === "month") next.setMonth(next.getMonth() + direction);
   state.anchor = next;
   resetVisible();
-  render();
+  loadRangeData();
 }
 function resetVisible() {
-  state.visible = state.category === "all" && state.source === "all" && !state.query.trim()
-    ? Number.POSITIVE_INFINITY
-    : PAGE_SIZE;
+  state.visible = PAGE_SIZE;
 }
 function relativeTime(value) {
   const date = new Date(value);
@@ -195,7 +196,8 @@ function renderFeed(items) {
     const link = fragment.querySelector("h3 a");
     link.textContent = item.title;
     if (["community", "feed", "page", "reader"].includes(item.articleKind)) {
-      link.href = `article.html?id=${encodeURIComponent(item.id)}`;
+      const date = item.publishedAt.slice(0, 10);
+      link.href = `article.html?id=${encodeURIComponent(item.id)}&date=${encodeURIComponent(date)}`;
     } else {
       const title = document.createElement("span");
       title.textContent = item.title;
@@ -296,8 +298,9 @@ function renderTrends(items) {
   });
 }
 function renderSources() {
+  const currentItems = rangeItems();
   const counts = new Map();
-  state.items.forEach((item) => counts.set(item.source, (counts.get(item.source) || 0) + 1));
+  currentItems.forEach((item) => counts.set(item.source, (counts.get(item.source) || 0) + 1));
   const sources = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7);
   el.sourceList.replaceChildren();
 
@@ -306,12 +309,12 @@ function renderSources() {
   allSources.className = "source-row source-row-all";
   allSources.classList.toggle("active", state.source === "all");
   allSources.setAttribute("aria-pressed", state.source === "all");
-  allSources.innerHTML = `<span class="source-all-mark" aria-hidden="true"></span><span>全部来源</span><small>${state.items.length} 条</small>`;
+  allSources.innerHTML = `<span class="source-all-mark" aria-hidden="true"></span><span>全部来源</span><small>${currentItems.length} 条</small>`;
   allSources.addEventListener("click", () => selectSource("all"));
   el.sourceList.append(allSources);
 
   sources.forEach(([name, count]) => {
-    const item = state.items.find((entry) => entry.source === name);
+    const item = currentItems.find((entry) => entry.source === name);
     const row = document.createElement("button");
     row.type = "button";
     row.className = "source-row";
@@ -370,7 +373,7 @@ function setupEvents() {
       item.classList.toggle("active", active);
       item.setAttribute("aria-selected", active);
     });
-    render();
+    loadRangeData();
   }));
   document.querySelectorAll("[data-category]").forEach((button) => button.addEventListener("click", () => {
     state.category = button.dataset.category;
@@ -385,7 +388,7 @@ function setupEvents() {
   }));
   el.previousRange.addEventListener("click", () => shiftRange(-1));
   el.nextRange.addEventListener("click", () => shiftRange(1));
-  el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); render(); });
+  el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); loadRangeData(); });
   el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; resetVisible(); render(); });
   el.importanceSelect.addEventListener("change", () => { state.importance = el.importanceSelect.value; resetVisible(); render(); });
   el.searchButton.addEventListener("click", openSearch);
@@ -411,16 +414,77 @@ function configureRepositoryLink() {
   const repo = window.location.pathname.split("/").filter(Boolean)[0] || `${owner}.github.io`;
   el.githubLink.href = `https://github.com/${owner}/${repo}`;
 }
+
+function utcDateKey(date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function shardDatesForRange() {
+  const { start, end } = getRange();
+  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const last = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate());
+  const dates = [];
+  while (cursor.getTime() <= last) {
+    dates.push(utcDateKey(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+async function loadShard(date) {
+  if (state.shardCache.has(date)) return state.shardCache.get(date);
+  const [year, month, day] = date.split("-");
+  const response = await fetch(`data/news/${year}/${month}/${day}.json`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${date} HTTP ${response.status}`);
+  const shard = await response.json();
+  const items = Array.isArray(shard.items) ? shard.items : [];
+  state.shardCache.set(date, items);
+  return items;
+}
+
+async function loadRangeData() {
+  updateRangeLabel();
+  if (!state.manifest) {
+    renderSources();
+    render();
+    return;
+  }
+  const version = ++state.loadVersion;
+  const dates = shardDatesForRange().filter((date) => state.manifest.days?.[date]);
+  try {
+    const shards = await Promise.all(dates.map(loadShard));
+    if (version !== state.loadVersion) return;
+    state.items = shards.flat();
+    renderSources();
+    render();
+  } catch (error) {
+    if (version !== state.loadVersion) return;
+    console.error("Unable to load daily news data", error);
+    state.items = [];
+    el.updateStatus.textContent = "当前时段数据暂时不可用";
+    renderSources();
+    render();
+  }
+}
+
 async function loadData() {
   try {
     const response = await fetch("data/news.json", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    state.items = Array.isArray(data.items) ? data.items : [];
     state.sources = Array.isArray(data.sources) ? data.sources : [];
     state.generatedAt = data.generatedAt;
-    if (state.items.length && !state.items.some((item) => inRange(item, getRange()))) {
-      state.anchor = new Date(Math.max(...state.items.map((item) => new Date(item.publishedAt).getTime())));
+    if (Array.isArray(data.items)) {
+      state.items = data.items;
+      if (state.items.length && !state.items.some((item) => inRange(item, getRange()))) {
+        state.anchor = new Date(Math.max(...state.items.map((item) => new Date(item.publishedAt).getTime())));
+      }
+    } else {
+      state.manifest = data;
+      const available = shardDatesForRange().some((date) => data.days?.[date]);
+      if (!available && /^\d{4}-\d{2}-\d{2}$/.test(data.latestDate || "")) {
+        state.anchor = new Date(`${data.latestDate}T12:00:00`);
+      }
     }
     const updated = state.generatedAt ? new Date(state.generatedAt) : null;
     el.updateStatus.textContent = updated && !Number.isNaN(updated.getTime())
@@ -431,8 +495,12 @@ async function loadData() {
     console.error("Unable to load news data", error);
     el.updateStatus.textContent = "数据暂时不可用";
   }
-  renderSources();
-  render();
+  if (state.manifest) {
+    await loadRangeData();
+  } else {
+    renderSources();
+    render();
+  }
 }
 (function init() {
   const savedTheme = localStorage.getItem("llm-pulse-theme");

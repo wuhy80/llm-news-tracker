@@ -124,6 +124,7 @@ class AIReviewTests(unittest.TestCase):
             self.assertTrue(snapshot["summaryZh"].startswith(raw[0]["summaryZh"].rstrip("。")))
             self.assertGreaterEqual(ai_review.visible_length(snapshot["summaryZh"]), 100)
             self.assertEqual(snapshot["summaryModel"], "gemini:example/model")
+            self.assertEqual(snapshot["aiReview"]["glossary"][0]["term"], "inference")
 
     def test_editorial_ceiling_limits_off_topic_and_unverified_items(self):
         base = {
