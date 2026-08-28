@@ -55,8 +55,49 @@ SOURCES = [
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
     indexed_source("Anthropic News", "site:anthropic.com/news", "anthropic.com", "release"),
+    {
+        "name": "Claude Blog",
+        "url": "https://claude.com/blog",
+        "domain": "claude.com",
+        "official": True,
+        "hint": "agent",
+        "format": "html-cards",
+        "link_prefix": "/blog/",
+    },
+    {
+        "name": "Claude Code Releases",
+        "url": "https://github.com/anthropics/claude-code/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "agent",
+    },
     indexed_source("Mistral AI News", "site:mistral.ai/news", "mistral.ai", "release"),
     indexed_source("xAI News", "site:x.ai/news", "x.ai", "release"),
+    {
+        "name": "Google DeepMind",
+        "url": "https://deepmind.google/blog/rss.xml",
+        "domain": "deepmind.google",
+        "official": True,
+    },
+    {
+        "name": "AWS Machine Learning",
+        "url": "https://aws.amazon.com/blogs/machine-learning/feed/",
+        "domain": "aws.amazon.com",
+        "official": True,
+    },
+    {
+        "name": "GitHub AI & ML",
+        "url": "https://github.blog/ai-and-ml/feed/",
+        "domain": "github.blog",
+        "official": True,
+        "hint": "agent",
+    },
+    {
+        "name": "Cloudflare AI",
+        "url": "https://blog.cloudflare.com/tag/ai/rss/",
+        "domain": "blog.cloudflare.com",
+        "official": True,
+    },
     indexed_source(
         "LMArena",
         '"LMArena" benchmark OR "Chatbot Arena" benchmark',
@@ -175,6 +216,63 @@ class TextExtractor(HTMLParser):
         self.parts.append(data)
 
 
+class BlogCardParser(HTMLParser):
+    def __init__(self, link_prefix: str) -> None:
+        super().__init__()
+        self.link_prefix = link_prefix
+        self.cards: list[dict[str, str]] = []
+        self.div_depth = 0
+        self.card_depth: int | None = None
+        self.date_depth: int | None = None
+        self.title_parts: list[str] = []
+        self.date_parts: list[str] = []
+        self.link = ""
+        self.capture_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "div":
+            self.div_depth += 1
+            if attributes.get("role") == "listitem":
+                self.card_depth = self.div_depth
+                self.title_parts = []
+                self.date_parts = []
+                self.link = ""
+            classes = (attributes.get("class") or "").split()
+            if self.card_depth is not None and "u-text-style-caption" in classes:
+                self.date_depth = self.div_depth
+        elif self.card_depth is not None and tag == "h2":
+            self.capture_title = True
+        elif self.card_depth is not None and tag == "a":
+            href = attributes.get("href") or ""
+            if href.startswith(self.link_prefix):
+                self.link = href
+                if attributes.get("data-cta-copy"):
+                    self.title_parts = [attributes["data-cta-copy"] or ""]
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "h2":
+            self.capture_title = False
+        if tag != "div":
+            return
+        if self.date_depth == self.div_depth:
+            self.date_depth = None
+        if self.card_depth == self.div_depth:
+            title = strip_html(" ".join(self.title_parts))
+            published = strip_html(" ".join(self.date_parts))
+            if title and published and self.link:
+                self.cards.append({"title": title, "published": published, "url": self.link})
+            self.card_depth = None
+            self.date_depth = None
+        self.div_depth = max(0, self.div_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_title:
+            self.title_parts.append(data)
+        if self.date_depth is not None:
+            self.date_parts.append(data)
+
+
 def strip_html(value: str) -> str:
     parser = TextExtractor()
     try:
@@ -223,14 +321,21 @@ def parse_date(value: str) -> datetime:
         try:
             date = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            return datetime.now(timezone.utc)
+            for date_format in ("%B %d, %Y", "%b %d, %Y"):
+                try:
+                    date = datetime.strptime(value, date_format)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return datetime.now(timezone.utc)
     if date.tzinfo is None:
         date = date.replace(tzinfo=timezone.utc)
     return date.astimezone(timezone.utc)
 
 
 def fetch(url: str, extra_headers: dict[str, str] | None = None) -> bytes:
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html"}
     if extra_headers:
         headers.update(extra_headers)
     request = urllib.request.Request(url, headers=headers)
@@ -270,11 +375,39 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         })
     return items
 
+
+def parse_blog_cards(payload: bytes, source: dict) -> list[dict]:
+    parser = BlogCardParser(source["link_prefix"])
+    parser.feed(payload.decode("utf-8", "replace"))
+    items = []
+    seen_urls = set()
+    for card in parser.cards:
+        url = urllib.parse.urljoin(source["url"], card["url"])
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        items.append({
+            "title": card["title"],
+            "url": url,
+            "summary": "",
+            "published": parse_date(card["published"]),
+            "source": source["name"],
+            "sourceDomain": source["domain"],
+            "official": source.get("official", False),
+            "hint": source.get("hint"),
+            "readerHtml": "",
+        })
+    return items
+
 def fetch_source(source: dict) -> list[dict]:
     errors = []
     for url in (source["url"], *source.get("fallback_urls", [])):
         try:
-            entries = parse_feed(fetch(url, source.get("headers")), source)
+            payload = fetch(url, source.get("headers"))
+            if source.get("format") == "html-cards":
+                entries = parse_blog_cards(payload, source)
+            else:
+                entries = parse_feed(payload, source)
             if entries:
                 return entries
         except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError) as error:

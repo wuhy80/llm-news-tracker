@@ -9,6 +9,55 @@ import fetch_news
 
 
 class FetchNewsTests(unittest.TestCase):
+    def test_curated_official_sources_are_unique_and_configured(self):
+        sources = {source["name"]: source for source in fetch_news.SOURCES}
+
+        self.assertEqual(len(sources), len(fetch_news.SOURCES))
+        expected = {
+            "Claude Blog": ("claude.com", "agent"),
+            "Claude Code Releases": ("github.com", "agent"),
+            "Google DeepMind": ("deepmind.google", None),
+            "AWS Machine Learning": ("aws.amazon.com", None),
+            "GitHub AI & ML": ("github.blog", "agent"),
+            "Cloudflare AI": ("blog.cloudflare.com", None),
+        }
+        for name, (domain, hint) in expected.items():
+            with self.subTest(source=name):
+                source = sources[name]
+                self.assertTrue(source["official"])
+                self.assertEqual(source["domain"], domain)
+                self.assertEqual(source.get("hint"), hint)
+
+        self.assertEqual(
+            sources["Claude Code Releases"]["url"],
+            "https://github.com/anthropics/claude-code/releases.atom",
+        )
+        self.assertEqual(sources["Claude Blog"]["url"], "https://claude.com/blog")
+        self.assertEqual(sources["Claude Blog"]["format"], "html-cards")
+
+    def test_blog_card_parser_extracts_dates_and_deduplicates_marquee_cards(self):
+        payload = b"""
+            <div role="listitem">
+              <h2>Claude Code now supports artifacts</h2>
+              <div class="u-text-style-caption">June 18, 2026</div>
+              <a data-cta-copy="Claude Code now supports artifacts"
+                 href="/blog/artifacts-in-claude-code">Read more</a>
+            </div>
+            <div role="listitem">
+              <h2>Claude Code now supports artifacts</h2>
+              <div class="u-text-style-caption">June 18, 2026</div>
+              <a href="/blog/artifacts-in-claude-code">Read more</a>
+            </div>
+        """
+        source = next(source for source in fetch_news.SOURCES if source["name"] == "Claude Blog")
+
+        items = fetch_news.parse_blog_cards(payload, source)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "Claude Code now supports artifacts")
+        self.assertEqual(items[0]["url"], "https://claude.com/blog/artifacts-in-claude-code")
+        self.assertEqual(items[0]["published"].isoformat(), "2026-06-18T00:00:00+00:00")
+
     def test_canonical_url_removes_tracking_and_normalizes_order(self):
         first = "HTTPS://Example.COM:443/posts/launch/?utm_source=rss&b=2&a=1#details"
         second = "https://example.com/posts/launch?a=1&b=2"
