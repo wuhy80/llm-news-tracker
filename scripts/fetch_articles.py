@@ -33,6 +33,8 @@ def needs_archive(item: dict, now: datetime) -> bool:
         return True
     if snapshot.get("contentKind") != "summary":
         return False
+    if snapshot.get("note") == "archive:not attempted":
+        return True
     if snapshot.get("archiveVersion", 0) < 2:
         return True
     try:
