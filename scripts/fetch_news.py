@@ -70,6 +70,7 @@ SOURCES = [
         "domain": "github.com",
         "official": True,
         "hint": "agent",
+        "title_prefix": "Claude Code",
     },
     indexed_source("Mistral AI News", "site:mistral.ai/news", "mistral.ai", "release"),
     indexed_source("xAI News", "site:x.ai/news", "x.ai", "release"),
@@ -362,6 +363,9 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
             source_name = embedded_source
             if " - " + embedded_source in title:
                 title = title.rsplit(" - " + embedded_source, 1)[0].strip()
+        title_prefix = source.get("title_prefix")
+        if title_prefix and not title.casefold().startswith(title_prefix.casefold()):
+            title = f"{title_prefix} {title}"
         items.append({
             "title": title,
             "url": url,

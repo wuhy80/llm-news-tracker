@@ -32,8 +32,27 @@ class FetchNewsTests(unittest.TestCase):
             sources["Claude Code Releases"]["url"],
             "https://github.com/anthropics/claude-code/releases.atom",
         )
+        self.assertEqual(sources["Claude Code Releases"]["title_prefix"], "Claude Code")
         self.assertEqual(sources["Claude Blog"]["url"], "https://claude.com/blog")
         self.assertEqual(sources["Claude Blog"]["format"], "html-cards")
+
+    def test_feed_title_prefix_makes_version_only_releases_identifiable(self):
+        payload = b"""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <title>v2.1.250</title>
+                <link rel="alternate" href="https://github.com/anthropics/claude-code/releases/tag/v2.1.250" />
+                <updated>2026-08-28T00:49:16Z</updated>
+              </entry>
+            </feed>
+        """
+        source = next(
+            source for source in fetch_news.SOURCES if source["name"] == "Claude Code Releases"
+        )
+
+        items = fetch_news.parse_feed(payload, source)
+
+        self.assertEqual(items[0]["title"], "Claude Code v2.1.250")
 
     def test_blog_card_parser_extracts_dates_and_deduplicates_marquee_cards(self):
         payload = b"""

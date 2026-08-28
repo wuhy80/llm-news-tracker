@@ -125,6 +125,7 @@ python -m http.server 8000
 - `extract_embedded_source`：对新闻索引 Feed 提取原始发布方名称
 - `format`：非 Feed 来源的解析格式，目前支持 `html-cards`
 - `link_prefix`：HTML 卡片来源允许抓取的站内文章路径前缀
+- `title_prefix`：为仅含版本号等缺少上下文的标题添加来源前缀
 
 ## 许可
 
