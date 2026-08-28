@@ -24,6 +24,9 @@ from news_store import load_news, save_news
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "news.json"
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker; by /u/wuhy80)"
+TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "mc_cid", "mc_eid", "ref_src", "s_cid",
+}
 
 def indexed_source(
     name: str,
@@ -305,6 +308,29 @@ def normalized_title(value: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
 
 
+def canonical_url(value: str) -> str:
+    """Normalize a public article URL without removing content-identifying parameters."""
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    scheme = parsed.scheme.casefold()
+    host = parsed.hostname.casefold()
+    netloc = host if port is None or (scheme, port) in {("http", 80), ("https", 443)} else f"{host}:{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    query = [
+        (key, item)
+        for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.casefold().startswith("utm_") and key.casefold() not in TRACKING_QUERY_KEYS
+    ]
+    return urllib.parse.urlunsplit((scheme, netloc, path, urllib.parse.urlencode(sorted(query)), ""))
+
+
 def finalize(raw: dict, now: datetime) -> dict:
     combined = f"{raw['title']} {raw['summary']}"
     category = classify(combined, raw.get("hint"))
@@ -345,9 +371,29 @@ def preserve_archive_metadata(item: dict, previous: dict | None) -> dict:
         return item
     if previous.get("publishedAt"):
         item["publishedAt"] = previous["publishedAt"]
+    for field in ("score", "signal"):
+        if field in previous:
+            item[field] = previous[field]
     if isinstance(previous.get("aiReview"), dict):
         item["aiReview"] = previous["aiReview"]
     return item
+
+
+def previous_indexes(items: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+    by_id = {item["id"]: item for item in items if item.get("id")}
+    by_url = {}
+    for item in items:
+        key = canonical_url(item.get("url", ""))
+        if key:
+            by_url.setdefault(key, item)
+    return by_id, by_url
+
+
+def news_content_changed(previous: list[dict], current: list[dict]) -> bool:
+    def stable(items: list[dict]) -> str:
+        ordered = sorted(items, key=lambda item: item.get("id", ""))
+        return json.dumps(ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return stable(previous) != stable(current)
 
 
 def main() -> int:
@@ -366,7 +412,10 @@ def main() -> int:
             except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError) as error:
                 print(f"[warn] {source['name']}: {error}", file=sys.stderr)
 
-    merged = {item.get("id"): item for item in load_previous() if item.get("id")}
+    previous_data = load_news(OUTPUT) if OUTPUT.exists() else {"items": []}
+    previous_items = previous_data.get("items", [])
+    previous_by_id, previous_by_url = previous_indexes(previous_items)
+    merged = dict(previous_by_id)
     resolved_urls = resolve_google_news_urls([raw["url"] for raw in collected])
     resolved_count = 0
     for raw in collected:
@@ -377,14 +426,20 @@ def main() -> int:
             resolved_count += 1
     print(f"[links] resolved {resolved_count} Google News links")
     seen_titles: set[str] = set()
+    seen_urls: set[str] = set()
     feed_snapshots = 0
     for raw in sorted(collected, key=lambda item: item["published"], reverse=True):
-        key = normalized_title(raw["title"])
-        if not key or key in seen_titles:
+        title_key = normalized_title(raw["title"])
+        url_key = canonical_url(raw["url"])
+        if not title_key or title_key in seen_titles or (url_key and url_key in seen_urls):
             continue
-        seen_titles.add(key)
+        seen_titles.add(title_key)
+        if url_key:
+            seen_urls.add(url_key)
         item = finalize(raw, now)
-        previous = merged.get(item["id"])
+        previous = previous_by_id.get(item["id"]) or previous_by_url.get(url_key)
+        if previous:
+            item["id"] = previous["id"]
         preserve_archive_metadata(item, previous)
         merged[item["id"]] = item
         if store_feed_snapshot(item, raw.get("readerHtml", "")):
@@ -402,12 +457,20 @@ def main() -> int:
         print("[error] no news items available", file=sys.stderr)
         return 1
 
+    changed = news_content_changed(previous_items, items)
+    generated_at = now.isoformat().replace("+00:00", "Z") if changed else previous_data.get("generatedAt")
+    sources = sorted(successful_sources, key=lambda source: source["name"])
+    if not changed and previous_data.get("sources"):
+        sources = previous_data["sources"]
+        print("[news] no article changes; preserving generatedAt and source metadata")
     payload = {
-        "generatedAt": now.isoformat().replace("+00:00", "Z"),
+        "generatedAt": generated_at or now.isoformat().replace("+00:00", "Z"),
         "historyPolicy": "append-only",
-        "sources": successful_sources,
+        "sources": sources,
         "items": items,
     }
+    if isinstance(previous_data.get("aiReview"), dict):
+        payload["aiReview"] = previous_data["aiReview"]
     save_news(payload, OUTPUT)
     print(f"[articles] stored {feed_snapshots} feed snapshots")
     print(f"[done] wrote {len(items)} items to {OUTPUT.relative_to(ROOT)}")

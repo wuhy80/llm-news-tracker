@@ -33,7 +33,7 @@ Vanilla HTML / CSS / JS -> GitHub Pages
 
 ## 自动更新
 
-`.github/workflows/update-news.yml` 每天北京时间 08:00 和 15:00 运行，更新分片数据。GitHub 的定时任务可能延迟数十分钟；更新提交会自动触发 Pages 部署。
+`.github/workflows/update-news.yml` 每 6 小时运行一次，计划时间为北京时间 02:17、08:17、14:17 和 20:17。任务避开整点以降低 GitHub 调度拥堵；定时任务仍可能延迟数十分钟。只有新闻、正文归档、AI 审核或摘要发生实际变化时才会提交，并自动触发 Pages 部署。
 
 ### 数据目录
 
