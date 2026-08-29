@@ -301,7 +301,12 @@ function renderSources() {
   const currentItems = rangeItems();
   const counts = new Map();
   currentItems.forEach((item) => counts.set(item.source, (counts.get(item.source) || 0) + 1));
-  const sources = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7);
+  const sourceMeta = new Map(state.sources.map((source) => [source.name, source]));
+  const sourceNames = new Set(sourceMeta.keys());
+  currentItems.forEach((item) => sourceNames.add(item.source));
+  const sources = [...sourceNames]
+    .map((name) => [name, counts.get(name) || 0])
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
   el.sourceList.replaceChildren();
 
   const allSources = document.createElement("button");
@@ -314,7 +319,11 @@ function renderSources() {
   el.sourceList.append(allSources);
 
   sources.forEach(([name, count]) => {
-    const item = currentItems.find((entry) => entry.source === name);
+    const item = currentItems.find((entry) => entry.source === name) || {
+      source: name,
+      sourceDomain: hostname(sourceMeta.get(name)?.url || ""),
+      url: sourceMeta.get(name)?.url || "https://example.com"
+    };
     const row = document.createElement("button");
     row.type = "button";
     row.className = "source-row";
