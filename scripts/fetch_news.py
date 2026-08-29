@@ -52,6 +52,12 @@ SOURCES = [
     {"name": "OpenAI", "url": "https://openai.com/news/rss.xml", "domain": "openai.com", "official": True},
     {"name": "Google AI", "url": "https://blog.google/technology/ai/rss/", "domain": "blog.google", "official": True},
     {"name": "Hugging Face", "url": "https://huggingface.co/blog/feed.xml", "domain": "huggingface.co", "official": True},
+    {
+        "name": "arXiv · 大模型研究",
+        "url": "https://export.arxiv.org/api/query?search_query=%28cat%3Acs.CL%20OR%20cat%3Acs.AI%29%20AND%20%28all%3A%22large%20language%20model%22%20OR%20all%3A%22foundation%20model%22%20OR%20all%3A%22language%20model%22%20OR%20all%3ALLM%29&start=0&max_results=100&sortBy=submittedDate&sortOrder=descending",
+        "domain": "arxiv.org",
+        "official": False,
+    },
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
     indexed_source("Anthropic News", "site:anthropic.com/news", "anthropic.com", "release"),

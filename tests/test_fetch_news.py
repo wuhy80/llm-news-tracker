@@ -54,6 +54,31 @@ class FetchNewsTests(unittest.TestCase):
 
         self.assertEqual(items[0]["title"], "Claude Code v2.1.250")
 
+
+    def test_arxiv_atom_feed_is_parsed_as_large_model_research(self):
+        payload = b"""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry>
+                <id>http://arxiv.org/abs/2608.12345</id>
+                <title>Scaling large language model reasoning with tool use</title>
+                <summary>We study foundation model reasoning and evaluation.</summary>
+                <published>2026-08-29T08:00:00Z</published>
+                <updated>2026-08-29T10:00:00Z</updated>
+                <link rel="alternate" type="text/html" href="https://arxiv.org/abs/2608.12345" />
+              </entry>
+            </feed>
+        """
+        source = next(source for source in fetch_news.SOURCES if source["name"] == "arXiv · 大模型研究")
+
+        items = fetch_news.parse_feed(payload, source)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "Scaling large language model reasoning with tool use")
+        self.assertEqual(items[0]["url"], "https://arxiv.org/abs/2608.12345")
+        self.assertEqual(items[0]["source"], "arXiv · 大模型研究")
+        self.assertEqual(items[0]["sourceDomain"], "arxiv.org")
+        self.assertEqual(items[0]["published"].isoformat(), "2026-08-29T08:00:00+00:00")
+
     def test_blog_card_parser_extracts_dates_and_deduplicates_marquee_cards(self):
         payload = b"""
             <div role="listitem">
