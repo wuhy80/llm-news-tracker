@@ -19,5 +19,60 @@
   "contentKind": "page",
   "archiveVersion": 2,
   "body": "vLLM V0 to V1: Correctness Before Corrections in RL\n\nPipelineRL uses vLLM as the inference engine for rollout generation. The inference engine samples tokens and returns token logprobs; the trainer uses those logprobs to compute policy ratios, KL, clip rate, entropy, and reward. Any discrepancy in how those logprobs are computed can change the training dynamics. This is the train-inference mismatch we needed to eliminate during the vLLM V0 to V1 migration.\n\nTL;DR. vLLM V1 matched our vLLM V0 reference after we fixed four things: processed rollout logprobs, V1-specific runtime defaults, the inflight weight-update path, and the fp32 lm_head used for the final projection. We fixed the backend behavior before changing the RL objective.\n\nThe reference run used vLLM 0.8.5 ; the V1 runs used vLLM 0.18.1 . Figure 1 shows the final result. The red run is the initial V1 attempt, and the green run is the final V1 run after the fixes described below.\n\nFigure 1. Trainer-side metrics for the vLLM V0 reference (blue), the initial vLLM V1 attempt (red), and the final vLLM V1 run after our fixes (green), including the fp32 lm_head . The final V1 run returns close to the V0 trajectory across clip rate, KL, entropy, and reward.\n\nvLLM V1 is a substantial rewrite of the V0 engine. Our migration target was therefore deliberately narrow:\n\nverify that V1 returned rollout logprobs in the form the trainer expected\n\nrerun the same workload against the V0 reference\n\nevaluate objective-level changes only after backend parity was restored\n\nThe first visible symptoms appeared in:\n\nclamp_log_ratio_new_old_indicator\n\nThose metrics came from a GSPO training run, the objective used for this experiment. The same class of mismatch can surface in PPO, GRPO, or any online RL system that treats rollout-side logprobs as part of the optimization target.\n\nThe initial V1 run showed the problem clearly. The trainer-side logprobs and reward moved away from the V0 reference early in training.\n\nFigure 2. Current-policy logprobs computed by the trainer during updates (left) and reward (right). The initial vLLM V1 run (red) separates from the vLLM V0 reference (blue).\n\nThe same pattern appears in the trainer metrics. Clip rate is the easiest signal to read in the initial comparison.\n\nFigure 3. Trainer-side metrics for the vLLM V0 reference (blue) and the initial vLLM V1 attempt (red). Clip rate tracks the rollout/trainer policy gap; entropy and reward show how that gap propagates into training.\n\nWe separated the possible causes into three layers:\n\nSemantic mismatch : the backend returns logprobs with different meaning relative to what the trainer expects.\n\nInference-path mismatch : the backend uses different runtime defaults for caching, scheduling, or request handling, so the same prompts follow a different execution path.\n\nObjective mismatch : the RL objective needs correction for the amount of staleness or backend mismatch that remains.\n\nWe initially suspected the third category too early. The useful diagnosis came from treating the first two as backend behavior problems and ruling them out first.\n\nThe first issue was semantic. vLLM V1 returns logprobs from the raw model outputs by default, before logits post-processing such as temperature scaling, penalties, and top-k/top-p filtering. PipelineRL expected logprobs from the processed distribution used by the sampler.\n\nThe required setting was:\n\nlogprobs-mode=processed_logprobs\n\nThis removed the obvious mean offset in rollout logprobs. The training curves still showed a gap relative to the known-good reference, so the next issue had to be in the inference path.\n\nThe policy-ratio plot shows this directly. Once processed_logprobs is on for V1, the mean policy ratio stays centered extremely close to 1.0 across all three runs. That establishes the mean-bias fix. The remaining mismatch shows up in clip rate, KL, entropy, and downstream training behavior.\n\nFigure 4. Per-step deviation of the rollout/trainer policy ratio from 1.0, scaled by 10,000, for the vLLM V0 reference (blue), the initial vLLM V1 run (red), and the corrected vLLM V1 run (green).\n\nThe early V1 run mixed the engine version with V1 runtime defaults:\n\nprefix caching, left unset in the early run so the vLLM 0.18.1 default applied\n\nasync scheduling, left unset in the early run so the vLLM 0.18.1 default applied\n\nan ad-hoc disable-cascade-attn override that was set through launch-time kwarg passthrough and sits outside the parity recipe in committed config\n\nFor the parity run, we made these choices explicit:\n\nvllm_config: use_v1: true vllm_kwargs: logprobs-mode: processed_logprobs enable-prefix-caching: false async-scheduling: false\n\nPrefix caching deserves a separate note. It is normally a correctness-preserving inference optimization for a fixed model state. In this online RL setup, it was a V1-only difference in cache lifetime and reuse relative to the V0 reference path. The actor was also handling repeated prefixes, concurrent requests, async scheduling, and inflight weight updates.\n\nA prefix-cache hit can reuse state computed before a weight update when the cache policy ignores the weight-update boundary. Disabling prefix caching removed one V1-only degree of freedom from the parity comparison.\n\nWeight synchronization also had to match the online-RL update model. One option was to make V1 stricter than V0 by draining requests and clearing caches at every update. That would answer a separate question. We first needed to verify that V1 could match the existing V0 behavior.\n\nWhat V0 effectively did was closer to:\n\nblock execution at an engine boundary\n\nresume without an explicit cached-state invalidation\n\nThe nearest V1 analogue was:\n\nawait engine.pause_generation(mode= \"keep\" , clear_cache= False ) await engine_client.collective_rpc_async( \"receive_weight_update\" , args=(request.model_dump_json(),), ) await engine.resume_generation()\n\nmode=\"keep\" matches the old inflight update model more closely than wait or abort\n\nclear_cache=False matches the V0 wrapper behavior, which left cached state intact on update\n\nLag was a useful runtime diagnostic. The initial V1 path carries more persistent lag later in training than the corrected V1 run.\n\nFigure 5. Number of steps the weights in the rollout server are behind the trainer policy, for the vLLM V0 reference (blue), the initial vLLM V1 run (red), and the corrected vLLM V1 run (green).\n\nThe Remaining Gap: fp32 lm_head\n\nThe V1 backend fixes above removed the obvious migration issues, but final parity still required matching the numerical path used to compute logits. The trainer used an fp32 lm_head for the final projection. The rollout backend had to match that behavior.\n\nA closely related issue appears in the MiniMax-M1 technical report : their RL run showed a training/inference token-probability mismatch that they traced to the LM output head and fixed by computing the head in fp32.\n\nThis matters because the RL update consumes token logprobs directly. Small changes in logits can become visible in policy ratios, KL, and clipping. The final projection precision is therefore part of the correctness surface for online RL. The ScaleRL paper later includes fp32 logits/head computation as part of its RL recipe and ablates it as a useful design choice for large-scale RL.\n\nWith the fp32 lm_head path included, reward gives a compact view of the final parity result. In Figure 6, the final V1 run tracks the V0 reference; the initial V1 attempt produces a clearly different reward curve.\n\nFigure 6. Reward for the vLLM V0 reference (blue), the initial vLLM V1 attempt (red), and the final vLLM V1 run with the fp32 lm_head path (green). With the fp32 head included, the final V1 run tracks the V0 reference.\n\nThe negative results are important because they rule out common explanations.\n\nprocessed_logprobs alone : fixed the semantic logprob bug; the training mismatch remained.\n\nBatch invariance : the mismatch remained in a separate test, with higher lag, higher clip rate, and NCCL complications.\n\nTreating the first V1 run as a fair baseline : the first V1 run had multiple V1-only defaults enabled, so it was a confounded migration comparison.\n\nWhy We Fixed Backend Correctness First\n\nObjective-side corrections such as truncated importance sampling, importance-ratio reweighting, and related methods are useful tools. If rollouts are intentionally stale, generated asynchronously, or produced by a backend where equivalence to the trainer-side policy is unavailable, then some form of correction is often the right thing to add.\n\nThe first problem here was inference correctness. After moving to V1, the rollout backend returned logprobs and runtime behavior that broke the trainer assumption. Adding an objective-side correction at that point would have mixed two questions:\n\nis the inference backend producing the right logprobs?\n\ngiven correct logprobs, does the objective still need an off-policy or async correction?\n\nThose questions need to be separated. Otherwise an objective-side correction can compensate for broken inference-backend behavior, which makes the training curve harder to interpret.\n\nThe current objective can still improve. After inference parity is restored, the next improvement is the usual async/off-policy cleanup:\n\nkeep explicit behavior-policy logprobs from rollout time\n\nrecompute trainer-side old-policy logprobs at optimization time\n\nseparate backend mismatch correction from the policy-update ratio\n\ntrack diagnostics like ESS for the correction term alongside aggregate trainer metrics\n\nThe main lesson from this migration is narrower: fix backend correctness first, then add corrections for the mismatch that remains.\n\nCan Voice Agents Handle Bilingual Customers? Benchmarking Frontier ASR on Code-Switched Speech\n\nEVA-Bench Data 2.0: 3 Domains, 121 Tools, 213 Scenarios\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
-  "articleKind": "page"
+  "summaryZh": "本文详细分析了vLLM从V0到V1版本迁移过程中，在强化学习（RL）训练流水线中遇到的训练-推理不匹配问题。作者指出，推理引擎生成的token logprobs与训练器预期的不一致会导致训练动态发生偏移。通过修复rollout logprobs处理、运行时默认配置、权重更新路径及fp32 lm_head等关键环节，团队成功实现了V1版本与V0版本的行为对齐。该分析为大规模RL训练基础设施的稳定性维护提供了宝贵的工程经验。",
+  "summaryGeneratedAt": "2026-08-30T11:06:05.711722Z",
+  "summaryModel": "gemini:gemini-3.1-flash-lite",
+  "articleKind": "page",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "reviewedAt": "2026-08-30T11:06:05.711722Z",
+    "isRelevant": true,
+    "relevanceScore": 78,
+    "importanceScore": 78,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 15,
+      "novelty": 10,
+      "credibility": 15,
+      "usefulness": 10,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "analysis",
+    "category": "benchmark",
+    "tags": [
+      "vLLM",
+      "RL",
+      "Inference",
+      "Training"
+    ],
+    "reasonZh": "本文深入探讨了vLLM在强化学习训练中的一致性问题，对于高性能模型训练基础设施的构建具有极高的技术参考价值。",
+    "summaryZh": "本文详细分析了vLLM从V0到V1版本迁移过程中，在强化学习（RL）训练流水线中遇到的训练-推理不匹配问题。作者指出，推理引擎生成的token logprobs与训练器预期的不一致会导致训练动态发生偏移。通过修复rollout logprobs处理、运行时默认配置、权重更新路径及fp32 lm_head等关键环节，团队成功实现了V1版本与V0版本的行为对齐。该分析为大规模RL训练基础设施的稳定性维护提供了宝贵的工程经验。",
+    "glossary": [
+      {
+        "term": "Inference Engine",
+        "explanationZh": "推理引擎，指负责模型前向计算与采样生成的组件。"
+      },
+      {
+        "term": "Train-inference Mismatch",
+        "explanationZh": "训练-推理不匹配，指训练阶段与推理阶段对同一数据处理逻辑不一致。"
+      },
+      {
+        "term": "Rollout",
+        "explanationZh": "采样过程，指在RL中模型生成轨迹数据的阶段。"
+      },
+      {
+        "term": "Logprobs",
+        "explanationZh": "对数概率，模型输出的概率分布值，常用于计算策略梯度。"
+      },
+      {
+        "term": "Backend Parity",
+        "explanationZh": "后端对齐，指确保不同版本后端在相同输入下产生一致输出。"
+      }
+    ],
+    "duplicateKey": "vllm-v1-rl-consistency"
+  }
 }
