@@ -89,10 +89,35 @@ class SnapshotTests(unittest.TestCase):
 
         self.assertEqual(snapshot["id"], item["id"])
         self.assertEqual(snapshot["contentKind"], "page")
+        self.assertEqual(snapshot["bodyFormatVersion"], article_store.BODY_FORMAT_VERSION)
         self.assertEqual(snapshot["originalUrl"], item["url"])
         self.assertEqual(snapshot["body"], "Body text")
         self.assertIn("fetchedAt", snapshot)
         self.assertEqual(path.relative_to(directory).as_posix(), "2026/08/27/0123456789ab.json")
+
+    def test_refresh_preserves_generated_summary_metadata(self):
+        item = {
+            "id": "0123456789ab",
+            "title": "Example article",
+            "source": "Example",
+            "url": "https://example.com/article",
+            "publishedAt": "2026-08-27T03:10:20Z",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                path = article_store.snapshot_path(item)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({
+                    "summaryZh": "已有中文摘要。",
+                    "summaryGeneratedAt": "2026-08-28T00:00:00Z",
+                    "summaryModel": "example/model",
+                }), encoding="utf-8")
+                article_store.write_snapshot(item, "Refreshed body", "page")
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(snapshot["summaryZh"], "已有中文摘要。")
+        self.assertEqual(snapshot["summaryGeneratedAt"], "2026-08-28T00:00:00Z")
+        self.assertEqual(snapshot["summaryModel"], "example/model")
 
     def test_snapshot_path_rejects_missing_or_invalid_publication_date(self):
         with tempfile.TemporaryDirectory() as directory:

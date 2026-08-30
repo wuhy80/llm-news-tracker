@@ -24,6 +24,7 @@ USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
 MAX_DOWNLOAD_BYTES = 2_500_000
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
+BODY_FORMAT_VERSION = 2
 READER_PREFIX = "https://r.jina.ai/"
 READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
 READER_LOCK = threading.Lock()
@@ -284,6 +285,10 @@ def write_snapshot(
     error: str | None = None,
 ) -> Path:
     path = snapshot_path(item)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
     payload = {
         "schemaVersion": 3,
         **{
@@ -296,8 +301,12 @@ def write_snapshot(
         "fetchedAt": utc_now(),
         "contentKind": content_kind,
         "archiveVersion": 2,
+        "bodyFormatVersion": BODY_FORMAT_VERSION,
         "body": body.strip()[:MAX_BODY_CHARS],
     }
+    for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
+        if field in existing and field not in payload:
+            payload[field] = existing[field]
     payload = redact_snapshot(payload)
     if error:
         payload["note"] = redact_secrets(error[:180])

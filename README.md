@@ -84,6 +84,8 @@ AI 审核会从相关性、影响力、新颖性、可信度、实用性和时�
 - 通过规范化标题去除同一事件的重复报道
 - 历史记录只追加和去重，不按时间或条数清理
 - 文章默认在站内阅读，优先保存 Feed 公开正文，否则提取原文的纯文本主体
+- HTML `<pre>/<code>` 与 Markdown fenced code 会保留为结构化代码块，不折叠换行和缩进
+- 历史旧格式正文由 `scripts/refresh_article_formats.py` 分批重抓；每轮优先修复疑似包含代码的文章，失败时保留原正文并延迟重试
 - 定时更新每次补抓 300 篇，手动运行默认补抓 600 篇，逐步覆盖全部历史记录；外部 Reader 仅低频补充
 - Google News 中转链接会先还原为发布者地址；源站受限时再尝试公开 Reader 文本接口
 - 两条正文通道都失败时站内阅读页回退到摘要，并保留具体失败原因供后续重试
@@ -96,6 +98,7 @@ AI 审核会从相关性、影响力、新颖性、可信度、实用性和时�
 
 ```bash
 python scripts/fetch_news.py
+python scripts/refresh_article_formats.py --limit 150
 python scripts/fetch_articles.py
 # 配置 GEMINI_API_KEY 或 OPENROUTER_API_KEY 后可选运行
 python scripts/ai_review.py

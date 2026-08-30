@@ -52,6 +52,7 @@ class NewsStoreTests(unittest.TestCase):
             self.assertNotIn("glossary", day["items"][0]["aiReview"])
             self.assertEqual(article["body"], "Source summary")
             self.assertEqual(article["archiveVersion"], 2)
+            self.assertEqual(article["bodyFormatVersion"], 2)
             self.assertEqual(article["aiReview"]["glossary"][0]["term"], "Agent")
             self.assertEqual(locator, {"0123456789ab": "2026/08/27"})
 

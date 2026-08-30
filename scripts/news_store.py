@@ -7,7 +7,7 @@ import json
 import re
 from pathlib import Path
 
-from article_store import ARTICLES_DIR, ROOT, publication_path, utc_now
+from article_store import ARTICLES_DIR, BODY_FORMAT_VERSION, ROOT, publication_path, utc_now
 
 MANIFEST_FILE = ROOT / "data" / "news.json"
 NEWS_DIR = ROOT / "data" / "news"
@@ -103,6 +103,7 @@ def sync_article_record(item: dict, articles_dir: Path = ARTICLES_DIR, generated
             "fetchedAt": generated_at or utc_now(),
             "contentKind": "summary",
             "archiveVersion": 2,
+            "bodyFormatVersion": BODY_FORMAT_VERSION,
             "body": item.get("summary", ""),
             "note": "archive:not attempted",
         }
