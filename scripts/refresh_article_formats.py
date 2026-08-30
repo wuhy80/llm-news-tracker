@@ -20,7 +20,10 @@ from article_store import (
     fetch_community_text,
     fetch_page_text,
     fetch_reader_text,
+    has_corrupted_text,
     has_flattened_code,
+    has_malformed_code_fence,
+    normalize_fenced_body,
     resolve_google_news_urls,
     restore_collapsed_code,
     snapshot_path,
@@ -52,9 +55,14 @@ def needs_format_refresh(item: dict, now: datetime, retry_days: int = 7) -> bool
     _, record = loaded
     if record.get("contentKind") not in READABLE_KINDS:
         return False
-    if record.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION:
+    damaged = (
+        has_flattened_code(record.get("body", ""))
+        or has_malformed_code_fence(record.get("body", ""))
+        or has_corrupted_text(record.get("body", ""))
+    )
+    if record.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION and not damaged:
         return False
-    if likely_flattened_code(record):
+    if damaged:
         return True
     attempted_at = record.get("formatRefreshAttemptedAt")
     if not attempted_at:
@@ -70,24 +78,39 @@ def acceptable_refresh(previous: dict, body: str) -> bool:
     previous_body = previous.get("body", "")
     if len(body) < max(MIN_BODY_CHARS, int(len(previous_body) * 0.55)):
         return False
-    if likely_flattened_code(previous):
-        if "```" not in body or has_flattened_code(body):
+    if has_corrupted_text(previous_body) and has_corrupted_text(body):
+        return False
+    if (
+        likely_flattened_code(previous)
+        or has_malformed_code_fence(previous.get("body", ""))
+        or has_corrupted_text(previous.get("body", ""))
+    ):
+        if (
+            "```" not in body
+            or has_flattened_code(body)
+            or has_malformed_code_fence(body)
+            or has_corrupted_text(body)
+        ):
             return False
     return True
 
 
 def repair_previous_body(previous: dict) -> str | None:
     body = previous.get("body", "")
-    if not likely_flattened_code(previous):
+    if not (
+        likely_flattened_code(previous)
+        or has_malformed_code_fence(previous.get("body", ""))
+    ):
         return None
+    normalized = normalize_fenced_body(previous.get("body", ""))
     repaired = []
     cursor = 0
-    for match in re.finditer(r"```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```", body):
-        repaired.append(body[cursor:match.start()])
+    for match in re.finditer(r"```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```", normalized):
+        repaired.append(normalized[cursor:match.start()])
         code = restore_collapsed_code(match.group(2))
         repaired.append(f"```{match.group(1)}\n{code}\n```")
         cursor = match.end()
-    repaired.append(body[cursor:])
+    repaired.append(normalized[cursor:])
     value = "".join(repaired).strip()
     return value if value and not has_flattened_code(value) else None
 

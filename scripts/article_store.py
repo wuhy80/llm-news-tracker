@@ -58,6 +58,7 @@ UNFENCED_CODE_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FENCED_CODE_PATTERN = re.compile(r"```[^\r\n]*\r?\n([\s\S]*?)\r?\n```")
+INLINE_FENCE_PATTERN = re.compile(r"(?m)^.*\S[ \t]+```(?:[^\r\n`]*)")
 YAML_KEY_PATTERN = re.compile(r"(?<![\w-])(?:[A-Za-z_][\w.-]*):(?=\s|$)")
 SHELL_COMMAND_PATTERN = re.compile(
     r"(?:hf\s+download|(?:cd|curl|wget|docker|git|kubectl|npm|pip|pnpm|python(?:\d+)?)\s+)",
@@ -132,6 +133,19 @@ class ReadableTextParser(HTMLParser):
             self.main_depth += 1
         elif tag in BLOCK_TAGS:
             self._flush()
+            if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                marker = "#" * int(tag[1]) + " "
+                self.all_buffer.append(marker)
+                if self.main_depth:
+                    self.main_buffer.append(marker)
+            elif tag == "li":
+                self.all_buffer.append("- ")
+                if self.main_depth:
+                    self.main_buffer.append("- ")
+            elif tag == "blockquote":
+                self.all_buffer.append("> ")
+                if self.main_depth:
+                    self.main_buffer.append("> ")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -233,6 +247,87 @@ def has_flattened_code(value: str) -> bool:
     return not blocks and bool(UNFENCED_CODE_HINT_PATTERN.search(body))
 
 
+def has_malformed_code_fence(value: str) -> bool:
+    body = value or ""
+    return body.count("```") % 2 != 0 or bool(INLINE_FENCE_PATTERN.search(body))
+
+
+def has_corrupted_text(value: str) -> bool:
+    body = value or ""
+    replacement_count = body.count("\ufffd")
+    control_count = sum(1 for char in body if ord(char) < 32 and char not in "\n\t")
+    return replacement_count >= 3 or control_count >= 3
+
+
+def normalize_fenced_body(value: str) -> str:
+    """Turn inline or unterminated fences from legacy feeds into block fences."""
+    lines = (value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    output: list[str] = []
+    in_code = False
+    for line in lines:
+        marker = line.find("```")
+        if not in_code:
+            if marker < 0:
+                output.append(line)
+                continue
+            before = line[:marker].rstrip()
+            tail = line[marker + 3:]
+            if before:
+                output.append(before)
+            if "```" in tail:
+                middle, after = tail.split("```", 1)
+                output.append("```")
+                output.append(middle.strip())
+                output.append("```")
+                if after.strip():
+                    output.append(after.strip())
+                continue
+            if tail.startswith((" ", "\t")):
+                output.append("```")
+                if tail.strip():
+                    output.append(tail.strip())
+            else:
+                output.append("```" + tail.strip())
+            in_code = True
+            continue
+        if marker >= 0:
+            before = line[:marker].rstrip()
+            if before:
+                output.append(before)
+            output.append("```")
+            suffix = line[marker + 3:].strip()
+            if suffix:
+                output.append(suffix)
+            in_code = False
+        else:
+            output.append(line)
+    if in_code:
+        output.append("```")
+    return "\n".join(output)
+
+
+def limit_body(value: str, limit: int = MAX_BODY_CHARS) -> str:
+    """Limit an article without leaving an unterminated fenced code block."""
+    body = (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(body) <= limit:
+        return body
+    lines = body.splitlines()
+    kept: list[str] = []
+    used = 0
+    in_code = False
+    for line in lines:
+        addition = line + "\n"
+        if used + len(addition) > limit:
+            break
+        kept.append(line)
+        used += len(addition)
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+    if in_code:
+        kept.append("```")
+    return "\n".join(kept).strip()
+
+
 def _split_outside_quotes(value: str, separator: str = ";") -> str:
     result: list[str] = []
     quote = ""
@@ -305,11 +400,11 @@ def text_from_html(value: str, prefer_main: bool = False) -> str:
         parser.feed(value or "")
         parser.close()
     except Exception:
-        return re.sub(r"\s+", " ", html.unescape(value or "")).strip()[:MAX_BODY_CHARS]
+        return limit_body(re.sub(r"\s+", " ", html.unescape(value or "")))
     main_blocks = clean_blocks(parser.main_blocks)
     all_blocks = clean_blocks(parser.all_blocks)
     blocks = main_blocks if prefer_main and sum(map(len, main_blocks)) >= 600 else all_blocks
-    return "\n\n".join(blocks)[:MAX_BODY_CHARS].strip()
+    return limit_body("\n\n".join(blocks))
 
 
 def text_from_reader(value: str) -> str:
@@ -343,7 +438,7 @@ def text_from_reader(value: str) -> str:
         if code_lines is not None:
             code_lines.append(raw_line.rstrip())
             continue
-        line = re.sub(r"^\s{0,3}(?:#{1,6}|>|[-*+]\s|\d+[.)]\s)\s*", "", raw_line).strip()
+        line = re.sub(r"^\s{0,3}(?:>|[-*+]\s|\d+[.)]\s)\s*", "", raw_line).strip()
         if not line:
             flush_prose()
             continue
@@ -355,7 +450,7 @@ def text_from_reader(value: str) -> str:
         if code.strip():
             blocks.append(f"```{code_language}\n{code}\n```")
     flush_prose()
-    return "\n\n".join(clean_blocks(blocks))[:MAX_BODY_CHARS].strip()
+    return limit_body("\n\n".join(clean_blocks(blocks)))
 
 
 def publication_path(published_at: str) -> Path:
@@ -409,7 +504,7 @@ def write_snapshot(
         "contentKind": content_kind,
         "archiveVersion": 2,
         "bodyFormatVersion": BODY_FORMAT_VERSION,
-        "body": body.strip()[:MAX_BODY_CHARS],
+        "body": limit_body(body),
     }
     for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
         if field in existing and field not in payload:
@@ -437,7 +532,13 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
             current_body = current.get("body", "")
             if current.get("contentKind") == "page":
                 return False
-            if current.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION and len(current_body) >= len(body):
+            if (
+                current.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION
+                and not has_flattened_code(current_body)
+                and not has_malformed_code_fence(current_body)
+                and not has_corrupted_text(current_body)
+                and len(current_body) >= len(body)
+            ):
                 return False
             if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)):
                 return False
@@ -599,7 +700,9 @@ def fetch_community_text(url: str) -> tuple[str, str]:
         body = text_from_html(posts[0].get("cooked", "")) if posts else ""
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("community body not found")
-    return body[:MAX_BODY_CHARS], url
+    if has_corrupted_text(body):
+        raise ValueError("community body contains corrupted text")
+    return limit_body(body), url
 
 
 def fetch_page_text(url: str) -> tuple[str, str]:
@@ -627,6 +730,8 @@ def fetch_page_text(url: str) -> tuple[str, str]:
     body = text_from_html(document, prefer_main=True)
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("readable body not found")
+    if has_corrupted_text(body):
+        raise ValueError("page body contains corrupted text")
     return body, resolved_url
 
 
@@ -653,6 +758,8 @@ def fetch_reader_text(url: str) -> tuple[str, str]:
     body = text_from_reader(payload.decode(charset, errors="replace"))
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("reader body not found")
+    if has_corrupted_text(body):
+        raise ValueError("reader body contains corrupted text")
     return body, url
 
 

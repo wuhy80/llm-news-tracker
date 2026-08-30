@@ -97,6 +97,27 @@ class FormatRefreshTests(unittest.TestCase):
                     item, datetime(2026, 8, 30, 1, tzinfo=timezone.utc), retry_days=7
                 ))
 
+    def test_malformed_fence_is_repaired_from_previous_body_when_fetch_fails(self):
+        item = {
+            "id": "0123456789ab",
+            "url": "https://example.com/article",
+            "publishedAt": "2026-08-20T00:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "article.json"
+            path.write_text(json.dumps({
+                "contentKind": "feed",
+                "body": "Intro\n\nRun: ```lmcache server --port 10001```",
+            }), encoding="utf-8")
+            with mock.patch.object(refresh_article_formats, "snapshot_path", return_value=path), \
+                 mock.patch.object(refresh_article_formats, "fetch_page_text", side_effect=ValueError("blocked")), \
+                 mock.patch("article_store.ARTICLES_DIR", Path(directory)):
+                result = refresh_article_formats.refresh_item(item, allow_reader=False)
+            record = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, "feed")
+        self.assertEqual(record["body"].count("```"), 2)
+
     def test_failed_refresh_preserves_existing_body(self):
         item = {
             "id": "0123456789ab",

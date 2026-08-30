@@ -73,6 +73,29 @@ class ArticleTextTests(unittest.TestCase):
         self.assertIn("hf download org/model \\\n --local-dir", article_store.restore_collapsed_code(shell))
         self.assertIn("import json\np='model.json';", article_store.restore_collapsed_code(python))
 
+    def test_body_limit_closes_a_code_block_instead_of_cutting_it_open(self):
+        body = "Introductory context.\n\n```python\n" + ("print('line')\n" * 5000) + "```"
+
+        limited = article_store.limit_body(body, 800)
+
+        self.assertLessEqual(len(limited), 800)
+        self.assertEqual(limited.count("```"), 2)
+
+    def test_normalizes_inline_and_unterminated_fences(self):
+        inline = "Run this: ```lmcache server --port 10001```"
+        unterminated = "An example:\n```\nline one\nline two"
+
+        normalized_inline = article_store.normalize_fenced_body(inline)
+        normalized_unterminated = article_store.normalize_fenced_body(unterminated)
+
+        self.assertEqual(normalized_inline.count("```"), 2)
+        self.assertEqual(normalized_unterminated.count("```"), 2)
+        self.assertIn("lmcache server --port 10001", normalized_inline)
+
+    def test_detects_corrupted_binary_like_body(self):
+        self.assertTrue(article_store.has_corrupted_text("text \ufffd\ufffd\ufffd"))
+        self.assertFalse(article_store.has_corrupted_text("normal text with one \ufffd"))
+
     def test_feed_refresh_upgrades_legacy_collapsed_code(self):
         item = {
             "id": "0123456789ab",

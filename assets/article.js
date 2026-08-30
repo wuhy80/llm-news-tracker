@@ -83,15 +83,21 @@ function renderCode(code, language = "") {
   return pre;
 }
 
+function normalizeBodyFences(value) {
+  let text = String(value || "").replace(/\r\n?/g, "\n");
+  text = text.replace(/```([^\n`]*)[ \t]+([\s\S]*?)[ \t]+```/g, "\n```$1\n$2\n```\n");
+  text = text.replace(/([^\n])```[ \t]*(?=\n|$)/g, "$1\n```\n");
+  return text;
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
   const proseLines = [];
   let codeLines = null;
   let codeLanguage = "";
   let rendered = false;
-  const flushProse = () => {
-    const text = proseLines.join(" ").trim();
-    proseLines.length = 0;
+  const appendParagraph = (lines) => {
+    const text = lines.join(" ").trim();
     if (!text) return;
     const tags = parseTags(text);
     if (tags.length) elements.articleBody.append(renderTags(tags));
@@ -102,7 +108,59 @@ function renderBody(body) {
     }
     rendered = true;
   };
-  String(body || "").split(/\r?\n/).forEach((line) => {
+  const flushProse = () => {
+    const lines = proseLines.splice(0).map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) return;
+    let paragraph = [];
+    let list = null;
+    const flushParagraph = () => {
+      appendParagraph(paragraph);
+      paragraph = [];
+    };
+    const flushList = () => {
+      if (!list) return;
+      elements.articleBody.append(list);
+      list = null;
+      rendered = true;
+    };
+    lines.forEach((line) => {
+      const heading = line.match(/^(#{1,6})\s+(.+)$/);
+      const unordered = line.match(/^[-*+]\s+(.+)$/);
+      const ordered = line.match(/^\d+[.)]\s+(.+)$/);
+      const quote = line.match(/^>\s?(.+)$/);
+      if (heading) {
+        flushParagraph();
+        flushList();
+        const element = document.createElement(`h${heading[1].length}`);
+        element.textContent = heading[2].trim();
+        elements.articleBody.append(element);
+        rendered = true;
+      } else if (unordered || ordered) {
+        flushParagraph();
+        const type = unordered ? "ul" : "ol";
+        if (!list || list.tagName.toLowerCase() !== type) {
+          flushList();
+          list = document.createElement(type);
+        }
+        const item = document.createElement("li");
+        item.textContent = (unordered || ordered)[1].trim();
+        list.append(item);
+      } else if (quote) {
+        flushParagraph();
+        flushList();
+        const element = document.createElement("blockquote");
+        element.textContent = quote[1].trim();
+        elements.articleBody.append(element);
+        rendered = true;
+      } else {
+        flushList();
+        paragraph.push(line);
+      }
+    });
+    flushParagraph();
+    flushList();
+  };
+  normalizeBodyFences(body).split("\n").forEach((line) => {
     const trimmed = line.trim();
     if (trimmed.startsWith("```")) {
       if (codeLines === null) {
@@ -129,6 +187,7 @@ function renderBody(body) {
   });
   if (codeLines !== null) {
     elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
+    elements.articleBody.append(document.createTextNode(""));
     rendered = true;
   }
   flushProse();
