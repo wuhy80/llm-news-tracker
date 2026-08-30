@@ -112,6 +112,12 @@ python -m http.server 8000
 
 站点不使用构建框架，`.nojekyll` 会确保静态文件按原样发布。
 
+## 访问统计与文章留言
+
+页面使用 Counter.dev 记录匿名的访问量、来源、设备和页面路径，不使用 Cookie；统计脚本的唯一标识位于 `index.html` 和 `article.html` 的 `data-id` 属性中。站点管理员可在 [Counter](https://counter.dev/) 注册后查看统计数据。
+
+文章页的留言使用 [giscus](https://giscus.app/) 对接 GitHub Discussions，按文章 ID 建立独立讨论，并通过 GitHub 账号授权后留言。仓库已启用 Discussions；首次使用前，需要仓库管理员在 [安装 giscus App](https://github.com/apps/giscus/installations/new) 页面将 App 安装到 `wuhy80/llm-news-tracker`，否则页面会显示无法发表评论。
+
 ## 调整信息源
 
 编辑 `scripts/fetch_news.py` 中的 `SOURCES`。每个来源支持以下字段：

@@ -18,6 +18,12 @@ const SNAPSHOT_LABEL = {
   reader: "Reader 正文",
   summary: "摘要回退"
 };
+const GISCUS_CONFIG = {
+  repo: "wuhy80/llm-news-tracker",
+  repoId: "R_kgDOUCQp2Q",
+  category: "General",
+  categoryId: "DIC_kwDOUCQp2c4DEen1"
+};
 
 const elements = Object.fromEntries([
   "articleBody", "articleCategory", "articleGlossary", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
@@ -156,6 +162,29 @@ function renderArticle(item, snapshot) {
   renderBody(body);
 }
 
+function loadComments(articleId) {
+  const container = document.getElementById("articleComments");
+  if (!container || container.dataset.loaded === "true") return;
+  const script = document.createElement("script");
+  script.src = "https://giscus.app/client.js";
+  script.dataset.repo = GISCUS_CONFIG.repo;
+  script.dataset.repoId = GISCUS_CONFIG.repoId;
+  script.dataset.category = GISCUS_CONFIG.category;
+  script.dataset.categoryId = GISCUS_CONFIG.categoryId;
+  script.dataset.mapping = "specific";
+  script.dataset.term = `article:${articleId}`;
+  script.dataset.strict = "1";
+  script.dataset.reactionsEnabled = "1";
+  script.dataset.inputPosition = "top";
+  script.dataset.theme = "preferred_color_scheme";
+  script.dataset.lang = "zh-CN";
+  script.dataset.loading = "lazy";
+  script.crossOrigin = "anonymous";
+  script.async = true;
+  container.dataset.loaded = "true";
+  container.append(script);
+}
+
 function renderFailure(message) {
   elements.articleTitle.textContent = "文章暂时无法读取";
   elements.readerStatus.textContent = "加载失败";
@@ -199,6 +228,7 @@ async function loadArticle() {
     }
     if (!record || record.id !== articleId) throw new Error("未找到该文章");
     renderArticle(record, record);
+    loadComments(articleId);
   } catch (error) {
     console.error("Unable to load article", error);
     renderFailure("无法加载该文章的本地记录，请稍后重试。");
