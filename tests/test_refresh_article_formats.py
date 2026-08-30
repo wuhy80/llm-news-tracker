@@ -67,6 +67,18 @@ class FormatRefreshTests(unittest.TestCase):
         self.assertFalse(refresh_article_formats.acceptable_refresh(previous, plain))
         self.assertTrue(refresh_article_formats.acceptable_refresh(previous, structured))
 
+    def test_refresh_rejects_code_fences_that_are_still_collapsed(self):
+        yaml = " ".join([
+            "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",
+            "spec: replicas: 1", "containers: name: server", "image: example/model",
+        ] * 8)
+        previous = {"body": f"```\n{yaml}\n```"}
+        structured = "```yaml\n" + yaml.replace(" kind:", "\nkind:").replace(" metadata:", "\nmetadata:") + "\n```"
+
+        self.assertTrue(refresh_article_formats.likely_flattened_code(previous))
+        self.assertFalse(refresh_article_formats.acceptable_refresh(previous, previous["body"]))
+        self.assertTrue(refresh_article_formats.acceptable_refresh(previous, structured))
+
     def test_failed_refresh_preserves_existing_body(self):
         item = {
             "id": "0123456789ab",

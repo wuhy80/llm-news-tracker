@@ -43,6 +43,21 @@ NOISE_PATTERNS = (
     "privacy policy", "sign in", "sign up", "sponsored by", "subscribe to", "terms of use",
     "use cookies", "版权所有", "登录后", "隐私政策",
 )
+UNFENCED_CODE_HINT_PATTERN = re.compile(
+    r"(?:\bdef\s+[A-Za-z_]\w*\s*\("
+    r"|\bclass\s+[A-Za-z_]\w*\s*[:({]"
+    r"|\b(?:async\s+)?function\s+[A-Za-z_$]\w*\s*\("
+    r"|\b(?:const|let|var)\s+[A-Za-z_$]\w*\s*="
+    r"|\bfrom\s+[A-Za-z_][\w.]*\s+import\s+"
+    r"|\bimport\s+[A-Za-z_][\w.]*"
+    r"|\b(?:pip|npm|yarn|pnpm)\s+(?:install|add|run|exec)\b"
+    r"|\b(?:docker|kubectl|git)\s+[a-z-]+\b"
+    r"|(?:curl|wget)\s+https?://"
+    r"|\{%|\{\{|</?[a-z][^>]*>"
+    r"|\bSELECT\s+[\w*].+\bFROM\s+[A-Za-z_])",
+    re.IGNORECASE,
+)
+FENCED_CODE_PATTERN = re.compile(r"```[^\r\n]*\r?\n([\s\S]*?)\r?\n```")
 
 SECRET_PATTERNS = (
     (re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"), "hf_[REDACTED]"),
@@ -192,6 +207,23 @@ def clean_blocks(blocks: list[str]) -> list[str]:
     return cleaned
 
 
+def has_flattened_code(value: str) -> bool:
+    body = value or ""
+    blocks = FENCED_CODE_PATTERN.findall(body)
+    for code in blocks:
+        nonempty_lines = [line for line in code.splitlines() if line.strip()]
+        if len(nonempty_lines) > 2 or len(code) < 240:
+            continue
+        shell_commands = len(re.findall(r"\b(?:hf\s+download|pip|npm|docker|kubectl|git)\b", code, re.IGNORECASE))
+        yaml_keys = len(re.findall(
+            r"\b(?:apiVersion|kind|metadata|spec|containers|volumes|name|image|args|env|value):",
+            code,
+        ))
+        if code.count(";") >= 2 or shell_commands >= 2 or yaml_keys >= 4:
+            return True
+    return not blocks and bool(UNFENCED_CODE_HINT_PATTERN.search(body))
+
+
 def text_from_html(value: str, prefer_main: bool = False) -> str:
     parser = ReadableTextParser()
     try:
@@ -327,7 +359,14 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
     if path.exists():
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
-            if current.get("contentKind") == "page" or len(current.get("body", "")) >= len(body):
+            current_body = current.get("body", "")
+            if current.get("contentKind") == "page":
+                return False
+            if current.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION and len(current_body) >= len(body):
+                return False
+            if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)):
+                return False
+            if has_flattened_code(current_body) and has_flattened_code(body):
                 return False
         except (json.JSONDecodeError, OSError):
             pass

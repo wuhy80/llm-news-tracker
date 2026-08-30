@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +19,7 @@ from article_store import (
     fetch_community_text,
     fetch_page_text,
     fetch_reader_text,
+    has_flattened_code,
     resolve_google_news_urls,
     snapshot_path,
     utc_now,
@@ -29,20 +29,6 @@ from news_store import atomic_write_json, load_news, save_news
 
 NEWS_FILE = ROOT / "data" / "news.json"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
-CODE_HINT_PATTERN = re.compile(
-    r"(?:\bdef\s+[A-Za-z_]\w*\s*\("
-    r"|\bclass\s+[A-Za-z_]\w*\s*[:({]"
-    r"|\b(?:async\s+)?function\s+[A-Za-z_$]\w*\s*\("
-    r"|\b(?:const|let|var)\s+[A-Za-z_$]\w*\s*="
-    r"|\bfrom\s+[A-Za-z_][\w.]*\s+import\s+"
-    r"|\bimport\s+[A-Za-z_][\w.]*"
-    r"|\b(?:pip|npm|yarn|pnpm)\s+(?:install|add|run|exec)\b"
-    r"|\b(?:docker|kubectl|git)\s+[a-z-]+\b"
-    r"|(?:curl|wget)\s+https?://"
-    r"|\{%|\{\{|</?[a-z][^>]*>"
-    r"|\bSELECT\s+[\w*].+\bFROM\s+[A-Za-z_])",
-    re.IGNORECASE,
-)
 
 
 def read_snapshot(item: dict) -> tuple[Path, dict] | None:
@@ -54,8 +40,7 @@ def read_snapshot(item: dict) -> tuple[Path, dict] | None:
 
 
 def likely_flattened_code(record: dict) -> bool:
-    body = record.get("body", "")
-    return "```" not in body and bool(CODE_HINT_PATTERN.search(body))
+    return has_flattened_code(record.get("body", ""))
 
 
 def needs_format_refresh(item: dict, now: datetime, retry_days: int = 7) -> bool:
@@ -81,8 +66,9 @@ def acceptable_refresh(previous: dict, body: str) -> bool:
     previous_body = previous.get("body", "")
     if len(body) < max(MIN_BODY_CHARS, int(len(previous_body) * 0.55)):
         return False
-    if likely_flattened_code(previous) and "```" not in body:
-        return False
+    if likely_flattened_code(previous):
+        if "```" not in body or has_flattened_code(body):
+            return False
     return True
 
 

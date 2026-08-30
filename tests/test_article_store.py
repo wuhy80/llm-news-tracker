@@ -34,6 +34,52 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertIn("```\nif ready:\n    print('go')\n\nreturn result\n```", body)
 
+    def test_detects_fenced_code_that_was_collapsed_to_one_line(self):
+        collapsed = "```\n" + " ".join([
+            "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",
+            "spec: replicas: 1", "containers: name: server", "image: example/model",
+        ] * 8) + "\n```"
+        structured = collapsed.replace(" kind:", "\nkind:").replace(" metadata:", "\nmetadata:")
+
+        self.assertTrue(article_store.has_flattened_code(collapsed))
+        self.assertFalse(article_store.has_flattened_code(structured))
+
+    def test_feed_refresh_upgrades_legacy_collapsed_code(self):
+        item = {
+            "id": "0123456789ab",
+            "title": "Example article",
+            "source": "Example",
+            "url": "https://example.com/article",
+            "publishedAt": "2026-08-27T03:10:20Z",
+        }
+        code_lines = [
+            "apiVersion: apps/v1", "kind: Deployment", "metadata:", "  name: model",
+            "spec:", "  replicas: 1", "  containers:", "    - name: server",
+            "      image: example/model", "      args:", "        - --serve",
+        ]
+        legacy_body = "```\n" + " ".join(code_lines * 4) + "\n```"
+        code_html = "\n".join(code_lines * 4)
+        feed_html = (
+            "<p>A detailed introduction before the deployment configuration example.</p>"
+            f"<pre>{code_html}</pre>"
+            "<p>A detailed explanation after the deployment configuration example.</p>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                path = article_store.snapshot_path(item)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({
+                    "contentKind": "feed",
+                    "archiveVersion": 2,
+                    "body": legacy_body,
+                }), encoding="utf-8")
+                changed = article_store.store_feed_snapshot(item, feed_html)
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(changed)
+        self.assertEqual(snapshot["bodyFormatVersion"], article_store.BODY_FORMAT_VERSION)
+        self.assertIn("apiVersion: apps/v1\nkind: Deployment\nmetadata:", snapshot["body"])
+
     def test_page_extraction_prefers_article_and_removes_noise(self):
         article_text = " ".join(["A useful model release detail"] * 30)
         page = (
