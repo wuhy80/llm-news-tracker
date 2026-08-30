@@ -34,6 +34,14 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertIn("```\nif ready:\n    print('go')\n\nreturn result\n```", body)
 
+    def test_feed_html_turns_preformatted_breaks_into_code_lines(self):
+        body = article_store.text_from_html(
+            "<article><pre>apiVersion: apps/v1<br>kind: Deployment<br>metadata:<br>  name: model</pre></article>",
+            prefer_main=True,
+        )
+
+        self.assertIn("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: model", body)
+
     def test_detects_fenced_code_that_was_collapsed_to_one_line(self):
         collapsed = "```\n" + " ".join([
             "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",
@@ -43,6 +51,21 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertTrue(article_store.has_flattened_code(collapsed))
         self.assertFalse(article_store.has_flattened_code(structured))
+
+    def test_restores_line_boundaries_for_collapsed_yaml_shell_and_python(self):
+        yaml = "apiVersion: apps/v1 kind: Deployment metadata: name: model spec: replicas: 1 containers: - name: server image: example/model"
+        shell = "hf download org/model \\ --local-dir ./model cd model python convert.py"
+        python = "import json p='model.json'; d=json.load(open(p)); print(d)"
+
+        for source in (yaml, shell, python):
+            restored = article_store.restore_collapsed_code(source)
+            self.assertGreaterEqual(len(restored.splitlines()), 2)
+            self.assertFalse(article_store.has_flattened_code(f"```\n{restored}\n```"))
+
+        restored_yaml = article_store.restore_collapsed_code(yaml)
+        self.assertIn("apiVersion: apps/v1\nkind: Deployment\nmetadata:", restored_yaml)
+        self.assertIn("hf download org/model \\\n --local-dir", article_store.restore_collapsed_code(shell))
+        self.assertIn("import json\np='model.json';", article_store.restore_collapsed_code(python))
 
     def test_feed_refresh_upgrades_legacy_collapsed_code(self):
         item = {

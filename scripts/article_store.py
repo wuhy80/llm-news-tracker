@@ -58,6 +58,11 @@ UNFENCED_CODE_HINT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FENCED_CODE_PATTERN = re.compile(r"```[^\r\n]*\r?\n([\s\S]*?)\r?\n```")
+YAML_KEY_PATTERN = re.compile(r"(?<![\w-])(?:[A-Za-z_][\w.-]*):(?=\s|$)")
+SHELL_COMMAND_PATTERN = re.compile(
+    r"(?:hf\s+download|(?:cd|curl|wget|docker|git|kubectl|npm|pip|pnpm|python(?:\d+)?)\s+)",
+    re.IGNORECASE,
+)
 
 SECRET_PATTERNS = (
     (re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"), "hf_[REDACTED]"),
@@ -119,6 +124,8 @@ class ReadableTextParser(HTMLParser):
             self.pre_buffer = []
             return
         if self.pre_depth:
+            if tag == "br":
+                self.pre_buffer.append("\n")
             return
         if tag in {"article", "main"}:
             self._flush()
@@ -141,6 +148,8 @@ class ReadableTextParser(HTMLParser):
             self.pre_buffer = []
             return
         if self.pre_depth:
+            if tag in {"br", "div", "li", "p"}:
+                self.pre_buffer.append("\n")
             return
         if tag in BLOCK_TAGS:
             self._flush()
@@ -179,7 +188,7 @@ class ReadableTextParser(HTMLParser):
 
     @staticmethod
     def _append_code(buffer: list[str], target: list[str]) -> None:
-        code = html.unescape("".join(buffer)).strip("\n")
+        code = restore_collapsed_code(html.unescape("".join(buffer))).strip("\n")
         if code.strip():
             target.append(f"```\n{code}\n```")
 
@@ -191,7 +200,7 @@ def clean_blocks(blocks: list[str]) -> list[str]:
         if block.lstrip().startswith("```"):
             lines = block.strip().splitlines()
             if len(lines) >= 3:
-                code = "\n".join(lines[1:-1]).rstrip()
+                code = restore_collapsed_code("\n".join(lines[1:-1])).rstrip()
                 if code.strip():
                     cleaned.append(f"{lines[0].strip()}\n{code}\n```")
             continue
@@ -222,6 +231,72 @@ def has_flattened_code(value: str) -> bool:
         if code.count(";") >= 2 or shell_commands >= 2 or yaml_keys >= 4:
             return True
     return not blocks and bool(UNFENCED_CODE_HINT_PATTERN.search(body))
+
+
+def _split_outside_quotes(value: str, separator: str = ";") -> str:
+    result: list[str] = []
+    quote = ""
+    escaped = False
+    for char in value:
+        if escaped:
+            result.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote:
+            result.append(char)
+            escaped = True
+            continue
+        if char in {"'", '"', "`"}:
+            quote = "" if quote == char else char if not quote else quote
+        if char == separator and not quote:
+            result.extend((char, "\n"))
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def _restore_yaml_code(code: str) -> str:
+    # Flattened YAML still exposes its keys, which gives us stable line boundaries.
+    code = re.sub(r"\s+(?=[A-Za-z_][\w.-]*:(?=\s|$))", "\n", code)
+    code = re.sub(r"\s+(?=-\s+|#\s*)", "\n", code)
+    return code
+
+
+def _restore_shell_code(code: str) -> str:
+    code = re.sub(r"\\\s+", "\\\n ", code)
+    return SHELL_COMMAND_PATTERN.sub(lambda match: ("\n" if match.start() else "") + match.group(0), code)
+
+
+def _restore_program_code(code: str) -> str:
+    code = _split_outside_quotes(code)
+    code = re.sub(
+        r"\s+(?=(?:from\s+\w|import\s+\w|(?:async\s+)?def\s+\w|class\s+\w|"
+        r"(?:const|let|var)\s+\w|(?:if|for|while|try|with|return|assert)\b|"
+        r"[A-Za-z_]\w*\s*=|[A-Za-z_]\w*\[[^]]+\]\s*=|[A-Za-z_]\w*\.(?:load|dump)\())",
+        "\n",
+        code,
+    )
+    code = re.sub(r":\s+(?=[A-Za-z_]\w*\s|[A-Za-z_]\w*\[)", ":\n    ", code)
+    return code
+
+
+def restore_collapsed_code(code: str) -> str:
+    """Recover useful line boundaries when a source flattened a fenced block."""
+    normalized = re.sub(r"[ \t]+", " ", code or "").strip()
+    if not normalized or len(normalized.splitlines()) > 2:
+        return code
+    shell_commands = len(SHELL_COMMAND_PATTERN.findall(normalized))
+    yaml_keys = len(YAML_KEY_PATTERN.findall(normalized))
+    if yaml_keys >= 4 and (normalized.startswith(("apiVersion:", "kind:", "---")) or yaml_keys >= 8):
+        return _restore_yaml_code(normalized)
+    if shell_commands >= 2:
+        return _restore_shell_code(normalized)
+    if any(pattern.search(normalized) for pattern in (
+        re.compile(r"\b(?:def|class|import|from)\b"),
+        re.compile(r"\b(?:const|let|var|function)\b"),
+    )):
+        return _restore_program_code(normalized)
+    return code
 
 
 def text_from_html(value: str, prefer_main: bool = False) -> str:

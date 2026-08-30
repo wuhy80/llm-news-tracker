@@ -79,6 +79,24 @@ class FormatRefreshTests(unittest.TestCase):
         self.assertFalse(refresh_article_formats.acceptable_refresh(previous, previous["body"]))
         self.assertTrue(refresh_article_formats.acceptable_refresh(previous, structured))
 
+    def test_flattened_code_is_retried_even_after_a_recent_failure(self):
+        item = {"id": "0123456789ab", "publishedAt": "2026-08-30T00:00:00Z"}
+        yaml = " ".join([
+            "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",
+            "spec: replicas: 1", "containers: name: server", "image: example/model",
+        ] * 8)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "article.json"
+            path.write_text(json.dumps({
+                "contentKind": "feed",
+                "body": f"```\n{yaml}\n```",
+                "formatRefreshAttemptedAt": "2026-08-30T00:00:00Z",
+            }), encoding="utf-8")
+            with mock.patch.object(refresh_article_formats, "snapshot_path", return_value=path):
+                self.assertTrue(refresh_article_formats.needs_format_refresh(
+                    item, datetime(2026, 8, 30, 1, tzinfo=timezone.utc), retry_days=7
+                ))
+
     def test_failed_refresh_preserves_existing_body(self):
         item = {
             "id": "0123456789ab",

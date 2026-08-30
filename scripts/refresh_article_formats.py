@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ from article_store import (
     fetch_reader_text,
     has_flattened_code,
     resolve_google_news_urls,
+    restore_collapsed_code,
     snapshot_path,
     utc_now,
     write_snapshot,
@@ -52,6 +54,8 @@ def needs_format_refresh(item: dict, now: datetime, retry_days: int = 7) -> bool
         return False
     if record.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION:
         return False
+    if likely_flattened_code(record):
+        return True
     attempted_at = record.get("formatRefreshAttemptedAt")
     if not attempted_at:
         return True
@@ -70,6 +74,22 @@ def acceptable_refresh(previous: dict, body: str) -> bool:
         if "```" not in body or has_flattened_code(body):
             return False
     return True
+
+
+def repair_previous_body(previous: dict) -> str | None:
+    body = previous.get("body", "")
+    if not likely_flattened_code(previous):
+        return None
+    repaired = []
+    cursor = 0
+    for match in re.finditer(r"```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```", body):
+        repaired.append(body[cursor:match.start()])
+        code = restore_collapsed_code(match.group(2))
+        repaired.append(f"```{match.group(1)}\n{code}\n```")
+        cursor = match.end()
+    repaired.append(body[cursor:])
+    value = "".join(repaired).strip()
+    return value if value and not has_flattened_code(value) else None
 
 
 def mark_failure(path: Path, record: dict, errors: list[str]) -> None:
@@ -101,6 +121,15 @@ def refresh_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
             return kind
         except Exception as error:
             errors.append(error_note(kind, error))
+    repaired = repair_previous_body(previous)
+    if repaired:
+        write_snapshot(
+            item,
+            repaired,
+            previous.get("contentKind", "feed"),
+            resolved_url=previous.get("resolvedUrl") or target_url,
+        )
+        return previous.get("contentKind", "feed")
     mark_failure(path, previous, errors)
     return None
 
