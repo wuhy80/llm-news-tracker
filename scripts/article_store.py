@@ -148,7 +148,7 @@ class ReadableTextParser(HTMLParser):
             self.pre_buffer = []
             return
         if self.pre_depth:
-            if tag in {"br", "div", "li", "p"}:
+            if tag in {"div", "li", "p"}:
                 self.pre_buffer.append("\n")
             return
         if tag in BLOCK_TAGS:

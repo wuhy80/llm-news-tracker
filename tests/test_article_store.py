@@ -42,6 +42,12 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertIn("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: model", body)
 
+    def test_feed_html_does_not_duplicate_self_closing_pre_breaks(self):
+        body = article_store.text_from_html("<pre>line one<br/>line two</pre>")
+
+        self.assertIn("line one\nline two", body)
+        self.assertNotIn("line one\n\nline two", body)
+
     def test_detects_fenced_code_that_was_collapsed_to_one_line(self):
         collapsed = "```\n" + " ".join([
             "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",
