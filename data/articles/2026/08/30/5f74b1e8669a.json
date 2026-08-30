@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 3,
+  "id": "5f74b1e8669a",
+  "title": "Qwen3.8-27B on RTX 5090: 144/256 t/s prose/code. 256/451 t/s on 2 parallel slots. 175k context. Sub-second prefix restore. Vision optional.",
+  "summary": "With the M5 Ultra release, we mustn't allow the 5090 to drop in value by even a single dollar! Let's band together to keep justifying our poor financial decisions. What You Get Blackwell only recipe to run Qwen3.8-27B on a single RTX 5090. Uses plain sglang, NVFP4 model (Q6 equivalent), and DFLASH2 speculative decoding. Ready-to-download checkpoints, no build steps. Perfect for Hermes and Opencode. Full recipe + chec",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1w2g5se/qwen3827b_on_rtx_5090_144256_ts_prosecode_256451/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-08-30T12:22:37Z",
+  "category": "release",
+  "tags": [
+    "模型发布"
+  ],
+  "score": 72,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w2g5se/qwen3827b_on_rtx_5090_144256_ts_prosecode_256451/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w2g5se/qwen3827b_on_rtx_5090_144256_ts_prosecode_256451/",
+  "fetchedAt": "2026-08-30T16:45:22.752528Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 2,
+  "body": "With the M5 Ultra release, we mustn't allow the 5090 to drop in value by even a single dollar! Let's band together to keep justifying our poor financial decisions.\n\n- Blackwell only recipe to run Qwen3.8-27B on a single RTX 5090.\n\n- Uses plain sglang, NVFP4 model (Q6 equivalent), and DFLASH2 speculative decoding.\n\n- Ready-to-download checkpoints, no build steps. Perfect for Hermes and Opencode.\n\nFull recipe + checkpoints\n\nWorkload single parallel x2\n\nPrefill (time to first token, mean of 3 cold runs):\n\nPrompt length TTFT avg t/s final 1s t/s\n\n- Host-RAM KV tier: a ~100k conversation resumes in ~1 s, not ~20 s cold.\n\n- xhigh reasoning, hard caps 16k think / 8k content. Tested against higher caps with no change in GPQA scoring.\n\n- Uses latest froggeric template to improve agentic use. Personally using in Hermes and Opencode with no issues.\n\n- 4 simultaneous agent conversations (example below)\n\nExternal evals (lm-evaluation-harness, quantized checkpoint as served; - = Qwen publishes no 3.8-27B number)\n\nBenchmark This stack Qwen published\n\nGPQA Diamond (xhigh thinking)\n\nGPQA was tested at xhigh with the thinking cap raised but the score hovered (85.4% vs 84.8%), so the 16k cap costs virtually nothing and keeps worst-case turns ~15-28 s tighter. Raise it if you wish though.\n\n4-Conversation Switching (4 multiturn agent conversations, identical except base size)\n\nMetric 60k conversations 100k conversations\n\nTwo 60k conversations fit the pool and run in parallel; at 100k only one fits, so they take turns, each resuming from RAM in ~1 s. Every conversation looks like it has a dedicated 100k context.\n\n- Spec tokens: --speculative-dflash-block-size 6 ; lower = less draft VRAM, 9-27% slower, each token is about 250mb so tune up/down as you see fit.\n\n- Max context: --max-total-tokens 175064 (~260 MiB free)\n\n- Vision: drop --language-only , set 150k context\n\n- I'm running with no vision, on Ubuntu with about 325MB going to display driver (XFCE) for reference.\n\n# Where The Gains Came From\n\n- Quantized lm_head (-1.7 GB, paid for the bigger pool)\n\n- DFLASH2 draft re-quantized to modelopt-NVFP4 (upstream doesn't load in sglang)\n\n- Block 6, NCCL buffer force capped to 2 MiB, fp8 KV (more room for more KV)\n\n- GPU-managed host-RAM KV tier ( --hicache-io-backend kernel ): the GPU does the RAM copies, so a spilled ~100k conversation restores in ~1 s, not ~20 s cold\n\n- froggeric chat template + capping strict thinking (no runaway reasoning, no empty content, most of the benefits from xhigh thinking with less total tokens)\n\n# Bonus Pro Tip: put a request gate in front of sglang\n\nThe problem I kept encountering was that a big request queued ahead of several small ones wastes parallel capacity. While the big one holds a slot, the small ones wait even when the budget has room for another. I made a small admission proxy that tokenizes each prompt and admits the queued small request that fits the leftover budget in parallel instead of waiting behind the big one. Anything that can never complete gets a clean 400 up front. sglang only gates by request count ( --max-running-requests ), not KV budget; the gate fills that gap. Perpetually delaying the big requests is handled by a 3 max, 20s limit on delay.\n\nEven if you don't end up using it, an admission layer is worth it for any provider imo whether it's, sglang, llama.cpp, or vLLM...\n\nPaste this into your agent and it'll build you one:\n\n```\nBuild me a small FastAPI admission-control proxy to put in front of an sglang server. Requirements: 1. Proxy every `/v1/*` request verbatim to the upstream sglang URL (configurable), streaming responses back. 2. For POST /v1/chat/completions, before forwarding, call the upstream POST /tokenize\nwith {\"messages\": <the messages array>} to get the exact prompt token count (includes chat-template framing). 3. Fetch GET /server_info on startup and on a 30s timer\nfor max_total_num_tokens and max_running_requests. 4. Admission:\n    admit a request when an sglang slot is free AND its projected KV fits the pool. Projected in-use = sum over active requests of (prompt − shared radix prefix + output reservation), where a conversation continuation shares its prefix\nwith the active request it extends. 5. Output\nreservation = min(client max_tokens or 24000, 4096);\n sglang's own scheduler only charges up to 4096 (SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION). 6. If prompt + the client's full output ceiling (24000 default) exceeds the pool,\nreturn HTTP 400 context_overflow up front instead of admitting. 7. If a request doesn't fit, queue it (asyncio.Condition). On every release and before each new admission, drain the queue FIFO:\n    admit every queued request that now fits, bypassing those that can't. After a queued request has been bypassed 3 times, or has waited 20s, make it a barrier:\n    nothing behind it may be admitted until it fits (prevents starvation by a stream of small requests). 8. Vision:\n    if any message has an image_url, charge estimated image tokens\nfrom the pixel dimensions (Qwen2VL grid formula, 28px factor, ~2048 tokens at 1080p) on top of the /tokenize count. 9. Clean up reliably:\n    if the client disconnects or the request is rejected\nwhile queued or admitted, release its slot (idempotent). 10. Expose /health, /status, and /metrics (Prometheus)\nwith a gauge\nfor current queue depth. Config via env vars:\n    upstream sglang URL, output reserve cap (default 4096), starve skips (default 3), starve seconds (default 20). Write it as a single main.py using only fastapi, uvicorn, httpx, prometheus-client. Include a Dockerfile.\n```\n\nBig thanks to everyone who makes local hosting of LLM possible and especially those below whose hard hard work the above was smushed together from:\n\n- gittensor-model-hub (NVFP4 base checkpoint)\n\n- incoai (DFlash2 draft)\n\n- calneymgp (lm_head quantization recipe)\n\n- NVIDIA ModelOpt (quantizer)\n\n- sglang (serving engine)\n\n- froggeric (chat template)\n\nRe-quantizations of open checkpoints. All Apache-2.0.\n\nsubmitted by /u/pennyonaire",
+  "summaryZh": "本文提供了一套针对Blackwell架构单卡RTX 5090运行Qwen3.8-27B模型的优化方案。该方案采用标准SGLang、NVFP4量化权重及DFLASH2投机解码技术，在维持高GPQA评分的同时实现了极高的生成吞吐量（单任务及多并发slot下表现优异），并引入了宿主机RAM的KV缓存分级恢复机制，大幅缩短了长上下文对话的恢复时间。",
+  "summaryGeneratedAt": "2026-08-30T16:52:45.500232Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-08-30T16:52:45.500232Z",
+    "isRelevant": true,
+    "relevanceScore": 81,
+    "importanceScore": 81,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 24,
+      "impact": 21,
+      "novelty": 14,
+      "credibility": 13,
+      "usefulness": 0,
+      "timeliness": 9
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "release",
+    "tags": [
+      "RTX 5090",
+      "Qwen3.8-27B",
+      "NVFP4",
+      "speculative decoding",
+      "SGLang"
+    ],
+    "reasonZh": "详细给出了在单张RTX 5090上利用NVFP4量化和DFLASH2投机解码高效运行Qwen3.8-27B模型的完整软硬件实测方案。",
+    "summaryZh": "本文提供了一套针对Blackwell架构单卡RTX 5090运行Qwen3.8-27B模型的优化方案。该方案采用标准SGLang、NVFP4量化权重及DFLASH2投机解码技术，在维持高GPQA评分的同时实现了极高的生成吞吐量（单任务及多并发slot下表现优异），并引入了宿主机RAM的KV缓存分级恢复机制，大幅缩短了长上下文对话的恢复时间。",
+    "glossary": [
+      {
+        "term": "Blackwell",
+        "explanationZh": "NVIDIA推出的新一代GPU微架构系列。"
+      },
+      {
+        "term": "NVFP4",
+        "explanationZh": "NVIDIA硬件原生支持的4位浮点量化格式，可提供极高的压缩比和计算效率。"
+      },
+      {
+        "term": "Speculative Decoding",
+        "explanationZh": "投机解码，利用轻量级草稿模型加速大模型推理的协同解码技术。"
+      },
+      {
+        "term": "KV Cache",
+        "explanationZh": "键值缓存，用于存储Transformer模型自注意力层中间计算结果以加速生成的缓存机制。"
+      },
+      {
+        "term": "GPQA",
+        "explanationZh": "衡量大模型在生物、物理和化学等专家级科学问题上推理能力的高难度基准测试。"
+      },
+      {
+        "term": "Prefix Restore",
+        "explanationZh": "前缀恢复技术，用于快速加载和恢复长对话历史的KV缓存状态。"
+      }
+    ],
+    "duplicateKey": "rtx-5090-qwen-nvfp4-speculative-decoding"
+  }
+}

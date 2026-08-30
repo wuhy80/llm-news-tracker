@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 3,
+  "id": "db87c83eb2a2",
+  "title": "Qwen3.8-Flash-Next NVFP4 2xDGX Spark config: 50t/s decode, 2,900t/s prefill",
+  "summary": "After a couple of days of faffing around, here's my current config in case it helps anyone out. Some of this is also valuable for a single Spark. Benchmarks: Dual-Spark TP2, eager + MTP k=3, 262k context (warmed medians, exact tokenizer counts): ┌─────────┬──────────────────┬───────────────────┬─────────────────────────────────┐ │ Streams │ Decode aggregate │ Decode per-stream │ Prefill aggregate (10k prompts) │ ├───",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1w2inlp/qwen38flashnext_nvfp4_2xdgx_spark_config_50ts/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-08-30T14:12:41Z",
+  "category": "benchmark",
+  "tags": [
+    "Benchmark"
+  ],
+  "score": 72,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w2inlp/qwen38flashnext_nvfp4_2xdgx_spark_config_50ts/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w2inlp/qwen38flashnext_nvfp4_2xdgx_spark_config_50ts/",
+  "fetchedAt": "2026-08-30T16:45:22.728561Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 2,
+  "body": "After a couple of days of faffing around, here's my current config in case it helps anyone out. Some of this is also valuable for a single Spark.\n\n```\nDual-Spark TP2, eager + MTP k=3, 262k context (warmed medians, exact tokenizer counts): ┌─────────┬──────────────────┬───────────────────┬─────────────────────────────────┐ │ Streams │ Decode aggregate │ Decode per-stream │ Prefill aggregate (10k prompts) │ ├─────────┼──────────────────┼───────────────────┼─────────────────────────────────┤ │ 1 │ 45.9 t/s │ 45.9 t/s │ 2,940 t/s │ ├─────────┼──────────────────┼───────────────────┼─────────────────────────────────┤ │ 4 │ 120.2 t/s │ 30.0 t/s │ 2,524 t/s │ ├─────────┼──────────────────┼───────────────────┼─────────────────────────────────┤ │ 8 │ 222.2 t/s │ 27.8 t/s │ 3,098 t/s │ ├─────────┼──────────────────┼───────────────────┼─────────────────────────────────┤ │ 13 │ 265.9 t/s │ 20.5 t/s │ 2,960 t/s │ └─────────┴──────────────────┴───────────────────┴─────────────────────────────────┘ Prefill vs prompt depth (single stream, exact tokens): ┌─────────────┬───────────┐ │ Prompt size │ Prefill │ ├─────────────┼───────────┤ │ 11k │ 2,875 t/s │ ├─────────────┼───────────┤ │ 100k │ 2,655 t/s │ ├─────────────┼───────────┤ │ 200k │ 2,463 t/s │ └─────────────┴───────────┘\n```\n\nAI slop below for you to read and paste into your own agent :)\n\n- vLLM PR #53896 ( release/qwen38next branch) — NOT main; main doesn't have the model, and the recipe image's vLLM commit isn't in the public repo\n\n- sm_121 support is a 2-file patch (details below) — GB10 is arch 12.1 and the NVFP4 E2M1 conversion needs a software fallback\n\n- PLE n-gram table served from internal NVMe via mmap:(48 GB, MADV_RANDOM is essential — it's a 30× read-amplification difference on hash-scattered row lookups), with a node-local CPU-worker process doing gathers over ZMQ + pinned buffers + CUDA-IPC outputs so the gather is graph-safe and TP2-safe\n\n- TP2 across both Sparks: native venv (NOT docker — see dead ends), eager + MTP k=3\n\n# Numbers (TP2, warmed medians, count-20 structured / 3-paragraph prose)\n\nconfig structured prose prefill (11k tokens)\n\n- PIECEWISE cudagraphs cost ~28% decode under MTP+TP2.\n\n- Same tree, same everything, graphs on vs off: 36 vs 50 tok/s. Graphs help single-node no-MTP decode (+80%, 9→16.5), but combined with MTP at TP2 they're a straight loss — MTP already amortizes the launch overhead the graphs were eliminating. We chased a \"tree-level MTP regression\" for a day before realizing the config was the regression.\n\n- Docker silently degrades NCCL to TCP sockets.\n\n- Default containers get no IB device → NET/Socket → TP2 prefill at ~40% of native. You need --privileged (or IB device passthrough) AND the right HCA name — see next point. Native venv runs just get RoCE.\n\n- RoCE device names are not stable across reboots, and can differ between two identical machines\n\n- (ours: rocep1s0f1 on one, rocep1s0f0 on the other, resolved dynamically). Hardcoded NCCL_IB_HCA will silently fail on one node. Enumerate with ibdev2netdev , match port-ACTIVE to your rail netdev, and verify with NCCL_DEBUG=INFO that you see NET/IB , not NET/Socket .\n\n- flashinfer must be 0.6.18\n\n- on GB10 — 0.6.17 crashes the NVFP4 MoE fallback kernel.\n\n- vLLM's MoE shuffleInputRowsKernel has an uninitialized-permutation OOB read that shows up as a fake CUTLASS status=7 GEMM failure — a two-line bounds guard fixes it (already in PR #53896).\n\n# The 2-file sm_121 patch (vs PR #53896 base)\n\n- CMakeLists.txt : add 12.1 to CUDA_SUPPORTED_ARCHS , SCALED_MM_ARCHS , CUTLASS_MOE_DATA_ARCHS , FP4_SM120_ARCHS\n\n- csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh : ~90-line software E2M1 conversion guarded by __CUDA_ARCH__ == 1210 (GB10 has no cvt.rn.satfinite.e2m1x2.f32 )\n\nThat's the whole delta. Build offline with the usual dependency cache; CUDA arch 121.\n\n```\nexport VLLM_PLE_MMAP=1 VLLM_PLE_MMAP_WORKERS=64 VLLM_PLE_MMAP_PREWARM=1 export VLLM_PLE_MMAP_DIR=$HOME/ple-table # internal NVMe copy of the table export VLLM_PLE_CPU_OFFLOAD=1 # activates the IPC CPU-worker gather path export NCCL_SOCKET_IFNAME=<your-rail-if> # bootstrap only; NCCL finds RoCE itself export GLOO_SOCKET_IFNAME=<your-rail-if> python -m vllm.entrypoints.openai.api_server \\ --model <path-to-qwen38-flashnext-nvfp4> \\ --host 0.0.0.0 --port 8086 --load-format safetensors \\ --tensor-parallel-size 2 --nnodes 2 --node-rank 0 \\ --master-addr <head-rail-ip> --master-port 29511 \\ --distributed-executor-backend mp \\ --max-model-len 262144 --max-num-seqs 13 --gpu-memory-utilization 0.85 \\ --no-enable-prefix-caching --enable-chunked-prefill --max-num-batched-tokens 8192 \\ --long-prefill-token-threshold 4096 --enforce-eager \\ --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \\ --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'\n```\n\nWorker node (rank 1): identical, but --node-rank 1 --headless , launched ~30s after the head. Note --enforce-eager — that's not a compromise, it's the fast path (see dead end #1).\n\nsubmitted by /u/-dysangel-",
+  "summaryZh": "本文展示了Qwen3.8-Flash-Next模型在NVFP4双DGX Spark集群配置下的实际性能压测数据。在双Spark TP2、eager模式结合MTP k=3以及262k长上下文的设置下，测试给出了详细的解码吞吐量（如单流45.9 t/s）与预填充吞吐量（超2,900 t/s）指标，并探讨了vLLM分支、硬件架构补丁及内存映射优化等工程经验。",
+  "summaryGeneratedAt": "2026-08-30T16:52:33.451445Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-08-30T16:52:33.451445Z",
+    "isRelevant": true,
+    "relevanceScore": 85,
+    "importanceScore": 85,
+    "importanceLevel": 5,
+    "dimensions": {
+      "relevance": 23,
+      "impact": 20,
+      "novelty": 12,
+      "credibility": 12,
+      "usefulness": 9,
+      "timeliness": 9
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "benchmark",
+    "tags": [
+      "Qwen3",
+      "NVFP4",
+      "vLLM",
+      "Benchmark",
+      "DualSpark"
+    ],
+    "reasonZh": "本文详细披露了Qwen3.8-Flash-Next在特定硬件配置下的解码与预填充性能基准数据，具有很高参考价值。",
+    "summaryZh": "本文展示了Qwen3.8-Flash-Next模型在NVFP4双DGX Spark集群配置下的实际性能压测数据。在双Spark TP2、eager模式结合MTP k=3以及262k长上下文的设置下，测试给出了详细的解码吞吐量（如单流45.9 t/s）与预填充吞吐量（超2,900 t/s）指标，并探讨了vLLM分支、硬件架构补丁及内存映射优化等工程经验。",
+    "glossary": [
+      {
+        "term": "NVFP4",
+        "explanationZh": "一种4位浮点量化格式，用于加速前沿硬件上的大模型推理。"
+      },
+      {
+        "term": "Prefill",
+        "explanationZh": "大模型推理的首轮提示词处理阶段，负责计算并缓存输入文本的KV Cache。"
+      },
+      {
+        "term": "Decode",
+        "explanationZh": "大模型推理的自回归逐Token生成阶段。"
+      },
+      {
+        "term": "TP2",
+        "explanationZh": "张量并行度为2（Tensor Parallelism 2），即跨两个计算设备切分模型层进行并行计算。"
+      },
+      {
+        "term": "Memory Mapping",
+        "explanationZh": "内存映射（mmap），将磁盘文件直接映射到进程的地址空间以优化大文件读取。"
+      }
+    ],
+    "duplicateKey": "qwen38-flash-next-nvfp4-spark-benchmark"
+  }
+}
