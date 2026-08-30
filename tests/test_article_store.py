@@ -25,6 +25,15 @@ class ArticleTextTests(unittest.TestCase):
         self.assertIn("first sufficiently detailed paragraph", body)
         self.assertIn("\n\n", body)
 
+    def test_feed_html_preserves_preformatted_code(self):
+        body = article_store.text_from_html(
+            "<p>A paragraph with enough context before the example.</p>"
+            "<pre><code>if ready:\n    print('go')\n\nreturn result</code></pre>"
+            "<p>A paragraph after the example with more context.</p>"
+        )
+
+        self.assertIn("```\nif ready:\n    print('go')\n\nreturn result\n```", body)
+
     def test_page_extraction_prefers_article_and_removes_noise(self):
         article_text = " ".join(["A useful model release detail"] * 30)
         page = (
@@ -53,6 +62,15 @@ class ArticleTextTests(unittest.TestCase):
         self.assertNotIn("URL Source", body)
         self.assertNotIn("https://example.com/source", body)
         self.assertIn("source link", body)
+
+    def test_reader_markdown_preserves_fenced_code(self):
+        body = article_store.text_from_reader(
+            "Introductory paragraph with enough detail to remain in the reader.\n\n"
+            "```python\nfor item in items:\n    print(item)\n```\n\n"
+            "A paragraph after the code block with enough detail to remain in the reader."
+        )
+
+        self.assertIn("```python\nfor item in items:\n    print(item)\n```", body)
 
 
 class SnapshotTests(unittest.TestCase):

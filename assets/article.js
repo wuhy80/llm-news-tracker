@@ -73,26 +73,71 @@ function renderTags(tags) {
   return section;
 }
 
+function renderCode(code, language = "") {
+  const pre = document.createElement("pre");
+  pre.className = "reader-code";
+  if (language) pre.dataset.language = language;
+  const element = document.createElement("code");
+  element.textContent = code;
+  pre.append(element);
+  return pre;
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
-  const paragraphs = String(body || "").split(/\n\s*\n/).map((text) => text.trim()).filter(Boolean);
-  if (!paragraphs.length) {
+  const proseLines = [];
+  let codeLines = null;
+  let codeLanguage = "";
+  let rendered = false;
+  const flushProse = () => {
+    const text = proseLines.join(" ").trim();
+    proseLines.length = 0;
+    if (!text) return;
+    const tags = parseTags(text);
+    if (tags.length) elements.articleBody.append(renderTags(tags));
+    else {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text;
+      elements.articleBody.append(paragraph);
+    }
+    rendered = true;
+  };
+  String(body || "").split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      if (codeLines === null) {
+        flushProse();
+        codeLines = [];
+        codeLanguage = trimmed.slice(3).trim();
+      } else {
+        elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
+        codeLines = null;
+        codeLanguage = "";
+        rendered = true;
+      }
+      return;
+    }
+    if (codeLines !== null) {
+      codeLines.push(line);
+      return;
+    }
+    if (!trimmed) {
+      flushProse();
+      return;
+    }
+    proseLines.push(trimmed);
+  });
+  if (codeLines !== null) {
+    elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
+    rendered = true;
+  }
+  flushProse();
+  if (!rendered) {
     const empty = document.createElement("p");
     empty.className = "reader-empty";
     empty.textContent = "暂无可用的内部正文，请查看原文。";
     elements.articleBody.append(empty);
-    return;
   }
-  paragraphs.forEach((text) => {
-    const tags = parseTags(text);
-    if (tags.length) {
-      elements.articleBody.append(renderTags(tags));
-      return;
-    }
-    const paragraph = document.createElement("p");
-    paragraph.textContent = text;
-    elements.articleBody.append(paragraph);
-  });
 }
 
 function fallbackSummary(item) {

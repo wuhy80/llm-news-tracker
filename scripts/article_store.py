@@ -87,6 +87,8 @@ class ReadableTextParser(HTMLParser):
         self.main_buffer: list[str] = []
         self.all_blocks: list[str] = []
         self.main_blocks: list[str] = []
+        self.pre_depth = 0
+        self.pre_buffer: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -94,6 +96,13 @@ class ReadableTextParser(HTMLParser):
             self.skip_depth += 1
             return
         if self.skip_depth:
+            return
+        if tag == "pre":
+            self._flush()
+            self.pre_depth += 1
+            self.pre_buffer = []
+            return
+        if self.pre_depth:
             return
         if tag in {"article", "main"}:
             self._flush()
@@ -108,13 +117,27 @@ class ReadableTextParser(HTMLParser):
             return
         if self.skip_depth:
             return
+        if tag == "pre" and self.pre_depth:
+            self._append_code(self.pre_buffer, self.all_blocks)
+            if self.main_depth:
+                self._append_code(self.pre_buffer, self.main_blocks)
+            self.pre_depth = max(0, self.pre_depth - 1)
+            self.pre_buffer = []
+            return
+        if self.pre_depth:
+            return
         if tag in BLOCK_TAGS:
             self._flush()
         if tag in {"article", "main"}:
             self.main_depth = max(0, self.main_depth - 1)
 
     def handle_data(self, data: str) -> None:
-        if self.skip_depth or not data.strip():
+        if self.skip_depth:
+            return
+        if self.pre_depth:
+            self.pre_buffer.append(data)
+            return
+        if not data.strip():
             return
         self.all_buffer.append(data)
         if self.main_depth:
@@ -125,6 +148,8 @@ class ReadableTextParser(HTMLParser):
         self._flush()
 
     def _flush(self) -> None:
+        if self.pre_depth:
+            return
         self._append_block(self.all_buffer, self.all_blocks)
         self._append_block(self.main_buffer, self.main_blocks)
         self.all_buffer = []
@@ -136,11 +161,24 @@ class ReadableTextParser(HTMLParser):
         if text:
             target.append(text)
 
+    @staticmethod
+    def _append_code(buffer: list[str], target: list[str]) -> None:
+        code = html.unescape("".join(buffer)).strip("\n")
+        if code.strip():
+            target.append(f"```\n{code}\n```")
+
 
 def clean_blocks(blocks: list[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for block in blocks:
+        if block.lstrip().startswith("```"):
+            lines = block.strip().splitlines()
+            if len(lines) >= 3:
+                code = "\n".join(lines[1:-1]).rstrip()
+                if code.strip():
+                    cleaned.append(f"{lines[0].strip()}\n{code}\n```")
+            continue
         block = re.sub(r"\s+", " ", block).strip()
         folded = block.casefold()
         if len(block) < 24 or any(pattern in folded for pattern in NOISE_PATTERNS):
@@ -170,18 +208,45 @@ def text_from_reader(value: str) -> str:
     value = re.sub(r"!\[[^]]*]\([^)]*\)", "", value or "")
     value = re.sub(r"\[([^]]+)]\([^)]*\)", r"\1", value)
     blocks = []
-    for block in re.split(r"\n\s*\n", value):
-        lines = []
-        for line in block.splitlines():
-            line = re.sub(r"^\s{0,3}(?:#{1,6}|>|[-*+]\s|\d+[.)]\s)\s*", "", line).strip()
-            if not line or line.startswith("```"):
-                continue
-            if re.match(r"^(?:Title|URL Source|Published Time|Markdown Content):", line, re.IGNORECASE):
-                continue
-            lines.append(line)
-        text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    prose_lines: list[str] = []
+    code_lines: list[str] | None = None
+    code_language = ""
+
+    def flush_prose() -> None:
+        text = re.sub(r"\s+", " ", " ".join(prose_lines)).strip()
         if text:
             blocks.append(text)
+        prose_lines.clear()
+
+    for raw_line in value.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            if code_lines is None:
+                flush_prose()
+                code_lines = []
+                code_language = stripped[3:].strip()
+            else:
+                code = "\n".join(code_lines).rstrip()
+                if code.strip():
+                    blocks.append(f"```{code_language}\n{code}\n```")
+                code_lines = None
+                code_language = ""
+            continue
+        if code_lines is not None:
+            code_lines.append(raw_line.rstrip())
+            continue
+        line = re.sub(r"^\s{0,3}(?:#{1,6}|>|[-*+]\s|\d+[.)]\s)\s*", "", raw_line).strip()
+        if not line:
+            flush_prose()
+            continue
+        if re.match(r"^(?:Title|URL Source|Published Time|Markdown Content):", line, re.IGNORECASE):
+            continue
+        prose_lines.append(line)
+    if code_lines is not None:
+        code = "\n".join(code_lines).rstrip()
+        if code.strip():
+            blocks.append(f"```{code_language}\n{code}\n```")
+    flush_prose()
     return "\n\n".join(clean_blocks(blocks))[:MAX_BODY_CHARS].strip()
 
 
