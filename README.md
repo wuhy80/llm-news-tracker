@@ -118,6 +118,10 @@ python -m http.server 8000
 
 文章页的留言使用 [giscus](https://giscus.app/) 对接 GitHub Discussions，按文章 ID 建立独立讨论，并通过 GitHub 账号授权后留言。仓库已启用 Discussions；首次使用前，需要仓库管理员在 [安装 giscus App](https://github.com/apps/giscus/installations/new) 页面将 App 安装到 `wuhy80/llm-news-tracker`，否则页面会显示无法发表评论。
 
+## 阅读历史
+
+阅读历史使用浏览器 `localStorage` 保存，每篇文章累计记录打开次数、首次阅读时间和最近阅读时间。数据只存在当前浏览器和当前站点，不会上传服务器，也不会在不同设备或浏览器之间同步；首页侧栏可以查看最近阅读并清空本地记录，最多保留最近 500 篇文章。
+
 ## 调整信息源
 
 编辑 `scripts/fetch_news.py` 中的 `SOURCES`。每个来源支持以下字段：

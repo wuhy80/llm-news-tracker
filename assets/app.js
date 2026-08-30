@@ -29,13 +29,14 @@ const state = {
   query: "",
   sort: "hot",
   visible: PAGE_SIZE,
-  saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]"))
+  saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]")),
+  history: window.LLMReadingHistory.load()
 };
 const el = Object.fromEntries([
   "feedList", "feedItemTemplate", "itemCount", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
   "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "importanceSelect", "trendRadar",
   "trendList", "watchTags", "sourceList", "updateStatus", "sourceStatus", "searchPanel", "searchInput",
-  "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink"
+  "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink", "historyList", "historySummary", "clearHistory"
 ].map((id) => [id, document.getElementById(id)]));
 
 function startOfDay(value) {
@@ -170,6 +171,52 @@ function filteredItems() {
 function saveBookmarks() {
   localStorage.setItem("llm-pulse-saved", JSON.stringify([...state.saved]));
 }
+function readingEntry(id) {
+  return state.history.find((entry) => entry.id === id);
+}
+function recordReading(item, href) {
+  const entry = window.LLMReadingHistory.record(item, { href });
+  if (!entry) return null;
+  state.history = [entry, ...state.history.filter((item) => item.id !== entry.id)];
+  renderHistory();
+  render();
+  return entry;
+}
+function isInternalArticleHref(href) {
+  return /^article\.html(?:\?|$)/.test(href || "");
+}
+function renderHistory() {
+  const stats = window.LLMReadingHistory.stats(state.history);
+  el.historySummary.textContent = stats.articles
+    ? `已读 ${stats.articles} 篇 · 打开 ${stats.opens} 次`
+    : "还没有阅读记录";
+  el.historyList.replaceChildren();
+  if (!state.history.length) {
+    const empty = document.createElement("p");
+    empty.className = "history-empty";
+    empty.textContent = "打开一篇文章后，最近阅读会显示在这里。";
+    el.historyList.append(empty);
+    return;
+  }
+  state.history.slice(0, 6).forEach((entry) => {
+    const href = entry.href || entry.url || "#";
+    const link = document.createElement("a");
+    link.className = "history-item";
+    link.href = href;
+    if (!isInternalArticleHref(href)) {
+      link.target = "_blank";
+      link.rel = "noreferrer";
+    }
+    const title = document.createElement("strong");
+    title.className = "history-item-title";
+    title.textContent = entry.title;
+    const meta = document.createElement("span");
+    meta.className = "history-item-meta";
+    meta.textContent = `${entry.source} · ${relativeTime(entry.lastReadAt)} · ${entry.count} 次`;
+    link.append(title, meta);
+    el.historyList.append(link);
+  });
+}
 function escapeSelector(value) {
   return window.CSS?.escape ? CSS.escape(value) : value.replace(/["\\]/g, "\\$&");
 }
@@ -207,6 +254,12 @@ function renderFeed(items) {
     const time = fragment.querySelector("time");
     time.dateTime = item.publishedAt;
     time.textContent = relativeTime(item.publishedAt);
+    const readStatus = fragment.querySelector(".read-status");
+    const historyEntry = readingEntry(item.id);
+    if (historyEntry) {
+      readStatus.textContent = `已读 ${historyEntry.count} 次`;
+      readStatus.hidden = false;
+    }
     const badge = fragment.querySelector(".signal-badge");
     badge.textContent = level + "级 · " + IMPORTANCE_LABEL[level] + " · " + itemScore(item) + "分";
     if (itemReview?.reasonZh) {
@@ -226,7 +279,9 @@ function renderFeed(items) {
       chip.textContent = tag;
       tags.append(chip);
     });
-    fragment.querySelector(".external-link").href = item.url;
+    const externalLink = fragment.querySelector(".external-link");
+    externalLink.href = item.url;
+    externalLink.addEventListener("click", () => recordReading(item, item.url));
     const bookmark = fragment.querySelector(".bookmark");
     bookmark.classList.toggle("saved", state.saved.has(item.id));
     bookmark.setAttribute("aria-label", state.saved.has(item.id) ? "取消收藏" : "收藏");
@@ -409,6 +464,18 @@ function setupEvents() {
     if (event.key === "Escape" && !el.searchPanel.hidden) closeSearch();
   });
   el.loadMore.addEventListener("click", () => { state.visible += PAGE_SIZE; renderFeed(filteredItems()); });
+  el.clearHistory.addEventListener("click", () => {
+    if (!state.history.length || !window.confirm("确定清空全部阅读历史吗？")) return;
+    window.LLMReadingHistory.clear();
+    state.history = [];
+    renderHistory();
+    render();
+  });
+  window.addEventListener("pageshow", () => {
+    state.history = window.LLMReadingHistory.load();
+    renderHistory();
+    render();
+  });
   el.themeButton.addEventListener("click", () => {
     const dark = document.documentElement.dataset.theme !== "dark";
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -517,5 +584,6 @@ async function loadData() {
   document.getElementById("footerYear").textContent = new Date().getFullYear();
   configureRepositoryLink();
   setupEvents();
+  renderHistory();
   loadData();
 })();

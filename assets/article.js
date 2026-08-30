@@ -28,7 +28,7 @@ const GISCUS_CONFIG = {
 const elements = Object.fromEntries([
   "articleBody", "articleCategory", "articleGlossary", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
   "articleImportance", "articleReason", "articleReview",
-  "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "themeButton"
+  "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "readCount", "themeButton"
 ].map((id) => [id, document.getElementById(id)]));
 
 function favicon(item) {
@@ -134,7 +134,7 @@ function renderGlossary(item, level) {
   elements.articleGlossary.hidden = entries.length === 0;
 }
 
-function renderArticle(item, snapshot) {
+function renderArticle(item, snapshot, historyEntry) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
   const category = item.aiReview?.category || item.category;
@@ -148,6 +148,8 @@ function renderArticle(item, snapshot) {
   elements.articleSourceIcon.src = favicon(item);
   elements.articleSourceIcon.addEventListener("error", () => { elements.articleSourceIcon.hidden = true; }, { once: true });
   elements.snapshotKind.textContent = SNAPSHOT_LABEL[kind] || "内部快照";
+  elements.readCount.textContent = `已读 ${historyEntry?.count || 1} 次`;
+  elements.readCount.hidden = false;
   const level = importanceLevel(item);
   elements.articleImportance.textContent = level + "级 · " + IMPORTANCE_LABEL[level] + " · " + importanceScore(item) + "分";
   elements.articleImportance.dataset.level = level;
@@ -227,7 +229,10 @@ async function loadArticle() {
       if (location) record = await fetchRecord(articlePath(articleId, location));
     }
     if (!record || record.id !== articleId) throw new Error("未找到该文章");
-    renderArticle(record, record);
+    const historyEntry = window.LLMReadingHistory.record(record, {
+      href: `article.html${window.location.search}`
+    });
+    renderArticle(record, record, historyEntry);
     loadComments(articleId);
   } catch (error) {
     console.error("Unable to load article", error);
