@@ -188,7 +188,7 @@ def main() -> int:
     items = [item for item, _ in selected]
     resolved_urls = resolve_google_news_urls([item["url"] for item in items])
     reader_ids = {item["id"] for item in items[:max(0, args.reader_limit)]}
-    counts = {"community": 0, "page": 0, "reader": 0, "failed": 0}
+    counts = {"community": 0, "feed": 0, "page": 0, "reader": 0, "failed": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(items)))) as pool:
         futures = {
             pool.submit(
@@ -216,7 +216,7 @@ def main() -> int:
     save_news(data, NEWS_FILE)
     print(
         f"[format] processed {len(items)} legacy snapshots: "
-        f"{counts['community']} community, {counts['page']} page, "
+        f"{counts['community']} community, {counts['feed']} feed, {counts['page']} page, "
         f"{counts['reader']} reader, {counts['failed']} preserved for retry"
     )
     return 0
