@@ -25,6 +25,15 @@ class ArticleTextTests(unittest.TestCase):
         self.assertIn("first sufficiently detailed paragraph", body)
         self.assertIn("\n\n", body)
 
+    def test_plain_feed_preserves_indented_paragraph_breaks(self):
+        body = article_store.text_from_html(
+            "First paragraph with enough detail to remain in the article snapshot.\n"
+            "  Second paragraph with enough detail to remain in the article snapshot."
+        )
+
+        self.assertIn("First paragraph", body)
+        self.assertIn("\n\nSecond paragraph", body)
+
     def test_feed_html_preserves_preformatted_code(self):
         body = article_store.text_from_html(
             "<p>A paragraph with enough context before the example.</p>"

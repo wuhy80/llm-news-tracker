@@ -67,6 +67,15 @@ class FormatRefreshTests(unittest.TestCase):
         self.assertFalse(refresh_article_formats.acceptable_refresh(previous, plain))
         self.assertTrue(refresh_article_formats.acceptable_refresh(previous, structured))
 
+    def test_markup_damage_can_refresh_to_plain_page_text_without_code(self):
+        previous = {"body": r"A paper with \textbf{important} notation and $x^2$."}
+        refreshed = (
+            "A paper with important notation and x2, followed by readable page text. "
+            * 8
+        )
+
+        self.assertTrue(refresh_article_formats.acceptable_refresh(previous, refreshed))
+
     def test_refresh_rejects_code_fences_that_are_still_collapsed(self):
         yaml = " ".join([
             "apiVersion: apps/v1", "kind: Deployment", "metadata: name: model",

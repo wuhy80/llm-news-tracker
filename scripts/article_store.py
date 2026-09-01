@@ -460,6 +460,13 @@ def restore_collapsed_code(code: str) -> str:
 
 
 def text_from_html(value: str, prefer_main: bool = False) -> str:
+    unescaped = html.unescape(value or "")
+    if not re.search(r"<[A-Za-z][^>]*>", unescaped):
+        # Atom summaries often encode paragraph breaks as a newline plus indentation.
+        plain = re.sub(r"\r\n?", "\n", unescaped)
+        paragraphs = re.split(r"\n[ \t]{2,}|\n[ \t]*\n", plain)
+        blocks = [re.sub(r"\s+", " ", paragraph).strip() for paragraph in paragraphs]
+        return limit_body(normalize_article_body("\n\n".join(block for block in blocks if block)))
     parser = ReadableTextParser()
     try:
         parser.feed(value or "")

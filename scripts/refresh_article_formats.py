@@ -83,12 +83,11 @@ def acceptable_refresh(previous: dict, body: str) -> bool:
         return False
     if has_corrupted_text(previous_body) and has_corrupted_text(body):
         return False
-    if (
+    code_damage = (
         likely_flattened_code(previous)
         or has_malformed_code_fence(previous.get("body", ""))
-        or has_corrupted_text(previous.get("body", ""))
-        or has_unrendered_markup(previous.get("body", ""))
-    ):
+    )
+    if code_damage:
         if (
             "```" not in body
             or has_flattened_code(body)
