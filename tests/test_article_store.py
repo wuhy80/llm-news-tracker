@@ -185,6 +185,7 @@ class ArticleTextTests(unittest.TestCase):
     def test_detects_unrendered_latex_markup(self):
         self.assertTrue(article_store.has_unrendered_markup(r"A \textbf{paper} with $x^2$."))
         self.assertFalse(article_store.has_unrendered_markup("A normal readable paragraph."))
+        self.assertFalse(article_store.has_unrendered_markup("```shell\necho $HOME \\textbf{literal}\n```"))
 
 
 class SnapshotTests(unittest.TestCase):

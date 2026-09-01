@@ -367,7 +367,8 @@ def normalize_article_body(value: str) -> str:
 
 def has_unrendered_markup(value: str) -> bool:
     """Detect source markup that would otherwise be shown literally in the reader."""
-    return bool(LATEX_MARKUP_PATTERN.search(value or ""))
+    prose = FENCED_CODE_PATTERN.sub("", normalize_fenced_body(value or ""))
+    return bool(LATEX_MARKUP_PATTERN.search(prose))
 
 
 def limit_body(value: str, limit: int = MAX_BODY_CHARS) -> str:
