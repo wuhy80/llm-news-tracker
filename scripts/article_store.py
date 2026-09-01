@@ -604,12 +604,15 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
             current_body = current.get("body", "")
             if current.get("contentKind") == "page":
                 return False
+            current_paragraphs = current_body.count("\n\n")
+            new_paragraphs = body.count("\n\n")
             if (
                 current.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION
                 and not has_flattened_code(current_body)
                 and not has_malformed_code_fence(current_body)
                 and not has_corrupted_text(current_body)
                 and len(current_body) >= len(body)
+                and current_paragraphs >= new_paragraphs
             ):
                 return False
             if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)):

@@ -141,6 +141,34 @@ class ArticleTextTests(unittest.TestCase):
         self.assertEqual(snapshot["bodyFormatVersion"], article_store.BODY_FORMAT_VERSION)
         self.assertIn("apiVersion: apps/v1\nkind: Deployment\nmetadata:", snapshot["body"])
 
+    def test_feed_refresh_keeps_new_paragraphs_even_when_body_is_shorter(self):
+        item = {
+            "id": "0123456789ab",
+            "title": "Example article",
+            "source": "Example",
+            "url": "https://example.com/article",
+            "publishedAt": "2026-08-27T03:10:20Z",
+        }
+        old_body = "A single paragraph with older source context. " * 10
+        feed_text = (
+            "A single paragraph restored from the feed with enough context to remain readable.\n  "
+            "A second paragraph restored from the feed with enough context to remain readable. "
+        ) * 2
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(article_store, "ARTICLES_DIR", Path(directory)):
+                path = article_store.snapshot_path(item)
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({
+                    "contentKind": "feed",
+                    "bodyFormatVersion": article_store.BODY_FORMAT_VERSION,
+                    "body": old_body,
+                }), encoding="utf-8")
+                changed = article_store.store_feed_snapshot(item, feed_text)
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertTrue(changed)
+        self.assertIn("\n\nA second paragraph", snapshot["body"])
+
     def test_page_extraction_prefers_article_and_removes_noise(self):
         article_text = " ".join(["A useful model release detail"] * 30)
         page = (
