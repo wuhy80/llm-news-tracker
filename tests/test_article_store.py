@@ -170,6 +170,22 @@ class ArticleTextTests(unittest.TestCase):
 
         self.assertIn("```python\nfor item in items:\n    print(item)\n```", body)
 
+    def test_normalizes_latex_paper_markup_without_touching_code(self):
+        body = article_store.normalize_article_body(
+            r"We introduce \textbf{S\textsuperscript{3}Gym} and compare S$^3$Gym with "
+            r"\textit{prior work}. The ratio is \frac{1}{2}."
+            "\n\n```python\nlabel = r'\\textbf{keep this}'\n```"
+        )
+
+        self.assertIn("We introduce S3Gym and compare S3Gym with prior work.", body)
+        self.assertIn("The ratio is (1)/(2).", body)
+        self.assertIn("label = r'\\textbf{keep this}'", body)
+        self.assertNotIn("\\textbf{S", body)
+
+    def test_detects_unrendered_latex_markup(self):
+        self.assertTrue(article_store.has_unrendered_markup(r"A \textbf{paper} with $x^2$."))
+        self.assertFalse(article_store.has_unrendered_markup("A normal readable paragraph."))
+
 
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_schema(self):

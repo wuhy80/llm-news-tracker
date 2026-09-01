@@ -59,6 +59,23 @@ UNFENCED_CODE_HINT_PATTERN = re.compile(
 )
 FENCED_CODE_PATTERN = re.compile(r"```[^\r\n]*\r?\n([\s\S]*?)\r?\n```")
 INLINE_FENCE_PATTERN = re.compile(r"(?m)^.*\S[ \t]+```(?:[^\r\n`]*)")
+LATEX_MARKUP_PATTERN = re.compile(
+    r"\\(?:textbf|textit|texttt|textrm|textsf|textsc|textup|textsl|emph|"
+    r"textsuperscript|textsubscript|mathrm|mathbf|mathit|mathsf|mathtt|"
+    r"operatorname|underline|overline|frac|sqrt|url|href|cite|ref|left|right|"
+    r"begin|end|[A-Za-z]{2,})(?:\s*\{|\s|$)|(?<!\\)\${1,2}"
+)
+LATEX_CONTENT_COMMANDS = (
+    "textbf", "textit", "texttt", "textrm", "textsf", "textsc", "textup", "textsl",
+    "emph", "textsuperscript", "textsubscript", "mathrm", "mathbf", "mathit", "mathsf",
+    "mathtt", "operatorname", "underline", "overline", "text", "url", "cite", "ref",
+)
+LATEX_SYMBOLS = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "theta": "θ", "lambda": "λ", "mu": "μ", "pi": "π", "sigma": "σ", "phi": "φ",
+    "omega": "ω", "times": "×", "cdot": "·", "pm": "±", "leq": "≤", "geq": "≥",
+    "neq": "≠", "infty": "∞",
+}
 YAML_KEY_PATTERN = re.compile(r"(?<![\w-])(?:[A-Za-z_][\w.-]*):(?=\s|$)")
 SHELL_COMMAND_PATTERN = re.compile(
     r"(?:hf\s+download|(?:cd|curl|wget|docker|git|kubectl|npm|pip|pnpm|python(?:\d+)?)\s+)",
@@ -306,6 +323,53 @@ def normalize_fenced_body(value: str) -> str:
     return "\n".join(output)
 
 
+def normalize_prose_markup(value: str) -> str:
+    """Convert common LaTeX emitted by paper feeds into readable plain text."""
+    text = html.unescape(value or "")
+    for _ in range(5):
+        previous = text
+        for command in LATEX_CONTENT_COMMANDS:
+            text = re.sub(rf"\\{command}\s*\{{([^{{}}]*)\}}", r"\1", text)
+        text = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", text)
+        text = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r"sqrt(\1)", text)
+        if text == previous:
+            break
+    for command, symbol in LATEX_SYMBOLS.items():
+        text = re.sub(rf"\\{command}\b", symbol, text)
+    text = re.sub(r"\\href\s*\{[^{}]*\}\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\(?:left|right)\s*", "", text)
+    text = re.sub(r"\\(?:quad|qquad|enspace|hspace\s*\{[^{}]*\}|[,;:!])", " ", text)
+    text = re.sub(r"\\([%&_#$])", r"\1", text)
+    text = re.sub(r"\${1,2}", "", text)
+    text = re.sub(r"(?<!\\)(?:\^|_)\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"(?<!\\)\^\s*([A-Za-z0-9+\-=()])", r"\1", text)
+    text = re.sub(r"\\(?:begin|end)\s*\{[^{}]*\}", "", text)
+    text = re.sub(r"\\[A-Za-z]+", "", text)
+    text = re.sub(r"(?<!\\)[{}]", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def normalize_article_body(value: str) -> str:
+    """Normalize prose while preserving fenced code exactly."""
+    normalized = normalize_fenced_body(value or "")
+    output: list[str] = []
+    in_code = False
+    for line in normalized.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            output.append(line)
+        elif in_code:
+            output.append(line)
+        else:
+            output.append(normalize_prose_markup(line))
+    return "\n".join(output).strip()
+
+
+def has_unrendered_markup(value: str) -> bool:
+    """Detect source markup that would otherwise be shown literally in the reader."""
+    return bool(LATEX_MARKUP_PATTERN.search(value or ""))
+
+
 def limit_body(value: str, limit: int = MAX_BODY_CHARS) -> str:
     """Limit an article without leaving an unterminated fenced code block."""
     body = (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -504,7 +568,7 @@ def write_snapshot(
         "contentKind": content_kind,
         "archiveVersion": 2,
         "bodyFormatVersion": BODY_FORMAT_VERSION,
-        "body": limit_body(body),
+        "body": limit_body(normalize_article_body(body)),
     }
     for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
         if field in existing and field not in payload:

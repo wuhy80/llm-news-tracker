@@ -23,6 +23,8 @@ from article_store import (
     has_corrupted_text,
     has_flattened_code,
     has_malformed_code_fence,
+    has_unrendered_markup,
+    normalize_article_body,
     normalize_fenced_body,
     resolve_google_news_urls,
     restore_collapsed_code,
@@ -59,6 +61,7 @@ def needs_format_refresh(item: dict, now: datetime, retry_days: int = 7) -> bool
         has_flattened_code(record.get("body", ""))
         or has_malformed_code_fence(record.get("body", ""))
         or has_corrupted_text(record.get("body", ""))
+        or has_unrendered_markup(record.get("body", ""))
     )
     if record.get("bodyFormatVersion", 0) >= BODY_FORMAT_VERSION and not damaged:
         return False
@@ -84,6 +87,7 @@ def acceptable_refresh(previous: dict, body: str) -> bool:
         likely_flattened_code(previous)
         or has_malformed_code_fence(previous.get("body", ""))
         or has_corrupted_text(previous.get("body", ""))
+        or has_unrendered_markup(previous.get("body", ""))
     ):
         if (
             "```" not in body
@@ -100,9 +104,10 @@ def repair_previous_body(previous: dict) -> str | None:
     if not (
         likely_flattened_code(previous)
         or has_malformed_code_fence(previous.get("body", ""))
+        or has_unrendered_markup(previous.get("body", ""))
     ):
         return None
-    normalized = normalize_fenced_body(previous.get("body", ""))
+    normalized = normalize_article_body(normalize_fenced_body(previous.get("body", "")))
     repaired = []
     cursor = 0
     for match in re.finditer(r"```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```", normalized):

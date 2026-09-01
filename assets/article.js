@@ -90,6 +90,46 @@ function normalizeBodyFences(value) {
   return text;
 }
 
+const LATEX_CONTENT_COMMANDS = [
+  "textbf", "textit", "texttt", "textrm", "textsf", "textsc", "textup", "textsl",
+  "emph", "textsuperscript", "textsubscript", "mathrm", "mathbf", "mathit", "mathsf",
+  "mathtt", "operatorname", "underline", "overline", "text", "url", "cite", "ref"
+];
+const LATEX_SYMBOLS = {
+  alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", theta: "θ", lambda: "λ",
+  mu: "μ", pi: "π", sigma: "σ", phi: "φ", omega: "ω", times: "×", cdot: "·", pm: "±",
+  leq: "≤", geq: "≥", neq: "≠", infty: "∞"
+};
+
+function normalizeProseMarkup(value) {
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = String(value || "");
+  let text = textarea.value;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const before = text;
+    LATEX_CONTENT_COMMANDS.forEach((command) => {
+      text = text.replace(new RegExp(`\\\\${command}\\s*\\{([^{}]*)\\}`, "g"), "$1");
+    });
+    text = text.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "($1)/($2)");
+    text = text.replace(/\\sqrt\s*\{([^{}]*)\}/g, "sqrt($1)");
+    if (text === before) break;
+  }
+  Object.entries(LATEX_SYMBOLS).forEach(([command, symbol]) => {
+    text = text.replace(new RegExp(`\\\\${command}\\b`, "g"), symbol);
+  });
+  text = text.replace(/\\href\s*\{[^{}]*\}\s*\{([^{}]*)\}/g, "$1");
+  text = text.replace(/\\(?:left|right)\s*/g, "");
+  text = text.replace(/\\(?:quad|qquad|enspace|hspace\s*\{[^{}]*\}|[,;:!])/g, " ");
+  text = text.replace(/\\([%&_#$])/g, "$1");
+  text = text.replace(/\${1,2}/g, "");
+  text = text.replace(/(?<!\\)(?:\^|_)\s*\{([^{}]*)\}/g, "$1");
+  text = text.replace(/(?<!\\)\^\s*([A-Za-z0-9+\-=()])/g, "$1");
+  text = text.replace(/\\(?:begin|end)\s*\{[^{}]*\}/g, "");
+  text = text.replace(/\\[A-Za-z]+/g, "");
+  text = text.replace(/(?<!\\)[{}]/g, "");
+  return text.replace(/[ \t]+/g, " ").trim();
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
   const proseLines = [];
@@ -183,7 +223,7 @@ function renderBody(body) {
       flushProse();
       return;
     }
-    proseLines.push(trimmed);
+    proseLines.push(normalizeProseMarkup(trimmed));
   });
   if (codeLines !== null) {
     elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
