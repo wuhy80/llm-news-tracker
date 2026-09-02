@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 3,
+  "id": "e5dabdbe6b7f",
+  "title": "Qwen3.8-Flash-Next (104 GB MoE) on a Strix Halo + RTX 3090 Ti eGPU: 22 -> 84 tok/s, and within one HumanEval+ problem of a dual-3090 vLLM box at 0.4x the wall time",
+  "summary": "Follow-up to my Qwen3.8-27B post. This time the target is Qwen3.8-Flash-Next: 512 experts per layer, 36 layers of gated DeltaNet, 12 layers of top-k sparse attention, a 26.8 GiB n-gram table and a built-in MTP draft head. unsloth UD-Q4_K_XL, 103.69 GiB. It fits in the Strix Halo's unified memory and nowhere else on a consumer box. Numbers first, caveats after. Hardware: AMD Ryzen AI MAX+ 395 (Strix Halo, 128 GB, 64 G",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1w4ur6e/qwen38flashnext_104_gb_moe_on_a_strix_halo_rtx/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-02T00:21:25Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w4ur6e/qwen38flashnext_104_gb_moe_on_a_strix_halo_rtx/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w4ur6e/qwen38flashnext_104_gb_moe_on_a_strix_halo_rtx/",
+  "fetchedAt": "2026-09-02T04:42:46.398119Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 2,
+  "body": "Follow-up to my Qwen3.8-27B post. This time the target is Qwen3.8-Flash-Next: 512 experts per layer, 36 layers of gated DeltaNet, 12 layers of top-k sparse attention, a 26.8 GiB n-gram table and a built-in MTP draft head. unsloth UD-Q4_K_XL, 103.69 GiB. It fits in the Strix Halo's unified memory and nowhere else on a consumer box. Numbers first, caveats after.\n\nHardware: AMD Ryzen AI MAX+ 395 (Strix Halo, 128 GB, 64 GiB carve-out for the iGPU) + RTX 3090 Ti on a PCIe x4-class eGPU link. One llama.cpp process: the 71.7 GiB of experts on the iGPU over Vulkan, the dense trunk, KV cache and draft head on the 3090 Ti over CUDA.\n\nBaseline: 22.2 tok/s on the iGPU alone. The obvious split: 32.9. Turning on the model's own MTP head as shipped: 31.3 on the split, 5.9 on the iGPU alone. The head that was trained to make it faster made it slower.\n\n4 streams, 196K total context, aggregate decode\n\n142K context, third consecutive generation\n\n36.8 (was 24.6 and falling)\n\n404-408, untouched by any of this\n\nHumanEval+, 164 problems, EvalPlus tests, same agent, same sampling profile, same day:\n\nlocal, Flash-Next Q4_K_XL\n\nremote 2x RTX 3090 vLLM, Qwen3.8-27B\n\nEvery problem the 27B failed, Flash-Next also failed.\n\nWhere the 3.8x came from, in order. Each step was A/B'd against an interleaved control on the same launcher, gated on draft acceptance and on quality, not on throughput.\n\n- Rollback snapshots for the DeltaNet state were crossing PCIe. Speculative decoding on a recurrent model has to restore a snapshot on every rejection, and upstream's path serialises it to host memory: 124.88 MiB per cycle, 19.75 ms, about 27% of decode time, for a copy that starts and ends on the same GPU. Device-resident snapshot: 0.29 ms.\n\n- qwen4exp could not actually roll back. Only the final per-token state slot was written, so every older rollback slot was stale and every rejection replayed a forward pass (with rollback enabled it produced fluent text that degenerated after a few hundred tokens, while passing every short test). Fixing the slots removed the replay. 1+2 together: 32.9 -> 42.7.\n\n- The iGPU's boundary tensors were read through the write-combined mapping. On an APU the host buffer is the same DRAM mapped cache-coherent. Routing the scheduler intermediates through it: 10.19 ms -> 0.77 ms per 4 MB hand-off, byte-identical output. 42.7 -> 47.6.\n\n- Sparse attention paid dense prices. QSA selects ~2,051 cells per token but the implementation masked the whole cache. Gathering the selected rows only pays past 64K because the indexer scan is still O(n_kv), so it turns on there: +8-14% at 128K, needle retrieval byte-identical, KL divergence inside the run-to-run noise. Graph reuse adds ~3%: 49.4.\n\n- Multi-stream speculation was a loss (60.5 vs 79.0 without it) while posting the best acceptance of any configuration. The batcher cannot pack unequal draft lengths, so 85% of verification passes carried a single stream. Drafting every stream to the same length takes full-batch passes from 3% to 72%. Four streams: 60 -> 75, 83 in the tuned cell.\n\n- Re-port onto the current upstream lineage (LaurentZuijdwijk's qwen4exp/mtp-fix), which reads the n-gram table from disk at no measurable cost (0.2% at four streams) and frees 27-51 GiB of RAM. That is what lets Q5_K_XL fit. The series is worth +51% single-stream and +98% at four streams over that branch alone.\n\n- Two upstream long-context ports. Indexer head reduction by strided views: +4.7% prefill at 142K. And an O(log n) index for the n-gram predecessor lookup, which was a linear scan of every used KV cell per micro-batch: 436.6 us -> 1.19 us per lookup. That scan was the depth tax.\n\nTuning, from a 72-cell sweep: draft depth 3 wins at every concurrency, and deeper loses monotonically. The best-accepting cell in the grid (0.956) is among the slowest; the fastest accepts 0.69 of its drafts. If you tune speculative decoding by maximising acceptance rate, you make it slower. KV cache by KL divergence against f16 KV: K q8_0 / V q8_0 keeps 96.4% top-1 agreement, V q4_0 gives up 1.5 points for 2% speed, and K below 8 bits is where it actually hurts (K q4_0 / V q4_0: 90.4%, perplexity +5%).\n\nThings that did not pay, so you don't have to try them:\n\n- A Q8_0 MTP head. More confident, accepts more per round, 2.6x the cost per draft pass. A wash, at 1.6 GB more VRAM.\n\n- Draft depth 4 or 5. Worse at every concurrency.\n\n- The gather below 64K: -5.8% at 16K.\n\n- Q5_K_XL for throughput: -8% single-stream, -16% at four streams, for +2 HumanEval+ problems inside the noise band. Fine for quality, not for serving.\n\nCaveats, because you'd find them anyway:\n\n- MTP speculative decoding is not bit-exact against sequential decoding, in upstream as much as here: a token verified inside a batch goes through different kernels, and the target's probabilities move ~2% at two thirds of positions. Still a valid greedy decode, passes every gate, but not the same token sequence.\n\n- Continuous batching is nondeterministic at temperature 0 in stock llama.cpp with speculation off entirely. Arrival timing changes batch composition, which changes reduction order. Test exactness single-stream only.\n\n- The 27B comparison is deployed stack vs deployed stack, not hardware-isolated: a different model and quant on the remote box.\n\n- Q4_K_XL with K/V q8_0 throughout. Validate on your own workload.\n\nFull write-up with every table, the charts, the reproduction guide and the link to the code (build script, launcher with the measured defaults, memory preflight, benchmark harness): https://definedrr.medium.com/sixty-extra-tokens-per-second-e1bd744b2a56\n\nsubmitted by /u/TrifleHopeful5418",
+  "summaryZh": "本文详细记录了在Strix Halo集成显卡与RTX 3090 Ti组成的异构环境下，运行104GB规模的Qwen3.8-Flash-Next模型的过程。通过优化Speculative Decoding（投机采样）、调整DeltaNet架构参数及内存分配，实现了推理速度从22 tok/s到84 tok/s的显著提升，并对比了HumanEval+基准测试结果，为大模型在消费级硬件上的高效部署提供了极具价值的工程实践参考。",
+  "summaryGeneratedAt": "2026-09-02T04:47:40.700852Z",
+  "summaryModel": "gemini:gemini-3.1-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "reviewedAt": "2026-09-02T04:47:40.700852Z",
+    "isRelevant": true,
+    "relevanceScore": 75,
+    "importanceScore": 75,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 20,
+      "novelty": 10,
+      "credibility": 10,
+      "usefulness": 10,
+      "timeliness": 5
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "industry",
+    "tags": [
+      "Strix Halo",
+      "推理加速",
+      "MoE",
+      "Speculative Decoding"
+    ],
+    "reasonZh": "详细记录了在异构硬件环境下通过技术手段显著提升大模型推理性能的实测过程。",
+    "summaryZh": "本文详细记录了在Strix Halo集成显卡与RTX 3090 Ti组成的异构环境下，运行104GB规模的Qwen3.8-Flash-Next模型的过程。通过优化Speculative Decoding（投机采样）、调整DeltaNet架构参数及内存分配，实现了推理速度从22 tok/s到84 tok/s的显著提升，并对比了HumanEval+基准测试结果，为大模型在消费级硬件上的高效部署提供了极具价值的工程实践参考。",
+    "glossary": [
+      {
+        "term": "Speculative Decoding",
+        "explanationZh": "投机采样，通过小模型预测草稿来加速大模型推理的技术。"
+      },
+      {
+        "term": "MoE",
+        "explanationZh": "混合专家模型，通过稀疏激活提高模型容量与推理效率。"
+      },
+      {
+        "term": "eGPU",
+        "explanationZh": "外置图形处理器，用于扩展计算资源。"
+      },
+      {
+        "term": "KV cache",
+        "explanationZh": "键值缓存，用于存储推理过程中的中间状态以加速生成。"
+      },
+      {
+        "term": "DeltaNet",
+        "explanationZh": "一种特定的模型架构，文中用于提升推理效率。"
+      },
+      {
+        "term": "HumanEval+",
+        "explanationZh": "用于评估代码生成模型能力的基准测试集。"
+      }
+    ],
+    "duplicateKey": "strix-halo-qwen-inference-optimization"
+  }
+}

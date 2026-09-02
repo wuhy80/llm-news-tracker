@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 3,
+  "id": "379981207ab7",
+  "title": "Got DeepSeek-V4-Flash-Vision running reliably on 2× RTX PRO 6000 Blackwell (SM120) with SGLang — had to patch 3 separate issues",
+  "summary": "I’ve been working on getting DeepSeek-V4-Flash-Vision-Exp running properly under SGLang on a 2× RTX PRO 6000 Blackwell setup, and figured I’d post the results here in case anyone else is pushing this model on SM120 hardware. Current setup: 2× NVIDIA RTX PRO 6000 Blackwell Max-Q (~96 GB each) Ubuntu 24.04 Driver 610.43.02 / CUDA UMD 13.3 SGLang Vision preview lineage FlashInfer 0.6.18 TP=2 MXFP4 MoE DSPARK speculative",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1w4prsg/got_deepseekv4flashvision_running_reliably_on_2/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-01T21:12:25Z",
+  "category": "industry",
+  "tags": [
+    "DeepSeek",
+    "行业应用"
+  ],
+  "score": 70,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w4prsg/got_deepseekv4flashvision_running_reliably_on_2/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w4prsg/got_deepseekv4flashvision_running_reliably_on_2/",
+  "fetchedAt": "2026-09-02T04:42:46.432119Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 2,
+  "body": "I’ve been working on getting DeepSeek-V4-Flash-Vision-Exp running properly under SGLang on a 2× RTX PRO 6000 Blackwell setup, and figured I’d post the results here in case anyone else is pushing this model on SM120 hardware.\n\n```\n2× NVIDIA RTX PRO 6000 Blackwell Max-Q (~96 GB each) Ubuntu 24.04 Driver 610.43.02 / CUDA UMD 13.3 SGLang Vision preview lineage FlashInfer 0.6.18 TP=2 MXFP4 MoE DSPARK speculative decoding context-length=278528 chunked-prefill-size=8192 max-running-requests=8 mem-fraction-static=0.94\n```\n\nThe final configuration is now successfully doing text, Vision, and a 269,320-token real prompt . Getting there exposed three unrelated issues.\n\n# 1. SM120 sparse-MLA Vision prefill crash\n\nBasic Vision tests worked, but a larger real image consistently killed the scheduler with:\n\n```\nUnsupported sparse-MLA prefill configuration: model=DSV4 num_heads=64 topk=512 page_block_size=64 topk_extra=512 extra_page_block_size=64\n```\n\nTracing it showed that the DSV4 image-span visibility logic caused the main SWA cache width to reach a logical topk=448 .\n\nThe existing SM120 wrapper was treating unsupported widths similarly to decode and padding:\n\n```\n448 -> 512\n```\n\nbut FlashInfer 0.6.18’s dual-cache DSV4 prefill support is much narrower than its decode/single-cache support. In particular, the native dual-cache path expects the main cache at topk=128 ; padding 448→512 doesn’t make the complete shape supported.\n\nThe fix was to add a complete prefill capability check before padding/dispatch . Unsupported dual-cache prefill shapes fall back to SGLang’s existing Triton sparse-MLA implementation.\n\nThat fallback already handles:\n\n```\nextra_k_cache extra_indices extra_topk_length\n```\n\nand merges the main + extra cache results with LSE, so we didn’t have to throw away any of the DSV4 hybrid/SWA semantics.\n\nAfter the patch, the exact request that crashed now logs:\n\n```\nSM120 sparse-MLA prefill: unsupported FlashInfer shape H=64 topk=448 extra_topk=512 pbs=64 extra_pbs=64 -> Triton fallback\n```\n\nand returns the correct Vision result.\n\nRepeated image request also succeeds.\n\n# 2. ~269k context caused an indexer CUDA OOM\n\nNext I tried a text-only 269,320-token request.\n\nThe model died during prefill:\n\n```\ntorch.OutOfMemoryError: Tried to allocate 1.50 GiB GPU had ~1.44 GiB free\n```\n\nThe traceback landed here:\n\n```\nlogits = page_table.new_empty( (batch_size, max_seq_len), dtype=torch.float32 )\n```\n\ninside the DSV4 c4 indexer.\n\nSo despite the KV/cache pools fitting, the indexer was creating a temporary:\n\n```\n[query_rows, max_c4_seq_len] fp32\n```\n\nlogits tensor whose size grows with context and isn’t accounted for by mem_fraction_static .\n\nThis corresponds to the same class of problem being worked on upstream in SGLang.\n\nI ported the row-slicing approach:\n\n- budget transient logits using a fraction of currently free GPU memory\n\n- split query rows into chunks\n\n- calculate logits + top-k per chunk\n\n- discard each logits slice before processing the next\n\n- preserve the full c4 width, so the actual indexer result is unchanged\n\nFor the failing workload, instead of potentially needing ~2 GiB for the full logits buffer, the transient is bounded to roughly 0.3 GiB per GPU under the observed free-memory conditions.\n\nRetested the same request:\n\n```\nprompt_tokens: 269320 completion_tokens: 6 response: LONG_CONTEXT_OK wall time: ~82 seconds\n```\n\nSo this setup now has a genuinely tested ~269k prompt rather than merely having --context-length 278528 configured.\n\n# 3. Vision preview was corrupting multi-turn tool-call history\n\nThis one was especially strange.\n\nWhile using the Vision model as a coding/agent model, it initially called tools correctly, then started producing calls shaped like:\n\n```\n{ \"arguments\": { \"command\": \"...\" } }\n```\n\nwhen the actual tool schema was simply:\n\n```\n{ \"command\": \"...\" }\n```\n\nIt could get progressively worse after validation errors.\n\nThe useful experiment was switching the same conversation history to my older known-good non-Vision DSV4 SGLang image.\n\n```\nbash -> PASS read -> PASS bash -> PASS\n```\n\nSo I diffed the tool-history encoding paths.\n\nThe bug turned out to be in the Vision preview’s encoding_dsv4.py .\n\nSGLang normalizes OpenAI:\n\n```\n\"arguments\": \"{\\\"command\\\":\\\"echo ONE\\\"}\"\n```\n\n```\n{\"command\": \"echo ONE\"}\n```\n\nbefore DSV4 history encoding.\n\nBut this version of encode_arguments_to_dsml() did effectively:\n\n```\ntry: arguments = json.loads(tool_call[\"arguments\"]) except: arguments = {\"arguments\": tool_call[\"arguments\"]}\n```\n\nCalling json.loads() on the already-normalized dict throws, so the fallback literally wraps it:\n\n```\n{ \"arguments\": { \"command\": \"echo ONE\" } }\n```\n\nThen the model sees this in its own history:\n\n```\n<parameter name=\"arguments\"> {\"command\":\"echo ONE\"} </parameter>\n```\n\n```\n<parameter name=\"command\">echo ONE</parameter>\n```\n\nSo the model wasn’t randomly hallucinating the wrapper — the server was teaching it the wrong schema through its conversation history .\n\n```\nraw_arguments = tool_call[\"arguments\"] arguments = ( json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments ) if not isinstance(arguments, dict): raise ValueError(...)\n```\n\nCPU round-trip tests now match my known-good non-Vision SGLang stack exactly, including multi-turn and error-history cases.\n\nFinal local image now passes:\n\n```\nText inference PASS Real Vision request PASS Repeated Vision request PASS SM120 dual-cache prefill fallback PASS 269,320-token text prompt PASS DSV4 tool-history round-trip PASS DSPARK block 4 PASS TP2 PASS\n```\n\n```\n269,320 prompt tokens LONG_CONTEXT_OK ~82.4 sec end-to-end\n```\n\n```\n409 prompt tokens 277 image tokens answer: RED\n```\n\nThe serving config I landed on is roughly:\n\n```\nsglang serve \\ --model-path /model \\ --tp 2 \\ --trust-remote-code \\ --moe-runner-backend flashinfer_mxfp4 \\ --mem-fraction-static 0.93 \\ --cuda-graph-max-bs-decode 4 \\ --max-running-requests 4 \\ --context-length 245760 \\ --chunked-prefill-size 8192 \\ --reasoning-parser deepseek-v4 \\ --tool-call-parser deepseekv4 \\ --speculative-algorithm DSPARK \\ --speculative-dspark-block-size 4\n```\n\nOne warning: I’m deliberately using DSPARK block size 4 , even though the checkpoint advertises 5. There are SM120 correctness issues around depth 5 in the current stack, so I’m not “fixing” that warning by changing it to 5.\n\nI kept each change isolated as a tiny derivative image rather than upgrading random pieces of SGLang/FlashInfer together. The final image is basically:\n\n```\nofficial Vision preview + SM120 dual-cache prefill capability/fallback fix + bounded DSV4 indexer logits for long context + DSV4 tool-history serialization fix\n```\n\nsubmitted by /u/shrug_hellifino",
+  "summaryZh": "本文详细记录了在双卡NVIDIA RTX PRO 6000 Blackwell架构上部署DeepSeek-V4-Flash-Vision模型的工程实践。作者通过SGLang框架实现了对该模型的高效推理，并重点解决了SM120架构下稀疏MLA（Sparse-MLA）预填充阶段的崩溃问题。通过深入分析FlashInfer 0.6.18的算子逻辑，作者修复了双缓存路径下的配置不兼容问题，并成功通过Triton算子回退机制实现了对长上下文（278k token）的稳定支持。该案例为在最新一代硬件上部署MoE架构模型提供了宝贵的底层优化参考。",
+  "summaryGeneratedAt": "2026-09-02T04:48:06.256227Z",
+  "summaryModel": "gemini:gemini-3.1-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "reviewedAt": "2026-09-02T04:48:06.256227Z",
+    "isRelevant": true,
+    "relevanceScore": 82,
+    "importanceScore": 82,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 22,
+      "impact": 18,
+      "novelty": 12,
+      "credibility": 12,
+      "usefulness": 10,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "industry",
+    "tags": [
+      "DeepSeek",
+      "SGLang",
+      "Blackwell",
+      "MLA",
+      "FlashInfer"
+    ],
+    "reasonZh": "该文详细记录了在NVIDIA Blackwell架构上部署DeepSeek-V4-Flash-Vision模型的工程实践与底层算子适配过程。",
+    "summaryZh": "本文详细记录了在双卡NVIDIA RTX PRO 6000 Blackwell架构上部署DeepSeek-V4-Flash-Vision模型的工程实践。作者通过SGLang框架实现了对该模型的高效推理，并重点解决了SM120架构下稀疏MLA（Sparse-MLA）预填充阶段的崩溃问题。通过深入分析FlashInfer 0.6.18的算子逻辑，作者修复了双缓存路径下的配置不兼容问题，并成功通过Triton算子回退机制实现了对长上下文（278k token）的稳定支持。该案例为在最新一代硬件上部署MoE架构模型提供了宝贵的底层优化参考。",
+    "glossary": [
+      {
+        "term": "Sparse-MLA",
+        "explanationZh": "一种针对多头潜在注意力机制的稀疏化优化技术，旨在降低计算复杂度。"
+      },
+      {
+        "term": "SGLang",
+        "explanationZh": "一种用于大模型推理的高效编程框架，支持复杂的调度与算子优化。"
+      },
+      {
+        "term": "FlashInfer",
+        "explanationZh": "高性能的LLM推理算子库，提供针对注意力机制的底层加速。"
+      },
+      {
+        "term": "MoE",
+        "explanationZh": "混合专家模型架构，通过激活部分参数实现高效推理。"
+      },
+      {
+        "term": "Speculative Decoding",
+        "explanationZh": "投机采样技术，通过小模型预测、大模型验证来加速推理过程。"
+      }
+    ],
+    "duplicateKey": "deepseek-v4-blackwell-deployment"
+  }
+}
