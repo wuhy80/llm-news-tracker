@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 3,
+  "id": "6442ae7d3ae4",
+  "title": "Running a 2-model literary book-translation pipeline on 2x Tesla P40: gemma-4-26B-A4B at ~40 tok/s + Qwen3.6-35B-A3B at 50-70 tok/s with MTP spec decode — full llama-server flags inside",
+  "summary": "Disclosure up front: I built this tool (open source, \"Sunny Narrator\") and I'm the author — this post is about the inference setup, not an ad. Feel free to skip to the flags if you're here for the numbers. Context: I run a pipeline that translates whole fiction books EN→RU locally — chunk + glossary + rolling chapter summaries → translate → reviewer notes → correction → proofread → chunk summary. A book is ~1.5–2M to",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1w54s3q/running_a_2model_literary_booktranslation/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-02T08:50:06Z",
+  "category": "release",
+  "tags": [
+    "Llama",
+    "开源",
+    "推理",
+    "模型发布"
+  ],
+  "score": 78,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w54s3q/running_a_2model_literary_booktranslation/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1w54s3q/running_a_2model_literary_booktranslation/",
+  "fetchedAt": "2026-09-02T11:26:21.537579Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 2,
+  "body": "Disclosure up front: I built this tool (open source, \"Sunny Narrator\") and I'm the author — this post is about the inference setup, not an ad. Feel free to skip to the flags if you're here for the numbers.\n\nContext: I run a pipeline that translates whole fiction books EN→RU locally — chunk + glossary + rolling chapter summaries → translate → reviewer notes → correction → proofread → chunk summary. A book is ~1.5–2M tokens across all stages, hardware is a pair of Tesla P40s (24GB each, Pascal, from the \"why not\" shelf). After a year of runs I have a launch config that's fast enough to be boring: 2–3 books per day.\n\nThe non-obvious finding: one model = half a text, two models = a book. Good translating models write beautifully and proofread terribly; good proofreading models edit well and translate dully. So the pipeline pins two roles to two servers:\n\n- MODEL_TRANSLATE: gemma-4-26B-A4B (MoE, A4B active)\n\n- MODEL_PROOFREAD: Qwen3.6-35B-A3B (MoE, A3B active)\n\nBoth are compact MoE — that's what makes P40s viable: active params fit the throughput envelope even though total weights don't fit comfort. Quantized Unscaled-Dynamic (UD) GGUFs, MTP speculative drafting on both, 64K context for chunk + glossary + summaries.\n\n# My most efficient launch lines (llama-server)\n\nGemma-4-26B-A4B as translator — ~40 tok/s sustained on P40:\n\n```\nllama-server -m gemma-4-26B-A4B-it-UD-Q5_K_XL.gguf \\ --model-draft mtp-gemma-4-26B-A4B-it.gguf \\ --host 192.168.0.55 --port 6155 \\ --ctx-size 65535 -ngl 99 \\ -ctk q8_0 -ctv q8_0 \\ --no-context-shift \\ --parallel 1 -np 1 --threads-http 2 \\ --load-mode mlock \\ --jinja \\ --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.8 \\ --top-k 64 --top-p 0.95 --min-p 0.02 \\ --repeat-penalty 1.0 --repeat-last-n 512 --presence-penalty 0 \\ --predict 32567 \\ --reasoning off \\ -fa on \\ --ctx-checkpoints 32 --checkpoint-min-step 1024 \\ --cache-ram 8192 \\ --ubatch-size 2048\n```\n\nQwen3.6-35B-A3B as proofreader — 50–70 tok/s on the same pair:\n\n```\nllama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \\ --host 192.168.0.55 --port 6150 \\ --ctx-size 65535 -ngl 99 -fa on \\ -ctk q8_0 -ctv q8_0 \\ --no-context-shift \\ --parallel 1 -np 1 --threads-http 2 \\ --load-mode mlock \\ --spec-type draft-mtp --spec-draft-n-max 4 \\ --top-k 20 --top-p 0.95 --min-p 0.05 \\ --presence-penalty 1.5 \\ --predict 32576 \\ --reasoning off \\ --jinja --chat-template-file chat_template.jinja \\ --ubatch-size 2048 \\ --ctx-checkpoints 32 --checkpoint-min-step 1024 \\ --cache-ram 8192\n```\n\n# Why each of these knobs ended up where it is\n\n- MTP spec decoding is the headline. --spec-type draft-mtp with the bundled MTP draft is what turns Pascal-class cards into something usable for long-form generation. Gemma takes --spec-draft-n-max 6 --spec-draft-p-min 0.8 (aggressive, accepts well because the base is strong at its job); Qwen is happier at n-max 4 . Without MTP these numbers don't happen.\n\n- -ctk q8_0 -ctv q8_0 — KV cache in q8 buys the 64K context (chunk + series glossary + rolling summaries) without blowing VRAM; quality cost at these sizes was invisible in my evals.\n\n- --load-mode mlock — two servers, 24GB×2, zero headroom for swapping. Pins weights, kills tail latency spikes mid-run.\n\n- --parallel 1 -np 1 — this is a batch-of-one workload (long generations, not concurrent requests); single slot is fastest.\n\n- --reasoning off + tuned sampling per role — translator runs top-k 64 / min-p 0.02 / repeat-penalty 1.0 (creative-ish but repetition is the enemy on book text — --repeat-last-n 512 matters); proofreader runs tighter top-k 20 / min-p 0.05 / presence-penalty 1.5 (deterministic editor voice).\n\n- --ctx-checkpoints 32 --checkpoint-min-step 1024 — pipeline writes a checkpoint after every chunk anyway (power outage = resume from chunk 51/100, not from scratch — this single feature saved my year), but in-server ctx checkpoints make stage-to-stage reuse on the same context cheap.\n\n- --predict 32567 — chunks translate in one shot; forcing the model to stop-and-resume was eating throughput and occasionally style.\n\n- --jinja + explicit chat template for Qwen — JSON_MODE across all pipeline stages (structured responses) only works if the template round-trips; the external chat_template.jinja fixed a parsing edge case for me.\n\n# Pipeline notes that aren't about llama.cpp but affect the numbers\n\n- Length is a free error detector: translated block deviating >10% from source block size → rechunk (split in half, retranslate both). EN→RU maps within a couple percent per block, so gross errors (eaten/hallucinated/duplicated paragraphs) pop on size alone. Final book converges within ±5% of original length.\n\n- Glossary is 80% of quality: names/terms/gender dictionary (NER-seeded with spaCy + manual cleaning) travels with every chunk. Model choice is secondary; consistency is everything in fiction.\n\n- Output is a high-readiness draft for human polish, not a publishable translation — the LLM removes the grunt work, the human keeps the wordcoinage and the puns.\n\nRepo (code + these configs + Ollama/Docker examples): github.com/NW15D/sunny-narrator — yes, I know the rules about self-promo, hence disclosure at the top; the pipeline exists because nothing off-the-shelf holds a book-length context of names/terms, and the year-ago proof-of-concept post is on Habr if you want the long version.\n\nQuestions for this crowd:\n\n- Anyone pushed MTP spec decode further on Pascal — is draft-n-max 6 / p-min 0.8 near the ceiling for Gemma, or would deeper drafts accept well with a colder p-min ?\n\n- --ctx-checkpoints behavior with -ctk q8_0 — any gotchas I should know about for week-long unattended runs?\n\n- Better than \"giant series glossary\" for cross-volume consistency: graph DBs / RAG over character state — real war stories?\n\nsubmitted by /u/neowisard",
+  "summaryZh": "开发者公开了使用两张Tesla P40显卡本地运行双模型文学翻译流水线的完整配置，通过结合gemma-4-26B-A4B进行翻译和Qwen3.6-35B-A3B进行校对，配合MTP投机解码实现了高效的本地长文本吞吐。",
+  "summaryGeneratedAt": "2026-09-02T11:34:26.889071Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-02T11:34:26.889071Z",
+    "isRelevant": true,
+    "relevanceScore": 89,
+    "importanceScore": 89,
+    "importanceLevel": 5,
+    "dimensions": {
+      "relevance": 24,
+      "impact": 20,
+      "novelty": 13,
+      "credibility": 14,
+      "usefulness": 10,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "release",
+    "tags": [
+      "LocalLLaMA",
+      "MoE",
+      "Translation Pipeline",
+      "Tesla P40",
+      "llama-server"
+    ],
+    "reasonZh": "详细展示了基于消费级双卡P40运行混合专家模型（MoE）的双模型翻译流利度流水线配置，对本地推理具有极高的实用参考价值。",
+    "summaryZh": "开发者公开了使用两张Tesla P40显卡本地运行双模型文学翻译流水线的完整配置，通过结合gemma-4-26B-A4B进行翻译和Qwen3.6-35B-A3B进行校对，配合MTP投机解码实现了高效的本地长文本吞吐。",
+    "glossary": [
+      {
+        "term": "MoE",
+        "explanationZh": "混合专家模型，仅激活部分参数以提高推理吞吐量"
+      },
+      {
+        "term": "MTP",
+        "explanationZh": "多层投机解码技术，用于加速大模型推理速度"
+      },
+      {
+        "term": "GGUF",
+        "explanationZh": "用于大模型在CPU和GPU上高效量化与运行的文件格式"
+      },
+      {
+        "term": "Speculative Decoding",
+        "explanationZh": "投机解码，利用小草稿模型加速大模型生成的技术"
+      }
+    ],
+    "duplicateKey": "dual_model_translation_pipeline_p40"
+  }
+}
