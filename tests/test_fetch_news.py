@@ -1,7 +1,9 @@
 import copy
 import sys
 import unittest
+import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -9,6 +11,77 @@ import fetch_news
 
 
 class FetchNewsTests(unittest.TestCase):
+    def test_anthropic_uses_direct_sitemap_source(self):
+        source = next(source for source in fetch_news.SOURCES if source["name"] == "Anthropic News")
+
+        self.assertEqual(source["url"], "https://www.anthropic.com/sitemap.xml")
+        self.assertEqual(source["format"], "sitemap")
+        self.assertTrue(source["official"])
+        self.assertIn("/news/", source["sitemap_prefixes"])
+
+    def test_anthropic_sitemap_discovers_direct_article_urls(self):
+        source = next(source for source in fetch_news.SOURCES if source["name"] == "Anthropic News")
+        payload = b"""<?xml version=\"1.0\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">
+          <url><loc>https://www.anthropic.com/claude-fable-and-mythos-5-1</loc><lastmod>2026-09-01T12:00:00Z</lastmod></url>
+          <url><loc>https://www.anthropic.com/news/claude-fable-5-mythos-5</loc><lastmod>2026-08-30T12:00:00Z</lastmod></url>
+          <url><loc>https://www.anthropic.com/about</loc><lastmod>2026-09-01T12:00:00Z</lastmod></url>
+        </urlset>"""
+
+        items = fetch_news.parse_sitemap(
+            payload,
+            source,
+            now=fetch_news.parse_date("2026-09-02T00:00:00Z"),
+        )
+
+        self.assertEqual(
+            [item["url"] for item in items],
+            [
+                "https://www.anthropic.com/claude-fable-and-mythos-5-1",
+                "https://www.anthropic.com/news/claude-fable-5-mythos-5",
+            ],
+        )
+
+    def test_anthropic_page_metadata_reads_title_summary_and_publication_date(self):
+        payload = (
+            b'<html><head><meta property="og:title" content="Introducing Claude Fable 5.1 and Claude Mythos 5.1 \\ Anthropic">'
+            b'<meta name="description" content="Our most advanced models."></head>'
+            b'<body><script>publishedOn\\":\\"2026-09-01T12:00:00.000Z\\"</script></body></html>'
+        )
+
+        metadata = fetch_news.parse_page_metadata(payload)
+
+        self.assertEqual(metadata["title"], "Introducing Claude Fable 5.1 and Claude Mythos 5.1")
+        self.assertEqual(metadata["summary"], "Our most advanced models.")
+        self.assertEqual(metadata["published"], "2026-09-01T12:00:00.000Z")
+
+    def test_page_metadata_prefers_open_graph_description_and_supports_json_ld_date(self):
+        payload = (
+            b'<html><head><meta name="description" content="Generic site description.">'
+            b'<meta property="og:description" content="Article-specific summary."></head>'
+            b'<body><script>{"datePublished":"2026-09-01"}</script></body></html>'
+        )
+
+        metadata = fetch_news.parse_page_metadata(payload)
+
+        self.assertEqual(metadata["summary"], "Article-specific summary.")
+        self.assertEqual(metadata["published"], "2026-09-01")
+
+    def test_legacy_anthropic_links_are_migrated_and_deduplicated(self):
+        old_url = "https://news.google.com/rss/articles/legacy?oc=5"
+        items = [
+            {"id": "aaaaaaaaaaaa", "source": "Anthropic", "sourceDomain": "anthropic.com", "url": old_url},
+            {"id": "bbbbbbbbbbbb", "source": "Anthropic", "sourceDomain": "anthropic.com", "url": old_url, "summaryZh": "kept"},
+            {"id": "cccccccccccc", "source": "OpenAI", "sourceDomain": "openai.com", "url": old_url},
+        ]
+        direct_url = "https://www.anthropic.com/news/example"
+        with mock.patch.object(fetch_news, "resolve_google_news_urls", return_value={old_url: direct_url}):
+            migrated = fetch_news.migrate_legacy_anthropic_items(items)
+
+        self.assertEqual(len(migrated), 2)
+        self.assertEqual(migrated[0]["url"], direct_url)
+        self.assertEqual(migrated[0]["summaryZh"], "kept")
+        self.assertEqual(migrated[1]["url"], old_url)
+
     def test_curated_official_sources_are_unique_and_configured(self):
         sources = {source["name"]: source for source in fetch_news.SOURCES}
 
@@ -35,6 +108,47 @@ class FetchNewsTests(unittest.TestCase):
         self.assertEqual(sources["Claude Code Releases"]["title_prefix"], "Claude Code")
         self.assertEqual(sources["Claude Blog"]["url"], "https://claude.com/blog")
         self.assertEqual(sources["Claude Blog"]["format"], "html-cards")
+
+    def test_official_publisher_sources_do_not_use_news_search(self):
+        search_hosts = {"news.google.com", "www.google.com", "bing.com", "www.bing.com"}
+        direct_sources = {
+            "Mistral AI News": ("https://mistral.ai/sitemap.xml", "/news/"),
+            "xAI News": ("https://x.ai/sitemap.xml", "/news/"),
+            "Artificial Analysis": ("https://artificialanalysis.ai/sitemap.xml", "/articles/"),
+        }
+        sources = {source["name"]: source for source in fetch_news.SOURCES}
+        for name, (url, prefix) in direct_sources.items():
+            with self.subTest(source=name):
+                source = sources[name]
+                self.assertTrue(source["official"])
+                self.assertEqual(source["url"], url)
+                self.assertEqual(source["format"], "sitemap")
+                self.assertNotIn("fallback_urls", source)
+                self.assertIn(prefix, source["sitemap_prefixes"])
+
+        linux_do = sources["LINUX DO · 444"]
+        self.assertNotIn("fallback_urls", linux_do)
+        for source in fetch_news.SOURCES:
+            with self.subTest(source=source["name"]):
+                if source.get("official"):
+                    self.assertNotIn(urllib.parse.urlparse(source["url"]).hostname, search_hosts)
+
+    def test_artificial_analysis_sitemap_discovers_direct_article_urls(self):
+        source = next(source for source in fetch_news.SOURCES if source["name"] == "Artificial Analysis")
+        payload = b'''<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://artificialanalysis.ai/articles/claude-fable-5-1</loc><lastmod>2026-09-01T00:00:00Z</lastmod></url>
+          <url><loc>https://artificialanalysis.ai/models/claude-fable-5-1</loc><lastmod>2026-09-01T00:00:00Z</lastmod></url>
+        </urlset>'''
+
+        items = fetch_news.parse_sitemap(
+            payload,
+            source,
+            now=fetch_news.parse_date("2026-09-02T00:00:00Z"),
+        )
+
+        self.assertEqual([item["url"] for item in items], [
+            "https://artificialanalysis.ai/articles/claude-fable-5-1",
+        ])
 
     def test_feed_title_prefix_makes_version_only_releases_identifiable(self):
         payload = b"""

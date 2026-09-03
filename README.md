@@ -130,14 +130,16 @@ python -m http.server 8000
 编辑 `scripts/fetch_news.py` 中的 `SOURCES`。每个来源支持以下字段：
 
 - `name`：来源名称
-- `url`：RSS 或 Atom 地址
+- `url`：RSS / Atom / sitemap 或官方文章页面地址
 - `domain`：用于展示站点图标
 - `official`：是否为官方来源
 - `hint`：可选的默认分类
-- `fallback_urls`：主来源失败时按顺序尝试的备用 RSS / Atom
+- `fallback_urls`：仅用于没有官方文章入口的聚合搜索渠道；有官方源时不配置其为兜底
 - `extract_embedded_source`：对新闻索引 Feed 提取原始发布方名称
-- `format`：非 Feed 来源的解析格式，目前支持 `html-cards`
+- `format`：非 Feed 来源的解析格式，目前支持 `html-cards` 和 `sitemap`
 - `link_prefix`：HTML 卡片来源允许抓取的站内文章路径前缀
+- `sitemap_prefixes`：`sitemap` 来源允许抓取的站内文章路径前缀
+- `sitemap_max_age_days`：可选的 sitemap 文章最大抓取天数
 - `title_prefix`：为仅含版本号等缺少上下文的标题添加来源前缀
 
 ## 许可

@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -28,13 +28,14 @@ TRACKING_QUERY_KEYS = {
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref_src", "s_cid",
 }
 
-def indexed_source(
+def search_source(
     name: str,
     query: str,
     domain: str,
     hint: str,
-    official: bool = True,
+    official: bool = False,
 ) -> dict:
+    """Build a search-backed source for topics without a direct publisher feed."""
     google_query = urllib.parse.quote_plus(f"{query} when:30d")
     bing_query = urllib.parse.quote_plus(query)
     return {
@@ -60,7 +61,17 @@ SOURCES = [
     },
     {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
-    indexed_source("Anthropic News", "site:anthropic.com/news", "anthropic.com", "release"),
+    {
+        "name": "Anthropic News",
+        "url": "https://www.anthropic.com/sitemap.xml",
+        "domain": "anthropic.com",
+        "official": True,
+        "hint": "release",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/news/", "/claude-fable-and-mythos-"),
+        "sitemap_max_age_days": 45,
+        "sitemap_metadata_workers": 8,
+    },
     {
         "name": "Claude Blog",
         "url": "https://claude.com/blog",
@@ -78,8 +89,28 @@ SOURCES = [
         "hint": "agent",
         "title_prefix": "Claude Code",
     },
-    indexed_source("Mistral AI News", "site:mistral.ai/news", "mistral.ai", "release"),
-    indexed_source("xAI News", "site:x.ai/news", "x.ai", "release"),
+    {
+        "name": "Mistral AI News",
+        "url": "https://mistral.ai/sitemap.xml",
+        "domain": "mistral.ai",
+        "official": True,
+        "hint": "release",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/news/",),
+        "sitemap_max_age_days": 90,
+        "sitemap_metadata_workers": 8,
+    },
+    {
+        "name": "xAI News",
+        "url": "https://x.ai/sitemap.xml",
+        "domain": "x.ai",
+        "official": True,
+        "hint": "release",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/news/",),
+        "sitemap_max_age_days": 90,
+        "sitemap_metadata_workers": 8,
+    },
     {
         "name": "Google DeepMind",
         "url": "https://deepmind.google/blog/rss.xml",
@@ -105,19 +136,24 @@ SOURCES = [
         "domain": "blog.cloudflare.com",
         "official": True,
     },
-    indexed_source(
+    search_source(
         "LMArena",
         '"LMArena" benchmark OR "Chatbot Arena" benchmark',
         "news.google.com",
         "benchmark",
         False,
     ),
-    indexed_source(
-        "Artificial Analysis",
-        "site:artificialanalysis.ai/articles",
-        "artificialanalysis.ai",
-        "benchmark",
-    ),
+    {
+        "name": "Artificial Analysis",
+        "url": "https://artificialanalysis.ai/sitemap.xml",
+        "domain": "artificialanalysis.ai",
+        "official": True,
+        "hint": "benchmark",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/articles/",),
+        "sitemap_max_age_days": 90,
+        "sitemap_metadata_workers": 8,
+    },
     {
         "name": "LangGraph Releases",
         "url": "https://github.com/langchain-ai/langgraph/releases.atom",
@@ -160,7 +196,6 @@ SOURCES = [
     {
         "name": "LINUX DO · 444",
         "url": "https://linux.do/tag/444-tag.rss",
-        "fallback_urls": ["https://news.google.com/rss/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29+when%3A30d&hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans", "https://www.bing.com/news/search?q=site%3Alinux.do%2Ft%2F+%28%22%E5%A4%A7%E6%A8%A1%E5%9E%8B%22+OR+%22Agent%22+OR+%22%E6%A8%A1%E5%9E%8B%E5%8F%91%E5%B8%83%22+OR+%22%E8%AF%84%E6%B5%8B%22%29&format=rss"],
         "headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
@@ -278,6 +313,35 @@ class BlogCardParser(HTMLParser):
             self.title_parts.append(data)
         if self.date_depth is not None:
             self.date_parts.append(data)
+
+
+class PageMetadataParser(HTMLParser):
+    """Read the small set of metadata needed to index a direct HTML page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.meta: dict[str, str] = {}
+        self.in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "title":
+            self.in_title = True
+            return
+        if tag.lower() != "meta":
+            return
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        key = (attributes.get("property") or attributes.get("name") or attributes.get("itemprop") or "").lower()
+        if key in {"og:title", "og:description", "description", "datepublished", "article:published_time"}:
+            self.meta.setdefault(key, attributes.get("content", ""))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_parts.append(data)
 
 
 def strip_html(value: str) -> str:
@@ -409,6 +473,91 @@ def parse_blog_cards(payload: bytes, source: dict) -> list[dict]:
         })
     return items
 
+
+def sitemap_url_allowed(url: str, source: dict) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    hostname = (parsed.hostname or "").casefold()
+    if hostname not in {source["domain"], f"www.{source['domain']}"}:
+        return False
+    path = parsed.path or "/"
+    prefixes = tuple(source.get("sitemap_prefixes", ()))
+    exact_urls = set(source.get("sitemap_urls", ()))
+    return path.startswith(prefixes) or url in exact_urls
+
+
+def parse_sitemap(
+    payload: bytes,
+    source: dict,
+    now: datetime | None = None,
+) -> list[dict]:
+    root = ET.fromstring(payload)
+    now = now or datetime.now(timezone.utc)
+    max_age_days = source.get("sitemap_max_age_days")
+    cutoff = now - timedelta(days=max_age_days) if max_age_days else None
+    items = []
+    seen_urls: set[str] = set()
+    for node in root.iter():
+        if node.tag.rsplit("}", 1)[-1].lower() != "url":
+            continue
+        url = find_text(node, ("loc",))
+        if not url or url in seen_urls or not sitemap_url_allowed(url, source):
+            continue
+        published = parse_date(find_text(node, ("lastmod",)))
+        if cutoff and published < cutoff:
+            continue
+        seen_urls.add(url)
+        slug = urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
+        title = re.sub(r"[-_]+", " ", slug).strip().title() or url
+        items.append({
+            "title": title,
+            "url": url,
+            "summary": "",
+            "published": published,
+            "source": source["name"],
+            "sourceDomain": source["domain"],
+            "official": source.get("official", False),
+            "hint": source.get("hint"),
+            "readerHtml": "",
+        })
+    return items
+
+
+def parse_page_metadata(payload: bytes) -> dict[str, str]:
+    document = payload.decode("utf-8", "replace")
+    parser = PageMetadataParser()
+    parser.feed(document)
+    title = parser.meta.get("og:title") or strip_html(" ".join(parser.title_parts))
+    title = re.sub(r"\s*\\\s*Anthropic\s*$", "", html.unescape(title), flags=re.IGNORECASE).strip()
+    summary = strip_html(parser.meta.get("og:description") or parser.meta.get("description", ""))
+    published = parser.meta.get("datepublished") or parser.meta.get("article:published_time", "")
+    if not published:
+        match = re.search(r"(?:publishedOn|datePublished)\\?\":\\?\"([^\"\\]+)", document)
+        published = match.group(1) if match else ""
+    return {"title": title, "summary": summary, "published": published}
+
+
+def enrich_sitemap_entries(entries: list[dict], source: dict) -> list[dict]:
+    def enrich(item: dict) -> dict:
+        try:
+            metadata = parse_page_metadata(fetch(item["url"], source.get("headers")))
+            if metadata["title"]:
+                item["title"] = metadata["title"]
+            if metadata["summary"]:
+                item["summary"] = metadata["summary"][:420]
+            if metadata["published"]:
+                item["published"] = parse_date(metadata["published"])
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            pass
+        return item
+
+    if not entries:
+        return []
+    workers = max(1, min(int(source.get("sitemap_metadata_workers", 8)), len(entries)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(enrich, entries))
+
 def fetch_source(source: dict) -> list[dict]:
     errors = []
     for url in (source["url"], *source.get("fallback_urls", [])):
@@ -416,6 +565,8 @@ def fetch_source(source: dict) -> list[dict]:
             payload = fetch(url, source.get("headers"))
             if source.get("format") == "html-cards":
                 entries = parse_blog_cards(payload, source)
+            elif source.get("format") == "sitemap":
+                entries = enrich_sitemap_entries(parse_sitemap(payload, source), source)
             else:
                 entries = parse_feed(payload, source)
             if entries:
@@ -448,7 +599,7 @@ def extract_tags(text: str, category: str) -> list[str]:
 
 def normalized_title(value: str) -> str:
     value = re.sub(r"\s+-\s+[^-]{2,40}$", "", value.casefold())
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
+    return re.sub(r"[^\w一-鿿]+", "", value)
 
 
 def canonical_url(value: str) -> str:
@@ -532,6 +683,42 @@ def previous_indexes(items: list[dict]) -> tuple[dict[str, dict], dict[str, dict
     return by_id, by_url
 
 
+def migrate_legacy_anthropic_items(items: list[dict]) -> list[dict]:
+    """Migrate old aggregator links before merging the direct Anthropic feed."""
+    legacy_items = [
+        item for item in items
+        if item.get("sourceDomain") == "anthropic.com"
+        or (
+            item.get("source", "").casefold() in {"anthropic", "anthropic news"}
+            and urllib.parse.urlparse(item.get("url", "")).hostname == "news.google.com"
+        )
+    ]
+    resolved = resolve_google_news_urls([item.get("url", "") for item in legacy_items])
+    migrated: list[dict] = []
+    seen_anthropic_urls: dict[str, dict] = {}
+    for item in items:
+        is_anthropic = item in legacy_items
+        if not is_anthropic:
+            migrated.append(item)
+            continue
+        old_url = item.get("url", "")
+        target_url = resolved.get(old_url, old_url)
+        if target_url != old_url:
+            item["url"] = target_url
+            item["sourceDomain"] = "anthropic.com"
+        key = canonical_url(item.get("url", ""))
+        if key and key in seen_anthropic_urls:
+            existing = seen_anthropic_urls[key]
+            for field in ("aiReview", "summaryZh", "articleKind"):
+                if field not in existing and field in item:
+                    existing[field] = item[field]
+            continue
+        migrated.append(item)
+        if key:
+            seen_anthropic_urls[key] = item
+    return migrated
+
+
 def news_content_changed(previous: list[dict], current: list[dict]) -> bool:
     def stable(items: list[dict]) -> str:
         ordered = sorted(items, key=lambda item: item.get("id", ""))
@@ -556,7 +743,8 @@ def main() -> int:
                 print(f"[warn] {source['name']}: {error}", file=sys.stderr)
 
     previous_data = load_news(OUTPUT) if OUTPUT.exists() else {"items": []}
-    previous_items = previous_data.get("items", [])
+    previous_items = migrate_legacy_anthropic_items(previous_data.get("items", []))
+    previous_data["items"] = previous_items
     previous_by_id, previous_by_url = previous_indexes(previous_items)
     merged = dict(previous_by_id)
     resolved_urls = resolve_google_news_urls([raw["url"] for raw in collected])
