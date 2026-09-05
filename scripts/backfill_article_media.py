@@ -18,6 +18,7 @@ from article_store import (
     fetch_page_text,
     fetch_reader_text,
     snapshot_path,
+    utc_now,
     write_snapshot,
 )
 from news_store import load_news
@@ -32,7 +33,11 @@ def media_backfill_item(item: dict) -> str:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return "missing"
-    if snapshot.get("contentKind") not in READABLE_KINDS or snapshot.get("images"):
+    if (
+        snapshot.get("contentKind") not in READABLE_KINDS
+        or snapshot.get("images")
+        or snapshot.get("mediaCheckedAt")
+    ):
         return "skip"
     target_url = snapshot.get("resolvedUrl") or item.get("url")
     try:
@@ -45,6 +50,14 @@ def media_backfill_item(item: dict) -> str:
         image_refs = FETCHED_IMAGE_REFS.pop(resolved_url, [])
         images = download_images(item, image_refs)
         if not images:
+            if not image_refs:
+                write_snapshot(
+                    item,
+                    snapshot.get("body", ""),
+                    snapshot["contentKind"],
+                    resolved_url=resolved_url,
+                    media_checked_at=utc_now(),
+                )
             return "none"
         write_snapshot(
             item,
@@ -52,6 +65,7 @@ def media_backfill_item(item: dict) -> str:
             snapshot["contentKind"],
             resolved_url=resolved_url,
             images=images,
+            media_checked_at=utc_now(),
         )
         return f"{len(images)} images"
     except Exception as error:
@@ -70,7 +84,11 @@ def main() -> int:
             snapshot = json.loads(snapshot_path(item).read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if snapshot.get("contentKind") in READABLE_KINDS and not snapshot.get("images"):
+        if (
+            snapshot.get("contentKind") in READABLE_KINDS
+            and not snapshot.get("images")
+            and not snapshot.get("mediaCheckedAt")
+        ):
             candidates.append(item)
     candidates = candidates[:max(0, args.limit)]
     if not candidates:
