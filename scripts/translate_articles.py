@@ -489,9 +489,9 @@ def normalize_headers(headers: object) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "1")))
-    parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "50")))
-    parser.add_argument("--interval", type=float, default=float(os.getenv("ARTICLE_TRANSLATION_INTERVAL", "30")))
+    parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "4")))
+    parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "1000")))
+    parser.add_argument("--interval", type=float, default=float(os.getenv("ARTICLE_TRANSLATION_INTERVAL", "15")))
     parser.add_argument("--chunk-chars", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_CHARS", "6000")))
     parser.add_argument("--chunk-blocks", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_BLOCKS", "20")))
     args = parser.parse_args()
