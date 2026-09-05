@@ -154,6 +154,27 @@ class TranslateArticlesTests(unittest.TestCase):
 
         self.assertEqual(state, {"schemaVersion": 1, "utcDate": "2026-09-05", "requestsToday": 0})
 
+    def test_build_translation_index_contains_progress_and_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            translations = root / "zh-CN" / "2026" / "09" / "05"
+            translations.mkdir(parents=True)
+            path = translations / "0123456789ab.json"
+            path.write_text(json.dumps({
+                "articleId": "0123456789ab",
+                "status": "partial",
+                "translatedBlocks": 2,
+                "totalBlocks": 5,
+                "importanceLevel": 5,
+                "updatedAt": "2026-09-05T00:00:00Z",
+                "model": "free/model",
+            }), encoding="utf-8")
+            with mock.patch.object(translate_articles, "TRANSLATIONS_DIR", root / "zh-CN"):
+                index = translate_articles.build_translation_index()
+
+        self.assertEqual(index["articles"]["0123456789ab"]["location"], "2026/09/05")
+        self.assertEqual(index["articles"]["0123456789ab"]["translatedBlocks"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

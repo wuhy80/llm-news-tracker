@@ -28,13 +28,15 @@ const state = {
   source: "all",
   query: "",
   sort: "hot",
+  translation: "all",
+  translations: {},
   visible: PAGE_SIZE,
   saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]")),
   history: window.LLMReadingHistory.load()
 };
 const el = Object.fromEntries([
   "feedList", "feedItemTemplate", "itemCount", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
-  "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "importanceSelect", "trendRadar",
+  "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "importanceSelect", "translationSelect", "trendRadar",
   "trendList", "watchTags", "sourceList", "updateStatus", "sourceStatus", "searchPanel", "searchInput",
   "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink", "historyList", "historySummary", "clearHistory"
 ].map((id) => [id, document.getElementById(id)]));
@@ -155,6 +157,17 @@ function aiModeMatch(item) {
 function importanceMatch(item) {
   return state.importance === "all" || itemLevel(item) >= Number(state.importance);
 }
+function translationRecord(item) {
+  return state.translations[item.id] || null;
+}
+function translationStatus(item) {
+  const record = translationRecord(item);
+  if (!record) return "none";
+  return record.status === "complete" ? "complete" : "partial";
+}
+function translationMatch(item) {
+  return state.translation === "all" || translationStatus(item) === state.translation;
+}
 function filteredItems() {
   const query = state.query.trim().toLocaleLowerCase();
   const filtered = rangeItems().filter((item) => {
@@ -162,7 +175,7 @@ function filteredItems() {
     const sourceMatch = state.source === "all" || item.source === state.source;
     const itemReview = review(item);
     const haystack = [item.title, itemSummary(item), item.source, itemReview?.reasonZh, ...itemTags(item)].join(" ").toLocaleLowerCase();
-    return aiModeMatch(item) && importanceMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
+    return aiModeMatch(item) && importanceMatch(item) && translationMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
   });
   return filtered.sort((a, b) => state.sort === "latest"
     ? new Date(b.publishedAt) - new Date(a.publishedAt)
@@ -267,6 +280,17 @@ function renderFeed(items) {
       badge.setAttribute("aria-label", `${badge.textContent}：${itemReview.reasonZh}`);
     }
     badge.hidden = !badge.textContent;
+    const translationBadge = fragment.querySelector(".translation-badge");
+    const translation = translationRecord(item);
+    if (translation?.status === "complete") {
+      translationBadge.textContent = "中文已完成";
+      translationBadge.classList.add("complete");
+      translationBadge.hidden = false;
+    } else if (translation) {
+      translationBadge.textContent = `翻译中 ${translation.translatedBlocks || 0}/${translation.totalBlocks || 0}`;
+      translationBadge.classList.add("partial");
+      translationBadge.hidden = false;
+    }
     fragment.querySelector(".item-summary").textContent = itemSummary(item) || "打开原文查看详情。";
     const sourceImg = fragment.querySelector(".source-identity img");
     sourceImg.src = favicon(item);
@@ -455,6 +479,7 @@ function setupEvents() {
   el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); loadRangeData(); });
   el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; resetVisible(); render(); });
   el.importanceSelect.addEventListener("change", () => { state.importance = el.importanceSelect.value; resetVisible(); render(); });
+  el.translationSelect.addEventListener("change", () => { state.translation = el.translationSelect.value; resetVisible(); render(); });
   el.searchButton.addEventListener("click", openSearch);
   el.mobileSearch.addEventListener("click", openSearch);
   el.closeSearch.addEventListener("click", closeSearch);
@@ -545,9 +570,18 @@ async function loadRangeData() {
 
 async function loadData() {
   try {
-    const response = await fetch("data/news.json", { cache: "no-store" });
+    const [response, translationResponse] = await Promise.all([
+      fetch("data/news.json", { cache: "no-store" }),
+      fetch("data/translations/index.json", { cache: "no-store" }),
+    ]);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (translationResponse.ok) {
+      const translationData = await translationResponse.json();
+      state.translations = translationData.articles && typeof translationData.articles === "object"
+        ? translationData.articles
+        : {};
+    }
     state.sources = Array.isArray(data.sources) ? data.sources : [];
     state.generatedAt = data.generatedAt;
     if (Array.isArray(data.items)) {
