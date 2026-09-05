@@ -65,6 +65,21 @@ class TranslateArticlesTests(unittest.TestCase):
                 "wordWise": [],
             }, chunk)
 
+    def test_response_accepts_id_map_from_free_model(self):
+        chunk = [
+            {"id": "b0001", "kind": "paragraph", "source": "First source block.", "sourceHash": "a"},
+            {"id": "b0002", "kind": "paragraph", "source": "Second source block.", "sourceHash": "b"},
+        ]
+
+        translated, _ = translate_articles.normalize_response({
+            "data": {
+                "b0001": "第一个来源段落。",
+                "b0002": "第二个来源段落。",
+            },
+        }, chunk)
+
+        self.assertEqual([block["id"] for block in translated], ["b0001", "b0002"])
+
     def test_translatable_blocks_include_short_english_prose(self):
         blocks = [
             {"id": "b0001", "source": "AI", "kind": "heading"},

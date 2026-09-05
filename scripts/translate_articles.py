@@ -231,17 +231,41 @@ def extract_json_object(content: object) -> dict:
     return value
 
 
-def normalize_response(payload: dict, chunk: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+def translation_entries(payload: dict) -> list[dict]:
     raw_translations = payload.get("translations")
+    if raw_translations is None:
+        for key in ("results", "items", "data", "translatedBlocks"):
+            if payload.get(key) is not None:
+                raw_translations = payload[key]
+                break
+    if isinstance(raw_translations, dict):
+        raw_translations = [
+            ({"id": block_id, "translationZh": value} if not isinstance(value, dict)
+             else {"id": block_id, **value})
+            for block_id, value in raw_translations.items()
+        ]
+    if raw_translations is None:
+        raw_translations = [
+            {"id": key, "translationZh": value}
+            for key, value in payload.items()
+            if re.fullmatch(r"b\d{4}", str(key))
+        ]
     if not isinstance(raw_translations, list):
-        raise ValueError("translation response has no translations array")
+        raise ValueError("translation response has no usable translations")
+    return [entry for entry in raw_translations if isinstance(entry, dict)]
+
+
+def normalize_response(payload: dict, chunk: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    raw_translations = translation_entries(payload)
     expected = [block["id"] for block in chunk]
     by_id = {}
     for entry in raw_translations:
         if not isinstance(entry, dict):
             continue
         block_id = str(entry.get("id", ""))
-        translated = normalize_translation(entry.get("translationZh"))
+        translated = normalize_translation(
+            entry.get("translationZh") or entry.get("translation") or entry.get("zh")
+        )
         if block_id in expected and translated:
             by_id[block_id] = translated
     if list(by_id) != expected:
