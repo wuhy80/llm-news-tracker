@@ -59,6 +59,27 @@ class FormatRefreshTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item, _ in selected], ["bbbbbbbbbbbb", "aaaaaaaaaaaa"])
 
+    def test_candidates_can_be_limited_to_a_source_domain(self):
+        items = [
+            {"id": "aaaaaaaaaaaa", "sourceDomain": "qbitai.com", "publishedAt": "2026-08-30T00:00:00Z"},
+            {"id": "bbbbbbbbbbbb", "sourceDomain": "example.com", "publishedAt": "2026-08-29T00:00:00Z"},
+        ]
+        records = {
+            "aaaaaaaaaaaa": {"body": "A useful QbitAI article body."},
+            "bbbbbbbbbbbb": {"body": "A useful other article body."},
+        }
+
+        def loaded(item):
+            return Path(f"{item['id']}.json"), records[item["id"]]
+
+        with mock.patch.object(refresh_article_formats, "needs_format_refresh", return_value=True), \
+             mock.patch.object(refresh_article_formats, "read_snapshot", side_effect=loaded):
+            selected = refresh_article_formats.select_candidates(
+                items, datetime.now(timezone.utc), limit=10, retry_days=7, domain="qbitai.com"
+            )
+
+        self.assertEqual([item["id"] for item, _ in selected], ["aaaaaaaaaaaa"])
+
     def test_refresh_requires_structured_code_and_sufficient_content(self):
         previous = {"body": ("const value = await loadData(); " * 20).strip()}
         plain = ("const value = await loadData(); " * 20).strip()
