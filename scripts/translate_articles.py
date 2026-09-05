@@ -20,6 +20,7 @@ from news_store import atomic_write_json, load_news
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
 STATE_FILE = ROOT / "data" / "translations" / "state.json"
+INDEX_FILE = ROOT / "data" / "translations" / "index.json"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 TRANSLATION_VERSION = "openrouter-zh-v2"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
@@ -424,6 +425,32 @@ def merge_word_wise(existing: list, incoming: list[dict[str, str]], limit: int =
     return merged
 
 
+def build_translation_index() -> dict:
+    articles = {}
+    if TRANSLATIONS_DIR.exists():
+        for path in sorted(TRANSLATIONS_DIR.rglob("*.json")):
+            try:
+                relative = path.relative_to(TRANSLATIONS_DIR)
+                if len(relative.parts) != 4:
+                    continue
+                record = read_json(path)
+            except (OSError, ValueError):
+                continue
+            article_id = str(record.get("articleId", ""))
+            if not re.fullmatch(r"[0-9a-f]{12}", article_id):
+                continue
+            articles[article_id] = {
+                "location": "/".join(relative.parts[:3]),
+                "status": record.get("status", "partial"),
+                "translatedBlocks": int(record.get("translatedBlocks", 0)),
+                "totalBlocks": int(record.get("totalBlocks", 0)),
+                "importanceLevel": record.get("importanceLevel"),
+                "updatedAt": record.get("updatedAt"),
+                "model": record.get("model") or record.get("requestedModel"),
+            }
+    return {"schemaVersion": 1, "generatedAt": utc_now(), "articles": articles}
+
+
 def apply_chunk(record: dict, translated: list[dict[str, str]], word_wise: list[dict[str, str]], model: str) -> None:
     by_id = {
         str(block.get("id")): block
@@ -561,6 +588,7 @@ def main() -> int:
         f"[translate] requests {requests_made}/{request_limit}; translated {translated_blocks_count} blocks; "
         f"completed {completed_articles} articles; daily {state.get('requestsToday', 0)}/{args.daily_limit}"
     )
+    atomic_write_json(INDEX_FILE, build_translation_index())
     return 0
 
 
