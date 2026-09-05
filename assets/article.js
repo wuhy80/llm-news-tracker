@@ -356,6 +356,25 @@ async function loadTranslation(articleId, location) {
 
 function renderBody(body) {
   elements.articleBody.replaceChildren();
+  const images = Array.isArray(readingState.item?.images) ? readingState.item.images : [];
+  images.forEach((image) => {
+    const source = String(image?.src || "");
+    if (!source.startsWith("data/article-media/")) return;
+    const figure = document.createElement("figure");
+    figure.className = "reader-figure";
+    const element = document.createElement("img");
+    element.src = source;
+    element.alt = String(image?.alt || "文章配图");
+    element.loading = "lazy";
+    element.decoding = "async";
+    figure.append(element);
+    if (image?.alt) {
+      const caption = document.createElement("figcaption");
+      caption.textContent = image.alt;
+      figure.append(caption);
+    }
+    elements.articleBody.append(figure);
+  });
   const proseLines = [];
   let codeLines = null;
   let codeLanguage = "";

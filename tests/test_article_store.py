@@ -221,6 +221,24 @@ class ArticleTextTests(unittest.TestCase):
         self.assertNotIn("< img", body)
         self.assertIn("Useful article content", body)
 
+    def test_extracts_unique_article_image_references(self):
+        refs = article_store.extract_image_refs(
+            '<img src="/chart.png" alt="Benchmark chart">'
+            '<img data-src="https://example.com/chart.png">'
+            '<img class="avatar" src="/avatar.png">',
+            "https://example.com/posts/entry",
+        )
+
+        self.assertEqual(refs, [{"url": "https://example.com/chart.png", "alt": "Benchmark chart"}])
+
+    def test_extracts_reader_markdown_image_references(self):
+        refs = article_store.extract_markdown_image_refs(
+            "![A chart](/images/chart.webp)\n![A chart](/images/chart.webp)",
+            "https://example.com/article",
+        )
+
+        self.assertEqual(refs, [{"url": "https://example.com/images/chart.webp", "alt": "A chart"}])
+
     def test_reader_markdown_removes_metadata_and_links(self):
         body = article_store.text_from_reader(
             "Title: Example\n\nURL Source: https://example.com\n\nMarkdown Content:\n\n"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import ipaddress
 import json
@@ -20,8 +21,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTICLES_DIR = ROOT / "data" / "articles"
+MEDIA_DIR = ROOT / "data" / "article-media"
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
 MAX_DOWNLOAD_BYTES = 2_500_000
+MAX_IMAGE_BYTES = 5_000_000
+MAX_IMAGES_PER_ARTICLE = 12
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
 BODY_FORMAT_VERSION = 3
@@ -29,6 +33,7 @@ READER_PREFIX = "https://r.jina.ai/"
 READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
 READER_LOCK = threading.Lock()
 READER_LAST_REQUEST = 0.0
+FETCHED_IMAGE_REFS: dict[str, list[dict[str, str]]] = {}
 
 BLOCK_TAGS = {
     "address", "article", "blockquote", "br", "div", "figcaption", "h1", "h2", "h3",
@@ -252,6 +257,101 @@ class ReadableTextParser(HTMLParser):
         code = restore_collapsed_code(html.unescape("".join(buffer))).strip("\n")
         if code.strip():
             target.append(f"```\n{code}\n```")
+
+
+class ImageReferenceParser(HTMLParser):
+    def __init__(self, base_url: str = "") -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.references: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() not in {"img", "source"}:
+            return
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        source = attributes.get("src") or attributes.get("data-src") or attributes.get("data-original")
+        if not source:
+            srcset = attributes.get("srcset") or attributes.get("data-srcset")
+            if srcset:
+                source = srcset.split(",", 1)[0].strip().rsplit(" ", 1)[0]
+        if not source or source.startswith(("data:", "blob:", "#")):
+            return
+        url = urllib.parse.urljoin(self.base_url, html.unescape(source.strip()))
+        if urllib.parse.urlparse(url).scheme not in {"http", "https"}:
+            return
+        alt = attributes.get("alt") or attributes.get("title") or ""
+        classes = f"{attributes.get('class', '')} {attributes.get('id', '')}".casefold()
+        if any(token in classes for token in ("logo", "avatar", "icon", "favicon", "sprite", "tracking", "pixel")):
+            return
+        self.references.append({"url": url, "alt": re.sub(r"\s+", " ", alt).strip()})
+
+
+def extract_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
+    parser = ImageReferenceParser(base_url)
+    try:
+        parser.feed(value or "")
+        parser.close()
+    except Exception:
+        return []
+    refs = []
+    seen = set()
+    for reference in parser.references:
+        if reference["url"] in seen:
+            continue
+        seen.add(reference["url"])
+        refs.append(reference)
+    return refs[:MAX_IMAGES_PER_ARTICLE]
+
+
+def extract_markdown_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
+    refs = []
+    seen = set()
+    for match in re.finditer(r"!\[([^]]*)\]\((\S+?)(?:\s+['\"][^)]*['\"])?\)", value or ""):
+        url = urllib.parse.urljoin(base_url, html.unescape(match.group(2)))
+        if urllib.parse.urlparse(url).scheme not in {"http", "https"} or url in seen:
+            continue
+        seen.add(url)
+        refs.append({"url": url, "alt": re.sub(r"\s+", " ", match.group(1)).strip()})
+    return refs[:MAX_IMAGES_PER_ARTICLE]
+
+
+def download_images(item: dict, references: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    if not references:
+        return []
+    destination = MEDIA_DIR / publication_path(item.get("publishedAt")) / str(item["id"])
+    result = []
+    seen = set()
+    for reference in references[:MAX_IMAGES_PER_ARTICLE]:
+        url = str(reference.get("url", "")).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        try:
+            validate_public_url(url)
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+            if suffix not in {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}:
+                suffix = ".img"
+            target = destination / f"{digest}{suffix}"
+            if not target.exists():
+                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/*"})
+                with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=20) as response:
+                    content_type = response.headers.get_content_type()
+                    payload = response.read(MAX_IMAGE_BYTES + 1)
+                if not content_type.startswith("image/") or len(payload) > MAX_IMAGE_BYTES:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                temporary.write_bytes(payload)
+                temporary.replace(target)
+            result.append({
+                "src": "/".join(target.relative_to(ROOT).parts),
+                "alt": str(reference.get("alt", ""))[:240],
+                "originalUrl": url,
+            })
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+            continue
+    return result
 
 
 def clean_blocks(blocks: list[str]) -> list[str]:
@@ -587,6 +687,7 @@ def write_snapshot(
     content_kind: str,
     resolved_url: str | None = None,
     error: str | None = None,
+    images: list[dict[str, str]] | None = None,
 ) -> Path:
     path = snapshot_path(item)
     try:
@@ -608,6 +709,10 @@ def write_snapshot(
         "bodyFormatVersion": BODY_FORMAT_VERSION,
         "body": limit_body(normalize_article_body(body)),
     }
+    if images:
+        payload["images"] = images
+    elif existing.get("images"):
+        payload["images"] = existing["images"]
     for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
         if field in existing and field not in payload:
             payload[field] = existing[field]
@@ -627,6 +732,7 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
     body = text_from_html(feed_html)
     if len(body) < MIN_BODY_CHARS:
         return False
+    image_refs = extract_image_refs(feed_html, item.get("url", ""))
     path = snapshot_path(item)
     if path.exists():
         try:
@@ -643,15 +749,17 @@ def store_feed_snapshot(item: dict, feed_html: str) -> bool:
                 and not has_corrupted_text(current_body)
                 and len(current_body) >= len(body)
                 and current_paragraphs >= new_paragraphs
+                and (current.get("images") or not image_refs)
             ):
                 return False
-            if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)):
+            if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)) and not image_refs:
                 return False
-            if has_flattened_code(current_body) and has_flattened_code(body):
+            if has_flattened_code(current_body) and has_flattened_code(body) and not image_refs:
                 return False
         except (json.JSONDecodeError, OSError):
             pass
-    write_snapshot(item, body, "feed")
+    images = download_images(item, image_refs)
+    write_snapshot(item, body, "feed", images=images)
     return True
 
 
@@ -782,7 +890,37 @@ def community_api_url(url: str) -> str | None:
     return None
 
 
-def fetch_community_text(url: str) -> tuple[str, str]:
+def community_image_refs(post: dict) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+
+    def add(value: str, alt: str = "") -> None:
+        value = html.unescape(str(value or "")).strip()
+        if value.startswith(("http://", "https://")):
+            refs.append({"url": value, "alt": alt})
+
+    destination = post.get("url_overridden_by_dest") or ""
+    if re.search(r"\.(?:avif|gif|jpe?g|png|webp)(?:\?|$)", destination, re.IGNORECASE):
+        add(destination, post.get("title", ""))
+    preview = post.get("preview", {})
+    for image in preview.get("images", []) if isinstance(preview, dict) else []:
+        if isinstance(image, dict):
+            source = image.get("source", {})
+            add(source.get("url", "") if isinstance(source, dict) else "", post.get("title", ""))
+    metadata = post.get("media_metadata", {})
+    if isinstance(metadata, dict):
+        for value in metadata.values():
+            if isinstance(value, dict):
+                add(value.get("s", {}).get("u", "") if isinstance(value.get("s"), dict) else "", post.get("title", ""))
+    unique = []
+    seen = set()
+    for ref in refs:
+        if ref["url"] not in seen:
+            seen.add(ref["url"])
+            unique.append(ref)
+    return unique[:MAX_IMAGES_PER_ARTICLE]
+
+
+def fetch_community_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     api_url = community_api_url(url)
     if not api_url:
         raise ValueError("unsupported community URL")
@@ -802,15 +940,22 @@ def fetch_community_text(url: str) -> tuple[str, str]:
         body = (post.get("selftext") or "").strip()
     else:
         posts = document.get("post_stream", {}).get("posts", [])
-        body = text_from_html(posts[0].get("cooked", "")) if posts else ""
+        post = posts[0] if posts else {}
+        body = text_from_html(post.get("cooked", "")) if posts else ""
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("community body not found")
     if has_corrupted_text(body):
         raise ValueError("community body contains corrupted text")
-    return limit_body(body), url
+    return limit_body(body), url, community_image_refs(post)
 
 
-def fetch_page_text(url: str) -> tuple[str, str]:
+def fetch_community_text(url: str) -> tuple[str, str]:
+    body, resolved_url, images = fetch_community_content(url)
+    FETCHED_IMAGE_REFS[resolved_url] = images
+    return body, resolved_url
+
+
+def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     validate_public_url(url)
     request = urllib.request.Request(
         url,
@@ -837,10 +982,16 @@ def fetch_page_text(url: str) -> tuple[str, str]:
         raise ValueError("readable body not found")
     if has_corrupted_text(body):
         raise ValueError("page body contains corrupted text")
+    return body, resolved_url, extract_image_refs(document, resolved_url)
+
+
+def fetch_page_text(url: str) -> tuple[str, str]:
+    body, resolved_url, images = fetch_page_content(url)
+    FETCHED_IMAGE_REFS[resolved_url] = images
     return body, resolved_url
 
 
-def fetch_reader_text(url: str) -> tuple[str, str]:
+def fetch_reader_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     global READER_LAST_REQUEST
     validate_public_url(url)
     reader_url = f"{READER_PREFIX}{url}"
@@ -860,12 +1011,19 @@ def fetch_reader_text(url: str) -> tuple[str, str]:
                 charset = response.headers.get_content_charset() or "utf-8"
         finally:
             READER_LAST_REQUEST = time.monotonic()
-    body = text_from_reader(payload.decode(charset, errors="replace"))
+    reader_text = payload.decode(charset, errors="replace")
+    body = text_from_reader(reader_text)
     if len(body) < MIN_BODY_CHARS:
         raise ValueError("reader body not found")
     if has_corrupted_text(body):
         raise ValueError("reader body contains corrupted text")
-    return body, url
+    return body, url, extract_markdown_image_refs(reader_text, url)
+
+
+def fetch_reader_text(url: str) -> tuple[str, str]:
+    body, resolved_url, images = fetch_reader_content(url)
+    FETCHED_IMAGE_REFS[resolved_url] = images
+    return body, resolved_url
 
 
 def error_note(stage: str, error: Exception) -> str:
@@ -879,20 +1037,20 @@ def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
     if community_api_url(target_url):
         try:
             body, resolved_url = fetch_community_text(target_url)
-            write_snapshot(item, body, "community", resolved_url=resolved_url)
+            write_snapshot(item, body, "community", resolved_url=resolved_url, images=download_images(item, FETCHED_IMAGE_REFS.pop(resolved_url, [])))
             return item["id"], "community"
         except Exception as error:
             errors.append(error_note("community", error))
     try:
         body, resolved_url = fetch_page_text(target_url)
-        write_snapshot(item, body, "page", resolved_url=resolved_url)
+        write_snapshot(item, body, "page", resolved_url=resolved_url, images=download_images(item, FETCHED_IMAGE_REFS.pop(resolved_url, [])))
         return item["id"], "page"
     except Exception as error:
         errors.append(error_note("page", error))
     if allow_reader:
         try:
             body, resolved_url = fetch_reader_text(target_url)
-            write_snapshot(item, body, "reader", resolved_url=resolved_url)
+            write_snapshot(item, body, "reader", resolved_url=resolved_url, images=download_images(item, FETCHED_IMAGE_REFS.pop(resolved_url, [])))
             return item["id"], "reader"
         except Exception as error:
             errors.append(error_note("reader", error))
