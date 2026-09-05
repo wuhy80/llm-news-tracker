@@ -73,12 +73,99 @@ function renderTags(tags) {
   return section;
 }
 
+const CODE_LANGUAGE_ALIASES = {
+  js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+  ts: "typescript", tsx: "typescript",
+  sh: "bash", shell: "bash", zsh: "bash", console: "bash",
+  yml: "yaml", md: "markdown", py: "python", rb: "ruby",
+};
+const CODE_KEYWORDS = {
+  python: new Set("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield self True False None".split(" ")),
+  javascript: new Set("as async await break case catch class const continue debugger default delete do else export extends finally for from function if import in instanceof let new null of return static super switch this throw try typeof var void while with yield true false undefined".split(" ")),
+  typescript: new Set("as async await break case catch class const continue debugger declare default delete do else export extends finally for from function if implements import in infer instanceof interface keyof let namespace never new null of private protected public readonly return static super switch this throw try type typeof var void while with yield true false undefined".split(" ")),
+  bash: new Set("if then else elif fi for while in do done case esac function select time coproc export local readonly set unset source alias unalias true false".split(" ")),
+  ruby: new Set("BEGIN END alias and begin break case class def defined do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield".split(" ")),
+  sql: new Set("select from where and or as join left right inner outer on group by order having limit offset insert into values update set delete create alter drop table index null is not distinct union all case when then else end asc desc".split(" ")),
+};
+const CODE_LITERALS = new Set("true false null undefined None True False NaN Infinity".split(" "));
+
+function escapeCodeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function canonicalCodeLanguage(language = "") {
+  const normalized = String(language).trim().toLowerCase().replace(/^language-/, "");
+  return CODE_LANGUAGE_ALIASES[normalized] || normalized;
+}
+
+function inferCodeLanguage(code, requested = "") {
+  const explicit = canonicalCodeLanguage(requested);
+  if (explicit) return explicit;
+  const text = String(code || "");
+  if (/^\s*(?:#!.*\b(?:ba|z|fi)?sh\b|(?:cd|npm|npx|pip|curl|wget|docker|git|aws)\s+)/m.test(text)) return "bash";
+  if (/^\s*(?:def\s+\w+\s*\(|from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|class\s+\w+\s*[:(]|async\s+def\s+)/m.test(text)) return "python";
+  if (/^\s*(?:const|let|var|function|interface|type|export|import\s+.+\s+from)\b/m.test(text) || /=>/.test(text)) return "javascript";
+  if (/^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/im.test(text)) return "sql";
+  if (/^\s*[A-Za-z_][\w-]*:\s*[^:=]/m.test(text) && !/[;{}]\s*$/.test(text)) return "yaml";
+  try {
+    if (/^\s*[\[{]/.test(text)) {
+      JSON.parse(text);
+      return "json";
+    }
+  } catch (_error) {
+    // Not JSON; continue with plain rendering.
+  }
+  return "";
+}
+
+function highlightCode(code, requestedLanguage = "") {
+  const source = String(code || "");
+  const language = inferCodeLanguage(source, requestedLanguage);
+  const keywords = CODE_KEYWORDS[language] || CODE_KEYWORDS.javascript;
+  const supportsHashComments = ["python", "bash", "ruby", "yaml", "shell"].includes(language);
+  const tokenPattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$-]*\b)/g;
+  let output = "";
+  let cursor = 0;
+  let match;
+  while ((match = tokenPattern.exec(source))) {
+    output += escapeCodeHtml(source.slice(cursor, match.index));
+    const token = match[0];
+    const next = source.slice(match.index + token.length);
+    let tokenClass = "";
+    if (/^(?:\/\/|\/\*)/.test(token) || (supportsHashComments && token.startsWith("#"))) {
+      tokenClass = "tok-comment";
+    } else if (/^[\"'`]/.test(token)) {
+      const property = language === "json" && /^\s*:/.test(next);
+      tokenClass = property ? "tok-property" : "tok-string";
+    } else if (/^\d/.test(token)) {
+      tokenClass = "tok-number";
+    } else if (CODE_LITERALS.has(token) || (language === "python" && ["True", "False", "None"].includes(token))) {
+      tokenClass = "tok-literal";
+    } else if (keywords.has(token)) {
+      tokenClass = "tok-keyword";
+    } else if (/^\s*\(/.test(next)) {
+      tokenClass = "tok-function";
+    }
+    output += tokenClass ? `<span class="${tokenClass}">${escapeCodeHtml(token)}</span>` : escapeCodeHtml(token);
+    cursor = match.index + token.length;
+  }
+  output += escapeCodeHtml(source.slice(cursor));
+  return { html: output, language };
+}
+
 function renderCode(code, language = "") {
   const pre = document.createElement("pre");
   pre.className = "reader-code";
-  if (language) pre.dataset.language = language;
+  const highlighted = highlightCode(code, language);
+  if (highlighted.language) pre.dataset.language = highlighted.language;
   const element = document.createElement("code");
-  element.textContent = code;
+  if (highlighted.language) element.className = `language-${highlighted.language}`;
+  element.innerHTML = highlighted.html;
   pre.append(element);
   return pre;
 }
