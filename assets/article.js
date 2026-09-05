@@ -29,7 +29,7 @@ const elements = Object.fromEntries([
   "articleBody", "articleCategory", "articleGlossary", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
   "articleImportance", "articleReason", "articleReview",
   "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "readCount", "themeButton",
-  "translationModes", "translationProgress", "translationToolbar", "wordWiseControl", "wordWiseToggle"
+  "translationControl", "translationProgress", "translationToggle", "translationToolbar", "wordWiseControl", "wordWiseToggle"
 ].map((id) => [id, document.getElementById(id)]));
 
 const readingState = {
@@ -37,9 +37,7 @@ const readingState = {
   item: null,
   location: "",
   translation: null,
-  mode: ["original", "bilingual", "chinese"].includes(localStorage.getItem("llm-pulse-reading-mode"))
-    ? localStorage.getItem("llm-pulse-reading-mode")
-    : "original",
+  showTranslation: localStorage.getItem("llm-pulse-show-translation") !== "off",
   wordWise: localStorage.getItem("llm-pulse-word-wise") !== "off",
 };
 
@@ -317,15 +315,9 @@ function appendReadableText(element, text, blockId, translations, wiseEntries, u
 }
 
 function applyReadingPreferences() {
-  const hasTranslation = translatedBlocks().size > 0;
-  const mode = hasTranslation ? readingState.mode : "original";
-  elements.articleBody.dataset.readingMode = mode;
+  elements.articleBody.dataset.showTranslation = readingState.showTranslation ? "on" : "off";
   elements.articleBody.dataset.wordWise = readingState.wordWise ? "on" : "off";
-  elements.translationModes?.querySelectorAll("button").forEach((button) => {
-    const active = button.dataset.readingMode === mode;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
+  if (elements.translationToggle) elements.translationToggle.checked = readingState.showTranslation;
   if (elements.wordWiseToggle) elements.wordWiseToggle.checked = readingState.wordWise;
 }
 
@@ -334,7 +326,7 @@ function updateTranslationToolbar() {
   const wordWise = wordWiseEntries();
   const available = translations.size > 0 || wordWise.length > 0;
   elements.translationToolbar.hidden = !available;
-  elements.translationModes.hidden = translations.size === 0;
+  elements.translationControl.hidden = translations.size === 0;
   elements.wordWiseControl.hidden = wordWise.length === 0;
   if (readingState.translation) {
     const complete = readingState.translation.status === "complete";
@@ -650,11 +642,9 @@ async function loadArticle() {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     localStorage.setItem("llm-pulse-theme", dark ? "dark" : "light");
   });
-  elements.translationModes?.addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-reading-mode]");
-    if (!button || !translatedBlocks().size) return;
-    readingState.mode = button.dataset.readingMode;
-    localStorage.setItem("llm-pulse-reading-mode", readingState.mode);
+  elements.translationToggle?.addEventListener("change", (event) => {
+    readingState.showTranslation = event.target.checked;
+    localStorage.setItem("llm-pulse-show-translation", readingState.showTranslation ? "on" : "off");
     applyReadingPreferences();
   });
   elements.wordWiseToggle?.addEventListener("change", (event) => {

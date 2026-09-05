@@ -23,7 +23,7 @@ class ValidateTranslationsTests(unittest.TestCase):
             source_path.write_text(json.dumps({"body": "An English source article."}), encoding="utf-8")
             translation_path.write_text(json.dumps({
                 "articleId": "0123456789ab",
-                "translationVersion": "openrouter-zh-v1",
+                "translationVersion": "openrouter-zh-v2",
                 "sourceBodyHash": body_hash("An English source article."),
                 "status": "complete",
                 "totalBlocks": 1,

@@ -65,6 +65,19 @@ class TranslateArticlesTests(unittest.TestCase):
                 "wordWise": [],
             }, chunk)
 
+    def test_translatable_blocks_include_short_english_prose(self):
+        blocks = [
+            {"id": "b0001", "source": "AI", "kind": "heading"},
+            {"id": "b0002", "source": "A short note.", "kind": "paragraph"},
+            {"id": "b0003", "source": "https://example.com", "kind": "paragraph"},
+            {"id": "b0004", "source": "标签: AI", "kind": "paragraph"},
+        ]
+
+        self.assertEqual(
+            [block["id"] for block in translate_articles.translatable_blocks(blocks)],
+            ["b0001", "b0002"],
+        )
+
     def test_candidates_prioritize_partial_level_five_translations(self):
         english = "Long-running agent memory needs careful relevance scoring. " * 12
         items = [
