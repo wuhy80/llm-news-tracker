@@ -161,9 +161,25 @@ def refresh_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
     return None
 
 
-def select_candidates(items: list[dict], now: datetime, limit: int, retry_days: int) -> list[tuple[dict, dict]]:
+def matches_domain(item: dict, domain: str) -> bool:
+    expected = domain.strip().lower().lstrip(".")
+    if not expected:
+        return True
+    actual = str(item.get("sourceDomain") or "").strip().lower().lstrip(".")
+    return actual == expected or actual.endswith(f".{expected}")
+
+
+def select_candidates(
+    items: list[dict],
+    now: datetime,
+    limit: int,
+    retry_days: int,
+    domain: str = "",
+) -> list[tuple[dict, dict]]:
     candidates = []
     for item in items:
+        if not matches_domain(item, domain):
+            continue
         if not needs_format_refresh(item, now, retry_days):
             continue
         loaded = read_snapshot(item)
@@ -180,11 +196,12 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=int(os.getenv("ARTICLE_FORMAT_REFRESH_WORKERS", "8")))
     parser.add_argument("--reader-limit", type=int, default=int(os.getenv("ARTICLE_FORMAT_READER_LIMIT", "12")))
     parser.add_argument("--retry-days", type=int, default=int(os.getenv("ARTICLE_FORMAT_RETRY_DAYS", "7")))
+    parser.add_argument("--domain", default=os.getenv("ARTICLE_FORMAT_REFRESH_DOMAIN", ""))
     args = parser.parse_args()
 
     data = load_news(NEWS_FILE)
     now = datetime.now(timezone.utc)
-    selected = select_candidates(data.get("items", []), now, args.limit, args.retry_days)
+    selected = select_candidates(data.get("items", []), now, args.limit, args.retry_days, args.domain)
     if not selected:
         print("[format] no legacy article snapshots need refreshing")
         return 0
