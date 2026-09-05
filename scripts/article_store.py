@@ -266,14 +266,32 @@ class ImageReferenceParser(HTMLParser):
         self.references: list[dict[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() not in {"img", "source"}:
-            return
+        tag = tag.lower()
         attributes = {key.lower(): value or "" for key, value in attrs}
-        source = attributes.get("src") or attributes.get("data-src") or attributes.get("data-original")
-        if not source:
-            srcset = attributes.get("srcset") or attributes.get("data-srcset")
-            if srcset:
-                source = srcset.split(",", 1)[0].strip().rsplit(" ", 1)[0]
+        if tag == "meta":
+            key = (attributes.get("property") or attributes.get("name") or attributes.get("itemprop") or "").casefold()
+            if key not in {"og:image", "og:image:url", "twitter:image", "twitter:image:src", "image"}:
+                return
+            source = attributes.get("content", "")
+        elif tag in {"img", "source"}:
+            source = (
+                attributes.get("src")
+                or attributes.get("data-src")
+                or attributes.get("data-original")
+                or attributes.get("data-lazy-src")
+                or attributes.get("data-original-src")
+                or attributes.get("data-url")
+            )
+            if not source:
+                srcset = (
+                    attributes.get("srcset")
+                    or attributes.get("data-srcset")
+                    or attributes.get("data-lazy-srcset")
+                )
+                if srcset:
+                    source = srcset.split(",", 1)[0].strip().rsplit(" ", 1)[0]
+        else:
+            return
         if not source or source.startswith(("data:", "blob:", "#")):
             return
         url = urllib.parse.urljoin(self.base_url, html.unescape(source.strip()))
@@ -338,8 +356,19 @@ def download_images(item: dict, references: list[dict[str, str]] | None) -> list
                 with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=20) as response:
                     content_type = response.headers.get_content_type()
                     payload = response.read(MAX_IMAGE_BYTES + 1)
-                if not content_type.startswith("image/") or len(payload) > MAX_IMAGE_BYTES:
+                detected_suffix = detect_image_suffix(payload, content_type)
+                if not detected_suffix or len(payload) > MAX_IMAGE_BYTES:
                     continue
+                if suffix == ".img":
+                    suffix = detected_suffix
+                    target = destination / f"{digest}{suffix}"
+                    if target.exists():
+                        result.append({
+                            "src": "/".join(target.relative_to(ROOT).parts),
+                            "alt": str(reference.get("alt", ""))[:240],
+                            "originalUrl": url,
+                        })
+                        continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target.with_suffix(target.suffix + ".tmp")
                 temporary.write_bytes(payload)
@@ -352,6 +381,31 @@ def download_images(item: dict, references: list[dict[str, str]] | None) -> list
         except (OSError, ValueError, urllib.error.URLError, TimeoutError):
             continue
     return result
+
+
+def detect_image_suffix(payload: bytes, content_type: str) -> str | None:
+    """Accept common image signatures when a CDN returns a generic MIME type."""
+    mime_suffixes = {
+        "image/avif": ".avif",
+        "image/gif": ".gif",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    normalized = (content_type or "").split(";", 1)[0].casefold()
+    if normalized in mime_suffixes:
+        return mime_suffixes[normalized]
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return ".webp"
+    if len(payload) >= 12 and payload[4:8] == b"ftyp" and payload[8:12] in {b"avif", b"avis"}:
+        return ".avif"
+    return None
 
 
 def clean_blocks(blocks: list[str]) -> list[str]:
@@ -731,13 +785,21 @@ def write_snapshot(
     return path
 
 
-def store_feed_snapshot(item: dict, feed_html: str) -> bool:
+def store_feed_snapshot(
+    item: dict,
+    feed_html: str,
+    extra_image_refs: list[dict[str, str]] | None = None,
+) -> bool:
     if not feed_html:
         return False
     body = text_from_html(feed_html)
     if len(body) < MIN_BODY_CHARS:
         return False
     image_refs = extract_image_refs(feed_html, item.get("url", ""))
+    for reference in extra_image_refs or []:
+        if reference.get("url") and reference["url"] not in {item["url"] for item in image_refs}:
+            image_refs.append(reference)
+    image_refs = image_refs[:MAX_IMAGES_PER_ARTICLE]
     path = snapshot_path(item)
     if path.exists():
         try:
