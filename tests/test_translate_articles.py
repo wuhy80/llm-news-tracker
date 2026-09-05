@@ -175,6 +175,11 @@ class TranslateArticlesTests(unittest.TestCase):
         self.assertEqual(index["articles"]["0123456789ab"]["location"], "2026/09/05")
         self.assertEqual(index["articles"]["0123456789ab"]["translatedBlocks"], 2)
 
+    def test_response_headers_are_normalized_for_rate_limit_tracking(self):
+        headers = translate_articles.normalize_headers({"X-RateLimit-Remaining": 49, "X-RateLimit-Limit": 50})
+        self.assertEqual(headers["x-ratelimit-remaining"], "49")
+        self.assertEqual(headers["x-ratelimit-limit"], "50")
+
 
 if __name__ == "__main__":
     unittest.main()
