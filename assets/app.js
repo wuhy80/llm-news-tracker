@@ -4,7 +4,7 @@ const CATEGORY = {
   release: { label: "模型发布", color: "var(--coral)" },
   benchmark: { label: "评测榜单", color: "var(--amber)" }
 };
-const PERIOD_LABEL = { day: "日", week: "周", month: "月" };
+const PERIOD_LABEL = { day: "日", week: "周", month: "月", year: "年" };
 const IMPORTANCE_LABEL = {
   5: "必须关注",
   4: "值得精读",
@@ -62,6 +62,12 @@ function getRange() {
     end.setDate(start.getDate() + 6);
     return { start, end };
   }
+  if (state.period === "year") {
+    return {
+      start: new Date(anchor.getFullYear(), 0, 1),
+      end: new Date(anchor.getFullYear(), 11, 31, 23, 59, 59, 999)
+    };
+  }
   return {
     start: new Date(anchor.getFullYear(), anchor.getMonth(), 1),
     end: new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0, 23, 59, 59, 999)
@@ -79,8 +85,10 @@ function updateRangeLabel() {
     el.rangeLabel.textContent = start.getTime() === today.getTime() ? "今天" : formatDate(start, start.getFullYear() !== today.getFullYear());
   } else if (state.period === "week") {
     el.rangeLabel.textContent = `${formatDate(start)} – ${formatDate(end, start.getFullYear() !== end.getFullYear())}`;
-  } else {
+  } else if (state.period === "month") {
     el.rangeLabel.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(start);
+  } else {
+    el.rangeLabel.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric" }).format(start);
   }
 }
 function shiftRange(direction) {
@@ -88,6 +96,7 @@ function shiftRange(direction) {
   if (state.period === "day") next.setDate(next.getDate() + direction);
   if (state.period === "week") next.setDate(next.getDate() + direction * 7);
   if (state.period === "month") next.setMonth(next.getMonth() + direction);
+  if (state.period === "year") next.setFullYear(next.getFullYear() + direction);
   state.anchor = next;
   resetVisible();
   loadRangeData();
