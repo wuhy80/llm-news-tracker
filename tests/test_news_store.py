@@ -93,6 +93,26 @@ class NewsStoreTests(unittest.TestCase):
                     root / "data/articles",
                 )
 
+    def test_removes_article_snapshots_not_referenced_by_current_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "data/news.json"
+            articles = root / "data/articles"
+            stale = articles / "2026/08/25/deadbeefcafe.json"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("{}", encoding="utf-8")
+            item = {
+                "id": "abcdef012345", "title": "Current", "summary": "Summary",
+                "url": "https://example.com/current", "source": "Example",
+                "sourceDomain": "example.com", "publishedAt": "2026-08-26T00:00:00Z",
+                "category": "release", "tags": [], "score": 70, "signal": "medium",
+            }
+
+            news_store.save_news({"items": [item]}, manifest, articles)
+
+            self.assertFalse(stale.exists())
+            self.assertTrue((articles / "2026/08/26/abcdef012345.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

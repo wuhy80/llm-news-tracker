@@ -213,6 +213,9 @@ def save_news(
         atomic_write_json(path, dict(sorted(mapping.items())))
     _remove_stale_json(article_index_dir, expected_indexes)
 
+    expected_articles = {article_path(record, articles_dir) for record in records}
+    _remove_stale_json(articles_dir, expected_articles)
+
     manifest = {
         "schemaVersion": SCHEMA_VERSION,
         "generatedAt": generated_at,
