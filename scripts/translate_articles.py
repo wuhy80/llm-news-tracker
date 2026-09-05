@@ -21,7 +21,7 @@ NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
 STATE_FILE = ROOT / "data" / "translations" / "state.json"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-TRANSLATION_VERSION = "openrouter-zh-v1"
+TRANSLATION_VERSION = "openrouter-zh-v2"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
 
 SYSTEM_PROMPT = """You translate high-value AI articles into Simplified Chinese.
@@ -126,7 +126,9 @@ def translatable_blocks(blocks: list[dict[str, str]]) -> list[dict[str, str]]:
         source = block["source"]
         if re.match(r"^(?:tags?|标签)\s*[:：]", source, re.IGNORECASE):
             continue
-        if len(source) >= 12 and len(re.findall(r"[A-Za-z]", source)) >= 8:
+        if re.fullmatch(r"(?:https?://|www\.)\S+", source, re.IGNORECASE):
+            continue
+        if re.search(r"[A-Za-z]", source):
             result.append(block)
     return result
 
