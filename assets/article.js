@@ -28,8 +28,20 @@ const GISCUS_CONFIG = {
 const elements = Object.fromEntries([
   "articleBody", "articleCategory", "articleGlossary", "articleSource", "articleSourceIcon", "articleSummary", "articleTime",
   "articleImportance", "articleReason", "articleReview",
-  "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "readCount", "themeButton"
+  "articleTitle", "glossaryList", "originalLink", "readerNotice", "readerStatus", "readerSummary", "snapshotKind", "readCount", "themeButton",
+  "translationModes", "translationProgress", "translationToolbar", "wordWiseControl", "wordWiseToggle"
 ].map((id) => [id, document.getElementById(id)]));
+
+const readingState = {
+  body: "",
+  item: null,
+  location: "",
+  translation: null,
+  mode: ["original", "bilingual", "chinese"].includes(localStorage.getItem("llm-pulse-reading-mode"))
+    ? localStorage.getItem("llm-pulse-reading-mode")
+    : "original",
+  wordWise: localStorage.getItem("llm-pulse-word-wise") !== "off",
+};
 
 function favicon(item) {
   const domain = item.sourceDomain || new URL(item.url).hostname;
@@ -217,20 +229,159 @@ function normalizeProseMarkup(value) {
   return text.replace(/[ \t]+/g, " ").trim();
 }
 
+function wordWiseEntries() {
+  const entries = [];
+  const seen = new Set();
+  const candidates = [
+    ...(Array.isArray(readingState.translation?.wordWise) ? readingState.translation.wordWise : []),
+    ...(Array.isArray(readingState.item?.aiReview?.glossary) ? readingState.item.aiReview.glossary : []),
+  ];
+  candidates.forEach((entry) => {
+    const term = String(entry?.term || "").trim();
+    const key = term.toLowerCase();
+    const explanation = String(entry?.explanationZh || "").trim();
+    const brief = String(entry?.briefZh || explanation.split(/[，。；：]/)[0] || "").trim().slice(0, 12);
+    if (!/[A-Za-z]/.test(term) || !brief || seen.has(key)) return;
+    seen.add(key);
+    entries.push({ term, briefZh: brief, explanationZh: explanation || brief });
+  });
+  return entries.slice(0, 24);
+}
+
+function decorateWordWise(container, text, entries, usedTerms) {
+  const terms = entries
+    .filter((entry) => !usedTerms.has(entry.term.toLowerCase()))
+    .sort((a, b) => b.term.length - a.term.length);
+  if (!terms.length) {
+    container.textContent = text;
+    return;
+  }
+  const lower = text.toLowerCase();
+  let cursor = 0;
+  while (cursor < text.length) {
+    let selected = null;
+    let selectedIndex = -1;
+    terms.forEach((entry) => {
+      if (usedTerms.has(entry.term.toLowerCase())) return;
+      const index = lower.indexOf(entry.term.toLowerCase(), cursor);
+      if (index >= 0 && (selectedIndex < 0 || index < selectedIndex || (index === selectedIndex && entry.term.length > selected.term.length))) {
+        selected = entry;
+        selectedIndex = index;
+      }
+    });
+    if (!selected) {
+      container.append(document.createTextNode(text.slice(cursor)));
+      break;
+    }
+    if (selectedIndex > cursor) container.append(document.createTextNode(text.slice(cursor, selectedIndex)));
+    const ruby = document.createElement("ruby");
+    ruby.className = "word-wise";
+    ruby.tabIndex = 0;
+    ruby.dataset.explanation = selected.explanationZh;
+    ruby.title = selected.explanationZh;
+    ruby.setAttribute("aria-label", `${text.slice(selectedIndex, selectedIndex + selected.term.length)}：${selected.explanationZh}`);
+    const source = document.createElement("rb");
+    source.textContent = text.slice(selectedIndex, selectedIndex + selected.term.length);
+    const hint = document.createElement("rt");
+    hint.textContent = selected.briefZh;
+    ruby.append(source, hint);
+    container.append(ruby);
+    usedTerms.add(selected.term.toLowerCase());
+    cursor = selectedIndex + selected.term.length;
+  }
+}
+
+function translatedBlocks() {
+  return new Map(
+    (Array.isArray(readingState.translation?.blocks) ? readingState.translation.blocks : [])
+      .filter((block) => block?.id && block?.translationZh)
+      .map((block) => [block.id, block.translationZh])
+  );
+}
+
+function appendReadableText(element, text, blockId, translations, wiseEntries, usedTerms) {
+  element.dataset.blockId = blockId;
+  const source = document.createElement("span");
+  source.className = "reader-source-text";
+  decorateWordWise(source, text, wiseEntries, usedTerms);
+  element.append(source);
+  const translated = translations.get(blockId);
+  if (translated) {
+    element.classList.add("has-translation");
+    const translation = document.createElement("span");
+    translation.className = "reader-translation";
+    translation.lang = "zh-CN";
+    translation.textContent = translated;
+    element.append(translation);
+  }
+}
+
+function applyReadingPreferences() {
+  const hasTranslation = translatedBlocks().size > 0;
+  const mode = hasTranslation ? readingState.mode : "original";
+  elements.articleBody.dataset.readingMode = mode;
+  elements.articleBody.dataset.wordWise = readingState.wordWise ? "on" : "off";
+  elements.translationModes?.querySelectorAll("button").forEach((button) => {
+    const active = button.dataset.readingMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (elements.wordWiseToggle) elements.wordWiseToggle.checked = readingState.wordWise;
+}
+
+function updateTranslationToolbar() {
+  const translations = translatedBlocks();
+  const wordWise = wordWiseEntries();
+  const available = translations.size > 0 || wordWise.length > 0;
+  elements.translationToolbar.hidden = !available;
+  elements.translationModes.hidden = translations.size === 0;
+  elements.wordWiseControl.hidden = wordWise.length === 0;
+  if (readingState.translation) {
+    const complete = readingState.translation.status === "complete";
+    const translated = Number(readingState.translation.translatedBlocks || translations.size);
+    const total = Number(readingState.translation.totalBlocks || translated);
+    elements.translationProgress.textContent = complete ? `译文完成 · ${total} 段` : `翻译进行中 · ${translated}/${total} 段`;
+  } else {
+    elements.translationProgress.textContent = wordWise.length ? "Word Wise 词汇提示" : "译文准备中";
+  }
+  applyReadingPreferences();
+}
+
+function translationPath(articleId, location) {
+  if (!/^[0-9a-f]{12}$/.test(articleId) || !/^\d{4}\/\d{2}\/\d{2}$/.test(location)) {
+    throw new Error("翻译位置无效");
+  }
+  return `data/translations/zh-CN/${location}/${articleId}.json`;
+}
+
+async function loadTranslation(articleId, location) {
+  const record = await fetchRecord(translationPath(articleId, location));
+  if (!record) return null;
+  if (record.articleId !== articleId || record.targetLanguage !== "zh-CN") return null;
+  if (!Array.isArray(record.blocks)) return null;
+  return record;
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
   const proseLines = [];
   let codeLines = null;
   let codeLanguage = "";
   let rendered = false;
+  let blockNumber = 0;
+  const translations = translatedBlocks();
+  const wiseEntries = wordWiseEntries();
+  const usedTerms = new Set();
+  const nextBlockId = () => `b${String(++blockNumber).padStart(4, "0")}`;
   const appendParagraph = (lines) => {
     const text = lines.join(" ").trim();
     if (!text) return;
+    const blockId = nextBlockId();
     const tags = parseTags(text);
     if (tags.length) elements.articleBody.append(renderTags(tags));
     else {
       const paragraph = document.createElement("p");
-      paragraph.textContent = text;
+      appendReadableText(paragraph, text, blockId, translations, wiseEntries, usedTerms);
       elements.articleBody.append(paragraph);
     }
     rendered = true;
@@ -259,7 +410,7 @@ function renderBody(body) {
         flushParagraph();
         flushList();
         const element = document.createElement(`h${heading[1].length}`);
-        element.textContent = heading[2].trim();
+        appendReadableText(element, heading[2].trim(), nextBlockId(), translations, wiseEntries, usedTerms);
         elements.articleBody.append(element);
         rendered = true;
       } else if (unordered || ordered) {
@@ -270,13 +421,13 @@ function renderBody(body) {
           list = document.createElement(type);
         }
         const item = document.createElement("li");
-        item.textContent = (unordered || ordered)[1].trim();
+        appendReadableText(item, (unordered || ordered)[1].trim(), nextBlockId(), translations, wiseEntries, usedTerms);
         list.append(item);
       } else if (quote) {
         flushParagraph();
         flushList();
         const element = document.createElement("blockquote");
-        element.textContent = quote[1].trim();
+        appendReadableText(element, quote[1].trim(), nextBlockId(), translations, wiseEntries, usedTerms);
         elements.articleBody.append(element);
         rendered = true;
       } else {
@@ -324,6 +475,7 @@ function renderBody(body) {
     empty.textContent = "暂无可用的内部正文，请查看原文。";
     elements.articleBody.append(empty);
   }
+  applyReadingPreferences();
 }
 
 function fallbackSummary(item) {
@@ -368,6 +520,9 @@ function renderGlossary(item, level) {
 function renderArticle(item, snapshot, historyEntry) {
   const kind = snapshot?.contentKind || "summary";
   const body = snapshot?.body || item.summary || "";
+  readingState.item = item;
+  readingState.body = body;
+  readingState.translation = null;
   const category = item.aiReview?.category || item.category;
   elements.articleTitle.closest(".reader-article").dataset.category = category;
   document.title = `${item.title} · 模型脉动`;
@@ -419,6 +574,10 @@ function loadComments(articleId) {
 }
 
 function renderFailure(message) {
+  readingState.item = null;
+  readingState.body = "";
+  readingState.translation = null;
+  elements.translationToolbar.hidden = true;
   elements.articleTitle.textContent = "文章暂时无法读取";
   elements.readerStatus.textContent = "加载失败";
   elements.readerNotice.hidden = false;
@@ -450,20 +609,32 @@ async function loadArticle() {
   }
   try {
     const date = params.get("date") || "";
+    let location = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.replaceAll("-", "/") : "";
     let record = null;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      record = await fetchRecord(articlePath(articleId, date.replaceAll("-", "/")));
+    if (location) {
+      record = await fetchRecord(articlePath(articleId, location));
     }
     if (!record) {
       const locator = await fetchRecord(`data/article-index/${articleId.slice(0, 2)}.json`);
-      const location = locator?.[articleId];
+      location = locator?.[articleId] || "";
       if (location) record = await fetchRecord(articlePath(articleId, location));
     }
     if (!record || record.id !== articleId) throw new Error("未找到该文章");
+    if (!location) throw new Error("未找到该文章日期目录");
     const historyEntry = window.LLMReadingHistory.record(record, {
       href: `article.html${window.location.search}`
     });
     renderArticle(record, record, historyEntry);
+    readingState.location = location;
+    try {
+      readingState.translation = await loadTranslation(articleId, location);
+    } catch (translationError) {
+      if (!String(translationError?.message || "").includes("HTTP 404")) {
+        console.warn("Unable to load article translation", translationError);
+      }
+    }
+    renderBody(readingState.body);
+    updateTranslationToolbar();
     loadComments(articleId);
   } catch (error) {
     console.error("Unable to load article", error);
@@ -478,6 +649,18 @@ async function loadArticle() {
     const dark = document.documentElement.dataset.theme !== "dark";
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     localStorage.setItem("llm-pulse-theme", dark ? "dark" : "light");
+  });
+  elements.translationModes?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-reading-mode]");
+    if (!button || !translatedBlocks().size) return;
+    readingState.mode = button.dataset.readingMode;
+    localStorage.setItem("llm-pulse-reading-mode", readingState.mode);
+    applyReadingPreferences();
+  });
+  elements.wordWiseToggle?.addEventListener("change", (event) => {
+    readingState.wordWise = event.target.checked;
+    localStorage.setItem("llm-pulse-word-wise", readingState.wordWise ? "on" : "off");
+    elements.articleBody.dataset.wordWise = readingState.wordWise ? "on" : "off";
   });
   loadArticle();
 })();
