@@ -187,6 +187,40 @@ class ArticleTextTests(unittest.TestCase):
         self.assertNotIn("window.secret", body)
         self.assertNotIn("Footer text", body)
 
+    def test_page_extraction_handles_qbitai_article_container_and_sidebars(self):
+        article_text = " ".join(["A useful article detail"] * 35)
+        page = (
+            '<div class="content"><div class="article">'
+            '<h1>Article title</h1>'
+            '<div class="article_info">Author and publication metadata</div>'
+            '<div class="zhaiyao"><p>Short abstract</p></div>'
+            f'<p>{article_text}</p>'
+            '<div class="person_box"><li>Author\'s other article</li></div>'
+            '<div class="share_pc">Share this article</div>'
+            '<div class="line_font">Copyright notice</div>'
+            '</div><div class="content_right">'
+            '<div class="xiangguan"><h3>相关阅读</h3><div class="item"><h4>Related article</h4></div></div>'
+            '<div class="yaowen"><h3>热门文章</h3><div class="item"><h4>Popular article</h4></div></div>'
+            '</div></div>'
+        )
+
+        body = article_store.text_from_html(page, prefer_main=True)
+
+        self.assertIn("useful article detail", body)
+        self.assertNotIn("publication metadata", body)
+        self.assertNotIn("Author's other article", body)
+        self.assertNotIn("Related article", body)
+        self.assertNotIn("Popular article", body)
+        self.assertNotIn("Copyright notice", body)
+
+    def test_page_extraction_removes_malformed_image_placeholder(self):
+        page = '<div class="article"><p>Useful article content that is long enough to keep.</p>< img id="logo" src="logo.png"></div>'
+
+        body = article_store.text_from_html(page, prefer_main=True)
+
+        self.assertNotIn("< img", body)
+        self.assertIn("Useful article content", body)
+
     def test_reader_markdown_removes_metadata_and_links(self):
         body = article_store.text_from_reader(
             "Title: Example\n\nURL Source: https://example.com\n\nMarkdown Content:\n\n"

@@ -24,7 +24,7 @@ USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
 MAX_DOWNLOAD_BYTES = 2_500_000
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
-BODY_FORMAT_VERSION = 2
+BODY_FORMAT_VERSION = 3
 READER_PREFIX = "https://r.jina.ai/"
 READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
 READER_LOCK = threading.Lock()
@@ -37,6 +37,14 @@ BLOCK_TAGS = {
 SKIP_TAGS = {
     "aside", "button", "canvas", "dialog", "footer", "form", "header", "iframe",
     "nav", "noscript", "script", "style", "svg", "template",
+}
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+}
+SKIP_CLASS_NAMES = {
+    "article_info", "author", "line_font", "person_box", "share_pc", "tags",
+    "xiangguan", "yaowen", "related", "recommend", "recommendation",
 }
 NOISE_PATTERNS = (
     "accept cookies", "all rights reserved", "cookie policy", "enable javascript",
@@ -120,7 +128,9 @@ def redact_snapshot(value):
 class ReadableTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.skip_depth = 0
+        self.skip_stack: list[tuple[str, int]] = []
+        self.main_stack: list[tuple[str, int]] = []
+        self.html_depth = 0
         self.main_depth = 0
         self.all_buffer: list[str] = []
         self.main_buffer: list[str] = []
@@ -131,10 +141,18 @@ class ReadableTextParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
-        if tag in SKIP_TAGS:
-            self.skip_depth += 1
+        attributes = {key.lower(): value or "" for key, value in attrs}
+        classes = set(attributes.get("class", "").split())
+        is_void = tag in VOID_TAGS
+        if not is_void:
+            self.html_depth += 1
+        if not is_void and classes & SKIP_CLASS_NAMES:
+            self.skip_stack.append((tag, self.html_depth))
             return
-        if self.skip_depth:
+        if self.skip_stack:
+            return
+        if tag in SKIP_TAGS:
+            self.skip_stack.append((tag, self.html_depth))
             return
         if tag == "pre":
             self._flush()
@@ -145,8 +163,9 @@ class ReadableTextParser(HTMLParser):
             if tag == "br":
                 self.pre_buffer.append("\n")
             return
-        if tag in {"article", "main"}:
+        if tag in {"article", "main"} or "article" in classes:
             self._flush()
+            self.main_stack.append((tag, self.html_depth))
             self.main_depth += 1
         elif tag in BLOCK_TAGS:
             self._flush()
@@ -166,10 +185,13 @@ class ReadableTextParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
-        if tag in SKIP_TAGS:
-            self.skip_depth = max(0, self.skip_depth - 1)
-            return
-        if self.skip_depth:
+        is_void = tag in VOID_TAGS
+        current_depth = self.html_depth
+        if self.skip_stack:
+            if not is_void and self.skip_stack[-1] == (tag, current_depth):
+                self.skip_stack.pop()
+            if not is_void:
+                self.html_depth = max(0, self.html_depth - 1)
             return
         if tag == "pre" and self.pre_depth:
             self._append_code(self.pre_buffer, self.all_blocks)
@@ -177,18 +199,25 @@ class ReadableTextParser(HTMLParser):
                 self._append_code(self.pre_buffer, self.main_blocks)
             self.pre_depth = max(0, self.pre_depth - 1)
             self.pre_buffer = []
+            if not is_void:
+                self.html_depth = max(0, self.html_depth - 1)
             return
         if self.pre_depth:
             if tag in {"div", "li", "p"}:
                 self.pre_buffer.append("\n")
+            if not is_void:
+                self.html_depth = max(0, self.html_depth - 1)
             return
         if tag in BLOCK_TAGS:
             self._flush()
-        if tag in {"article", "main"}:
+        if self.main_stack and self.main_stack[-1] == (tag, current_depth):
+            self.main_stack.pop()
             self.main_depth = max(0, self.main_depth - 1)
+        if not is_void:
+            self.html_depth = max(0, self.html_depth - 1)
 
     def handle_data(self, data: str) -> None:
-        if self.skip_depth:
+        if self.skip_stack:
             return
         if self.pre_depth:
             self.pre_buffer.append(data)
@@ -213,7 +242,8 @@ class ReadableTextParser(HTMLParser):
 
     @staticmethod
     def _append_block(buffer: list[str], target: list[str]) -> None:
-        text = re.sub(r"\s+", " ", html.unescape(" ".join(buffer))).strip()
+        joined = re.sub(r"<\s+/?\s*[A-Za-z][^>]*>", " ", " ".join(buffer))
+        text = re.sub(r"\s+", " ", html.unescape(joined)).strip()
         if text:
             target.append(text)
 
