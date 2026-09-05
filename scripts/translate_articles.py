@@ -337,7 +337,7 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
     )
     with urllib.request.urlopen(request, timeout=180) as response:
         response_payload = json.loads(response.read().decode("utf-8"))
-        headers = dict(response.headers.items())
+        headers = normalize_headers(response.headers)
     content = response_payload["choices"][0]["message"]["content"]
     return extract_json_object(content), str(response_payload.get("model") or model), headers
 
@@ -483,11 +483,15 @@ def error_message(error: Exception) -> str:
     return message[:500]
 
 
+def normalize_headers(headers: object) -> dict[str, str]:
+    return {str(key).lower(): str(value) for key, value in dict(headers or {}).items()}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "2")))
-    parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "45")))
-    parser.add_argument("--interval", type=float, default=float(os.getenv("ARTICLE_TRANSLATION_INTERVAL", "60")))
+    parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "1")))
+    parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "50")))
+    parser.add_argument("--interval", type=float, default=float(os.getenv("ARTICLE_TRANSLATION_INTERVAL", "30")))
     parser.add_argument("--chunk-chars", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_CHARS", "6000")))
     parser.add_argument("--chunk-blocks", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_BLOCKS", "20")))
     args = parser.parse_args()
@@ -558,8 +562,13 @@ def main() -> int:
                 completed_articles += 1
             state["lastStatus"] = "success"
             state["lastModel"] = actual_model
-            if headers.get("x-ratelimit-remaining"):
-                state["reportedRemaining"] = headers["x-ratelimit-remaining"]
+            for header, field in (
+                ("x-ratelimit-limit", "reportedLimit"),
+                ("x-ratelimit-remaining", "reportedRemaining"),
+                ("x-ratelimit-reset", "reportedReset"),
+            ):
+                if headers.get(header):
+                    state[field] = headers[header]
             state.pop("lastError", None)
             state.pop("nextAttemptAt", None)
             print(
