@@ -688,6 +688,7 @@ def write_snapshot(
     resolved_url: str | None = None,
     error: str | None = None,
     images: list[dict[str, str]] | None = None,
+    media_checked_at: str | None = None,
 ) -> Path:
     path = snapshot_path(item)
     try:
@@ -713,6 +714,10 @@ def write_snapshot(
         payload["images"] = images
     elif existing.get("images"):
         payload["images"] = existing["images"]
+    if media_checked_at:
+        payload["mediaCheckedAt"] = media_checked_at
+    elif existing.get("mediaCheckedAt"):
+        payload["mediaCheckedAt"] = existing["mediaCheckedAt"]
     for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
         if field in existing and field not in payload:
             payload[field] = existing[field]
