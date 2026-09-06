@@ -78,6 +78,23 @@ def media_backfill_item(item: dict, recheck: bool = False) -> str:
         )
         return f"{len(images)} images"
     except Exception as error:
+        if recheck:
+            existing_images = snapshot.get("images") or []
+            migrated_images = [
+                {**image, "src": image.get("originalUrl", image.get("src", ""))}
+                for image in existing_images
+                if isinstance(image, dict) and image.get("originalUrl")
+            ]
+            if migrated_images:
+                write_snapshot(
+                    item,
+                    snapshot.get("body", ""),
+                    snapshot["contentKind"],
+                    resolved_url=target_url,
+                    images=migrated_images,
+                    media_rechecked_at=utc_now(),
+                )
+                return f"{len(migrated_images)} migrated after {type(error).__name__}"
         return f"error:{type(error).__name__}"
 
 
