@@ -238,6 +238,26 @@ class ArticleTextTests(unittest.TestCase):
         )
 
         self.assertEqual(refs, [{"url": "https://example.com/images/chart.webp", "alt": "A chart"}])
+    def test_extracts_social_and_lazy_loaded_article_images(self):
+        refs = article_store.extract_image_refs(
+            '<meta property="og:image" content="/hero.jpg">'
+            '<img data-lazy-src="/chart" alt="Chart">',
+            "https://example.com/article",
+        )
+        self.assertEqual(
+            refs,
+            [
+                {"url": "https://example.com/hero.jpg", "alt": ""},
+                {"url": "https://example.com/chart", "alt": "Chart"},
+            ],
+        )
+
+    def test_detects_images_with_generic_content_type(self):
+        self.assertEqual(
+            article_store.detect_image_suffix(b"\x89PNG\r\n\x1a\n", "application/octet-stream"),
+            ".png",
+        )
+        self.assertEqual(article_store.detect_image_suffix(b"not an image", "text/plain"), None)
 
     def test_reader_markdown_removes_metadata_and_links(self):
         body = article_store.text_from_reader(
