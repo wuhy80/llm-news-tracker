@@ -385,7 +385,13 @@ def find_feed_image_refs(node: ET.Element, base_url: str) -> list[dict[str, str]
             url = urllib.parse.urljoin(base_url, value)
             if not value or urllib.parse.urlparse(url).scheme not in {"http", "https"}:
                 continue
-            if local == "enclosure" and not child.attrib.get("type", "").startswith("image/"):
+            content_type = child.attrib.get("type", "").casefold()
+            image_extension = re.search(r"\.(?:avif|gif|jpe?g|png|webp)(?:[?#].*)?$", urllib.parse.urlparse(url).path, re.IGNORECASE)
+            if content_type and not content_type.startswith("image/"):
+                continue
+            if local == "enclosure" and not content_type.startswith("image/"):
+                continue
+            if local in {"content", "image"} and not content_type.startswith("image/") and not image_extension:
                 continue
             refs.append({"url": url, "alt": ""})
     unique = []
