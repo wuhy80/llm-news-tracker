@@ -18,7 +18,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-from article_store import resolve_google_news_urls, snapshot_kind, store_feed_snapshot
+from article_store import extract_image_refs, resolve_google_news_urls, snapshot_kind, store_feed_snapshot
 from news_store import load_news, save_news
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -370,6 +370,33 @@ def find_rich_text(node: ET.Element) -> str:
             candidates.append(child.text.strip())
     return max(candidates, key=len, default="")
 
+def find_feed_image_refs(node: ET.Element, base_url: str) -> list[dict[str, str]]:
+    """Keep image URLs carried by RSS/Atom media extensions before XML is flattened."""
+    refs = extract_image_refs(find_rich_text(node), base_url)
+    for child in node.iter():
+        local = child.tag.rsplit("}", 1)[-1].casefold()
+        if local not in {"enclosure", "content", "thumbnail", "image"}:
+            continue
+        candidates = [child.attrib.get(key, "") for key in ("url", "href", "src")]
+        if child.text and child.text.strip():
+            candidates.append(child.text.strip())
+        for value in candidates:
+            value = html.unescape(value).strip()
+            url = urllib.parse.urljoin(base_url, value)
+            if not value or urllib.parse.urlparse(url).scheme not in {"http", "https"}:
+                continue
+            if local == "enclosure" and not child.attrib.get("type", "").startswith("image/"):
+                continue
+            refs.append({"url": url, "alt": ""})
+    unique = []
+    seen = set()
+    for ref in refs:
+        if ref["url"] in seen:
+            continue
+        seen.add(ref["url"])
+        unique.append(ref)
+    return unique[:12]
+
 
 def find_link(node: ET.Element) -> str:
     for child in node.iter():
@@ -425,6 +452,7 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
             continue
         reader_html = find_rich_text(node)
         summary = strip_html(reader_html)
+        image_refs = find_feed_image_refs(node, url)
         published = parse_date(find_text(node, ("pubdate", "published", "updated", "date")))
         source_name = source["name"]
         source_domain = source["domain"]
@@ -446,6 +474,7 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
             "official": source.get("official", False),
             "hint": source.get("hint"),
             "readerHtml": reader_html,
+            "imageRefs": image_refs,
         })
     return items
 
@@ -773,7 +802,7 @@ def main() -> int:
             item["id"] = previous["id"]
         preserve_archive_metadata(item, previous)
         merged[item["id"]] = item
-        if store_feed_snapshot(item, raw.get("readerHtml", "")):
+        if store_feed_snapshot(item, raw.get("readerHtml", ""), raw.get("imageRefs")):
             feed_snapshots += 1
 
     items = list(merged.values())

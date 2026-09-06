@@ -359,7 +359,7 @@ function renderBody(body) {
   const images = Array.isArray(readingState.item?.images) ? readingState.item.images : [];
   images.forEach((image) => {
     const source = String(image?.src || "");
-    if (!source.startsWith("data/article-media/")) return;
+    if (!source.startsWith("data/article-media/") && !/^https?:\/\//i.test(source)) return;
     const figure = document.createElement("figure");
     figure.className = "reader-figure";
     const element = document.createElement("img");

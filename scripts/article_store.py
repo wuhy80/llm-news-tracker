@@ -26,6 +26,7 @@ USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
 MAX_DOWNLOAD_BYTES = 2_500_000
 MAX_IMAGE_BYTES = 5_000_000
 MAX_IMAGES_PER_ARTICLE = 12
+MEDIA_STORAGE_MODE = os.getenv("ARTICLE_MEDIA_STORAGE", "remote").casefold()
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
 BODY_FORMAT_VERSION = 3
@@ -273,6 +274,11 @@ class ImageReferenceParser(HTMLParser):
             if key not in {"og:image", "og:image:url", "twitter:image", "twitter:image:src", "image"}:
                 return
             source = attributes.get("content", "")
+        elif tag == "link":
+            rel = {part.casefold() for part in attributes.get("rel", "").split()}
+            if not rel & {"image_src", "preload"} or ("preload" in rel and attributes.get("as") != "image"):
+                return
+            source = attributes.get("href", "")
         elif tag in {"img", "source"}:
             source = (
                 attributes.get("src")
@@ -318,6 +324,16 @@ def extract_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
             continue
         seen.add(reference["url"])
         refs.append(reference)
+    for match in re.finditer(
+        r'"(?:image|thumbnailUrl|contentUrl)"\s*:\s*"(https?[^"\\]+)"',
+        value or "",
+        re.IGNORECASE,
+    ):
+        url = html.unescape(match.group(1))
+        if url in seen:
+            continue
+        seen.add(url)
+        refs.append({"url": url, "alt": ""})
     return refs[:MAX_IMAGES_PER_ARTICLE]
 
 
@@ -346,6 +362,13 @@ def download_images(item: dict, references: list[dict[str, str]] | None) -> list
         seen.add(url)
         try:
             validate_public_url(url)
+            if MEDIA_STORAGE_MODE != "download":
+                result.append({
+                    "src": url,
+                    "alt": str(reference.get("alt", ""))[:240],
+                    "originalUrl": url,
+                })
+                continue
             digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
             suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
             if suffix not in {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}:
