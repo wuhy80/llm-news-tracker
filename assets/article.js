@@ -367,6 +367,7 @@ function renderBody(body) {
     element.alt = String(image?.alt || "文章配图");
     element.loading = "lazy";
     element.decoding = "async";
+    element.addEventListener("error", () => figure.remove(), { once: true });
     figure.append(element);
     if (image?.alt) {
       const caption = document.createElement("figcaption");
