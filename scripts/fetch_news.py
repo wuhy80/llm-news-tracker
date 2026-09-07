@@ -461,7 +461,7 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         source_name = source["name"]
         source_domain = source["domain"]
         embedded_source = find_text(node, ("source",))
-        if (source["domain"] == "news.google.com" or source.get("extract_embedded_source")) and embedded_source:
+        if source.get("extract_embedded_source") and embedded_source:
             source_name = embedded_source
             if " - " + embedded_source in title:
                 title = title.rsplit(" - " + embedded_source, 1)[0].strip()
@@ -593,7 +593,7 @@ def enrich_sitemap_entries(entries: list[dict], source: dict) -> list[dict]:
 
 def fetch_source(source: dict) -> list[dict]:
     errors = []
-    for url in (source["url"], *source.get("fallback_urls", [])):
+    for url in (source["url"],):
         try:
             payload = fetch(url, source.get("headers"))
             if source.get("format") == "html-cards":
