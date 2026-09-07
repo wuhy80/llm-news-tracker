@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTICLES_DIR = ROOT / "data" / "articles"
 MEDIA_DIR = ROOT / "data" / "article-media"
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
+IMAGE_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
 MAX_DOWNLOAD_BYTES = 2_500_000
 MAX_IMAGE_BYTES = 5_000_000
 MAX_IMAGES_PER_ARTICLE = 12
@@ -349,6 +350,28 @@ def extract_markdown_image_refs(value: str, base_url: str = "") -> list[dict[str
     return refs[:MAX_IMAGES_PER_ARTICLE]
 
 
+def is_site_chrome_image(url: str) -> bool:
+    """Exclude publisher branding and QR codes from article media."""
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").casefold()
+    if hostname != "qbitai.com" and not hostname.endswith(".qbitai.com"):
+        return False
+    name = Path(parsed.path).name.casefold()
+    return any(token in name for token in ("logo", "qrcode", "qr-code", "wechat", "weixin"))
+
+
+def is_browser_incompatible_image(url: str) -> bool:
+    """Identify CDN responses that Chromium may block despite a successful CLI fetch."""
+    hostname = (urllib.parse.urlparse(url).hostname or "").casefold()
+    return hostname == "i.qbitai.com"
+
+
+def should_download_image(url: str) -> bool:
+    if MEDIA_STORAGE_MODE == "download":
+        return True
+    return is_browser_incompatible_image(url)
+
+
 def download_images(item: dict, references: list[dict[str, str]] | None) -> list[dict[str, str]]:
     if not references:
         return []
@@ -360,9 +383,11 @@ def download_images(item: dict, references: list[dict[str, str]] | None) -> list
         if not url or url in seen:
             continue
         seen.add(url)
+        if is_site_chrome_image(url):
+            continue
         try:
             validate_public_url(url)
-            if MEDIA_STORAGE_MODE != "download":
+            if not should_download_image(url):
                 result.append({
                     "src": url,
                     "alt": str(reference.get("alt", ""))[:240],
@@ -375,7 +400,11 @@ def download_images(item: dict, references: list[dict[str, str]] | None) -> list
                 suffix = ".img"
             target = destination / f"{digest}{suffix}"
             if not target.exists():
-                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/*"})
+                headers = {"User-Agent": USER_AGENT, "Accept": "image/avif,image/webp,image/*"}
+                if is_browser_incompatible_image(url):
+                    headers["User-Agent"] = IMAGE_BROWSER_USER_AGENT
+                    headers["Referer"] = str(item.get("url") or "")
+                request = urllib.request.Request(url, headers=headers)
                 with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=20) as response:
                     content_type = response.headers.get_content_type()
                     payload = response.read(MAX_IMAGE_BYTES + 1)
