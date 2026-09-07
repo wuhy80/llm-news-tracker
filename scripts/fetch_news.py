@@ -35,13 +35,11 @@ def search_source(
     hint: str,
     official: bool = False,
 ) -> dict:
-    """Build a search-backed source for topics without a direct publisher feed."""
-    google_query = urllib.parse.quote_plus(f"{query} when:30d")
+    """Build a Bing-backed source for topics without a direct publisher feed."""
     bing_query = urllib.parse.quote_plus(query)
     return {
         "name": name,
         "url": f"https://www.bing.com/news/search?q={bing_query}&format=rss",
-        "fallback_urls": [f"https://news.google.com/rss/search?q={google_query}&hl=en-US&gl=US&ceid=US%3Aen"],
         "domain": domain,
         "official": official,
         "hint": hint,
@@ -139,7 +137,7 @@ SOURCES = [
     search_source(
         "LMArena",
         '"LMArena" benchmark OR "Chatbot Arena" benchmark',
-        "news.google.com",
+        "bing.com",
         "benchmark",
         False,
     ),
@@ -206,28 +204,28 @@ SOURCES = [
     {
         "name": "全球大模型动态",
         "url": "https://www.bing.com/news/search?q=%22large+language+model%22+OR+LLM&format=rss",
-        "fallback_urls": ["https://news.google.com/rss/search?q=%22large+language+model%22+OR+LLM+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen"],
-        "domain": "news.google.com", "official": False,
+        "domain": "bing.com", "official": False,
+        "extract_embedded_source": True,
     },
     {
         "name": "Agent 技术动态",
         "url": "https://www.bing.com/news/search?q=%22AI+agent%22+OR+%22agentic+AI%22&format=rss",
-        "fallback_urls": ["https://news.google.com/rss/search?q=%22AI+agent%22+OR+%22agentic+AI%22+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen"],
-        "domain": "news.google.com", "official": False,
+        "domain": "bing.com", "official": False,
+        "extract_embedded_source": True,
         "hint": "agent",
     },
     {
         "name": "模型发布与评测",
         "url": "https://www.bing.com/news/search?q=%22AI+model%22+release+OR+benchmark&format=rss",
-        "fallback_urls": ["https://news.google.com/rss/search?q=%22AI+model%22+release+OR+benchmark+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen"],
-        "domain": "news.google.com", "official": False,
+        "domain": "bing.com", "official": False,
+        "extract_embedded_source": True,
         "hint": "release",
     },
     {
         "name": "中文大模型动态",
         "url": "https://www.bing.com/news/search?q=%E5%A4%A7%E6%A8%A1%E5%9E%8B+OR+AI%E6%99%BA%E8%83%BD%E4%BD%93&format=rss",
-        "fallback_urls": ["https://news.google.com/rss/search?q=%E5%A4%A7%E6%A8%A1%E5%9E%8B+OR+AI%E6%99%BA%E8%83%BD%E4%BD%93+when%3A7d&hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans"],
-        "domain": "news.google.com", "official": False,
+        "domain": "bing.com", "official": False,
+        "extract_embedded_source": True,
     },
 ]
 
@@ -790,7 +788,7 @@ def main() -> int:
             raw["url"] = resolved_url
             raw["sourceDomain"] = urllib.parse.urlparse(resolved_url).hostname or raw["sourceDomain"]
             resolved_count += 1
-    print(f"[links] resolved {resolved_count} Google News links")
+    print(f"[links] resolved {resolved_count} aggregator links")
     seen_titles: set[str] = set()
     seen_urls: set[str] = set()
     feed_snapshots = 0
