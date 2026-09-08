@@ -22,6 +22,7 @@ TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
 STATE_FILE = ROOT / "data" / "translations" / "state.json"
 INDEX_FILE = ROOT / "data" / "translations" / "index.json"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_TRANSLATION_MODEL = "z-ai/glm-5.2:free"
 TRANSLATION_VERSION = "openrouter-zh-v2"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
 
@@ -370,11 +371,16 @@ def global_pause_until(error: urllib.error.HTTPError, now: datetime) -> datetime
 
 
 def article_backoff(failure_count: int, now: datetime) -> datetime:
-    hours = (1, 4, 12, 24, 72)[min(max(0, failure_count - 1), 4)]
-    return now + timedelta(hours=hours)
+    """Briefly defer bad model output without starving the request budget."""
+    minutes = (10, 30, 120, 720, 1440)[min(max(0, failure_count - 1), 4)]
+    return now + timedelta(minutes=minutes)
 
 
-def select_candidates(items: list[dict], now: datetime) -> list[tuple[dict, dict, list[dict[str, str]], Path, dict]]:
+def select_candidates(
+    items: list[dict],
+    now: datetime,
+    requested_model: str = "",
+) -> list[tuple[dict, dict, list[dict[str, str]], Path, dict]]:
     candidates = []
     for item in items:
         level = item.get("aiReview", {}).get("importanceLevel")
@@ -396,7 +402,8 @@ def select_candidates(items: list[dict], now: datetime) -> list[tuple[dict, dict
         if record.get("status") == "complete":
             continue
         retry_at = parse_time(record.get("nextAttemptAt"))
-        if retry_at and retry_at > now:
+        model_changed = bool(requested_model) and record.get("requestedModel") != requested_model
+        if retry_at and retry_at > now and not model_changed:
             continue
         candidates.append((item, snapshot, blocks, path, record))
     candidates.sort(key=lambda entry: entry[0].get("publishedAt", ""), reverse=True)
@@ -451,6 +458,30 @@ def build_translation_index() -> dict:
     return {"schemaVersion": 1, "generatedAt": utc_now(), "articles": articles}
 
 
+def remove_stale_records() -> int:
+    """Remove translations whose archived source body changed after translation."""
+    removed = 0
+    if not TRANSLATIONS_DIR.exists():
+        return removed
+    for path in TRANSLATIONS_DIR.rglob("*.json"):
+        try:
+            relative = path.relative_to(TRANSLATIONS_DIR)
+            source_path = ROOT / "data" / "articles" / relative
+            record = read_json(path)
+            source = read_json(source_path)
+            stale = (
+                not record
+                or not source
+                or record.get("sourceBodyHash") != body_hash(str(source.get("body", "")))
+            )
+            if stale:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def apply_chunk(record: dict, translated: list[dict[str, str]], word_wise: list[dict[str, str]], model: str) -> None:
     by_id = {
         str(block.get("id")): block
@@ -496,11 +527,16 @@ def main() -> int:
     parser.add_argument("--chunk-blocks", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_BLOCKS", "20")))
     args = parser.parse_args()
 
+    stale_records = remove_stale_records()
+    if stale_records:
+        print(f"[translate] removed {stale_records} stale translation records")
+        atomic_write_json(INDEX_FILE, build_translation_index())
+
     token = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not token:
         print("[translate] disabled: OPENROUTER_API_KEY is not available")
         return 0
-    model = os.getenv("ARTICLE_TRANSLATION_MODEL", "openrouter/free").strip() or "openrouter/free"
+    model = os.getenv("ARTICLE_TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL).strip() or DEFAULT_TRANSLATION_MODEL
     endpoint = os.getenv("ARTICLE_TRANSLATION_ENDPOINT", OPENROUTER_ENDPOINT).strip() or OPENROUTER_ENDPOINT
     state = load_state()
     now = datetime.now(timezone.utc)
@@ -521,7 +557,7 @@ def main() -> int:
     completed_articles = 0
     while requests_made < request_limit:
         now = datetime.now(timezone.utc)
-        candidates = select_candidates(data.get("items", []), now)
+        candidates = select_candidates(data.get("items", []), now, model)
         if not candidates:
             break
         item, _, blocks, path, record = candidates[0]

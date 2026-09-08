@@ -127,6 +127,37 @@ class TranslateArticlesTests(unittest.TestCase):
 
         self.assertEqual([entry[0]["id"] for entry in selected], ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])
 
+    def test_model_change_retries_a_candidate_without_waiting_for_old_backoff(self):
+        english = "A capable multilingual model should translate this technical article. " * 10
+        item = {
+            "id": "aaaaaaaaaaaa",
+            "publishedAt": "2026-09-02T00:00:00Z",
+            "aiReview": {"importanceLevel": 5},
+        }
+        snapshot = {"contentKind": "page", "body": english}
+        record = translate_articles.new_record(item, snapshot, translate_articles.article_blocks(english))
+        record.update({
+            "requestedModel": "openrouter/free",
+            "nextAttemptAt": "2026-09-09T00:00:00Z",
+        })
+
+        with mock.patch.object(translate_articles, "snapshot_path", return_value=Path("article.json")), \
+             mock.patch.object(translate_articles, "read_json", return_value=snapshot), \
+             mock.patch.object(translate_articles, "load_record", return_value=(Path("translation.json"), record)):
+            selected = translate_articles.select_candidates(
+                [item], datetime(2026, 9, 8, tzinfo=timezone.utc), "z-ai/glm-5.2:free"
+            )
+
+        self.assertEqual([entry[0]["id"] for entry in selected], ["aaaaaaaaaaaa"])
+
+    def test_translation_output_backoff_retries_after_ten_minutes(self):
+        now = datetime(2026, 9, 8, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            translate_articles.article_backoff(1, now),
+            datetime(2026, 9, 8, 0, 10, tzinfo=timezone.utc),
+        )
+
     def test_apply_chunk_marks_complete_and_merges_word_wise(self):
         record = {
             "status": "partial",
@@ -174,6 +205,24 @@ class TranslateArticlesTests(unittest.TestCase):
 
         self.assertEqual(index["articles"]["0123456789ab"]["location"], "2026/09/05")
         self.assertEqual(index["articles"]["0123456789ab"]["translatedBlocks"], 2)
+
+    def test_remove_stale_records_discards_changed_source_translation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            translations = root / "translations" / "2026" / "09" / "05"
+            articles = root / "data" / "articles" / "2026" / "09" / "05"
+            translations.mkdir(parents=True)
+            articles.mkdir(parents=True)
+            translation_path = translations / "0123456789ab.json"
+            translation_path.write_text(json.dumps({"sourceBodyHash": translate_articles.body_hash("old")}), encoding="utf-8")
+            (articles / translation_path.name).write_text(json.dumps({"body": "new"}), encoding="utf-8")
+
+            with mock.patch.object(translate_articles, "ROOT", root), \
+                 mock.patch.object(translate_articles, "TRANSLATIONS_DIR", root / "translations"):
+                removed = translate_articles.remove_stale_records()
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(translation_path.exists())
 
     def test_response_headers_are_normalized_for_rate_limit_tracking(self):
         headers = translate_articles.normalize_headers({"X-RateLimit-Remaining": 49, "X-RateLimit-Limit": 50})
