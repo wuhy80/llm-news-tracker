@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 3,
+  "id": "1fa12c40109d",
+  "title": "How many agents can 2×4090 actually run at once? Three weeks of llama.cpp concurrency data — soft cap 5 @ 64k, hard cap 9, and why.",
+  "summary": "I'm the CTO of a mid-size nonprofit, and I run a local Qwen stack as a coding subagent for that work — partly on principle (a fair amount of what I handle shouldn't leave the building), partly because the token bill for bulk code work adds up fast on a nonprofit budget. Over three weeks I benchmarked four models and three quants to answer one question: how many agents can actually run at once, at what context, before",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wb35xo/how_many_agents_can_24090_actually_run_at_once/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-08T22:21:43Z",
+  "category": "agent",
+  "tags": [
+    "Llama",
+    "Qwen",
+    "Agent",
+    "Benchmark"
+  ],
+  "score": 84,
+  "signal": "high",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wb35xo/how_many_agents_can_24090_actually_run_at_once/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wb35xo/how_many_agents_can_24090_actually_run_at_once/",
+  "fetchedAt": "2026-09-09T04:52:57.738795Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "I'm the CTO of a mid-size nonprofit, and I run a local Qwen stack as a coding subagent for that work — partly on principle (a fair amount of what I handle shouldn't leave the building), partly because the token bill for bulk code work adds up fast on a nonprofit budget. Over three weeks I benchmarked four models and three quants to answer one question: how many agents can actually run at once, at what context, before it stops being useful?\n\nI'm writing this out in full because I keep half-answering it in comments. Every time concurrency, quant choice or expert offload comes up I end up typing a fragment of this from memory, and the reply is always some version of why — why that quant, why that slot count, why not just add more agents. Fragments in comment threads aren't a good way to answer that, so here's the whole thing in one place, with the numbers and the mistakes that produced the wrong numbers first.\n\nShort version: I started trying to make a 122B MoE fast, gave up on it, and ended up on a 27B — not because the 27B was more accurate (it wasn't measurably), but because everything else about it was better. Then I found that adding agents past a point buys nothing at all.\n\nHardware: 2× RTX 4090 (44.6 GiB usable), Threadripper TRX50, 128 GB DDR5 — importantly, only 2 of 4 memory channels populated (2×64 GB), which turns out to matter a lot. llama.cpp, Windows, q8_0 KV throughout.\n\n## 1. Why I didn't keep the 122B\n\n(Chart 1 of 4 in the gallery above: models tested)\n\nQwen3.5-122B-A10B at UD-IQ4_XS runs — 18.75 tok/s decode with expert offload — but the number that killed it is 11.91 seconds per agent tool-call , against 3.40 s for the 27B. For an agent that makes dozens of calls per task, 3.5× per call is the whole ballgame.\n\nQwen3.6-35B-A3B looks like the winner on raw decode (78 tok/s — it's a 3B-active MoE) and it has the fastest per-call time. It also failed 1 of 5 executed code tasks on a sliding-window bug, against 5/5 for the 27B. That's the entire reason \"decode tok/s\" is the wrong headline metric and I lead with seconds-per-call instead.\n\nI also tried Qwen3.8-Flash-Next (125B MoE, the Qwen4 architecture preview) as soon as it landed. It needed a build from an unmerged PR, and after a full tuning sweep — expert placement, thread counts, --poll , --cpu-strict , load modes, llama.cpp's own memory fitter — it topped out at 23.7 tok/s .\n\nThe ceiling wasn't the GPUs. Of 103.7 GiB of weights, 71.7 GiB is routed experts and 26.8 GiB is a 20-million-row n-gram embedding table, so most of it lives in system RAM and streams over the memory bus every token. At --n-cpu-moe 40 I measured 14.1 GB/s effective against an 83.2 GB/s peak — because two of four channels are empty. A single-3090 box with DDR4 posts better absolute expert bandwidth than mine does. Filling the other two channels is worth more than any flag I tried, and I can't justify buying RAM at current prices. So: shelved, honestly, with the number published.\n\n## 2. Accuracy: I could not separate the quants\n\nBefore the concurrency numbers, the caveat that makes them meaningful.\n\nMy probe plants three facts at 15%, 50% and 85% depth in a long document, with six decoy lines quoting the same fields for the wrong district , so the model has to match on an identifier across tens of thousands of tokens rather than pattern-match a label. Each agent gets its own document with its own secrets in a disjoint numeric band, so cross-slot leakage is detectable.\n\nlargest prompt answered perfectly\n\nQ4_K_M, Q6_K_XL and Q8_K_XL all scored 1.00, everywhere, including with nine agents running.\n\nThis is a tie at ceiling, which means \"cannot discriminate\", not \"equal\". The honest claim is: no measurable accuracy difference between these three quants up to 251k tokens on long-range retrieval with distractors. It is not \"Q4 is lossless\". Retrieval saturates; something requiring synthesis across the planted facts might separate them where this didn't.\n\nSo the quant choice came down to throughput, latency and VRAM — not quality.\n\n## 3. The concurrency result\n\n(Chart 2 of 4 in the gallery above: concurrency scaling)\n\nSame model, same 64k context per agent, three quants at the most slots each could fit:\n\nquant agents @64k completions/min median wait aggregate prefill\n\nTripling the agents changed total throughput by 6% and tripled the wait.\n\nThe mechanism is the last column: aggregate prefill throughput is constant at roughly 1,500 tokens/second regardless of slot count. The box has one prefill budget. Slots divide it; they do not multiply it.\n\nThat's specific to this workload shape and worth stating plainly: agent prompts are enormous and replies are short, so prefill dominates. A decode-heavy workload would batch far better — decode is bandwidth-bound and batching amortises the weight reads across slots. Don't generalise this to \"concurrency doesn't help llama.cpp.\"\n\n### Soft cap and hard cap\n\n- Soft cap — 5 agents at 64k. Past this, added slots stop buying throughput and start buying latency. It's not a failure, it's a bad trade: at 9 agents you wait 330 s for the same 1.5 completions/min you got at 112 s.\n\n- Hard cap — 9 agents at 64k , and it's VRAM, not compute.\n\n(Chart 3 of 4 in the gallery above: VRAM budget)\n\nEvery configuration lands within 3.5 GiB of the 44.6 GiB ceiling. A smaller quant buys slots and then spends the savings straight back on KV cache: Q4 frees 14 GiB of weights versus Q8 and hands 17.5 GiB of it to the cache. The hard cap is arithmetic, not tuning.\n\n### Single agent, huge context\n\n(Chart 4 of 4 in the gallery above: context vs latency)\n\nLatency is linear in prompt size and the quants barely differ — fitted prefill rates Q4 1,482 tok/s , Q6 1,346 , Q8 1,340 . A 10% spread, not the 3× the slot counts might suggest. Q8 showed a higher fixed cost (12.8 s intercept vs ~5.5 s); n=6 per quant, so treat that as an observation, not a finding.\n\nMy operating point: UD-Q6_K_XL, 5 concurrent agents, 64k each (327,680 total context), 41.1 GiB. Same total work as Q4-at-9, in half the wait per agent, with higher-fidelity weights and 2.6 GiB more headroom. The extra slots Q4 buys are worth having only when nothing is waiting on them.\n\n## 4. KV cache: q8_0, and one combination that just hangs\n\nTested on identical weights, 65k context, code executed against hidden tests:\n\nK / V PassRate EditFidelity LongRecall tok/s VRAM @65k\n\nNo measurable quality difference, no speed difference, 1.4 GiB cheaper . q8_0 is my standard now.\n\nThe trap: mixed --cache-type-k f16 --cache-type-v q8_0 never finished a long prefill — no answer in 900 s, twice, on a prompt smaller than one a matched-q8_0 config answered in 32 s. Matched f16 answered the same prompt in 24 s. Match your K and V types.\n\n## 5. Using it as a subagent inside Claude Code\n\nThe thing worth knowing up front: Claude Code's model: field only accepts its own models. You cannot register a local model as a Claude Code subagent. What you can do is expose it as an MCP server , so it becomes a tool the orchestrator calls.\n\nMine is a stdio MCP server exposing local_ask_about_files , local_implement , local_edit_file , local_engine_status , pointed at the 27B on 127.0.0.1:8080 . The division of labour:\n\n- Orchestrator plans and decides.\n\n- Frontier subagents do work that needs to be right the first time.\n\n- Local Qwen answers \"what's in these files\", drafts implementations, and does bulk edits — the high-token, low-stakes work that would otherwise burn budget.\n\nEdit fidelity is the metric that decides whether this is usable at all. A paraphrased region comes back as \"String to replace not found\" , which reads like a broken tool rather than a worse quant. At Q6 with q8_0 KV it measured 1.00.\n\nFor stress-testing I use a personal side project — a game with a Rust simulation server and a thin UE5 client. Nothing to do with the day job; it's the thing I throw at the rig for fun because it produces realistic multi-file, multi-language agent work on demand. A representative local job from this week: 10,127 tokens generated at 29.8 tok/s on slot 4 while other slots were live.\n\n## 6. Mistakes worth stealing\n\nEvery one of these produced a confident wrong number first:\n\n- Reply budget of 512 tokens with reasoning_effort: xhigh . Every reply hit the cap mid-thinking, so the scored \"answer\" was truncated reasoning. Recall became noise and Q8 looked worse than Q4 . Raised to 2048; truncated replies are now excluded rather than scored wrong.\n\n- .NET's 2-connections-per-host default. My \"16 concurrent agents\" harness was quietly running 2 at a time . It passed testing because I validated on PowerShell 7 (HttpClient, no such limit) and shipped to Windows PowerShell 5.1 (HttpWebRequest, limited). The runspaces were real; the sockets were not.\n\n- Estimating tokens at 4 chars/token. Real ratio was 2.99, so a \"39,599-token\" prompt was actually ~53,000. Call /tokenize .\n\n- An error handler that discarded the exception. Returned a bare Failed=true , throwing away the message, HTTP status and llama.cpp's response body. About 40 minutes of hypotheses existed only because of that.\n\n- ** general.file_type lies on Unsloth UD quants.** My Q6_K_XL file reports Q4_K_S in metadata. The file sizes (15.3 / 24.1 / 29.3 GiB for Q4_K_M / Q6_K_XL / Q8_K_XL on the same model) confirm the quants are what the filenames say — the enum simply has no value for a dynamic mix. Don't benchmark off that field.\n\nSingle machine, single workload shape, one model family. Everything above is prefill-dominated agent traffic; a chat or long-generation workload will scale differently and probably better with slots. The Flash-Next numbers came from an unmerged PR build and should be re-measured after it lands upstream. And my memory bus is half-populated, which caps every CPU-offload result here — if you have four channels filled, expect better MoE numbers than mine.\n\nHappy to answer questions or run a specific config if someone wants a data point.\n\nsubmitted by /u/Iamisseibelial",
+  "images": [
+    {
+      "src": "https://preview.redd.it/h11fw8n6gdoh1.png?width=140&height=62&auto=webp&s=6f52455d5927ddba8b9bf827a53a93e7b8380153",
+      "alt": "How many agents can 2×4090 actually run at once? Three weeks of llama.cpp concurrency data — soft cap 5 @ 64k, hard cap 9, and why.",
+      "originalUrl": "https://preview.redd.it/h11fw8n6gdoh1.png?width=140&height=62&auto=webp&s=6f52455d5927ddba8b9bf827a53a93e7b8380153"
+    }
+  ],
+  "mediaRecheckedAt": "2026-09-09T04:52:57.738581Z",
+  "summaryZh": "该文章基于双RTX 4090硬件平台，对本地llama.cpp运行Qwen系列多Agent的代码并发能力进行了为期三周的深度实测。测试表明在64k上下文下并发软上限为5个、硬上限为9个。研究还对比了122B MoE与27B模型在工具调用延迟上的显著差距，指出内存通道带宽对本地多智能体并发吞吐有关键制约。",
+  "summaryGeneratedAt": "2026-09-09T04:56:04.215485Z",
+  "summaryModel": "gemini:gemini-3.7-flash",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.7-flash",
+    "reviewedAt": "2026-09-09T04:56:04.215485Z",
+    "isRelevant": true,
+    "relevanceScore": 75,
+    "importanceScore": 75,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 14,
+      "novelty": 12,
+      "credibility": 12,
+      "usefulness": 9,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "analysis",
+    "category": "agent",
+    "tags": [
+      "llama.cpp",
+      "多智能体",
+      "本地部署",
+      "基准测试",
+      "并发优化"
+    ],
+    "reasonZh": "提供了详实的本地多智能体并发性能实测数据，揭示了硬件瓶颈与模型选型的核心权衡。",
+    "summaryZh": "该文章基于双RTX 4090硬件平台，对本地llama.cpp运行Qwen系列多Agent的代码并发能力进行了为期三周的深度实测。测试表明在64k上下文下并发软上限为5个、硬上限为9个。研究还对比了122B MoE与27B模型在工具调用延迟上的显著差距，指出内存通道带宽对本地多智能体并发吞吐有关键制约。",
+    "glossary": [
+      {
+        "term": "concurrency",
+        "explanationZh": "模型在同一硬件或服务实例上同时处理多个独立请求的能力"
+      },
+      {
+        "term": "tool-call",
+        "explanationZh": "智能体调用外部代码执行环境、API或函数完成特定步骤的操作过程"
+      },
+      {
+        "term": "expert offload",
+        "explanationZh": "将混合专家（MoE）模型中非活跃专家的参数卸载至CPU内存以节省显存的技术"
+      },
+      {
+        "term": "KV cache",
+        "explanationZh": "在自回归解码过程中缓存注意力键值以避免重复计算的高速缓存机制"
+      }
+    ],
+    "duplicateKey": "llama-cpp-agent-concurrency-benchmark-4090"
+  }
+}
