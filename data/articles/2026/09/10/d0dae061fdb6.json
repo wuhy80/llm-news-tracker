@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 3,
+  "id": "d0dae061fdb6",
+  "title": "Qwen3.8-Flash-Next on 2x3090 + DDR4, part 4: 2.2-2.5x faster prefill by kicking the expert cache off the GPU while the prompt runs",
+  "summary": "Part 4 of the same box. Part 1 was 17 -> 25-29 t/s with the expert cache PR, part 2 was 37-41 t/s after switching to UD-Q4_K_XL and stacking MTP on the cache, part 3 was the top-k fallback that was sorting more than it needed to. This one is all about prefill, which was honestly the weak spot the whole time. 80+ seconds before the first token on an 8k prompt, and 24 minutes on a 119k one...I know lol. Box is still 2x",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wc6fsk/qwen38flashnext_on_2x3090_ddr4_part_4_2225x/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-10T02:39:31Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wc6fsk/qwen38flashnext_on_2x3090_ddr4_part_4_2225x/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wc6fsk/qwen38flashnext_on_2x3090_ddr4_part_4_2225x/",
+  "fetchedAt": "2026-09-10T04:51:27.275143Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Part 4 of the same box. Part 1 was 17 -> 25-29 t/s with the expert cache PR, part 2 was 37-41 t/s after switching to UD-Q4_K_XL and stacking MTP on the cache, part 3 was the top-k fallback that was sorting more than it needed to. This one is all about prefill, which was honestly the weak spot the whole time. 80+ seconds before the first token on an 8k prompt, and 24 minutes on a 119k one...I know lol.\n\nBox is still 2x 3090, dual Broadwell Xeon, llama.cpp, UD-Q4_K_XL with the Q8 MTP head on the second card, all expert layers pinned in host RAM, 150-slot cache, 261k context, f16 KV. There has been one hardware change since part 2. I swapped the LRDIMMs for 6x32 GB DDR4-2133 ECC. I'll say which numbers are 4-DIMM and which are 6-DIMM, they're not mixed.\n\nThe thing I might not have explained well in part 2\n\nI ran -ub 512 and that's because it was a compromise for the cache. A 2048 token micro-batch needs about 7.3 GiB of compute buffer per GPU, 512 wants 1.9GiB and that gap is roughly 50 cache slots that I wanted for decode. So I kept the slots and quietly ate about 3x on prefill at the time.\n\nAs for why it cost 3x, the experts get streamed host to GPU0 once per micro-batch, and that upload costs the same whether the batch has 512 tokens in it or 2048. So prefill speed basically scales with the micro-batch. At ub 512 an 8k prompt drags the whole expert set over PCIe 16 times, at ub 2048 it's 4 times.\n\nThe cache only ever serves batches of <= 8 tokens (decode and the MTP verify batches). During a prompt it just sits there holding VRAM so I thought of trying to claim that space when it's unneeded. So now, when a prompt comes in, the server drops the cache slots, the decode compute buffers and the CUDA pools then it grabs compute buffers sized for ub 2048, runs the whole prompt at 2048, then puts everything back before the first generated token. Decode is untouched by this, it runs exactly the code it ran before. It's two env vars ( LLAMA_PHASE_PREFILL_UBATCH=2048 , LLAMA_PHASE_PREFILL_MODE=transaction ) and the server still starts with -ub 512 . And to clarify, \"transaction\" means the swap is all-or-nothing, if the restore can't happen you will get an error, not a server that's silently limping along. Just making that clear.\n\nNumbers (6 DIMMs, same day, fresh server per arm)\n\nwhat before (ub 512 + cache) now change\n\n8k fresh prompt, greedy: prefill\n\n8k: decode over the next 2048 tokens\n\n~37k context, my normal sampling: prefill\n\n~37k: time to first token\n\n~37k: decode, median of 38 requests\n\n~119k: time to first token\n\n~119k: decode, median of 42 requests\n\nThe 8k row is greedy, two fresh processes per arm, medians (the two phase-memory runs landed within 0.01 t/s of each other). The deep rows are one seed at temp 0.7 / top-p 0.8 / top-k 20 with thinking on, one fresh prefill per depth and then a pile of follow-up questions over the cached prefix, so decode is a median over all of them. Prefill = llama-server's prompt eval time, decode = its generation time.\n\nWell, nothing comes completely free. This approach costs roughly 2.8 s of fixed overhead per prompt for the release + restore, which is why 8k gets 2.24x and the long ones get 2.4-2.5x. For decode, I can't find a loss. +2% at 8k, -1% / 0% at depth, and in the three-seed quality screen every seed x depth cell was within +2% / -3.6% of its control. MTP acceptance didn't change either (0.79-0.83).\n\nBefore putting it in production I ran the same screen I used for the top-k change (My last post AKA Part 3), 42 questions over long documents at two depths (~37k and ~119k), three seeds, my normal sampling, paired per question and seed against a fresh control run the same day. That was still on 4 DIMMs. 240 pairs: 2 worse, 235 same, 3 better, nothing regressed on more than one seed, and the two misses are questions the old config also flubs on some seed. A seed-1 rerun on 6 DIMMs came out 1 worse / 78 same / 1 better. I'm aware and anyone reading should be aware that this is a screening not concrete proof, but it's the bar I hold my own changes to.\n\nSome caveats you may want to know about or at least I would if I were you\n\n- First-token logits differ from the untouched path by max 1.51 / mean 0.22 across the 248k vocab, argmax the same. For scale, just changing ub 512 -> 2048 with nothing released moves them by max 1.81 / mean 0.27 on the same request. So the release/restore adds less noise than the batch-shape change any ub change already brings.\n\n- One machine, one model, one quant, 8k to 119k. I have not tried anything past 119k, other quants, or the no-MTP setup.\n\n- The extra two memory channels helped this config a lot more than the old one at 8k (+19% vs +3% against my 4-DIMM numbers), and it did nearly nothing at 37k-119k (+0.6% / 0%). This makes sense to me, attention takes over from expert upload as the context grows, but that's one run per depth, so take it as a hint.\n\n- Where the remaining 37s of an 8k prompt goes, rough split: ~18 s uploads, ~5 s kernels, ~3 s transitions, ~11 s I haven't pinned down yet (CPU side, draft model, syncs). A profile says the uploads are still 3.6x the expert set per prompt, so there's more on the table I assume. I'll be working on that next.\n\nhttps://github.com/Inovello/llama.cpp/tree/flashnext-e06\n\nIt's my flashnext-2x3090 branch from part 2 (master b96806d + PR #27861 expert cache + PR #28223 + PR #28243 MTP + the batched-cache fixes + PR #28198) plus this change and a couple of inert debug switches.\n\nIf you just want to copy and run it, this is the whole thing, taken from the process that's serving me right now. You need CUDA, numactl ( apt install numactl ), the four UD-Q4_K_XL shards and the MTP head from unsloth/Qwen3.8-Flash-Next-GGUF on HF\n\n```\ngit clone -b flashnext-e06 https://github.com/Inovello/llama.cpp && \ncd llama.cpp cmake -B build -DGGML_CUDA=ON && cmake --build build -j -t llama-server export LLAMA_ATTN_ROT_DISABLE=1 export LLAMA_MMAP_PIN_HOST=1 export LLAMA_PHASE_PREFILL_UBATCH=2048 export LLAMA_PHASE_PREFILL_MODE=transaction numactl --interleave=all build/bin/llama-server \\\n -m /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \\\n -md /path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-type draft-mtp -devd CUDA1 --spec-draft-n-max 3 \\\n --host 127.0.0.1 --port 18080 \\\n -ngl 99 -c 261888 --parallel 1 --flash-attn on \\\n -ot \"ffn_(gate|up|down)_exps\\.weight=CUDA_Host,per_layer_token_embd\\.weight=CPU\" \\\n -lzm off --numa distribute -t 16 -tb 44 -b 4096 -ub 512 -ctk f16 -ctv f16 \\\n --temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 \\\n --moe-expert-cache 150 -lv 4\n```\n\nWhat to change for your box:\n\n- The two model paths; -t / -tb to your physical core count (mine is 16 decode threads, 44 for batch on 2x22 cores)\n\n- -devd CUDA1 puts the MTP head on the second GPU, on a single card use CUDA0 or drop the three -md flags and give the freed VRAM to the cache.\n\n- -ot is what keeps every expert layer in host RAM; only the first shard goes on -m , the rest are found next to it.\n\n- The two LLAMA_PHASE_* exports are the change from this post, drop them and you have part 2's behavior.\n\n- -lv 4 is just so the log shows the cache hit rate and the draft acceptance. Useful if you want to post your numbers in thread.\n\nNow the things it's strict about because those are the invariants the code checks: The server at -ub 512 and -b 4096 , --parallel 1 , the prefill micro-batch exactly 2048, the cache exactly 150 slots, and the MTP draft as the only speculative decoder. Anything else refuses to start. CUDA only .\n\nThe top-k fallback fix from part 3 is in the branch too and it's up on its own as PR #28671. My older PR #28223 is closed for now because llama.cpp gives new contributors one open PR at a time, I'll reopen it after #28671 is dealt with.\n\nLet me know if you try it and if you have any questions.\n\nsubmitted by /u/Extension-Bid-639",
+  "summaryZh": "作者在双RTX 3090和DDR4平台上对Qwen3.8-Flash-Next推理进行了深度优化，分享了系列调优的第4部分。通过在Prompt运行期间释放专家缓存与显存池，将微批次大小提升至2048，大幅减少了专家权重在PCIe总线上的搬运次数，实现了预填充速度2.2至2.5倍的提升。",
+  "summaryGeneratedAt": "2026-09-10T04:55:57.745805Z",
+  "summaryModel": "gemini:gemini-3.7-flash",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.7-flash",
+    "reviewedAt": "2026-09-10T04:55:57.745805Z",
+    "isRelevant": true,
+    "relevanceScore": 70,
+    "importanceScore": 70,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 10,
+      "novelty": 12,
+      "credibility": 12,
+      "usefulness": 8,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "industry",
+    "tags": [
+      "llama.cpp",
+      "Qwen",
+      "Prefill Optimization",
+      "Dual GPU",
+      "MoE"
+    ],
+    "reasonZh": "社区深入探索了消费级双卡运行大型MoE模型时的Prompt预填充加速方案。",
+    "summaryZh": "作者在双RTX 3090和DDR4平台上对Qwen3.8-Flash-Next推理进行了深度优化，分享了系列调优的第4部分。通过在Prompt运行期间释放专家缓存与显存池，将微批次大小提升至2048，大幅减少了专家权重在PCIe总线上的搬运次数，实现了预填充速度2.2至2.5倍的提升。",
+    "glossary": [],
+    "duplicateKey": "qwen-38-flash-prefill-opt"
+  }
+}
