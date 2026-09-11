@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 3,
+  "id": "945b6e872e3d",
+  "title": "Running Qwen3.8-27B-Q4 at max context on a 32 GB GPU while avoiding kvcache quantization",
+  "summary": "I can't stand kv cache quantization. Even at q8_0, I can feel the difference. But realistically, when running Qwen3.8-27B-UD-Q4_K_XL on my 32 GB GPU, I only have room for ~170k tokens (with mtp and mmproj enabled). It's a lot of context, but Qwen3.8 eats through it on xhigh effort. I've been wanting a setup that could serve me a full-precision kvcache when I have space available, and dynamically quantize my kvcache o",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wdqit1/running_qwen3827bq4_at_max_context_on_a_32_gb_gpu/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-11T19:41:29Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wdqit1/running_qwen3827bq4_at_max_context_on_a_32_gb_gpu/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wdqit1/running_qwen3827bq4_at_max_context_on_a_32_gb_gpu/",
+  "fetchedAt": "2026-09-11T21:02:11.446188Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "I can't stand kv cache quantization. Even at q8_0, I can feel the difference.\n\nBut realistically, when running Qwen3.8-27B-UD-Q4_K_XL on my 32 GB GPU, I only have room for ~170k tokens (with mtp and mmproj enabled). It's a lot of context, but Qwen3.8 eats through it on xhigh effort.\n\nI've been wanting a setup that could serve me a full-precision kvcache when I have space available, and dynamically quantize my kvcache only when I run into the context limit. That way, I can push my sessions farther without sacrificing quality before I absolutely need to.\n\nSo, that's what I built: https://github.com/wadealexc/llama-manager\n\nVanilla llama.cpp's model configurations are static : you set them when you launch llama-server , and they can't change after the fact.\n\nllama-manager is a small wrapper around a fork of llama.cpp. It serves models the same way, except that it supports dynamic model configuration.\n\nThis means that after loading a model, it's possible to enable/disable speculative decoding, add/remove an mmproj, or update context-level parameters. llama-manager preserves your kvcache between reconfigurations, so you don't need to redo prompt processing. The end effect is the ability to 'hot reload' your model, even mid token generation.\n\nI implemented this using a fork of llama.cpp that supports rebuilding a model's context and runtime components without touching its weights. This capability is supported by 2 new HTTP endpoints (and changes to a few others). Further info on the fork can be found in the README (see README.md#llamacpp-changes ).\n\nDuring token generation, llama-manager detects when requests fail due to hitting the context limit. Without pausing generation, it applies various strategies mid-generation to increase context. The existing kv cache is cached/restored so that generation can resume as soon as reconfiguration is complete.\n\nCurrently, the built in strategies are: - disable-spec : disable speculative decoder, if enabled - mmproj-to-cpu : move mmproj off GPU - quantize-kv-q8 and quantize-kv-q4\n\nPersonally, I want kv quantization to be the last resort, so my models are configured to execute those last. When I serve Qwen3.8-27B-UD-Q4_K_XL , it applies strategies in this order:\n\n════════════════════════════════════════════════════════════════════════════ qwen3.8-27b baseline: 167,680 tokens device: 31 GiB ════════════════════════════════════════════════════════════════════════════ i strategy ctx (tokens) gain (tokens) weights / ctx GiB ────────────────────────────────────────────────────────────────────────── 0 baseline 167,680 17.13 / 13.14 1 disable-spec 200,960 (+33,280) 17.13 / 13.16 2 mmproj-to-cpu 218,880 (+17,920) 16.02 / 14.27 3 quantize-kv-q8 262,144 (+43,264) 16.02 / 10.40 ────────────────────────────────────────────────────────────────────────── final ctx: 262,144 tokens\n\nInitially, llama-manager serves the model at 167k tokens (f16 kv, mtp on, mmproj on). At 167k context, mtp is disabled, and the context window expands to 200k. At 200k, the mmproj is moved to the cpu. And at 218k, the kv cache is quantized to q8.\n\nIf you're running your models with a quantized kvcache (or other quality compromises), you're likely doing so because you have a certain ctx limit in mind that will serve all your usecases. But not all your inference is done at the ctx limit . You're leaving quality on the table by quantizing too early.\n\nFor my usecase, I wasn't willing to set my ctx higher than 170k as it would mean a q8_0 kv cache. Now, I can push my sessions as far as I want, but the bulk of the session stays high quality. The smaller your GPU, the more impactful this is.\n\nSome example configs running the same model with different strategies and on differently-sized devices. All of these runs are performed using a basic config.yaml and modifying the ladder field to change the order of each strategy:\n\n```\n spec-type: draft-mtp spec-draft-n-max: 2 fit-target: 512 n-gpu-layers: 99 ladder: [disable-spec, mmproj-to-cpu, quantize-kv-q8, quantize-kv-q4]\n```\n\n- Prefer q8_0 over disable-spec: [mmproj-to-cpu, quantize-kv-q8, disable-spec, quantize-kv-q4] . For this one, the model reaches max ctx after just 2 strategies. The first 184k tokens are generated with mtp on and kv at f16:\n\n════════════════════════════════════════════════════════════════════════════ qwen3.8-27b baseline: 167,680 tokens device: 31 GiB ════════════════════════════════════════════════════════════════════════════ i strategy ctx (tokens) gain (tokens) weights / ctx GiB ────────────────────────────────────────────────────────────────────────── 0 baseline 167,680 17.13 / 13.14 1 mmproj-to-cpu 184,320 (+16,640) 16.02 / 14.25 2 quantize-kv-q8 262,144 (+77,824) 16.02 / 12.89 ────────────────────────────────────────────────────────────────────────── final ctx: 262,144 tokens\n\n- The same ladder on a 24 GB GPU (simulated by setting fit-target to 8192). Here, all strategies are needed to serve max ctx, but q4_0 isn't needed until 164k context:\n\n════════════════════════════════════════════════════════════════════════════ qwen3.8-27b baseline: 55,040 tokens device: 31 GiB ════════════════════════════════════════════════════════════════════════════ i strategy ctx (tokens) gain (tokens) weights / ctx GiB ────────────────────────────────────────────────────────────────────────── 0 baseline 55,040 17.13 / 5.65 1 mmproj-to-cpu 71,680 (+16,640) 16.02 / 6.73 2 quantize-kv-q8 115,200 (+43,520) 16.02 / 6.72 3 disable-spec 164,352 (+49,152) 16.02 / 6.76 4 quantize-kv-q4 262,144 (+97,792) 16.02 / 6.40 ────────────────────────────────────────────────────────────────────────── final ctx: 262,144 tokens\n\nI have a list of known issues and other important notes in the README (see #known-issues ).\n\nThe most important things I want to highlight: 1. llama-manager doesn't handle CPU or multi-device inference. Single-gpu only. I would like to support this, but didn't want to spend the time on it unless there was demand (and people willing to try it out, since multi-device setups would be hard for me to test!) 2. This project is in beta, tested only on my machine and with a few models. YMMV.\n\nPlease open issues if you run into bugs!\n\nsubmitted by /u/wadeAlexC",
+  "summaryZh": "作者开发了开源工具 llama-manager，通过对 llama.cpp 进行 Fork 封装，实现了大模型推理过程中的动态模型配置与 KV Cache 热重载。当 GPU 显存不足触发上下文极限时，该工具能在不中断生成且保留已有 KV Cache 的情况下，动态调整参数或执行 KV Cache 量化，解决大上下文占用与全精度 KV Cache 量化降质之间的矛盾。",
+  "summaryGeneratedAt": "2026-09-11T21:08:04.302174Z",
+  "summaryModel": "gemini:gemini-3.6-flash",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.6-flash",
+    "reviewedAt": "2026-09-11T21:08:04.302174Z",
+    "isRelevant": true,
+    "relevanceScore": 81,
+    "importanceScore": 81,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 23,
+      "impact": 16,
+      "novelty": 13,
+      "credibility": 12,
+      "usefulness": 9,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "release",
+    "tags": [
+      "llama.cpp",
+      "KV Cache",
+      "Inference",
+      "Context Window",
+      "Open Source"
+    ],
+    "reasonZh": "开源了支持在推理生成过程中动态重组上下文与KV Cache热重载的中间件工具。",
+    "summaryZh": "作者开发了开源工具 llama-manager，通过对 llama.cpp 进行 Fork 封装，实现了大模型推理过程中的动态模型配置与 KV Cache 热重载。当 GPU 显存不足触发上下文极限时，该工具能在不中断生成且保留已有 KV Cache 的情况下，动态调整参数或执行 KV Cache 量化，解决大上下文占用与全精度 KV Cache 量化降质之间的矛盾。",
+    "glossary": [
+      {
+        "term": "kv cache quantization",
+        "explanationZh": "键值缓存量化，指对大模型注意力机制中的KV缓存进行低比特压缩，以节省显存占用。"
+      },
+      {
+        "term": "max context",
+        "explanationZh": "最大上下文长度，指模型单次推理能够处理的最大Token数量。"
+      },
+      {
+        "term": "dynamic model configuration",
+        "explanationZh": "动态模型配置，指在模型运行时无需重新加载权重即可实时修改推理参数。"
+      },
+      {
+        "term": "speculative decoding",
+        "explanationZh": "投机解码，一种通过小模型预测、大模型验证来加速LLM文本生成的推理技术。"
+      },
+      {
+        "term": "prompt processing",
+        "explanationZh": "提示词处理阶段，指大模型在生成新Token前对输入上下文进行编码计算的Prefill过程。"
+      },
+      {
+        "term": "hot reload",
+        "explanationZh": "热重载，指在不停止服务或丢失当前计算状态的情况下实时更新系统配置或模型组件。"
+      }
+    ],
+    "duplicateKey": "llama_manager_dynamic_kv_cache"
+  }
+}
