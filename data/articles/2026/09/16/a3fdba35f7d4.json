@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 3,
+  "id": "a3fdba35f7d4",
+  "title": "5090 + r9700 in one case, configs inside: exl3, vllm nvfp4, and radiance mxfp4 running together",
+  "summary": "I've been running NVIDIA and AMD in the same machine for a few weeks now, a 5090 plus a single-slot r9700 on a ProArt X870E with 192gb ddr5, and the accepted advice that you have to pick a side just doesn't hold. Several of you asked for my settings in the Flash Next thread, so here's the whole thing, actual launch commands, no teaser. One llama-swap instance schedules everything across both vendors. Resident process",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1whha0b/5090_r9700_in_one_case_configs_inside_exl3_vllm/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-16T00:02:47Z",
+  "category": "release",
+  "tags": [
+    "Llama",
+    "模型发布"
+  ],
+  "score": 76,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1whha0b/5090_r9700_in_one_case_configs_inside_exl3_vllm/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1whha0b/5090_r9700_in_one_case_configs_inside_exl3_vllm/",
+  "fetchedAt": "2026-09-16T04:56:13.027087Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "I've been running NVIDIA and AMD in the same machine for a few weeks now, a 5090 plus a single-slot r9700 on a ProArt X870E with 192gb ddr5, and the accepted advice that you have to pick a side just doesn't hold. Several of you asked for my settings in the Flash Next thread, so here's the whole thing, actual launch commands, no teaser.\n\nOne llama-swap instance schedules everything across both vendors. Resident processes with TTLs, not per-request spawning. Three engines: exl3/TabbyAPI for the interactive lane on the 5090, vllm with nvfp4 weights for heavy workers on the 5090, radiance on the r9700 running the same 27B family in mxfp4. Crons, bots, and background agents get a Radiance-only route and never touch the NVIDIA card, which is what makes the whole thing work instead of a fight.\n\nThe interactive lane is what most of you were asking about, exl3 through TabbyAPI, config is one yaml, sanitized:\n\n```\n# loopback only, no auth, my scheduler proxies it\nmodel:\nbackend: exllamav3\nmodel_name: qfn-opt-exl3-2.05\n# my own quant recipe at 2.05 bpw\nmax_seq_len: 262144\ncache_size: 262144\ncache_mode: Q8\ngpu_split_auto: true\nautosplit_reserve: [96]\nmax_batch_size: 1\nchunk_size: 2048\ncpu_moe_split_experts: 192\ncpu_moe_threads: 8\ntemplate_vars_force: {enable_thinking: true}\nreasoning: true\ntool_format: qwen3_coder\ndraft_model:\ndraft_mode: mtp\ndraft_cache_mode: Q8\ndraft_num_tokens: 2\nmemory:\nsysmem_recurrent_cache: 4096\n```\n\nWhat matters in it: batch size 1, single-stream lane, batching hurts decode on offloaded MoE. Chunk 2048. 192 experts pinned to CPU with the MTP head fully on GPU. Q8 caches both sides, recurrent state in pinned host RAM, EXL3_MOE_PINNED_ARENA=1 in the env. Engine built from v150 source with the memfd/requeue fixes, not the pip wheel. Don't translate your llama.cpp n-cpu-moe numbers over, exl3 counts experts differently than gguf counts layers. With this shape I sit at 40 to 70 t/s decode and 600 to 1400 t/s prefill at full 262K depth, xhigh reasoning, stable through long tool sessions. If your decode collapses as context grows, your bottleneck is RAM bandwidth, and the expert count is the lever, not the engine.\n\nWorker lane on the 5090, stock vllm pinned by image sha, not tag:\n\n```\ndocker run --gpus device=0 --ipc=host --memory 64g --memory-swap 64g \\ -p 127.0.0.1:PORT:8000 -v <weights-dir>/qwen38-nvfp4:/model:ro \\ --entrypoint vllm vllm/vllm-openai@sha256:<pinned-sha> serve /model \\ --kv-cache-dtype fp8 --gpu-memory-utilization 0.90 \\ --max-model-len 262144 --max-num-seqs 4 --max-num-batched-tokens 1024 \\ --compilation-config '{\"cudagraph_mode\":\"PIECEWISE\"}' \\ --enable-prefix-caching --mamba-cache-mode align \\ --reasoning-parser qwen3 --tool-call-parser qwen3_xml \\ --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' \\ --limit-mm-per-prompt '{\"image\":0,\"video\":0}'\n```\n\nPIECEWISE cudagraphs are required, not taste, the 262K KV floor doesn't fit when default graph capture runs.\n\nBackground lane on the r9700, radiance, mxfp4 weights plus a dflash draft:\n\n```\ndocker run --device /dev/kfd --device /dev/dri/renderD<N> \\ --ulimit memlock=-1:-1 --shm-size 8g --memory 64g \\ -p 127.0.0.1:PORT:8000 \\ -v <weights-dir>/qwen38-27b-quark-mxfp4:/model:ro \\ -v <draft-dir>:/draft:ro \\ -e ROCR_VISIBLE_DEVICES=GPU-<amd-uuid> -e HIP_VISIBLE_DEVICES=0 \\ -e CUDA_VISIBLE_DEVICES=0 \\ -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 \\ -e RADIANCE_MXFP4=1 -e RADIANCE_MXFP4_W4A8=1 -e RADIANCE_USE_R4D=1 \\ --entrypoint /opt/radiance_entrypoint.sh <radiance-image> /model \\ --tensor-parallel-size 1 --max-model-len 196608 \\ --max-num-seqs 4 --max-num-batched-tokens 1024 \\ --gpu-memory-utilization 0.98 --kv-cache-dtype fp8 \\ --attention-backend R4D \\ --speculative-config '{\"method\":\"dflash\",\"model\":\"/draft\",\"quantization\":\"fp8\",\"num_speculative_tokens\":7,\"attention_backend\":\"TRITON_ATTN\",\"disable_padded_drafter_batch\":true,\"draft_sample_method\":\"greedy\"}' \\ --compilation-config '{\"pass_config\":{\"fuse_norm_quant\":true,\"fuse_act_quant\":true}}' \\ --enable-prefix-caching --mamba-cache-mode align \\ --reasoning-parser qwen3 --tool-call-parser qwen3_coder \\ --default-chat-template-kwargs '{\"enable_thinking\":true,\"preserve_thinking\":true}'\n```\n\nThe wrapper finds the r9700's render node by PCI ids, vendor 0x1002 device 0x7551, instead of trusting indexes. Every lane pins its GPUs by uuid or device id, one vendor's engines never wander onto the other card. Behind the radiance command sits a long tail of RADIANCE_* env knobs for the MXFP4 kernels, the flags above are the ones that decide whether it runs at all.\n\nNumbers, same client, same sampling (temp 1.0, top_p 0.95, thinking on, no output caps), decode rates approximate:\n\n- 5090 nvfp4 27B: 173 to 179 t/s decode, 0.79s first token at about 8K prompt, four concurrent workflows done in 8.15s\n\n- r9700 radiance: 71 to 73 t/s decode, same four workflows in 17.90s. Half the speed, and it takes all the traffic that doesn't care, which is most of it\n\n- Depth on the exl3 interactive lane: 40 to 70 t/s decode and 600 to 1400 t/s prefill at full 262K depth. Real source/tool workflows, wall time with reasoning: about 40K in 161s, 64K in 139s, 128K in 254s, 239K in 307s\n\n- The r9700 at four-way concurrency takes about 51s median to first token on about 44K prompts, which is exactly why my chat doesn't live there\n\n- GLM-5.3-Flash exl3, 224 of 288 experts on CPU: 21.5 t/s at 32K, huge MoE answering on one 5090 plus RAM\n\n- From the tuning phase, llama.cpp spill on the 5090 with q8 KV: pp 1146 and tg 51.9 at 8K, pp 819 and tg 27.4 at 60K. Spill decode is RAM-bandwidth-bound, it drops about 40% with depth while prefill gives up about 30%. Q8 KV nearly doubled prefill against f16 KV on this arch, 1146 vs 507 at 8K\n\nWhat doesn't work, tested:\n\n- exl3 on rocm: HIP compiles fine for gfx1201, but exl3's matrix primitive uses a PTX instruction that simply doesn't exist on RDNA4. Dies at the source gate, before any model load\n\n- Gemma 31B on vulkan at 253K depth: wedged the r9700 mid-generation and the kernel hung_task-panicked the box. Failed config, not broken card, root cause still open\n\n- np-pooling on AMD: llama.cpp aggregate throughput is flat against np on vulkan and HIP, capped around 115 to 145 t/s. np8 pooling only works on CUDA, don't build r9700 np-pool twins\n\nKnobs worth stealing on any hardware: speculative decoding everywhere, MTP3 on the CUDA lane, MTP2 on exl3, dflash depth 7 on radiance, acceptance runs 80%+ on the 5090. fp8 KV cache, weighed against context length per lane, not auto-crushed, KV quality affects output quality. TTL raised to an hour plus cuda-checkpoint, so hourly cron traffic hits warm cache instead of cold starts, and the checkpoint even survives a card handoff, 202K cached tokens restored in under 10 seconds. All of these are measured operating points on this specific pair of cards, your mileage on a 9070 xt or 4090 will differ.\n\nFull writeup with the journey and the failure war stories is up here\n\nsubmitted by /u/IvGranite",
+  "summaryZh": "该文章详细分享了一套在单台主机上同时集成NVIDIA RTX 5090与AMD单槽r9700显卡的异构推理系统配置。系统利用llama-swap进行跨厂商调度，配合exl3/TabbyAPI驱动交互 lane、vLLM处理高负载任务，并通过Radiance运行MXFP4量化模型专门处理后台Agent任务。配置中展示了详细的YAML参数、CPU专家卸载策略以及针对MoE架构的批处理与缓存优化方法。",
+  "summaryGeneratedAt": "2026-09-16T05:06:53.160460Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-16T05:06:53.160460Z",
+    "isRelevant": true,
+    "relevanceScore": 95,
+    "importanceScore": 95,
+    "importanceLevel": 5,
+    "dimensions": {
+      "relevance": 25,
+      "impact": 22,
+      "novelty": 14,
+      "credibility": 14,
+      "usefulness": 10,
+      "timeliness": 10
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "release",
+    "tags": [
+      "MultiGPU",
+      "ExLlamaV3",
+      "vLLM",
+      "MoE",
+      "Quantization"
+    ],
+    "reasonZh": "本文详细披露了在单机中混合部署NVIDIA与AMD显卡并结合多种前沿推理引擎（ExLlamaV3、vLLM、Radiance）的高级异构部署方案，具有极高的工程实用价值和技术前沿性。",
+    "summaryZh": "该文章详细分享了一套在单台主机上同时集成NVIDIA RTX 5090与AMD单槽r9700显卡的异构推理系统配置。系统利用llama-swap进行跨厂商调度，配合exl3/TabbyAPI驱动交互 lane、vLLM处理高负载任务，并通过Radiance运行MXFP4量化模型专门处理后台Agent任务。配置中展示了详细的YAML参数、CPU专家卸载策略以及针对MoE架构的批处理与缓存优化方法。",
+    "glossary": [
+      {
+        "term": "exl3",
+        "explanationZh": "ExLlamaV3推理引擎，专为高效加载极低比特量化大模型设计的推理后端"
+      },
+      {
+        "term": "vllm",
+        "explanationZh": "高吞吐量、低延迟的大语言模型推理和服务引擎"
+      },
+      {
+        "term": "MoE",
+        "explanationZh": "混合专家模型（Mixture of Experts），一种通过激活部分参数来提升效率的架构"
+      },
+      {
+        "term": "mxfp4",
+        "explanationZh": "微缩浮点4位量化数据格式，用于降低显存占用并加速计算"
+      },
+      {
+        "term": "TabbyAPI",
+        "explanationZh": "基于ExLlama后端的高性能兼容OpenAI API的推理服务器"
+      },
+      {
+        "term": "Q8",
+        "explanationZh": "8位量化精度，常用于KV缓存以节省显存空间"
+      }
+    ],
+    "duplicateKey": "heterogeneous_gpu_llm_deployment_config"
+  }
+}
