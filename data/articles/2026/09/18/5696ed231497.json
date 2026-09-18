@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 3,
+  "id": "5696ed231497",
+  "title": "Deploy Hugging Face models on Amazon SageMaker AI with coding agents",
+  "summary": "Deploying a Hugging Face model to production means making a dozen decisions: choosing the right serving container for the model’s architecture, confirming the current image tag for your AWS Region, and matching an instance type to the model’s memory footprint. Beyond infrastructure, you must wire autoscaling so you don’t burn GPU hours on an idle endpoint. You also set Amazon CloudWatch alarms that catch silent failu",
+  "url": "https://aws.amazon.com/blogs/machine-learning/deploy-hugging-face-models-on-amazon-sagemaker-ai-with-coding-agents/",
+  "source": "AWS Machine Learning",
+  "sourceDomain": "aws.amazon.com",
+  "publishedAt": "2026-09-18T15:25:23Z",
+  "category": "industry",
+  "tags": [
+    "Agent",
+    "行业应用"
+  ],
+  "score": 88,
+  "signal": "high",
+  "originalUrl": "https://aws.amazon.com/blogs/machine-learning/deploy-hugging-face-models-on-amazon-sagemaker-ai-with-coding-agents/",
+  "resolvedUrl": "https://aws.amazon.com/cn/blogs/machine-learning/deploy-hugging-face-models-on-amazon-sagemaker-ai-with-coding-agents/",
+  "fetchedAt": "2026-09-18T16:33:18.946842Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Deploying a Hugging Face model to production means making a dozen decisions: choosing the right serving container for the model’s architecture, confirming the current image tag for your AWS Region, and matching an instance type to the model’s memory footprint. Beyond infrastructure, you must wire autoscaling so you don’t burn GPU hours on an idle endpoint. You also set Amazon CloudWatch alarms that catch silent failures before your users do. After you’ve made those decisions, Amazon SageMaker AI collapses that work into hours.\n\nThis kind of structured, repeatable work is exactly what coding agents, like Kiro and Claude Code , are built for. It’s tempting to describe a model to deploy in a coding agent, walk away, and come back to a working endpoint. In practice, an unguided coding agent might make wrong decisions, producing endpoints that are fragile, costly, or quietly wrong. The problem gets worse for newer models, since their training data might not include the latest deployment knowledge.\n\nIn this post, you learn how to deploy production-ready Hugging Face models on SageMaker AI using agent skills. You install six skills from Hugging Face Skills , point a coding agent at a Hugging Face model, and get back a real-time endpoint with autoscaling, Amazon CloudWatch alarms, the correct serving container from the AWS Deep Learning Containers (DLC) catalog, and a verified teardown path. Real-time endpoint is the default, but the skills also support real-time with scale-to-zero, serverless inference, asynchronous inference, batch transform, and Amazon Bedrock Custom Model Import. The skills are open source, use only Python and the AWS Command Line Interface (AWS CLI) , and work unchanged on macOS, Linux, and Windows.\n\n## The problem with an unguided coding agent\n\nTo show what the skills actually prevent, it helps to watch what a capable agent does without them. We tested both Kiro (with Auto or Claude Fable 5) and Claude Code (with Opus 4.8) for the request:\n\n```\ndeploy the small [Qwen/Qwen3-0.6B] (https://huggingface.co/Qwen/Qwen3-0.6B) model to a real-time endpoint, write the plan to a file first, and keep a log of every action.\n```\n\nBoth coding agents initially chose Text Generation Inference (TGI) as the serving container to deploy, an understandable choice given that TGI was the default for years and model training data is full of tutorials that reach it. But the TGI build available in the Region predated Qwen3’s architecture and couldn’t load the model. The endpoint failed its health check. The agent bumped the TGI version, redeployed, failed again, and pivoted to vLLM. This resulted in multiple deployment failures, each of which billed GPU time as it started and then crashed.\n\nThe second request failed more quietly. We asked the same agent to deploy a multimodal mixture-of-experts (MoE) diffusion model released only weeks before the test. The coding agents confirmed it existed, and again wrote a script built on TGI, a text-generation server with no backend for a discrete-diffusion image-text model. Nothing failed loudly. You would find out only when the endpoint refused to come up.\n\nThe two runs share the same root cause: missing deployment facts, not reasoning failure. The agent planned and debugged well. What it lacked was current, specific knowledge. Recent Qwen models need vLLM. Python 3.13 has no working wheels for much of the machine learning (ML) stack. Container images should be resolved from the published AWS Deep Learning Containers catalog. This knowledge changes faster than model weights get updated. So we make it into editable skill files rather than rely on the latest release of a model to absorb it.\n\nTable 1 compares the model deployment made by the unguided agent against the agent with skills installed.\n\nTGI first → health-check failure → vLLM\n\nvLLM, chosen before any resource was created\n\nDiscovered by trial and error\n\nResolved from the AWS DLC catalog, with fallback when the registry query was denied\n\nTarget tracking, 1–2 instances\n\nThree CloudWatch alarms (latency, errors, overhead)\n\nREADME recommended TGI, the SageMaker SDK, and Python 3.13\n\nPlan and scripts matched what actually ran\n\nRegion, role, environment\n\nRun, then verified the resources were gone\n\nTable 1: The same request, run by the agent without and with the skills installed\n\nThe rest of this post shows how we deploy Hugging Face models on SageMaker AI endpoints (the right-hand column of Table 1) using agent skills.\n\n## Agent skills for deploying Hugging Face models on SageMaker AI\n\nSix skills from the Hugging Face Skills GitHub repo cover the end-to-end deployment workflow. The planner skill orchestrates the other five, as shown in the following diagram.\n\n```\nhf-cloud-sagemaker-deployment-planner (orchestrate, ask only what's needed)\n│\n├── hf-cloud-aws-context-discovery (discover local AWS context)\n├── hf-cloud-python-env-setup (set up an isolated Python environment)\n├── hf-cloud-sagemaker-iam-preflight (verify a usable execution role)\n├── hf-cloud-serving-image-selection (select the right container family and image URI)\n└── hf-cloud-sagemaker-production-defaults (deploy with autoscaling, alarms, and tags)\n```\n\n## An agent skill example\n\nAn agent skill is an open standard package consisting of a folder with a required SKILL.md file. This file includes metadata (name and description, at minimum) and instructions that tell an agent how to perform a specific task. Skills load through progressive disclosure. An agent reads a skill on demand when the current task matches its description. The following is a trimmed version of the hf-cloud-serving-image-selection skill.\n\n```\n---\nname: hf-cloud-serving-image-selection\ndescription: Pick the right serving container for a SageMaker model deployment and find its current image URI. Use this skill whenever about to deploy a model to a SageMaker endpoint and an image URI needs to be chosen --- including when the user says \"deploy this LLM\", \"host this HuggingFace model\", \"serve this fine-tuned model\", \"deploy this embedding model\", \"host a reranker\", \"serve a sentence-transformers model\", or when about to hardcode any container URI in deployment code. HuggingFace-curated Deep Learning Containers are ALWAYS preferred: HuggingFace vLLM (LLMs and generative rerankers), HuggingFace vLLM-Omni (multimodal), TEI (embeddings/cross-encoder rerankers), HF Inference Toolkit (other transformers). Generic images (AWS vLLM, DJL-LMI, SGLang) are used only when no HuggingFace image is compatible --- never merely because they carry a newer version. Never hardcode a container URI from memory and never default to TGI. Prevents stale-image failures and wrong-region URIs\n---\nServing Image Selection\nThe serving container is the single thing most likely to break a deployment\nthat \"looked correct on paper\". Wrong container, stale tag, or wrong AMI all\nproduce the same opaque `Failed to pass health check` error.\n```\n\n## End-to-end model deployment phases\n\nThe skills drive five AWS services. Amazon SageMaker AI hosts the endpoint, AWS Identity and Access Management (IAM) provides the execution role. Amazon Elastic Container Registry (Amazon ECR) and AWS Deep Learning Containers supply the serving image, while Amazon CloudWatch powers the alarms. All helper scripts in skills call these services through Boto3 and the AWS Command Line Interface (AWS CLI), which retains full control over what gets created. The SageMaker Python SDK works too, but the skills default to Boto3.\n\nThe deployment follows six phases:\n\n- Discover the AWS context (profile, Region, account, and caller identity) with read-only calls.\n\n- Set up an isolated Python environment with a supported Python version and a current boto3 .\n\n- Find an existing SageMaker AI execution role and create one only if none exists and you have permission.\n\n- Select the serving container family and resolve a current image URI from the AWS DLC catalog.\n\n- Create the model, endpoint configuration, and endpoint, and then attach autoscaling and Amazon CloudWatch alarms.\n\n- Run a smoke test against the live endpoint and report the result.\n\nTo follow along, you need the following:\n\n- An AWS account with permission to use Amazon SageMaker AI, including an existing SageMaker AI execution role. The skills can find one automatically or create one if none exists and your credentials allow it.\n\n- AWS CLI v2 , configured with credentials for that account.\n\n- Python 3.10, 3.11, or 3.12 . Python 3.13 or later isn’t supported because much of the ML stack does not yet publish wheels for these versions.\n\n- A coding agent that supports skills. This post uses Kiro IDE .\n\n- Git, to clone the skills repository.\n\nThis post deploys Qwen/Qwen3-0.6B to a single ml.g5.xlarge real-time inference instance in US East (N. Virginia) Region (us-east-1) . Confirm your account has available quota for this instance type before you start.\n\nNote that a real-time endpoint bills continuously whether it serves traffic, so delete the endpoint when you’re done or follow the teardown steps at the end of this post.\n\nKiro supports two skill scopes: workspace and global. The workspace skills reside in your project under .kiro/skills/ and apply only to project-specific workflows. The global skills reside under ~/.kiro/skills/ and are available across all workspaces.\n\nTo install the six skills from the Hugging Face Skills GitHub repo in the current workspace, enter the following request in a Kiro default agent chat session:\n\n```\nInstall six agent skills from the huggingface/skills repo, pinned to commit\nf3186efbbc322121eb5d0f31e8a1d669ee961159, into this workspace.\nSource: https://github.com/huggingface/skills.git\nCommit: f3186efbbc322121eb5d0f31e8a1d669ee961159\nSkills live under the repo's skills/ directory:\n- hf-cloud-sagemaker-deployment-planner\n- hf-cloud-aws-context-discovery\n- hf-cloud-python-env-setup\n- hf-cloud-sagemaker-iam-preflight\n- hf-cloud-serving-image-selection\n- hf-cloud-sagemaker-production-defaults\n```\n\nKiro summarizes the installed files as shown in Figure 1. Note that this post tested and used the repo with a specific SHA: f3186efbbc322121eb5d0f31e8a1d669ee961159 .\n\nFigure 1: Kiro finishes installing the six agent skills\n\nTo confirm all six skill directories are present, enter / in the Kiro chat session to see available skills as slash commands, as shown in Figure 2.\n\nFigure 2: Enter / to see available skills in the Kiro chat session\n\n## Deploy a model with Kiro\n\nWith the skills installed, you describe the model to the agent in plain language, and the planner skill takes over. You don’t specify which container family to use, how to find the execution role, or which production defaults to attach, because those decisions live in the skills.\n\nEnter the following request in the Kiro chat session:\n\n```\nI need to deploy a model on AWS SageMaker, and I don't want to deal\nwith all the console selecting and boto3 myself. The model is Qwen3 0.6B, pinned to commit `c1899de289a04d12100db370d81485cdf75e47ca`, called\nfrom an internal app. Figure out the best way to deploy it and walk me through it. Write the plan to a file first, and keep a log of every action you take.\n```\n\nTo deploy the model, complete the following steps:\n\nReview the plan. The agent writes a deployment plan to a file and waits for your approval before creating any billable resources.\n\nAWS context discovery and container selection. The agent discovers the AWS context (profile, Region, account). The hf-cloud-serving-image-selection skill selects vLLM for Qwen3 and resolves the image URI from the AWS DLC catalog.\n\nApprove the deployment when the agent asks. The hf-cloud-sagemaker-production-defaults skill creates the model, endpoint configuration, and endpoint as a unit, then attaches autoscaling and CloudWatch alarms.\n\nVerify. Review the smoke-test result the agent reports after the endpoint reaches InService .\n\nThe following lines come from the deployment log the agent kept during the run:\n\n```\n## Step 5: Serving Image Selection\n| Value | Resolved to |\n| Image URI | `763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-vllm:0.28.0-transformers5.15.0-gpu-py312-cu130-ubuntu24.04` |\n| InferenceAmiVersion | `al2-ami-sagemaker-inference-gpu-3-1` |\n| `SM_VLLM_MODEL` | `Qwen/Qwen3-0.6B` |\n| `SM_VLLM_HOST` | `0.0.0.0` (else vLLM binds localhost, ping fails, container dies) |\n| `SM_VLLM_TRUST_REMOTE_CODE` | `false` |\n| `SM_VLLM_MAX_MODEL_LEN` | `8192` |\n```\n\nFor a gated model, add a HUGGING_FACE_HUB_TOKEN environment variable.\n\n## Resolve the execution role\n\nDeployments often stop at the execution role when calling iam:CreateRole fails on a corporate account whose AWS IAM Identity Center session has no IAM write access. The hf-cloud-sagemaker-iam-preflight skill reverses the order: find first, create only as a last resort.\n\nIts check_role.py script searches the account for existing roles that match patterns such as AmazonSageMaker-ExecutionRole-* and *SageMaker*Execution* , and ranks them by last-used date. It also validates the trust policy and returns the Amazon Resource Name (ARN). It creates a role only when none exists and the caller has iam:CreateRole permission. Note that the created role carries AmazonSageMakerFullAccess . We recommend updating the role to grant only the permissions it needs, following the principle of least privilege.\n\n## Apply production defaults\n\nThe hf-cloud-sagemaker-production-defaults skill turns an endpoint from a demo into a production deployment. It applies the defaults in Table 2 to every endpoint, establishing an operational baseline. For production deployment, you need to add user-specific configurations, such as Amazon Virtual Private Cloud and AWS Key Management Service configurations.\n\nqwen3-06b-internal-20260904-1913-config\n\nqwen3-06b-internal-20260904-1913\n\nAutoscaling target + policy\n\nendpoint/.../variant/AllTraffic , min 1 max 4\n\n<endpoint>-Invocation5XXErrors , -ModelLatencyP99 , -OverheadLatencyP99\n\nTable 2: Production defaults the skill applies to every endpoint\n\n## Decisions the coding agent made on its own\n\nAgent skills define the workflow, but the coding agent still makes judgment calls within it. In one case, when the agent queried Amazon ECR for the newest image tag, the call was denied because the IAM Identity Center role lacked ecr-public:DescribeImages permission. Rather than fail the deployment, the agent fell back to the known-good tag the skill ships as a safety net and recorded the reason in the log. In another case, after the smoke test returned HTTP 200, the agent noticed that the actual answer was never emitted. This is because the model’s reply was truncated at max_tokens while still inside the Qwen3 reasoning block. The agent flagged this in the log as a configuration issue: the calling application should raise the token limit rather than treat the test as a pass.\n\nA real-time endpoint bills for its instance the entire time it exists. Delete the resources you created to avoid ongoing charges. The sagemaker-production-defaults skill includes a teardown.py script that removes the deployment resources and then confirms they’re gone.\n\nTo clean up, complete the following steps:\n\n- Ask the agent to tear down the deployment or run teardown.py directly with the endpoint name and Region.\n\n- Confirm the script reports the endpoint, endpoint configuration, and model as deleted. The script verifies the deletion.\n\n- Check that the autoscaling policy and CloudWatch alarms have been removed. Delete any that remain.\n\nSix reusable agent skills turn an unguided coding agent into one that deploys Hugging Face models on SageMaker AI endpoints with production-ready features. Each deployment includes the proper container, autoscaling, CloudWatch alarms, and a verified teardown path. Without these skills, agents reach for outdated containers, skip production safeguards, and leave misleading documentation. This post walks through each skill: AWS context discovery, Python environment setup, IAM role resolution, container selection from the AWS DLC catalog, and deployment with production defaults.\n\nTo get started, install the skills from the Hugging Face Skills GitHub repo and deploy your first model. The skills are open source and contributions are welcome.\n\nTeams can also use Amazon SageMaker JumpStart to deploy a set of popular Hugging Face models directly from the console, and Inference Recommendations to automatically benchmark and select the optimal instance type for their workload.\n\nAmazon SageMaker AI Developer Guide – Real-time inference\n\nAWS Deep Learning Containers documentation",
+  "images": [
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-featured-image.png",
+      "alt": "",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-featured-image.png"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/reinvent-register.3822079bac49f139ae46016a9a99c3eed71fad4a.png",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/reinvent-register.3822079bac49f139ae46016a9a99c3eed71fad4a.png"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/data-migration.9bea2e27c55c0c72b7e840545dbb72b423271564.jpg",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/data-migration.9bea2e27c55c0c72b7e840545dbb72b423271564.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/isv.bce7bdc05328153704c0c2a90d7dd38658e4d349.jpg",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/isv.bce7bdc05328153704c0c2a90d7dd38658e4d349.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_innovation_8_1200.07a6484f8eaa3100138cf8b6dce14f1db024db32.jpg",
+      "alt": "an abstract illustration",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_innovation_8_1200.07a6484f8eaa3100138cf8b6dce14f1db024db32.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_2_1200.77dd122bde9af49ea0c09cdc009c193866f62ad7.jpg",
+      "alt": "alt",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_2_1200.77dd122bde9af49ea0c09cdc009c193866f62ad7.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_11_1200.29c48d4e742090396f61d0c5d5eec4ea8d714817.jpg",
+      "alt": "alt",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_11_1200.29c48d4e742090396f61d0c5d5eec4ea8d714817.jpg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-1.png",
+      "alt": "Kiro chat session confirming the six agent skills installed in the workspace",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-1.png"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-2.png",
+      "alt": "Kiro chat session listing the six installed skills as slash commands",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-2.png"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-3.jpg",
+      "alt": "Dario Salvati",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-3.jpg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-4.jpg",
+      "alt": "Álvaro Bartolomé",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/15/ML-21283-4.jpg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/Qiong-100x127.jpg",
+      "alt": "Qiong (Jo) Zhang",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/Qiong-100x127.jpg"
+    }
+  ],
+  "mediaCheckedAt": "2026-09-18T16:33:18.946612Z",
+  "mediaRecheckedAt": "2026-09-18T16:33:18.946622Z",
+  "summaryZh": "AWS 介绍了如何结合 Hugging Face Skills 与编程 Agent（如 Claude Code 和 Kiro），在 Amazon SageMaker AI 上自动化部署大模型。针对无引导 Agent 容易产生配置错误和高成本部署的痛点，该方法通过提供标准化的技能扩展，指导 Agent 自动完成计算实例选择、自动扩缩容、CloudWatch 告警设置及零扩容设置，帮助开发者快速构建稳健的生产级推理端点。",
+  "summaryGeneratedAt": "2026-09-18T16:39:04.352448Z",
+  "summaryModel": "gemini:gemini-3.6-flash",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.6-flash",
+    "reviewedAt": "2026-09-18T16:39:04.352448Z",
+    "isRelevant": true,
+    "relevanceScore": 79,
+    "importanceScore": 79,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 22,
+      "impact": 16,
+      "novelty": 11,
+      "credibility": 14,
+      "usefulness": 8,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "agent",
+    "tags": [
+      "AWS",
+      "SageMaker AI",
+      "Hugging Face",
+      "Coding Agents",
+      "Claude Code"
+    ],
+    "reasonZh": "AWS 介绍了结合 Hugging Face Skills 与编程 Agent 在 SageMaker AI 上自动化部署端点的标准化方案。",
+    "summaryZh": "AWS 介绍了如何结合 Hugging Face Skills 与编程 Agent（如 Claude Code 和 Kiro），在 Amazon SageMaker AI 上自动化部署大模型。针对无引导 Agent 容易产生配置错误和高成本部署的痛点，该方法通过提供标准化的技能扩展，指导 Agent 自动完成计算实例选择、自动扩缩容、CloudWatch 告警设置及零扩容设置，帮助开发者快速构建稳健的生产级推理端点。",
+    "glossary": [
+      {
+        "term": "coding agents",
+        "explanationZh": "编程 Agent，指能够自主编写代码、调用工具并执行开发运维任务的 AI 代理系统。"
+      },
+      {
+        "term": "SageMaker AI",
+        "explanationZh": "AWS 提供的托管机器学习平台，用于构建、训练和部署 AI 模型。"
+      },
+      {
+        "term": "autoscaling",
+        "explanationZh": "自动扩缩容，根据实时请求流量自动调整计算节点数量以优化成本与性能。"
+      },
+      {
+        "term": "serverless inference",
+        "explanationZh": "无服务器推理，按实际推理请求付费且无请求时自动缩容至零的部署模式。"
+      },
+      {
+        "term": "scale-to-zero",
+        "explanationZh": "缩容至零，在没有调用请求时自动将计算资源释放为零以节省运行成本。"
+      }
+    ],
+    "duplicateKey": "aws_sagemaker_coding_agents_deployment"
+  }
+}
