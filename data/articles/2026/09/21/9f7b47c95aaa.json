@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 3,
+  "id": "9f7b47c95aaa",
+  "title": "5090 + 3090, Qwen3.8 27B and Flash-Next at 60k–160k context tests with llama.cpp",
+  "summary": "Disclosure: I wrote this post with the help of an AI assistant for structure and wording. All numbers come from my own runs and logs. I spent the evening tuning my llama.cpp router presets and measured everything along the way. Some findings apply beyond my setup, so here they are. Hardware / software Ryzen 7 9800X3D, 128 GB DDR5-6000 CL32 (2×64 GB), ASRock X870E Taichi RTX 5090 (PCIe 5.0 x8, also drives the desktop)",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wmoqgz/5090_3090_qwen38_27b_and_flashnext_at_60k160k/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-21T20:39:39Z",
+  "category": "industry",
+  "tags": [
+    "Llama",
+    "行业应用"
+  ],
+  "score": 70,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wmoqgz/5090_3090_qwen38_27b_and_flashnext_at_60k160k/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wmoqgz/5090_3090_qwen38_27b_and_flashnext_at_60k160k/",
+  "fetchedAt": "2026-09-21T22:02:16.098707Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Disclosure: I wrote this post with the help of an AI assistant for structure and wording. All numbers come from my own runs and logs.\n\nI spent the evening tuning my llama.cpp router presets and measured everything along the way. Some findings apply beyond my setup, so here they are.\n\n- Ryzen 7 9800X3D, 128 GB DDR5-6000 CL32 (2×64 GB), ASRock X870E Taichi\n\n- RTX 5090 (PCIe 5.0 x8, also drives the desktop) + RTX 3090 (PCIe 4.0 x8)\n\n- Linux (Kubuntu 26.04 LTS), llama.cpp built from source (CUDA 13.4), build 0.4.1-dev (build 11028, commit 972d2313b) , router mode with a presets INI\n\n- Models (Unsloth): Qwen3.8-27B UD-Q6_K and Q8_0, Qwen3.8-Flash-Next UD-Q4_K_XL\n\n- flash-attn on, KV cache q8_0, single stream, MTP speculative decoding on the 27B\n\n1. lazy-mode regression on MoE with experts in RAM\n\nRecent builds map the large embedding table lazily even with mmap disabled. On Flash-Next with experts offloaded to RAM ( n-cpu-moe ), this costs a lot of prefill. Same 20.6k-token document, ubatch 4096, everything else identical:\n\nlazy-mode on + load-mode mmap\n\nlazy-mode off + load-mode mmap\n\nlazy-mode off + load-mode none\n\nWith the default ubatch (512) on top of lazy-mode on + mmap, I was at ~300 t/s. During Flash prefill, nvtop shows the 5090 receiving ~28 GiB/s, which is a saturated Gen5 x8 link. Prefill is bound by expert weights crossing PCIe on every micro-batch.\n\n2. For offloaded MoE, ubatch matters far more than n-cpu-moe\n\n- ubatch 2048 → 4096 on the 32k preset: 941 → 1,234 t/s (+31%)\n\n- Moving 2 more expert layers back to GPU: +3%\n\nBigger micro-batches mean fewer weight transfers per token. Note that n-cpu-moe offloads the first layers, which live on the first device. Lowering it loads CUDA0, not the second card. To use the second card's spare VRAM, shift tensor-split toward it first.\n\n3. batch-size = ubatch-size kills pipelining on a 2-GPU layer split\n\n27B Q8 split across both cards, fully in VRAM, same 33k document:\n\nWith one micro-batch per batch, the two GPUs work one after the other instead of overlapping. Keep batch at 3–4× ubatch. This is the opposite of point 2, where the bottleneck is PCIe, not inter-GPU overlap.\n\n4. The 5090 alone beats the split for the 27B\n\nQ6 on the 5090 alone: 2,766 t/s prefill, ~100 t/s decode (33k document). Q8 split on both cards: 2,687 t/s / 69.5 t/s. Not the same quant, but the 3090 clearly paces the split. I now run Q6 on the 5090 with 128k context by default and only use the split for >128k.\n\n5. At 262k context, the compute buffer lands on the second card\n\nFlash at 262k with ubatch 2048 failed with a 7.1 GiB compute buffer allocation on CUDA1 (the 3090). It scales with ubatch × context. Fix: keep ubatch 1024 at 262k, or use a 128k preset where ubatch 2048 fits.\n\nMTP: draft 3 is the sweet spot\n\nOn the 27B, spec-draft-n-max 2 → 3: +12% decode (61.9 → 69.5 t/s). 4: +<1%, with acceptance dropping to ~58%.\n\nAcceptance by task type (27B Q6, 5090, draft 3):\n\nTask Context Decode MTP acceptance\n\nNumeric reasoning (tax computation, rules given)\n\nCode (with thinking, 24.8k tokens generated)\n\nSummary, Pillar Two directive\n\nSo it's not just a summarization artifact. Decode speed is driven mostly by context length.\n\nLong documents (full document in context, 20-bullet summary)\n\nTTFT = server-side prefill time.\n\nPreset Document Tokens Prefill TTFT Decode Output Total\n\nFlash Q4, both GPUs, 128k\n\nFlash Q4, both GPUs, 262k\n\n* ~5k tokens of Open WebUI system prompt were reused from cache on these runs.\n\nGoing from 61k to 97k, the 27B loses 18% prefill (attention cost grows with context), Flash only 6% (it's capped by PCIe, which doesn't depend on context).\n\nOpen WebUI → llama.cpp router, file sent as full document (not RAG). Timings from llama-server logs and Open WebUI's info panel ( prompt_per_second , predicted_per_second , draft_n_accepted ). New chat per run, one warm-up request after each preset load (the first request after load is slow regardless of load mode). Single runs except the lazy-mode A/B, where I repeated the best config.\n\n[*] n-gpu-layers = 99 flash-attn = on jinja = true parallel = 1 cache-type-k = q8_0 cache-type-v = q8_0 lazy-mode = off load-mode = none\n\n[Qwen-27B-Q6-128k-5090] model = .../Qwen3.8-27B-UD-Q6_K.gguf device = CUDA0 split-mode = none spec-type = draft-mtp spec-draft-n-max = 3 ctx-size = 131072 batch-size = 2048 ubatch-size = 1024\n\n[Qwen-27B-Q8-262k-DualGPU] model = .../Qwen3.8-27B-Q8_0.gguf device = CUDA0,CUDA1 split-mode = layer tensor-split = 0.60,0.40 spec-type = draft-mtp spec-draft-n-max = 3 ctx-size = 262144 batch-size = 4096 ubatch-size = 1024\n\n[Qwen-Flash-Q4-32k] model = .../Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf device = CUDA0,CUDA1 split-mode = layer tensor-split = 0.70,0.30 n-cpu-moe = 22 ctx-size = 32768 batch-size = 4096 ubatch-size = 4096\n```\n\nHappy to run other tests if people want specific comparisons.\n```",
+  "summaryZh": "该测试针对双显卡（RTX 5090与3090）环境下的 llama.cpp 推理性能进行了长文本上下文实测。研究发现在 MoE 模型（如 Qwen3.8-Flash-Next）将专家权重卸载至内存时，默认的延迟加载模式会导致严重的预填充性能衰退。此外，增大微批次（ubatch）相比调整 CPU 专家层数能更显著提升跨 PCIe 传输效率与吞吐量。",
+  "summaryGeneratedAt": "2026-09-21T22:10:04.178299Z",
+  "summaryModel": "gemini:gemini-3.6-flash",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.6-flash",
+    "reviewedAt": "2026-09-21T22:10:04.178299Z",
+    "isRelevant": true,
+    "relevanceScore": 81,
+    "importanceScore": 81,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 22,
+      "impact": 16,
+      "novelty": 12,
+      "credibility": 13,
+      "usefulness": 10,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "benchmark",
+    "tags": [
+      "llama.cpp",
+      "Hardware Optimization",
+      "MoE",
+      "Long Context",
+      "RTX 5090"
+    ],
+    "reasonZh": "文章给出了基于双显卡硬软环境对 llama.cpp 在长上下文与 MoE 卸载场景下的详尽性能瓶颈实测与调优指南。",
+    "summaryZh": "该测试针对双显卡（RTX 5090与3090）环境下的 llama.cpp 推理性能进行了长文本上下文实测。研究发现在 MoE 模型（如 Qwen3.8-Flash-Next）将专家权重卸载至内存时，默认的延迟加载模式会导致严重的预填充性能衰退。此外，增大微批次（ubatch）相比调整 CPU 专家层数能更显著提升跨 PCIe 传输效率与吞吐量。",
+    "glossary": [
+      {
+        "term": "KV cache",
+        "explanationZh": "大模型生成过程中用于存储注意力机制中间状态以加速推理的内存缓冲区。"
+      },
+      {
+        "term": "Speculative Decoding",
+        "explanationZh": "利用轻量草稿模型生成候选 Token，再由大模型并行验证以加速推理的技术。"
+      },
+      {
+        "term": "Prefill",
+        "explanationZh": "大语言模型处理输入 Prompt 并生成首个 Token 前的上下文计算阶段。"
+      },
+      {
+        "term": "Micro-batch",
+        "explanationZh": "在模型并行或卸载计算中，将大批次拆分处理的最小数据单元，直接影响显存与传输效率。"
+      }
+    ],
+    "duplicateKey": "llamacpp-qwen38-multi-gpu-benchmark"
+  }
+}

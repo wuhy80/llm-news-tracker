@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 3,
+  "id": "50d9cf5ec50a",
+  "title": "WarpState: experimenting with dual-timescale associative memory + local attention for long-running LLMs",
+  "summary": "Hey everyone, I’m sharing a research project I’ve been working on called WarpState — an experimental language-model architecture exploring whether we can move away from storing an ever-growing history of token-level KV states and instead maintain a compact recurrent memory. The basic idea is: exact causal self-attention inside small, non-overlapping token chunks; two associative matrix memories per attention head; a ",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wmf590/warpstate_experimenting_with_dualtimescale/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-21T14:57:06Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wmf590/warpstate_experimenting_with_dualtimescale/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wmf590/warpstate_experimenting_with_dualtimescale/",
+  "fetchedAt": "2026-09-21T22:02:16.513296Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "I’m sharing a research project I’ve been working on called WarpState — an experimental language-model architecture exploring whether we can move away from storing an ever-growing history of token-level KV states and instead maintain a compact recurrent memory.\n\n- exact causal self-attention inside small, non-overlapping token chunks;\n\n- two associative matrix memories per attention head;\n\n- a fast memory and a slow memory , with separately learned decay rates;\n\n- bounded key/value writes from completed chunks;\n\n- an input-dependent gate that decides how much to use local attention vs. recurrent memory;\n\n- optional parameter sharing across logical depth.\n\nThe current reference preset is about 2.005B parameters , with:\n\n- 28 logical layers / 28 physical cores\n\n- vocabulary size 32,768\n\nhttps://preview.redd.it/pa7xlbp2hnqh1.png?width=1280&format=png&auto=webp&s=14e87c7f750dfab0133ab92513680fd5b110d357\n\nhttps://preview.redd.it/dw29eok3hnqh1.png?width=964&format=png&auto=webp&s=dd54e98df212f9245572012715b733c14fba65dd\n\nhttps://preview.redd.it/qup0dol4hnqh1.png?width=1280&format=png&auto=webp&s=35b44a293934d6d1ca78212c8e6cd942aa5a0286\n\nInstead of keeping one recurrent state, WarpState keeps two exponentially decaying associative memories.\n\nAt initialization, their decay values are approximately:\n\nWith 128-token chunks, their ideal isolated-contribution half-lives are roughly:\n\nThe model learns the decay coefficients, and every head also learns how to mix the two memories.\n\nThis does not mean that the model has an 8K semantic memory limit — or that information is guaranteed to survive for that long. Those values only describe the initial exponential weighting of isolated writes.\n\nActual usable retention depends on learned decays, interference, queries, training, and how information propagates through depth.\n\n# Fixed-size streaming state\n\nOne of the parts I find most interesting is the token-step inference path.\n\nFor streaming inference, WarpState keeps:\n\n- two recurrent matrix memories,\n\n- a partial-chunk write accumulator,\n\nFor the supplied 2B configuration at batch size 1 with BF16 cache tensors, the persistent tensor cache is approximately:\n\nwith the two recurrent memory banks themselves taking around:\n\nImportantly, this recurrent state does not grow with the number of previously processed tokens .\n\nSo, algorithmically, you can keep carrying the state through an arbitrarily long stream without continually expanding a token-indexed KV cache.\n\nThat is very different from claiming the model can perfectly recall something from millions of tokens ago.\n\nStream length ≠ effective memory horizon.\n\nThat distinction is one of the main things I wanted the paper to make explicit.\n\nFor a completed chunk, WarpState creates a bounded associative write roughly of the form:\n\nW = mean(tanh(K)T · tanh(U))\n\nand updates both memory banks as normalized exponential moving averages:\n\nM_fast = β_fast M_fast + (1 - β_fast) W\n\nM_slow = β_slow M_slow + (1 - β_slow) W\n\nThe next chunks can query a learned mixture of those states.\n\nBecause the writes are bounded and the update is a convex combination, every entry of the completed-chunk memory remains bounded within [-1, 1] in real arithmetic.\n\n# Local attention is still exact\n\nThis isn't a pure linear-attention model.\n\nInside each 128-token chunk, WarpState performs normal causal softmax attention.\n\nHistory before the current chunk is accessed through the compressed recurrent state.\n\nSo the architecture is closer in spirit to the family of hybrid recurrent/attention approaches such as Infini-attention, RetNet, Griffin, GLA, DeltaNet, RWKV, xLSTM , etc., rather than being a replacement for all previous work.\n\nIn particular, Infini-attention is probably the closest structural comparison.\n\nWarpState differs in several implementation choices, including:\n\n- two normalized EMA memory banks,\n\n- separate memory-value projections,\n\n- signed tanh write features,\n\n- token- and feature-dependent local/memory fusion,\n\nWhether those choices are actually better needs controlled experiments.\n\n# An important implementation caveat\n\nThere are currently multiple execution modes.\n\nThe streaming/token-step implementation has bounded recurrent state and bounded per-token work for fixed model geometry.\n\nHowever, the supplied parallel forward/training implementation is not linear-time over arbitrarily long sequences .\n\nIt constructs a dense chunk-to-chunk decay matrix, so that path has quadratic complexity in the number of chunks.\n\nAn optimized scan/tiled recurrence would be an obvious future systems improvement.\n\nI wanted to explicitly document this rather than advertise the architecture as universally “linear-time”.\n\n# What has actually been tested?\n\nFor small randomly initialized CPU fixtures, FP32 execution was compared across multiple paths.\n\nObserved maximum absolute differences included:\n\n- serial forward vs. token-step: 1.79e-7\n\n- serial vs. parallel forward: 2.98e-8\n\n- core serial vs. parallel: 2.38e-7\n\n- earlier logits after changing future tokens: 0\n\nSo the implementation checks support the intended causal ordering and FP32 agreement on those fixtures.\n\nBF16 was more interesting.\n\nThe serial and parallel paths do not perform decay arithmetic in exactly the same precision/order, and BF16 exposed noticeably larger discrepancies. That is something I think deserves proper trained-checkpoint testing rather than being hidden as an implementation detail.\n\n# Preliminary / historical training evidence\n\nThere was also an earlier ~150M parameter WarpState configuration .\n\nAn earlier project draft reported approximately 300M training tokens , with sampled validation cross-entropy reaching:\n\nwith the best tabulated point at:\n\nHowever, I want to be very clear here:\n\nthe original checkpoint, complete logs, resolved configuration and evaluation artifacts for that run are not included with the inspected research package.\n\nSo these numbers should be treated as historical project reports , not independently reproduced benchmark results.\n\nI do not currently claim that WarpState has demonstrated better sample efficiency than Transformers, superior long-range recall, or a proven 128M-token semantic context.\n\nThose are hypotheses that still need proper controlled testing.\n\n# What I want to test next\n\nThe experiment I think matters most is actually pretty simple:\n\nTrain three matched models:\n\n2. Local attention + one associative memory bank\n\n3. Local attention + WarpState dual memory\n\n- parameter or compute budget\n\nThen test retrieval at progressively larger distances:\n\nusing randomized keys, distractors, multiple insertion positions, RULER/BABILong-style tasks, etc.\n\nI'd also like to measure:\n\n- trained fast/slow decay distributions;\n\n- memory-gate utilization;\n\n- likelihood vs. training FLOPs;\n\n- exact-match and semantic retrieval separately;\n\n- recurrent-state memory usage;\n\n- FP32 vs. BF16 state behavior.\n\nThe real question isn't:\n\n“Can it technically process 100 million tokens?”\n\nThe more interesting question is:\n\nHow much useful information can a fixed-size recurrent state preserve per byte and per FLOP compared with one memory bank, local attention alone, and other hybrid recurrent architectures?\n\nThat’s what I want to find out.\n\nI’ve attached the research paper with the architecture equations, implementation analysis, complexity discussion, reproducibility notes, and the preliminary/historical results.\n\nI’d genuinely appreciate technical criticism — especially around the memory update, numerical behavior, appropriate baselines, and experiment design.\n\nIf anyone here has worked with Infini-attention / GLA / DeltaNet / RetNet / RWKV / xLSTM / recurrent-depth models, I’d be particularly interested in your thoughts. Thanks to this user for sponsoring this project: https://www.reddit.com/user/kimyj78/\n\nsubmitted by /u/zemondza",
+  "summaryZh": "WarpState是一个实验性大模型架构研究项目，旨在用紧凑的循环记忆替代不断增长的token级KV状态缓存。该模型结合了局部屋注意力、快慢双关联矩阵记忆以及输入依赖门控机制，探索长序列处理的新方案。",
+  "summaryGeneratedAt": "2026-09-21T22:14:38.513043Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-21T22:14:38.513043Z",
+    "isRelevant": true,
+    "relevanceScore": 69,
+    "importanceScore": 69,
+    "importanceLevel": 3,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 16,
+      "novelty": 12,
+      "credibility": 9,
+      "usefulness": 6,
+      "timeliness": 6
+    },
+    "evidenceLevel": "partial",
+    "informationType": "original",
+    "category": "industry",
+    "tags": [
+      "LLMArchitecture",
+      "AssociativeMemory",
+      "KVcache",
+      "WarpState"
+    ],
+    "reasonZh": "提出了一种创新的双时间尺度关联记忆加局部屋attn架构，探索替代不断增长的KV缓存。",
+    "summaryZh": "WarpState是一个实验性大模型架构研究项目，旨在用紧凑的循环记忆替代不断增长的token级KV状态缓存。该模型结合了局部屋注意力、快慢双关联矩阵记忆以及输入依赖门控机制，探索长序列处理的新方案。",
+    "glossary": [],
+    "duplicateKey": "warpstate-dual-timescale-memory-architecture"
+  }
+}
