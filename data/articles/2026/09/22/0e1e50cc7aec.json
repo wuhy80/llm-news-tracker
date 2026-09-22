@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 3,
+  "id": "0e1e50cc7aec",
+  "title": "MiMo-V2.6-Flash on vLLM: fixes for \"empty responses\" with thinking + tools, and a hidden 2,048-token output cap",
+  "summary": "Some people here say MiMo-V2.6 is bad with tools and are going back to GLM-5.3-Flash. I spent today running MiMo-V2.6-Flash-RL as the backend for an agent harness, on 2× DGX Spark with vLLM, using the tonyd2wild recipe. Most of the \"tool problems\" I hit turned out to be serving bugs rather than the model. There are three separate issues, all fixable without touching vLLM's core logic. Details below, in case it saves ",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wnjbwn/mimov26flash_on_vllm_fixes_for_empty_responses/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-09-22T19:28:26Z",
+  "category": "agent",
+  "tags": [
+    "Agent"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wnjbwn/mimov26flash_on_vllm_fixes_for_empty_responses/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1wnjbwn/mimov26flash_on_vllm_fixes_for_empty_responses/",
+  "fetchedAt": "2026-09-22T21:25:14.309638Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Some people here say MiMo-V2.6 is bad with tools and are going back to GLM-5.3-Flash. I spent today running MiMo-V2.6-Flash-RL as the backend for an agent harness, on 2× DGX Spark with vLLM, using the tonyd2wild recipe. Most of the \"tool problems\" I hit turned out to be serving bugs rather than the model. There are three separate issues, all fixable without touching vLLM's core logic. Details below, in case it saves someone a day.\n\n# 1. With thinking on, replies after the first turn come back \"empty\"\n\n- My agent (Hermes) kept reporting \"No response from provider\" and retried the same call 4–5 times.\n\n- The server log was all 200 OK .\n\n- Only happened in streaming mode with thinking on , and only once the conversation had any earlier assistant message . Single-turn requests were fine.\n\n- delta.reasoning stayed empty.\n\n- The reasoning arrived as normal content starting with a literal <think> , and the closing </think> never showed up.\n\n- Any client that strips <think>…</think> sees an unclosed block and throws the whole reply away.\n\n- MiMo's chat template renders every earlier assistant message as <think>reasoning</think>content , so any multi-turn prompt contains </think> .\n\n- With thinking on, the stock template ends the prompt at <|im_start|>assistant and leaves it to the model to emit <think> .\n\n- vLLM's streaming path runs is_reasoning_end(prompt_token_ids) over the prompt, finds the </think> from history, and decides reasoning is already over before generation starts. Everything then streams as content.\n\n- Non-streaming works because it only parses the model's output.\n\nA controlled test confirms it: a single turn works; adding one prior \"Hello!\" from the assistant breaks it. Speculative decoding is identical in both cases, so it's not a multi-token-chunk issue.\n\nFix: pre-open <think> in the generation prompt (credit: issue #1 on the recipe repo ). At the end of chat_template.jinja :\n\n```\n{%- if add_generation_prompt -%} {{- '<|im_start|>assistant\\n' -}} {%- if enable_thinking is false -%} {{- '<think></think>' -}} {%- else -%} {{- '<think>' -}} {%- endif -%} {%- endif -%}\n```\n\nServe it with --chat-template /path/to/fixed.jinja .\n\nVerified , streaming with thinking on:\n\n- after a plain assistant turn\n\n- after an assistant turn with reasoning\n\n6/6 pass: reasoning only in delta.reasoning , no <think> in content, and tool calls parse.\n\n# 2. The model silently loses its own earlier reasoning in tool loops\n\nXiaomi's docs say that with thinking on, earlier reasoning must be passed back on assistant messages that made tool calls.\n\n- Template: the stock template only reads message.reasoning_content . vLLM returns reasoning in a field called reasoning , so clients that echo back vLLM's own format lose it.\n\n- vLLM: vLLM only reads message.get(\"reasoning\") ( vllm/entrypoints/chat_utils.py ). A client that sends reasoning_content (my harness does) has it dropped before the template ever sees it . You can confirm it with /tokenize : put a marker string in reasoning_content on a past assistant message, and it's missing from the rendered prompt.\n\n- In the template: %- set reasoning = message.reasoning_content if message.reasoning_content is string else (message.reasoning if message.reasoning is string else '') -%\n\n- In chat_utils.py , one extra fallback (I bind-mount the patched file into the container): reasoning = message.get(\"reasoning\") if reasoning is None: reasoning = message.get(\"reasoning_content\")\n\nAfter both, /tokenize shows earlier reasoning in the prompt under either field name.\n\n# 3. Every reply is capped at 2,048 tokens unless you send max_tokens\n\nThe checkpoint's generation_config.json has \"max_new_tokens\": 2048 . With --generation-config auto (the recipe uses it for the sampling defaults), vLLM turns that into the default max_tokens . Any client that doesn't send max_tokens gets 2,048 tokens total, thinking included , so thinking-heavy replies get cut off.\n\nFix: override it. Xiaomi's API allows 128K–131,072 output tokens for V2.6.\n\n```\n--generation-config auto --override-generation-config '{\"repetition_penalty\": 1.05, \"max_new_tokens\": 131072}'\n```\n\nKeep the repetition_penalty 1.05 from the recipe. The recipe author documents \"tool-call storms\" (hundreds of identical tool calls in one turn) under near-greedy sampling without it.\n\n# Other things worth knowing\n\n- The \"one-line\" <parameter= fix from the other thread is a no-op on vLLM. Changing '<parameter=' ~ name to '<parameter' ~ '=' ~ name renders byte-identical prompts under transformers' Jinja env. vLLM also parses tool-call argument strings into dicts before the template runs, so earlier calls always render in the native <parameter=…> form. It might matter on SGLang; I didn't test that.\n\n- There's no reasoning effort control. Xiaomi's API and the vLLM recipes only have thinking on/off. In vLLM, reasoning_effort: \"none\" turns thinking off and any other value turns it on. The template does receive reasoning_effort , so I added an experimental \"think thoroughly\" hint for max . On 4 short reasoning prompts × 2 runs:effort avg tokens avg time correct unset 262 4.8 s 7/8 low hint 221 4.1 s 8/8 max hint 536 10.6 s 8/8 So the max hint roughly doubles thinking; low barely changes anything. Small, easy test set, so treat it as a trick, not a feature.\n\n- Sampling: temperature 1.0 / top_p 0.95. Xiaomi's API forces these in thinking mode.\n\n- Don't health-check vision with a solid-color PNG. Pure red came back \"Black\". Real screenshots are read fine.\n\n# Setup and numbers, for context\n\n- Hardware: 2× DGX Spark (GB10), TP=2 over RoCE, vLLM from the recipe's sm121-v11-dflash2 image.\n\n- fp8 KV cache, full native 1,048,576 context, DFlash with 7 draft tokens.\n\n- 1M needle test: 3/3 hidden codes retrieved from a 996K-token prompt.\n\n- Decode: ~42–51 tok/s on real agentic code at default sampling (69 on the recipe's coding benchmark at temperature 0), ~20–23 on prose.\n\n- Deep prefill is the weak spot: ~160 tok/s past 800K, so a cold 1M prompt takes ~67 min. Keep contexts append-only so the prefix cache does the work.\n\nWith these three fixes, my harness's multi-step tool tasks with thinking on stopped failing. Happy to share the full patched template.\n\nsubmitted by /u/mamolengo",
+  "summaryZh": "文章探讨了在智能体框架中运行MiMo-V2.6-Flash-RL模型时遇到的服务器端Bug，重点分析了多轮对话中思考标签未闭合导致流式响应返回空内容的成因，并给出了无需修改vLLM核心逻辑的具体修复策略。",
+  "summaryGeneratedAt": "2026-09-22T21:33:50.233705Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-22T21:33:50.233705Z",
+    "isRelevant": true,
+    "relevanceScore": 76,
+    "importanceScore": 76,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 22,
+      "impact": 16,
+      "novelty": 12,
+      "credibility": 9,
+      "usefulness": 9,
+      "timeliness": 8
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "agent",
+    "tags": [
+      "MiMo-V2.6",
+      "vLLM",
+      "agent harness",
+      "bug fix"
+    ],
+    "reasonZh": "针对MiMo-V2.6-Flash在vLLM推理服务中带有思考和工具调用时出现的空响应与输出截断问题给出了具体修复方案。",
+    "summaryZh": "文章探讨了在智能体框架中运行MiMo-V2.6-Flash-RL模型时遇到的服务器端Bug，重点分析了多轮对话中思考标签未闭合导致流式响应返回空内容的成因，并给出了无需修改vLLM核心逻辑的具体修复策略。",
+    "glossary": [],
+    "duplicateKey": "mimo v2.6 vllm thinking tools fix 2026"
+  }
+}
