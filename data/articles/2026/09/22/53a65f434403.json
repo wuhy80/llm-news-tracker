@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 3,
+  "id": "53a65f434403",
+  "title": "Right-size generative AI endpoints with concurrency sweeps on Amazon SageMaker AI",
+  "summary": "Concurrency sweeps help you right-size a generative AI endpoint by finding the instance type and serving configuration that maximizes price-performance while holding latency within acceptable bounds. Without a systematic approach, right-sizing means deploying, load-testing manually, adjusting, and repeating until the numbers look acceptable. Choose five ml.g7e.2xlarge instances when one would suffice, and you burn yo",
+  "url": "https://aws.amazon.com/blogs/machine-learning/right-size-generative-ai-endpoints-with-concurrency-sweeps-on-amazon-sagemaker-ai/",
+  "source": "AWS Machine Learning",
+  "sourceDomain": "aws.amazon.com",
+  "publishedAt": "2026-09-22T15:35:53Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 84,
+  "signal": "high",
+  "originalUrl": "https://aws.amazon.com/blogs/machine-learning/right-size-generative-ai-endpoints-with-concurrency-sweeps-on-amazon-sagemaker-ai/",
+  "resolvedUrl": "https://aws.amazon.com/cn/blogs/machine-learning/right-size-generative-ai-endpoints-with-concurrency-sweeps-on-amazon-sagemaker-ai/",
+  "fetchedAt": "2026-09-22T17:04:41.562979Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Concurrency sweeps help you right-size a generative AI endpoint by finding the instance type and serving configuration that maximizes price-performance while holding latency within acceptable bounds. Without a systematic approach, right-sizing means deploying, load-testing manually, adjusting, and repeating until the numbers look acceptable. Choose five ml.g7e.2xlarge instances when one would suffice, and you burn your budget on idle GPUs. Choose too few, and requests queue, latency spikes, and users experience degraded service.\n\nConcurrency sweeps address this problem. A concurrency sweep is a systematic benchmarking approach that sends controlled, increasing levels of concurrent traffic to your Amazon SageMaker AI endpoint and analyzes its performance. Concurrency sweeps are built into Amazon SageMaker AI Inference Recommendations , so there’s no custom load-testing infrastructure to build or maintain.\n\nIn this post, we walk through deploying the NVIDIA Nemotron-3 Nano 30B model, running automated concurrency sweeps, and using the results to make data-driven capacity decisions. By the end, you will know how many concurrent requests your endpoint can handle before latency becomes unacceptable, and how to automate that discovery.\n\n## What is a concurrency sweep?\n\nA concurrency sweep sends a controlled number of simultaneous requests to your SageMaker AI endpoint and measures two metrics at each level:\n\n- Throughput : how many tokens per second your endpoint produces.\n\n- Latency: how long each request takes.\n\nBy progressively increasing the concurrency (for example, 64 to 256, and then 1,024 simultaneous requests), you can trace a curve that reveals your endpoint’s saturation point . This is the point where adding more concurrent traffic stops improving throughput and degrades latency.\n\nA concurrency sweep gives you three data points for production planning:\n\n- The ideal balance: the concurrency level where throughput is maximized with acceptable latency.\n\n- The breaking point: where latency crosses your service level agreement (SLA) threshold.\n\n- The right-size factor: how many instances you need to cover your peak traffic, given the per-instance capacity.\n\nLet’s now look at how the end-to-end workflow comes together.\n\nThe concurrency sweep workflow has four steps:\n\n- Deploy the model to a SageMaker AI endpoint using the native vLLM container.\n\n- Configure the workload profile (input and output token counts, streaming mode).\n\n- Run the concurrency sweep using the CreateAIBenchmarkJob API.\n\n- Analyze the results to identify optimal concurrency and right-size your fleet.\n\nThe following diagram illustrates this process.\n\nFigure 1: The four-step concurrency sweep workflow\n\nThe following four steps will take you from a fresh deployment to a complete capacity profile. Each step builds on the previous one, so we recommend following along with the accompanying notebook .\n\nBefore getting started, make sure that you have:\n\n- An AWS account with Amazon SageMaker AI access.\n\n- An AWS Identity and Access Management (IAM) execution role with permissions for SageMaker AI and Amazon Simple Storage Service (Amazon S3). You can check instructions in the notebook.\n\n- Service quota for ml.g7e.2xlarge endpoints.\n\n### Step 1: Deploy the model with the native vLLM container\n\nWe deploy NVIDIA Nemotron-3 Nano 30B, a Mixture-of-Experts (MoE) model with only 3B active parameters, to an ml.g7e.2xlarge instance. This instance is backed by an NVIDIA Blackwell GPU , which provides a strong price-performance ratio for inference workloads.\n\nWe use the vLLM Deep Learning Container for SageMaker AI, configured through SM_VLLM_* environment variables:\n\n```\nVLLM_IMAGE = (\n    f\"763104351884.dkr.ecr.{region}.amazonaws.com/\"\n    f\"vllm:0.19.1-gpu-py312-cu129-ubuntu22.04-sagemaker\"\n)\n\nenvironment = {\n    \"SM_VLLM_MODEL\": \"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16\",\n    \"SM_VLLM_ENFORCE_EAGER\": \"true\",  # required for Mamba-Transformer hybrid\n    \"SM_VLLM_TENSOR_PARALLEL_SIZE\": \"1\",  # single GPU\n    \"SM_VLLM_GPU_MEMORY_UTILIZATION\": \"0.85\",\n    \"SM_VLLM_MAX_MODEL_LEN\": \"10240\",\n    \"SM_VLLM_ENABLE_PREFIX_CACHING\": \"true\",\n    \"SM_VLLM_TRUST_REMOTE_CODE\": \"true\",\n}\n```\n\nThree of these settings are worth explaining. The SM_VLLM_ENFORCE_EAGER flag is required because Nemotron-3 Nano uses a Mamba-Transformer hybrid architecture that requires eager execution mode. We set the GPU memory utilization to 0.85 to leave headroom for KV cache growth under high concurrency. Prefix caching is enabled to improve performance in scenarios where system prompts are repeated across requests to benefit from reusing cached key-value pairs.\n\nAfter creating the model, endpoint configuration, and endpoint, we verify the deployment with a validation before moving on to benchmarking.\n\n### Step 2: Configure the workload profile\n\nBefore running any load test, the benchmark engine needs to know what kind of traffic to simulate. We define a workload profile that mirrors a realistic generative AI inference pattern using CreateAIWorkloadConfig . The following table summarizes the values we used for defining the workload. You can follow the code in the accompanying notebook .\n\nUsed to count tokens accurately\n\nEnables streaming responses (required for TTFT metrics)\n\nprompt_input_tokens_mean\n\nAverage input prompt length\n\nAverage generated response length\n\nThe choice of 1,024 input tokens and 256 output tokens is representative of Retrieval Augmented Generation (RAG) or summarization workloads. If your application uses shorter prompts and longer completions (such as code generation), adjust these values accordingly. Streaming is enabled to capture time to first token (TTFT) metrics, which are important for interactive user experiences where perceived responsiveness matters as much as raw throughput.\n\nWith the workload profile defined, the next step is to launch the sweep.\n\n### Step 3: Run the concurrency sweep\n\nWe can now create the benchmark job with the CreateAIBenchmarkJob API with the parameters to use in the sweep. In the scenario illustrated in the sample notebook, we have:\n\n```\nsweep_params = {\n    \"concurrency\": [64, 256, 1024],  # powers of 4\n    \"request_count\": 1024,  # requests per concurrency level\n}\n```\n\nThe benchmark engine ( AIPerf ) runs each concurrency level sequentially within a single job, sending the total number of requests defined under request_count at each level. Running the levels sequentially instead of in parallel means each measurement reflects a clean, isolated load. This approach gives you statistically stable estimates while keeping costs contained.\n\nWhen the job completes, the results are written to the Amazon S3 path defined under OutputConfig as a tarball containing per-level metrics in JSON format.\n\n### Step 4: Analyze the results\n\nAfter the job completes, we can download and parse the output for analysis. Four metrics matter most when reading the results:\n\n- Throughput (output tokens/sec): Does it plateau or keep climbing?\n\n- p99 end-to-end latency : Where does it cross your SLA?\n\n- p50 to p99 latency spread: A widening gap signals queuing under load.\n\n- Time to first token (TTFT) : Critical for streaming user experiences.\n\nWhen you plot throughput against latency across the concurrency levels, the saturation point is visible as a “knee” in the curve: throughput flattens while p99 latency bends sharply upward. This happens at 256 concurrent requests in our test scenario. Concurrency levels below the knee are your safe operating region. Above it, the endpoint is overloaded and users are waiting.\n\nFigure 2: Throughput and p99 latency across concurrency levels, with the saturation knee at 256 concurrent requests\n\nAt this point you have a complete picture of how your endpoint behaves under load. For many teams, this is sufficient to make a confident capacity decision. If you want to automate the search for the optimal operating point across model versions or instance types, the benchmark engine offers an automated alternative.\n\n## Going further: Automatic SLA-based concurrency search\n\nThe concurrency sweep in Step 3 requires you to choose the concurrency levels to test. You might not know the right range, or you might want to automate capacity planning across model versions. In either case, replace the fixed concurrency list with a search recipe in the same CreateAIBenchmarkJob call. The max-concurrency-under-sla recipe accepts one or more SLA thresholds and searches for the highest concurrency that satisfies all of them.\n\nThe following table describes the available SLA threshold parameters:\n\nMax Time To First Token (ms)\n\nMax Time Per Output Token (ms)\n\nMax end-to-end request latency (ms)\n\nMax fraction of failed requests\n\nFor example, we can use the following search parameters to find the maximum concurrency where p99 end-to-end latency stays under 50 seconds:\n\n```\nsearch_params = {\n    \"search_recipe\": \"max-concurrency-under-sla\",\n    \"e2e_sla_ms\": 50000,\n    \"concurrency_min\": 16,\n    \"concurrency_max\": 4096,\n    \"search_max_iterations\": 10,\n    \"search_initial_points\": 512,\n    \"request_count\": 1024,\n}\n```\n\nThe search engine uses an optimization planner that can converge on the answer in fewer iterations than a linear sweep. It starts with a broad range and narrows progressively, evaluating only the concurrency levels needed to identify the boundary. This can reduce both the number of iterations and the total cost of the search.\n\nIn this example, the planner starts at concurrency 16 and doubles through each iteration. At concurrency 512, the first SLA violation occurs, either because the p99 end-to-end latency exceeded the threshold or because invocations failed. The planner then narrows the search to the 256–512 range and finds that concurrency 320 meets the SLA at 2,782 tokens per second. The search runs for at most the number of iterations you define in search_max_iterations .\n\n## Combining multiple SLAs\n\nA single SLA threshold is insufficient for most production workloads, as some scenarios require that a model must meet multiple SLAs at the same time. For instance, in interactive user experiences, you might need to control both the end-to-end latency and the time to first token. You can still use the max-concurrency-under-sla search recipe by passing multiple SLAs under search parameters:\n\n```\nsearch_params = {\n    \"search_recipe\": \"max-concurrency-under-sla\",\n    \"e2e_sla_ms\": 50000,  # p99 end-to-end < 50s\n    \"ttft_sla_ms\": 1500,  # p95 time-to-first-token < 1.5s\n    \"concurrency_min\": 16,\n    \"concurrency_max\": 4096,\n    \"search_max_iterations\": 10,\n    \"request_count\": 1024,\n}\n```\n\nIn this case, we observe that when putting SLAs in both the end-to-end latency and time to first token, the maximum level of concurrency supported is 80.\n\nWith the benchmarking complete, let’s clean up the resources we created during this walkthrough.\n\nTo avoid ongoing charges, delete your SageMaker endpoints , endpoint configurations , and models after testing. Endpoints bill by the hour whether or not they’re receiving traffic.\n\nConcurrency sweeps replace guesswork with data in the capacity planning process for generative AI endpoints. Instead of over-provisioning as a precaution or discovering bottlenecks in production, you can systematically map your endpoint’s performance envelope. You can then make informed decisions about fleet size before a single user request hits your system.\n\nIn this post, you learned how to:\n\n- Deploy a model using the native vLLM container on Amazon SageMaker AI.\n\n- Run concurrency sweeps using the CreateAIBenchmarkJob API.\n\n- Plot throughput against latency to identify the saturation point.\n\n- Use the max-concurrency-under-sla recipe to automatically discover the optimal concurrency for your SLA targets.\n\nThe complete notebook is available in the GitHub repository . To get started with your own models, see the Generative AI Inference Recommendations documentation. We have also created another example that benchmarks GLM 5.3 Flash on Amazon SageMaker AI using this feature .\n\n- Amazon SageMaker AI now supports optimized generative AI inference recommendations\n\n- Benchmark and optimize deployment of generative AI models on Amazon SageMaker AI",
+  "images": [
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-featured-image.png",
+      "alt": "",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-featured-image.png"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/reinvent-register.3822079bac49f139ae46016a9a99c3eed71fad4a.png",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/reinvent-register.3822079bac49f139ae46016a9a99c3eed71fad4a.png"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/data-migration.9bea2e27c55c0c72b7e840545dbb72b423271564.jpg",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/data-migration.9bea2e27c55c0c72b7e840545dbb72b423271564.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/isv.bce7bdc05328153704c0c2a90d7dd38658e4d349.jpg",
+      "alt": "An abstract image",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/homepage/global-nav/isv.bce7bdc05328153704c0c2a90d7dd38658e4d349.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_innovation_8_1200.07a6484f8eaa3100138cf8b6dce14f1db024db32.jpg",
+      "alt": "an abstract illustration",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_innovation_8_1200.07a6484f8eaa3100138cf8b6dce14f1db024db32.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_2_1200.77dd122bde9af49ea0c09cdc009c193866f62ad7.jpg",
+      "alt": "alt",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_2_1200.77dd122bde9af49ea0c09cdc009c193866f62ad7.jpg"
+    },
+    {
+      "src": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_11_1200.29c48d4e742090396f61d0c5d5eec4ea8d714817.jpg",
+      "alt": "alt",
+      "originalUrl": "https://d1.awsstatic.com/onedam/marketing-channels/website/aws/en_US/global-nav/aws-library_illustration_culture_11_1200.29c48d4e742090396f61d0c5d5eec4ea8d714817.jpg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-1.png",
+      "alt": "Four-step concurrency sweep workflow: deploy the model, configure the workload profile, run the sweep, and analyze the results",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-1.png"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-2.png",
+      "alt": "Throughput-versus-latency curve with the saturation knee at 256 concurrent requests, where throughput flattens and p99 latency rises sharply",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-2.png"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/06/30/ML-21187-7.jpeg",
+      "alt": "Mona Mona",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/06/30/ML-21187-7.jpeg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/07/09/ML-21345-11.jpg",
+      "alt": "Hrushikesh Gangur",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/07/09/ML-21345-11.jpg"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-3.jpg",
+      "alt": "Felipe Lopez",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/09/17/ML-21905-3.jpg"
+    }
+  ],
+  "mediaCheckedAt": "2026-09-22T17:04:41.557190Z",
+  "mediaRecheckedAt": "2026-09-22T17:04:41.557203Z",
+  "summaryZh": "AWS介绍了在Amazon SageMaker AI上使用并发扫描（Concurrency Sweeps）进行生成式AI端点性能评估的方法。通过系统化地增加并发流量，测量吞吐量与延迟，企业可以精准识别端点的饱和点，从而选择最优的实例类型和配置。这种方法避免了盲目部署导致的资源浪费或性能瓶颈，为企业在生产环境中实现高性价比的AI推理部署提供了数据驱动的决策依据。",
+  "summaryGeneratedAt": "2026-09-22T17:13:51.296147Z",
+  "summaryModel": "gemini:gemini-3.1-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "reviewedAt": "2026-09-22T17:13:51.296147Z",
+    "isRelevant": true,
+    "relevanceScore": 80,
+    "importanceScore": 80,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 15,
+      "novelty": 10,
+      "credibility": 15,
+      "usefulness": 10,
+      "timeliness": 10
+    },
+    "evidenceLevel": "clear",
+    "informationType": "analysis",
+    "category": "benchmark",
+    "tags": [
+      "SageMaker",
+      "Benchmarking",
+      "Concurrency",
+      "Optimization"
+    ],
+    "reasonZh": "提供了系统化的AI推理端点性能评估方法，有助于企业优化算力成本。",
+    "summaryZh": "AWS介绍了在Amazon SageMaker AI上使用并发扫描（Concurrency Sweeps）进行生成式AI端点性能评估的方法。通过系统化地增加并发流量，测量吞吐量与延迟，企业可以精准识别端点的饱和点，从而选择最优的实例类型和配置。这种方法避免了盲目部署导致的资源浪费或性能瓶颈，为企业在生产环境中实现高性价比的AI推理部署提供了数据驱动的决策依据。",
+    "glossary": [
+      {
+        "term": "Concurrency Sweep",
+        "explanationZh": "并发扫描，指通过逐步增加并发请求量来测试系统性能极限的方法。"
+      },
+      {
+        "term": "Throughput",
+        "explanationZh": "吞吐量，指单位时间内系统处理请求或生成Token的数量。"
+      },
+      {
+        "term": "Latency",
+        "explanationZh": "延迟，指系统处理单个请求所需的时间。"
+      },
+      {
+        "term": "Endpoint",
+        "explanationZh": "端点，指部署AI模型并提供API服务的网络接口。"
+      }
+    ],
+    "duplicateKey": "aws-sagemaker-concurrency-sweep"
+  }
+}
