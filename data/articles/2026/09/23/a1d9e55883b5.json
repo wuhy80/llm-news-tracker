@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 3,
+  "id": "a1d9e55883b5",
+  "title": "Rendering huge pull requests in the GitHub Copilot app",
+  "summary": "Broad refactors and migrations often have to land as one change. Stacked pull requests are a great way to split work into smaller changes, which makes reviews easier and helps teams ship with less risk. But some changes, like this one, can’t be split cleanly. That leaves you with a single pull request that can get very large, and the review conversation causes it to grow. The review experience needs to remain fast an",
+  "url": "https://github.blog/engineering/user-experience/rendering-huge-pull-requests-in-the-github-copilot-app/",
+  "source": "GitHub AI & ML",
+  "sourceDomain": "github.blog",
+  "publishedAt": "2026-09-23T18:29:49Z",
+  "category": "agent",
+  "tags": [
+    "Agent"
+  ],
+  "score": 84,
+  "signal": "high",
+  "originalUrl": "https://github.blog/engineering/user-experience/rendering-huge-pull-requests-in-the-github-copilot-app/",
+  "resolvedUrl": "https://github.blog/engineering/user-experience/rendering-huge-pull-requests-in-the-github-copilot-app/",
+  "fetchedAt": "2026-09-23T21:37:21.824410Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Broad refactors and migrations often have to land as one change.\n\nStacked pull requests are a great way to split work into smaller changes, which makes reviews easier and helps teams ship with less risk. But some changes, like this one, can’t be split cleanly. That leaves you with a single pull request that can get very large, and the review conversation causes it to grow.\n\nThe review experience needs to remain fast and smooth even when the diff and its conversation are enormous. In the GitHub Copilot app , we rebuilt the pull request view with that requirement in mind.\n\nTo see how far that goes, we opened the biggest pull request we could find: an open source one with 2,200 files, over a million changed lines, and more than 400 inline review comments. Here’s how we made even this extreme pull request performant.\n\n## The scope of the problem\n\nRendering a large diff at speed is well-understood: virtualize the rows, keep the mounted DOM small, and lean on the fact that every row is a line of code at a known height.\n\nComments are the hard part. A comment’s height depends on how its markdown wraps, the expandable sections, whether there’s a reply box in it, and whether its images have loaded yet. You find all of that out at render time. This forces a different architecture.\n\n- Measurement. You can’t know how tall a comment is until you render it. This breaks the design that lets big diffs stay responsive as you scroll.\n\n- The data pipeline. A fast diff surface is worthless if the data pipeline feeding it stalls, or if it throws away work it already did.\n\n- How we actually found the bugs. These problems surface under load, on a specific engine, at a specific scroll position. So we defined what healthy meant, instrumented the surface to answer it, and ran the whole change → measure → improve loop unattended.\n\n## Part 1: Virtualization, and why comments break it\n\nThe first step is to understand the geometry that makes a code-only diff fast. Once comments enter the picture, that geometry is no longer enough.\n\n### What makes big diffs fast\n\nYou cannot put a million DOM nodes on a page. The standard answer is virtualization : mount only the rows that are on screen, plus a small margin, and recycle those same DOM elements as the user scrolls. The list behaves as if all million rows exist. The scrollbar is the right size, scroll-to-row works. But only about 100 rows are ever real at once.\n\nFor this illusion to hold, something has to supply the geometry. The scrollbar height is the sum of all row heights. The position of row N is the sum of the heights of the rows above it. Jumping to a row, drawing the scrollbar, deciding what’s on screen, it’s all arithmetic over a table of heights. You can build that table from estimates and correct it as rows get measured, and general-purpose variable-height virtualizers do exactly that.\n\nBut if every row is a line of code at a known font size, you don’t have to. You can compute the whole table up front and it never changes, so there’s nothing to correct later.\n\nCall this the “all heights known before paint” contract. Our diff surface is built around it:\n\n- An imperative, recycled code-row renderer (no React component per row)\n\n- Typed-array geometry for the offset math\n\n- Backend-owned diff documents streamed structure-first\n\n- An imperative scroll API with exact “scroll to row N “\n\nNone of it scales badly, because no per-frame work grows with the total row count. On pure code this design is the right one, and we kept all of it.\n\n### How comments change the contract\n\nNow put a review thread in the middle of the diff. How tall is it?\n\nYou don’t know, and you can’t know without rendering it. Its height depends on things that only exist at render time, and they can keep changing after first paint:\n\n- Markdown that wraps differently at different widths\n\n- <details> blocks the user can expand or collapse in place\n\n- A reply composer that opens inside the existing thread and grows as you type\n\n- Suggested-change diffs, reactions, edit mode, resolution banners\n\n- Images and async assets that change height when they finish loading\n\nThe obvious answer is to reserve a fixed-height slot for each comment, sized by an estimator. It falls apart on a big pull request. An estimator that’s right on average is still wrong at the extremes. It over-reserves most comments, leaving gaps of whitespace, and under-reserves the expensive ones, which clip or sprout a nested scrollbar. If you measure the real height after paint and write it back into the shared offset table, everything below moves, while the user is already scrolling. That’s a scroll jump, and on a big pull request it’s a large one.\n\nSo comments need a different contract. “All heights known before paint” is unachievable for this content. What we could promise instead: heights are bounded, measured lazily, and corrections are small and anchored to whatever the user is looking at.\n\n### Two geometries instead of one\n\nThe idea that made this tractable was to stop forcing one geometry to serve both kinds of content. We split the document’s height into two independent domains:\n\n```\ntotal height = deterministic code height          (exact, known up front)\n             + Σ dynamic block effective heights   (estimated, then measured)\n             + scroll padding\n```\n\nCode geometry keeps the original world. It’s deterministic, prefix-summed, exact, never rebuilt when a comment resizes.\n\nDynamic block geometry covers everything whose height we can’t predict, such as review threads, drafts, and reply composers. Each one is a block identified by what it is rather than where it currently sits. It has a stable key that survives its content loading, and it’s anchored to a file, line and side rather than to a pixel coordinate, so a reflow can’t lose track of it. We also keep a fingerprint of everything that could change the block’s height: its content, whether a <details> is open, whether a composer is active. And we record the width it was last measured at, rounded into buckets, so an ordinary window resize doesn’t invalidate every measurement in the document.\n\nA block’s effective height is then simple: the measured height if we have a valid one, a cached height if the fingerprint and width still match, and the estimate otherwise. Those heights live in their own index, separate from the code rows, so a resizing comment never forces the code geometry to be rebuilt. And the number of blocks is bounded by comments, not by rows. A few thousand blocks is fine, as long as first paint never mounts or measures all of them at once.\n\n### The measurement scheduler, and the mistake we made first\n\nThis part took the longest to get right, because our first design was wrong in an instructive way.\n\nThe obvious way to measure dynamic content is one ResizeObserver per block, which watches the element and writes its measured height back into the layout whenever it changes. This is what we designed and then rejected during performance hardening. It is the feedback loop that big virtualized surfaces have to avoid. An observer that writes a height back into the layout of the element it’s watching can retrigger itself, and the cost grows with every mounted block.\n\nWhat shipped instead is a single idle- and scroll-gated measurement pass, held to the same discipline as the deterministic side:\n\n- Off the hot path. It runs when the visible range settles, never once per scroll frame, and waits entirely while a scroll is in flight. A reflow mid-scroll is exactly the jank we’re avoiding. It runs again once scrolling stops.\n\n- Scoped to the viewport. Only blocks within roughly 2400px of the viewport are candidates, so the work is O(viewport). Distant blocks keep riding their estimate and get corrected as they approach.\n\n- On-screen reads win. A mounted block is on screen, so its rendered height is ground truth. The pass reads every mounted candidate in one batch, a single reflow with no writes in between, and records what it finds. A mounted block is never skipped in favor of a stale estimate. That one rule fixed the nastiest bug we hit: comments that rendered with a strip of blank space underneath, because a mounted block had been filtered out of measurement and left sitting on a too-tall estimate.\n\n- Off-screen measurement is a bounded fallback. For a nearby block that hasn’t mounted yet, the pass does at most one off-screen render, to correct its reservation before it scrolls into view. Blocks taller than the viewport skip even that. Their over-reservation hides below the fold, so the render isn’t worth paying for.\n\n- An observer catches the rest. Some height changes don’t move the fingerprint and don’t coincide with a scroll: typing in a reply composer, an image finishing loading, toggling a <details> . Each mounted block keeps a ResizeObserver , but by default all it does is flag the block so the idle pass re-reads it. It never writes a height itself, which is what would close the feedback loop we rejected. It disconnects on unmount, and an inactive pull request tab observes nothing.\n\n- With one deliberate exception. Waiting was visibly wrong for resizes you caused yourself: expanding a <details> , opening a reply composer, an image landing. The block grew immediately, but the code below it only moved on the next idle pass. For one frame the comment was taller while everything under it sat at its old position, and you could see the two steps. So when a block is mounted and on screen, the observer now measures it and applies the correction in the same frame, before paint. The block grows, the code repositions, and everything below shifts together. Two safeguards keep this from becoming the loop we were avoiding: at most one synchronous commit per frame, so a burst of resizes collapses into one, and never during an active scroll, where it falls back to the batched pass.\n\n### Scroll anchoring: Correcting without fighting the user\n\nWhen a measured height differs from its estimate, the scrollbar arithmetic changes, and the naive result is that the viewport jumps. The fix is to correct by identity rather than by pixel:\n\n- Before applying height updates, capture what the user is anchored to (a row or a block, by identity), plus the offset within it.\n\n- Apply the height deltas.\n\n- Resolve that same anchor to its new pixel position.\n\n- Scroll so the anchor stays put in the viewport.\n\nPlus a few rules that keep it from feeling wrong:\n\n- A block above the viewport changing height → adjust by the delta (keeps your place).\n\n- Content hydrating below the viewport → don’t adjust (you can’t see it).\n\n- If you toggled a <details> or opened a reply in a visible block → suppress above-block correction for that block, so the interaction feels direct, and let the content below flow down naturally.\n\n- Never fight active pointer or wheel momentum; batch the correction after the frame.\n\nThat last rule has a sharp edge, and it bit us. “Don’t correct while the user is scrolling” was implemented as a guard on the last observed scroll, and programmatic scrolls refreshed that timestamp too. Toggling the file-tree sidebar changes the width of the diff pane. With line wrapping on, every wrapped line above you reflows to a different number of visual lines, the whole coordinate space shifts, and the surface emits a small scroll of its own as it settles. The guard read that as “the user just scrolled” and skipped the very correction that was supposed to keep your place, so the file you were reading drifted off screen. The fix was to tell user scrolls apart from ones the surface caused itself. Any “is the user interacting?” check has to be one your own side effects can’t satisfy.\n\nSo corrections stay small, they reuse measurements we already have, and they follow whatever you’re looking at.\n\n## Part 2: The pipeline behind the surface\n\nA diff surface can only be as fast as the data feeding it, and three habits from that side of the work shaped what the UI could do. The first is stream structure before content. The diff is requested incrementally, so the file tree and metadata paint while the document is still loading, and the full set of review threads is resolved up front rather than trickling in. The second is defer per-item work until something needs it. Syntax highlighting runs off the main thread, so rows appear as plain text immediately and get colored when the results arrive. Highlighting improves the surface instead of blocking the scroll. Large markdown bodies and suggested-change context work the same way: nothing is built until it approaches the viewport.\n\nThe third habit is about which costs are worth keeping. Releasing a diff document when you navigate away is the right default. These documents are large, and holding on to every one you’ve visited is how a long session ends up eating memory. But pull request metadata persists, so the shell around the diff, the header and the file tree, repaints instantly when you go back, and then sits there for several seconds waiting for a diff it had complete moments ago. An instantly-drawn shell around an empty diff looks broken, even though you’re waiting less time overall. So the policy stayed and we added a cache: keep the last few diffs resident, evict anything beyond that, and let the background refresh notice when one has gone stale.\n\n## Part 3: The measurement loop, or how we actually found the bugs\n\nAlmost every bug in this project was invisible until it wasn’t, and reproducing one by hand is miserable. A typical report reads: “a strip of whitespace appears below some comments, but only sometimes, only on big pull requests, and it heals if you scroll past and back.” You can’t debug that by staring at the screen, so we built tooling to debug it mechanically.\n\n### Instrument with the app’s real signals, not throwaway logs\n\nThe naive workflow is to sprinkle console.log calls, exercise the flow by hand, copy the output, paste it to someone (or something) that can analyze it, delete the logs, and repeat. It’s slow, it needs a human in the loop, and worst of all you end up measuring your own hand-rolled instrumentation rather than the app’s real behavior.\n\nSo the surface carries permanent, structured probes for its own invariants. They’re plain questions it answers about itself on every render:\n\n- Is the surface actually viewport-bound? How many rows and comment blocks are mounted right now?\n\n- Is measurement coalescing to a single commit per frame, and how long does that frame take?\n\n- How large are the scroll corrections we’re making?\n\n- Did any comment block get inserted after scrolling started? (Must be zero once the backend topology has landed.)\n\n- Do the per-block observers actually tear down on unmount, or are we leaking one per block?\n\nThese are the objective pass/fail signals, and they’re asserted as budgets in an end-to-end test against a synthetic many-comment huge-pull-request fixture. CI can now tell us whether the surface is healthy.\n\n### Put the loop on autopilot\n\nThe centerpiece was an autonomous change → measure → improve loop. Two lanes:\n\nA headless probe lane ran a declarative flow (open a pull request, scroll to a fraction, toggle a details block, resize the window) against a mock server, reading the app’s own production instrumentation: React render counts, the performance timeline, and a requestAnimationFrame sampler for jank. It did the whole instrument, drive, collect, analyze, rank cycle by itself and printed the bottlenecks in order. Because the flow is just JSON handed to the probe at runtime, an agent could profile any flow by describing it in plain English, without editing a line of source.\n\nAn autopilot drove the actual desktop app through the huge-pull-request flow, unattended, on a loop: first cold, with comments still skeletons, then warm, with comments loaded, toggling <details> blocks, opening and cancelling reply composers, collapsing and expanding files, toggling the sidebar tree, sweeping deep into the file list, resizing the window. Every measurement was mirrored to the app’s on-disk log, so an agent could read runtime behavior with nobody at the keyboard. Each sample carried a health signal, and that was the objective check. A warm sample counted as healthy only if there were no unfilled gaps between comments, no comment blocks left blank, and real thread content actually mounted, across the entire scroll range, deep-file sweep included.\n\n- Reproduce unattended, on the real engine. Arm the autopilot, let it loop, read the on-disk log.\n\n- Detect with a health signal, not with your eyes. Trust the sample fields.\n\n- Probe the suspect seam. When a signal goes bad, add one narrow structured probe there, re-arm, re-read. (Editing the surface hot-reloads the live window and re-arms the autopilot, so a fresh capture is about one cycle away.)\n\n- Remove the scaffolding. Once you understand the invariant, pin it in a test and the design doc, and keep only the detector-grade signals.\n\nReviewing a pull request this large used to mean one of two things: waiting, or giving up and reading it somewhere else. A review isn’t a document with known dimensions. It’s a conversation that changes shape while you’re reading it, and the surface underneath has to be built for that from the start rather than patched into it afterwards.\n\nThe result is a pull request view where a million-line diff with hundreds of threaded comments opens, scrolls, and behaves like a normally sized pull request. Comments render in full instead of clipping into a scrollable box. Expanding a collapsed section moves the code below it and nothing else. Coming back to a pull request you just left puts you where you were.\n\nIf you review code for a living, it’s worth feeling the difference on a pull request you already know is painful. Open the worst one you’ve got.\n\nTry the GitHub Copilot app >\n\nThe post Rendering huge pull requests in the GitHub Copilot app appeared first on The GitHub Blog .",
+  "images": [
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/06/MSFTBuild_Blog_Header_01.jpg",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/06/MSFTBuild_Blog_Header_01.jpg"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/06/AI-DarkMode-4.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/06/AI-DarkMode-4.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/05/Enterprise-DarkMode-3.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/05/Enterprise-DarkMode-3.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.42.45 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.42.45 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.43.47 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.43.47 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.44.23 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.44.23 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.46.23 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.46.23 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.47.04 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.47.04 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/06/MSFTBuild_Blog_Header_01.jpg?resize=1600%2C850",
+      "alt": "Decorative image showing the GitHub Copilot App logo.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/06/MSFTBuild_Blog_Header_01.jpg?resize=1600%2C850"
+    },
+    {
+      "src": "https://avatars.githubusercontent.com/u/50486?v=4&s=200",
+      "alt": "",
+      "originalUrl": "https://avatars.githubusercontent.com/u/50486?v=4&s=200"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/09/GIT_THUMB_PODCAST_S2_EP2_B2-1.png?resize=400%2C212",
+      "alt": "Video thumbnail that reads 'AI jargon explained' with photos of GPS, Marlene Mhangami, and Cassidy Williams.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/09/GIT_THUMB_PODCAST_S2_EP2_B2-1.png?resize=400%2C212"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/01/generic-github-copilot-logo-stripe.png?resize=400%2C212",
+      "alt": "Copilot appears against a decorative background with scattered green squares.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/01/generic-github-copilot-logo-stripe.png?resize=400%2C212"
+    }
+  ],
+  "mediaCheckedAt": "2026-09-23T21:37:21.823795Z",
+  "mediaRecheckedAt": "2026-09-23T21:37:21.823804Z",
+  "summaryZh": "GitHub Copilot团队分享了在处理超大规模Pull Request（PR）时的性能优化经验。针对包含数千个文件和海量评论的PR，团队通过虚拟化渲染、优化数据管道及精确的测量机制，解决了DOM渲染瓶颈。文章详细阐述了如何通过架构重构确保AI辅助审查界面的流畅性，为处理复杂代码库的AI工具开发提供了工程参考。",
+  "summaryGeneratedAt": "2026-09-23T21:41:43.837360Z",
+  "summaryModel": "gemini:gemini-3.1-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.1-flash-lite",
+    "reviewedAt": "2026-09-23T21:41:43.837360Z",
+    "isRelevant": true,
+    "relevanceScore": 76,
+    "importanceScore": 76,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 15,
+      "novelty": 10,
+      "credibility": 14,
+      "usefulness": 8,
+      "timeliness": 9
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "agent",
+    "tags": [
+      "GitHubCopilot",
+      "Performance",
+      "UI"
+    ],
+    "reasonZh": "探讨了在AI辅助开发工具中处理大规模代码审查的性能优化方案，具有工程实践价值。",
+    "summaryZh": "GitHub Copilot团队分享了在处理超大规模Pull Request（PR）时的性能优化经验。针对包含数千个文件和海量评论的PR，团队通过虚拟化渲染、优化数据管道及精确的测量机制，解决了DOM渲染瓶颈。文章详细阐述了如何通过架构重构确保AI辅助审查界面的流畅性，为处理复杂代码库的AI工具开发提供了工程参考。",
+    "glossary": [
+      {
+        "term": "Pull Request",
+        "explanationZh": "代码合并请求。"
+      },
+      {
+        "term": "Virtualization",
+        "explanationZh": "虚拟化渲染技术，仅渲染可见区域以提升性能。"
+      },
+      {
+        "term": "DOM",
+        "explanationZh": "文档对象模型，网页渲染的核心结构。"
+      }
+    ],
+    "duplicateKey": "github-copilot-pr-performance"
+  }
+}
