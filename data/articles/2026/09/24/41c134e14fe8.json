@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 3,
+  "id": "41c134e14fe8",
+  "title": "AI-powered fuzzing with the GitHub Security Lab Taskflow Agent",
+  "summary": "If you’re new to fuzzing and want to learn the fundamentals first, check out our Fuzzing 101 course at gh.io/fuzzing101 . Continuous fuzzing is not a magic solution that solves all your problems . Even projects that have been enrolled in OSS-Fuzz for years can still hide critical bugs, and the reason is almost always the same: someone needs to keep an eye on coverage, write new harnesses for the code that nobody is r",
+  "url": "https://github.blog/security/application-security/ai-powered-fuzzing-with-the-github-security-lab-taskflow-agent/",
+  "source": "GitHub AI & ML",
+  "sourceDomain": "github.blog",
+  "publishedAt": "2026-09-24T18:26:12Z",
+  "category": "agent",
+  "tags": [
+    "Agent"
+  ],
+  "score": 84,
+  "signal": "high",
+  "originalUrl": "https://github.blog/security/application-security/ai-powered-fuzzing-with-the-github-security-lab-taskflow-agent/",
+  "resolvedUrl": "https://github.blog/security/application-security/ai-powered-fuzzing-with-the-github-security-lab-taskflow-agent/",
+  "fetchedAt": "2026-09-24T21:38:34.670254Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "If you’re new to fuzzing and want to learn the fundamentals first, check out our Fuzzing 101 course at gh.io/fuzzing101 .\n\nContinuous fuzzing is not a magic solution that solves all your problems . Even projects that have been enrolled in OSS-Fuzz for years can still hide critical bugs, and the reason is almost always the same: someone needs to keep an eye on coverage, write new harnesses for the code that nobody is reaching, and triage the crashes that come out the other end. In other words, fuzzing still needs a human in the loop.\n\nSo the natural question I kept asking myself was: how much of that human work can we actually hand over to an LLM agent?\n\nThat is what led me to build the Fuzzing Taskflow, an autonomous fuzzing pipeline for C/C++ projects. You only need to point it at a GitHub repository, and it does the rest: it identifies the suitable entrypoints, analyzes the build system, writes the harnesses, runs AFL++, reads the coverage reports, improves the harnesses, triages every crash, and writes a vulnerability report for each unique bug, all without a human babysitting it.\n\nThe Fuzzing Taskflow is built on top of the GitHub Security Lab Taskflow Agent , our framework for writing LLM-driven security automation, so the pipeline is expressed as a set of taskflows that an agent runs end to end.\n\nIn this post, I’ll walk you through how it works and the design decisions behind it. Let’s get going!\n\nThe simplest way to run it’s just to go to https://github.com/GitHubSecurityLab/seclab-taskflows-fuzzing and start a codespace.\n\nThen, run the script like this:\n\n```\n./scripts/fuzzing/run_fuzzing.sh PROJECT\n```\n\n```\n./scripts/fuzzing/run_fuzzing.sh tukaani-project/xz\n```\n\nThat’s it. The argument is just a GitHub owner/repo slug. Then, the agent, takes care of all the preliminary steps on its own:\n\n- Installing software such as AFL\n\n- Cloning the repository\n\n- Identifying the most relevant functions in the code\n\n- Creating fuzz targets for those functions\n\nIf you just want a quick smoke test before committing to a long campaign, point it at something small:\n\n```\n./scripts/fuzzing/run_fuzzing.sh DaveGamble/cJSON\n```\n\nA word of warning before you run it: this taskflow runs afl-fuzz , clang , and arbitrary build commands chosen by the LLM directly on the host, with no container in between. A prompt-injected agent could, in principle, do anything your user can. So please run it only inside a disposable environment (e.g., a Codespace or a throwaway VM), without elevated privileges .\n\nSome frontier models impose security guardrails on their outputs. For the fuzzing task flow, we use Claude Sonnet 5 by default because it passed all of our internal tests without issues. You can choose a different model by modifying the following file: src/seclab_taskflows_fuzzing/configs/model_config.yaml .\n\n## The architecture in one minute\n\nBefore getting into the interesting parts, it helps to know how the pieces fit together. There are three layers:\n\n- A shell driver ( run_fuzzing.sh) that chains the pipeline stages together.\n\n- A set of taskflow YAMLs , one per stage, which are essentially the prompts that tell the LLM agent what to do at each step.\n\n- A set of MCP tools that the agent calls to actually do the work: run AFL, compile a harness, store a crash, read a coverage report, and so on.\n\nThe design rule I cared about most is a clean separation of responsibility: the LLM agent owns the decisions, and the MCP tools own the execution . The agent decides what to fuzz, what harness to write, and what coverage gap to chase next. The tools just expose primitives like run_afl_for or compile_harness . The agent never calls AFL or clang directly; it composes the pipeline out of these building blocks. All the state lives in a SQLite database ( fuzz_context.db ), so the stages never hand data to each other in memory, only through the database.\n\nOne small but important detail: each harness is built twice. AFL’s edge instrumentation is great for guiding the fuzzer but useless for human-readable coverage reports. So every harness becomes both a .afl binary (built with afl-clang-lto -fsanitize=address,undefined ) and a .cov binary (built with clang -fprofile-instr-generate -fcoverage-mapping ). The .afl binary does the fuzzing; the .cov binary replays AFL’s queue afterwards to produce real source-line and branch coverage.\n\n## The coverage-feedback loop\n\nThis is the heart of the whole pipeline, and it’s the part that most directly automates the manual workflow I described at the start.\n\nIf you have ever tried to improve fuzzing coverage by hand, you’ll know that it’s an iterative process that looks like this:\n\nThe “check the coverage” step used to be completed by me, manually reading an LCOV report looking for uncovered branches. The “improve the coverage” step was also completed by me, this time, writing a new harness or crafting a new input. The Fuzzing Taskflow hands both of those steps to the agent.\n\nEach iteration, for each harness, the agent runs AFL for a time budget, replays the queue against the .cov binary to get a real coverage report, and then reads the list of uncovered branches. Based on what it finds, it picks one of a handful of actions:\n\n- Add a new seed crafted to reach an uncovered branch\n\n- Edit the harness source to call an additional API\n\n- Auto-enrich the AFL dictionary with the magic constants a guard is comparing against\n\n- Simply skip the gap if it’s a cold error path or vendor code that isn’t worth chasing\n\nThe time budgets double every iteration:\n\n30s → 60s → 120s → 240s → 480s → 960s (≈ 32 min/target)\n\nThe idea is to spend cheap, short rounds early (when there’s lots of low-hanging coverage to grab) and longer rounds later (when the fuzzer needs more time to break through a hard guard).\n\nAnd just like in my manual workflow, I need an answer to the question: when do we stop? Here, the loop uses plateau detection : once two consecutive iterations each gain less than a configurable threshold (1% absolute line coverage by default), the loop decides it has hit diminishing returns and moves on. This keeps the agent from burning hours of compute squeezing out the last fraction of a percent.\n\n## Structure-aware fuzzing\n\nAFL’s default byte-level mutators (bit flips, arithmetic, block splicing) do a great job on binary formats but struggle with structured, text-based inputs. The classic solution is to hand-write custom mutators for each format, which is tedious work. This time I want the pipeline to do that work for me, so it ships four complementary mechanisms for producing structure-aware inputs.\n\n1. Per-format dictionaries and custom mutators . For targets whose input format is recognized (JSON, XML, regex, PNG, length-prefixed binary TLV), the taskflow ships pre-built AFL dictionaries and LLVMFuzzerCustomMutator C files. The JSON mutator does token splicing and balanced-bracket duplication; the XML one knows about tags, entities, and billion-laughs tokens; the regex one carries real ReDoS patterns. Each mutator delegates half of its mutations back to AFL’s default byte mutator, so we keep the engine’s randomization instead of fighting it.\n\n2. A source level dictionary. For formats the pipeline doesn’t recognize, it generates a custom mutator on the fly by scanning the target’s own .c/.h files. It extracts string literals and 32-bit numeric constants (from #define , case , and enum ), filters out the noise, and uses them as splice tokens. The intuition is simple: the most interesting magic values that a parser checks for are usually written down somewhere in its own source.\n\n3. A dynamically generated AFL dictionary with coverage-driven enrichment . The same source-token set is also emitted as an AFL classic dictionary before iteration 1 (numeric constants in both endiannesses, so the fuzzer can satisfy a memcmp against a 4-byte magic regardless of host byte order). Then, after every coverage step, the pipeline looks at the guards near the uncovered lines ( strncmp , memcmp , case 0xN , == ‘X’ ) and appends any new tokens it finds. The dictionary literally grows toward the code the fuzzer can’t yet reach.\n\n4. A corpus-splice operator . The smart mutator can also load files from a corpus directory and splice random sub-regions of them into the input, a recombination-style operator that AFL’s stock havoc doesn’t do well.\n\nOne of the things that quietly kills fuzzing efficiency is throwing away progress. If every run starts from the original seeds, you re-pay the cost of rediscovering the same paths over and over.\n\nTo avoid that, every harness gets a stable corpus directory that survives across iterations and across entire campaigns:\n\n```\n<workspace>/corpus/harness_<id>/\n```\n\nAt the end of each iteration, AFL’s queue is merged into this directory and run through afl-cmin to keep its size bounded. The effect is that yesterday’s interesting inputs carry into today’s run, and the inputs you found in last week’s campaign carry into this one. If you stop and restart a campaign, you lose nothing.\n\n## Triage and vulnerability reports\n\nFinding a crash is only half the job. As anyone who has done root-cause analysis knows, triaging is often the most tedious part of the whole process. This is the other place where the agent shines.\n\nAfter the fuzzing loop finishes, three stages run automatically. First, every crash is minimized with afl-tmin , replayed under ASan to capture a stack trace, and deduplicated by a stack-top hash (the top normalized frames, with templates, inline namespaces, and LTO suffixes stripped so semantically identical crashes collapse together). Second, previously known crashes are replayed against the current binary to see whether an upstream fix has resolved them. Third, the agent reads the harness source and the crashing function, walks the call chain back from the public API, and writes a per-crash markdown report.\n\nEach report assigns one of the following verdicts:\n\nThe distinction between a real vulnerability (reachable and exploitable through a public API) and a mere harness_bug (the bug is in our own harness, not the library) is exactly the kind of judgment call that used to require me to sit down and trace the code by hand. Every report includes a root-cause analysis with file:line references, a reachability argument, an exploitability assessment, a suggested fix as a unified diff and a regression-test sketch.\n\nJust as clarification: the suggested patches are marked “review required” for a reason. The agent’s analysis is limited by the model’s understanding of the target code, and it does get things wrong. Treat the verdicts as a very well-prepared starting point for a human, not as final result.\n\nRunning an autonomous campaign and not being able to see what it’s doing is uncomfortable, so the pipeline publishes everything to a live HTML dashboard. It auto-starts in the background as soon as you launch a campaign, on port 8765 . In a Codespace that port is auto-forwarded, so you can open it in any browser and watch the campaign progress in real time on the dashboard.\n\nThe page shows amongst others:\n\n- a per-harness “running” pulse\n\n- a coverage-trend table with inline sparklines\n\nI started this project motivated by the limitations that any security researcher knows well: fuzzing works, but it doesn’t scale without human attention, and that human attention is the bottleneck. The Fuzzing Taskflow is my attempt to push that bottleneck back by handing the repetitive parts (writing harnesses, reading coverage, chasing gaps, triaging crashes) to an LLM agent, while keeping a clean separation between the agent’s judgment and the tools that do the real work.\n\nIf you’re the maintainer of C/C++ project, then please give it a try . If your project has never been fuzzed before, then this tool will help you to get started quickly. Or if your project has been fuzzed before, then this tool might help to find new bugs by increasing your fuzzing coverage.\n\nThe source code is open source, so please create an issue if you encounter any bugs. Contributions are also welcome!\n\nThe post AI-powered fuzzing with the GitHub Security Lab Taskflow Agent appeared first on The GitHub Blog .",
+  "images": [
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/01/generic-github-security-invertocat.png",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/01/generic-github-security-invertocat.png"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/06/AI-DarkMode-4.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/06/AI-DarkMode-4.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/05/Enterprise-DarkMode-3.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/05/Enterprise-DarkMode-3.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.42.45 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.42.45 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.43.47 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.43.47 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.44.23 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.44.23 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.46.23 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.46.23 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.47.04 AM.png?resize=800%2C425",
+      "alt": "",
+      "originalUrl": "https://github.blog/wp-content/uploads/2024/07/Screenshot-2024-07-23-at-8.47.04 AM.png?resize=800%2C425"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/01/generic-github-security-invertocat.png?resize=1600%2C850",
+      "alt": "An abstract graphic featuring stacked cubes with a security checkmark shield and the GitHub invertocat logo.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/01/generic-github-security-invertocat.png?resize=1600%2C850"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-09-23-at-3.16.38-PM.png?resize=1024%2C453",
+      "alt": "Screenshot of Seclab Taskflows Fuzzing.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-09-23-at-3.16.38-PM.png?resize=1024%2C453"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-08-26-at-1.37.40-PM.png?resize=843%2C704",
+      "alt": "Three bubbles that say: Run the fuzzers, Check the coverage, and Improve the fuzzers. They are connected by three arrows in a circular flow.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-08-26-at-1.37.40-PM.png?resize=843%2C704"
+    },
+    {
+      "src": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-09-23-at-3.19.43-PM.png?resize=1024%2C345",
+      "alt": "Screenshot of the fuzzing dashboard.",
+      "originalUrl": "https://github.blog/wp-content/uploads/2026/08/Screenshot-2026-09-23-at-3.19.43-PM.png?resize=1024%2C345"
+    }
+  ],
+  "mediaCheckedAt": "2026-09-24T21:38:34.670003Z",
+  "mediaRecheckedAt": "2026-09-24T21:38:34.670018Z",
+  "summaryZh": "GitHub AI & ML团队介绍了如何利用GitHub Security Lab Taskflow Agent构建自动化模糊测试（Fuzzing）流水线。该智能体能够自主分析C/C++项目的构建系统、识别合适的入口点、编写测试框架、运行AFL++、读取覆盖率报告并最终生成漏洞报告，实现了从代码分析到崩溃分诊的全流程自动化，显著降低了人工介入成本。",
+  "summaryGeneratedAt": "2026-09-24T21:43:57.362949Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "articleKind": "feed",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-24T21:43:57.362949Z",
+    "isRelevant": true,
+    "relevanceScore": 94,
+    "importanceScore": 94,
+    "importanceLevel": 5,
+    "dimensions": {
+      "relevance": 25,
+      "impact": 23,
+      "novelty": 14,
+      "credibility": 14,
+      "usefulness": 9,
+      "timeliness": 9
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "agent",
+    "tags": [
+      "Fuzzing",
+      "Security Lab",
+      "Agent",
+      "Taskflow"
+    ],
+    "reasonZh": "介绍了基于GitHub Security Lab Taskflow Agent构建的端到端AI自动化模糊测试流水线。",
+    "summaryZh": "GitHub AI & ML团队介绍了如何利用GitHub Security Lab Taskflow Agent构建自动化模糊测试（Fuzzing）流水线。该智能体能够自主分析C/C++项目的构建系统、识别合适的入口点、编写测试框架、运行AFL++、读取覆盖率报告并最终生成漏洞报告，实现了从代码分析到崩溃分诊的全流程自动化，显著降低了人工介入成本。",
+    "glossary": [
+      {
+        "term": "fuzzing",
+        "explanationZh": "模糊测试，一种通过向程序输入大量半随机数据来发现潜在软件漏洞的技术"
+      },
+      {
+        "term": "Taskflow Agent",
+        "explanationZh": "用于编写LLM驱动的安全自动化任务流的智能体框架"
+      },
+      {
+        "term": "harness",
+        "explanationZh": "测试框架，用于驱动目标代码进行模糊测试的适配代码"
+      },
+      {
+        "term": "AFL++",
+        "explanationZh": "广泛使用的覆盖率引导模糊测试工具"
+      },
+      {
+        "term": "triage",
+        "explanationZh": "对模糊测试产生的程序崩溃和漏洞进行分类与优先级排序的过程"
+      }
+    ],
+    "duplicateKey": "github-security-lab-fuzzing-taskflow-agent"
+  }
+}
