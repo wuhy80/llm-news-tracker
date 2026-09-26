@@ -30,6 +30,17 @@ class ModelTests(unittest.TestCase):
                      dict(base, id='nvidia/content-safety:free')]:
             self.assertFalse(free_text_model(item), item)
 
+    def test_quality_allowlist_cannot_be_bypassed_by_preference_or_catalog(self):
+        rejected=['liquid/lfm-2.5-2.6b:free','openrouter/free','unknown/large-new-model:free']
+        for ident in rejected:
+            self.assertFalse(free_text_model(model(ident)))
+            with tempfile.TemporaryDirectory() as d:
+                pool=ModelPool(Path(d)/'health.json',ident,[model(ident),model(PREFERRED[0])])
+                self.assertEqual(pool.select(),PREFERRED[0])
+        with tempfile.TemporaryDirectory() as d:
+            pool=ModelPool(Path(d)/'health.json',catalog=[model(x) for x in rejected])
+            with self.assertRaises(RuntimeError): pool.select()
+
     def test_removed_model_ignored_and_persistent_cooldown_expires(self):
         now=datetime(2026,9,26,tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as d:
