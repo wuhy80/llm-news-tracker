@@ -577,7 +577,52 @@ async function loadRangeData() {
   }
 }
 
+function renderTranslationProgress(data) {
+  const status = document.getElementById("translationOverallStatus");
+  const details = document.getElementById("translationOverallDetails");
+  const d = data?.documents;
+  if (data?.schemaVersion !== 1 || !d || !["total", "complete", "partial", "pending", "notRequired", "awaitingBody"].every(key => Number.isFinite(d[key]) && d[key] >= 0)) {
+    throw new Error("Invalid translation progress data");
+  }
+  const number = value => Number(value || 0).toLocaleString("zh-CN");
+  const eligible = d.complete + d.partial + d.pending;
+  const percent = eligible ? d.complete / eligible * 100 : 0;
+  status.textContent = `共 ${number(d.total)} 篇文档 · ${number(eligible)} 篇需翻译`;
+  document.getElementById("translationDocumentLabel").textContent = eligible ? `完整译文 ${number(d.complete)} / ${number(eligible)} 篇` : "暂无需翻译的正文";
+  document.getElementById("translationDocumentPercent").textContent = eligible ? `${percent.toFixed(2)}%` : "—";
+  document.getElementById("translationDocumentProgress").value = percent;
+  const counts = document.getElementById("translationOverallCounts");
+  counts.replaceChildren();
+  [["complete", "已完成"], ["partial", "部分完成"], ["pending", "未开始"], ["notRequired", "无需翻译"], ["awaitingBody", "待获取正文"]].forEach(([key, label]) => {
+    const cell = document.createElement("div");
+    const value = document.createElement("strong");
+    const caption = document.createElement("span");
+    value.textContent = number(d[key]);
+    caption.textContent = label;
+    cell.append(value, caption);
+    counts.append(cell);
+  });
+  const blocksPercent = data.totalBlocks ? Math.min(100, data.translatedBlocks / data.totalBlocks * 100).toFixed(2) : "0.00";
+  document.getElementById("translationBlockSummary").textContent = `段落完成率 ${blocksPercent}% · 已译 ${number(data.translatedBlocks)} / ${number(data.totalBlocks)} 段`;
+  document.getElementById("translationScopeNote").textContent = `统计覆盖全部文档；完成率以有正文且需翻译的文档为分母。自动任务目前仅处理 4、5 级英文文章（${number(data.automaticEligibleDocuments)} 篇）。无需翻译含不符合现有英文翻译规则的正文（如中文、短文本或纯代码）；过期译文不计入已完成。`;
+  const updated = new Date(data.generatedAt);
+  document.getElementById("translationProgressUpdated").textContent = Number.isNaN(updated.getTime()) ? "" : `统计更新于 ${updated.toLocaleString("zh-CN", { hour12: false })}`;
+  details.hidden = false;
+}
+
+async function loadTranslationProgress() {
+  try {
+    const response = await fetch("data/translations/progress.json", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderTranslationProgress(await response.json());
+  } catch (error) {
+    document.getElementById("translationOverallStatus").textContent = "全站翻译统计暂不可用，请稍后刷新。";
+    document.getElementById("translationOverallDetails").hidden = true;
+  }
+}
+
 async function loadData() {
+  void loadTranslationProgress();
   try {
     const [response, translationResponse] = await Promise.all([
       fetch("data/news.json", { cache: "no-store" }),
@@ -630,3 +675,4 @@ async function loadData() {
   renderHistory();
   loadData();
 })();
+
