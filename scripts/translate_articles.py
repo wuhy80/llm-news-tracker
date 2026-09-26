@@ -514,11 +514,26 @@ def error_message(error: Exception) -> str:
     message = re.sub(r"\s+", " ", str(error)).strip()
     if isinstance(error, urllib.error.HTTPError):
         try:
-            detail = error.read(1000).decode("utf-8", errors="replace")
+            detail = error.read(16384).decode("utf-8", errors="replace")
+            try:
+                error.translation_limit_source = json.loads(detail).get("error", {}).get("metadata", {}).get("limit_source")
+            except (ValueError, AttributeError):
+                error.translation_limit_source = None
             message = f"HTTP {error.code}: {detail}"
         except Exception:
             message = f"HTTP {error.code}: {message}"
     return message[:500]
+
+
+def shared_pool_limit(error):
+    return (isinstance(error, urllib.error.HTTPError) and error.code == 429
+            and getattr(error, "translation_limit_source", None) == "upstream_provider_shared_pool")
+
+
+def old_shared_pool_pause(state):
+    # Migrate only the positively identified shared-provider pause written by
+    # the old generic 429 handler; account/unknown limits remain untouched.
+    return bool(re.search(r'"limit_source"\s*:\s*"upstream_provider_shared_pool"', state.get("lastError", "")))
 
 
 def normalize_headers(headers: object) -> dict[str, str]:
@@ -553,6 +568,9 @@ def main() -> int:
     state = load_state()
     now = datetime.now(timezone.utc)
     reset_daily_state(state, now)
+    if old_shared_pool_pause(state):
+        state.pop("nextAttemptAt", None)
+        atomic_write_json(STATE_FILE, state)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
         publish_queue(requests, data["items"], pause_until.isoformat())
@@ -639,7 +657,7 @@ def main() -> int:
             failed_at = datetime.now(timezone.utc)
             message = error_message(error)
             code = error.code if isinstance(error, urllib.error.HTTPError) else None
-            if code in {404, 410, 502, 503, 504} or isinstance(error, (ValueError, KeyError, TimeoutError)):
+            if code in {404, 410, 502, 503, 504} or shared_pool_limit(error) or isinstance(error, (ValueError, KeyError, TimeoutError)):
                 # Model/service failure is not an article failure. Retry the same
                 # pending text using another free model, within the same budget.
                 pool.failed(model, message, permanent=code in {404, 410})
