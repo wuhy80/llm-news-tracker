@@ -17,13 +17,15 @@ from pathlib import Path
 from article_store import ROOT, normalize_fenced_body, publication_path, snapshot_path, utc_now
 from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
+from translation_models import ModelPool
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
 STATE_FILE = ROOT / "data" / "translations" / "state.json"
 INDEX_FILE = ROOT / "data" / "translations" / "index.json"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_TRANSLATION_MODEL = "z-ai/glm-5.2:free"
+DEFAULT_TRANSLATION_MODEL = "qwen/qwen3.8-27b:free"
+MODEL_HEALTH_FILE = ROOT / "data" / "translations" / "model-health.json"
 TRANSLATION_VERSION = "openrouter-zh-v2"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
 
@@ -323,6 +325,7 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
         ],
         "temperature": 0,
         "max_tokens": 8000,
+        "provider": {"max_price": {"prompt": 0, "completion": 0}},
     }
     request = urllib.request.Request(
         endpoint,
@@ -561,6 +564,17 @@ def main() -> int:
         print(f"[translate] daily request budget exhausted ({state.get('requestsToday', 0)}/{args.daily_limit})")
         return 0
 
+    try:
+        pool = ModelPool(MODEL_HEALTH_FILE, model)
+        model = pool.select()
+        print(f"[translate:model] selected {model}; checked live free-model catalog")
+    except Exception as error:
+        state.update(lastStatus="model_error", lastError=str(error)[:600])
+        atomic_write_json(STATE_FILE, state)
+        print(f"::error::Free-model availability check failed: {error}")
+        return 1
+
+    fatal_error = False
     requests_made = 0
     translated_blocks_count = 0
     completed_articles = 0
@@ -602,6 +616,7 @@ def main() -> int:
             response, actual_model, headers = request_translation(token, model, chunk, endpoint)
             translated, word_wise = normalize_response(response, chunk)
             apply_chunk(record, translated, word_wise, actual_model)
+            pool.succeeded(model)
             translated_blocks_count += len(translated)
             if record.get("status") == "complete":
                 completed_articles += 1
@@ -622,8 +637,31 @@ def main() -> int:
             )
         except Exception as error:
             failed_at = datetime.now(timezone.utc)
+            message = error_message(error)
+            code = error.code if isinstance(error, urllib.error.HTTPError) else None
+            if code in {404, 410, 502, 503, 504} or isinstance(error, (ValueError, KeyError, TimeoutError)):
+                # Model/service failure is not an article failure. Retry the same
+                # pending text using another free model, within the same budget.
+                pool.failed(model, message, permanent=code in {404, 410})
+                state.update(lastStatus="model_error", lastError=message)
+                atomic_write_json(STATE_FILE, state)
+                try:
+                    previous = model
+                    model = pool.select()
+                    print(f"[translate:model] {previous} failed; switching to {model}")
+                    continue
+                except RuntimeError as unavailable:
+                    print(f"::error::{unavailable}")
+                    fatal_error = True
+                    break
+            if code in {401, 403}:
+                state.update(lastStatus="auth_error", lastError=message)
+                atomic_write_json(STATE_FILE, state)
+                print("::error::OpenRouter authentication/permission failure; stopping")
+                fatal_error = True
+                break
             record["failureCount"] = int(record.get("failureCount", 0)) + 1
-            record["lastError"] = error_message(error)
+            record["lastError"] = message
             record["nextAttemptAt"] = article_backoff(record["failureCount"], failed_at).isoformat().replace("+00:00", "Z")
             record["updatedAt"] = utc_now()
             state["lastStatus"] = "error"
@@ -644,9 +682,10 @@ def main() -> int:
     )
     atomic_write_json(INDEX_FILE, build_translation_index())
     publish_queue(requests, data["items"], state.get("nextAttemptAt"))
-    return 0
+    return 1 if fatal_error or (requests_made and not translated_blocks_count) else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
