@@ -1,12 +1,16 @@
 """Build site-wide translation coverage without making model/network requests."""
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from article_store import ROOT, utc_now
 from news_store import load_news, atomic_write_json
 from translate_articles import (read_json, article_blocks, translatable_blocks, mostly_english,
                                 body_hash, TRANSLATION_VERSION, READABLE_KINDS)
 
 
-def build_progress(root: Path) -> dict:
+def build_progress(root: Path, now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    recent = {"hour": 0, "day": 0, "week": 0}
+    completed_without_time = 0
     items = {str(item['id']): item for item in load_news(root / 'data/news.json').get('items', [])}
     snapshots = {}
     for path in sorted((root / 'data/articles').rglob('*.json')):
@@ -47,8 +51,19 @@ def build_progress(root: Path) -> dict:
             stale += 1
         blocks_total += len(expected)
         blocks_done += len(done)
+        if valid and len(done) == len(expected):
+            try:
+                completed_at = datetime.fromisoformat(str(record.get('completedAt', '')).replace('Z', '+00:00'))
+                if completed_at.tzinfo is None:
+                    raise ValueError('completion timestamp has no timezone')
+                for period, delta in [('hour', timedelta(hours=1)), ('day', timedelta(days=1)), ('week', timedelta(days=7))]:
+                    if now - delta <= completed_at <= now:
+                        recent[period] += 1
+            except (ValueError, TypeError):
+                completed_without_time += 1
         counts['complete' if len(done) == len(expected) else 'partial' if done else 'pending'] += 1
-    return {'schemaVersion': 1, 'generatedAt': utc_now(), 'scope': 'all-documents', 'documents': counts,
+    return {'schemaVersion': 1, 'generatedAt': now.isoformat().replace('+00:00', 'Z'), 'recentCompleted': recent,
+            'completedWithoutTimestamp': completed_without_time, 'scope': 'all-documents', 'documents': counts,
             'eligibleDocuments': eligible, 'automaticEligibleDocuments': automatic,
             'translatedBlocks': blocks_done, 'totalBlocks': blocks_total,
             'documentPercent': round(counts['complete'] * 100 / eligible, 2) if eligible else 0,
@@ -60,3 +75,4 @@ if __name__ == '__main__':
     result = build_progress(ROOT)
     atomic_write_json(ROOT / 'data/translations/progress.json', result)
     print(result)
+

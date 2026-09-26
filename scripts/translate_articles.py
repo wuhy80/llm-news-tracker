@@ -16,6 +16,7 @@ from pathlib import Path
 
 from article_store import ROOT, normalize_fenced_body, publication_path, snapshot_path, utc_now
 from news_store import atomic_write_json, load_news
+from translation_queue import sync_requests, resolve_items, publish_queue
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
@@ -380,11 +381,13 @@ def select_candidates(
     items: list[dict],
     now: datetime,
     requested_model: str = "",
+    priority_ids: list[str] | None = None,
 ) -> list[tuple[dict, dict, list[dict[str, str]], Path, dict]]:
     candidates = []
+    priorities = {ident: rank for rank, ident in enumerate(priority_ids or [])}
     for item in items:
         level = item.get("aiReview", {}).get("importanceLevel")
-        if level not in {4, 5}:
+        if level not in {4, 5} and item.get("id") not in priorities:
             continue
         try:
             snapshot = read_json(snapshot_path(item))
@@ -409,6 +412,7 @@ def select_candidates(
     candidates.sort(key=lambda entry: entry[0].get("publishedAt", ""), reverse=True)
     candidates.sort(key=lambda entry: -int(entry[0].get("aiReview", {}).get("importanceLevel", 0)))
     candidates.sort(key=lambda entry: entry[4].get("translatedBlocks", 0) == 0)
+    candidates.sort(key=lambda entry: priorities.get(entry[0]["id"], len(priorities)))
     return candidates
 
 
@@ -532,6 +536,11 @@ def main() -> int:
         print(f"[translate] removed {stale_records} stale translation records")
         atomic_write_json(INDEX_FILE, build_translation_index())
 
+    data = load_news(NEWS_FILE)
+    requests = sync_requests()
+    data["items"] = resolve_items(data.get("items", []), requests)
+    publish_queue(requests, data["items"])
+
     token = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not token:
         print("[translate] disabled: OPENROUTER_API_KEY is not available")
@@ -543,6 +552,7 @@ def main() -> int:
     reset_daily_state(state, now)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
+        publish_queue(requests, data["items"], pause_until.isoformat())
         print(f"[translate] paused until {pause_until.isoformat()}")
         return 0
     remaining = max(0, args.daily_limit - int(state.get("requestsToday", 0)))
@@ -551,13 +561,12 @@ def main() -> int:
         print(f"[translate] daily request budget exhausted ({state.get('requestsToday', 0)}/{args.daily_limit})")
         return 0
 
-    data = load_news(NEWS_FILE)
     requests_made = 0
     translated_blocks_count = 0
     completed_articles = 0
     while requests_made < request_limit:
         now = datetime.now(timezone.utc)
-        candidates = select_candidates(data.get("items", []), now, model)
+        candidates = select_candidates(data.get("items", []), now, model, list(requests))
         if not candidates:
             break
         item, _, blocks, path, record = candidates[0]
@@ -634,8 +643,10 @@ def main() -> int:
         f"completed {completed_articles} articles; daily {state.get('requestsToday', 0)}/{args.daily_limit}"
     )
     atomic_write_json(INDEX_FILE, build_translation_index())
+    publish_queue(requests, data["items"], state.get("nextAttemptAt"))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
