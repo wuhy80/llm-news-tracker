@@ -197,3 +197,28 @@ Closing an issue cancels it at the next queue reconciliation; reopening triggers
 another attempt. Queue statuses on the website reflect the last completed sync,
 not live execution. Completed request issues can be closed by the maintainer.
 
+
+## Inline media positions
+
+New snapshots record image/video occurrences relative to stable article block IDs.
+Translation block IDs and archived body text remain unchanged; fenced code uses a
+separate `c` ID namespace. The reader inserts media after the corresponding text
+and its translation. Repeated occurrences and consecutive media retain source order.
+
+Positions are bound to the exact archived body SHA-256. Missing, ambiguous, or
+outdated positions appear in a collapsible attachment section at the end instead
+of being guessed or placed above the article. Source extraction is restricted to
+the article, and existing video source restrictions still apply.
+
+To restore positions in historical snapshots:
+
+```sh
+python scripts/backfill_article_media.py --layout --limit 100 --workers 4 --retry-days 7
+```
+
+This operation preserves archived body text, translations and downloaded media;
+it adds media IDs and layout metadata. It uses exact neighbouring text matches
+against the archived body. Incomplete matches remain attachments and are retried
+with independent state in `data/media-layout-state.json`. The hourly historical
+media workflow includes this batch, with up to 10 Reader fallback requests per run
+(`ARTICLE_LAYOUT_READER_LIMIT`). Fully restored, current layouts are skipped.

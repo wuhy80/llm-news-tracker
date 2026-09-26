@@ -40,6 +40,19 @@ READER_LAST_REQUEST = 0.0
 FETCHED_VIDEO_REFS: dict[str, list[dict[str, str]]] = {}
 FETCHED_IMAGE_REFS: dict[str, list[dict[str, str]]] = {}
 
+MEDIA_SOURCE_CONTEXT = threading.local()
+
+
+def record_media_source(url, source, source_format):
+    MEDIA_SOURCE_CONTEXT.value = (url, source, source_format)
+
+
+def take_media_source(url):
+    value = getattr(MEDIA_SOURCE_CONTEXT, "value", None)
+    MEDIA_SOURCE_CONTEXT.value = None
+    return (value[1], value[2]) if value and value[0] == url else None
+
+
 BLOCK_TAGS = {
     "address", "article", "blockquote", "br", "div", "figcaption", "h1", "h2", "h3",
     "h4", "h5", "h6", "li", "main", "p", "pre", "section", "td",
@@ -732,6 +745,7 @@ def write_snapshot(
     media_rechecked_at: str | None = None,
     videos: list[dict[str, str]] | None = None,
     media_format_version: int | None = None,
+    media_source: tuple[str, str] | None = None,
 ) -> Path:
     path = snapshot_path(item)
     try:
@@ -776,6 +790,18 @@ def write_snapshot(
     for field in ("summaryZh", "summaryGeneratedAt", "summaryModel"):
         if field in existing and field not in payload:
             payload[field] = existing[field]
+    from media_layout import build_layout, body_digest
+    source = media_source or take_media_source(payload["resolvedUrl"])
+    if source:
+        try:
+            payload.update(build_layout(payload["body"], payload.get("images", []), payload.get("videos", []), source[0], source[1], payload["resolvedUrl"]))
+            payload["mediaLayoutCheckedAt"] = utc_now()
+        except (ValueError, RecursionError):
+            pass  # Text archival remains usable; unknown positions render as attachments.
+    elif (existing.get("mediaLayoutBodyHash") == body_digest(payload["body"])
+          and payload.get("images", []) == existing.get("images", [])
+          and payload.get("videos", []) == existing.get("videos", [])):
+        payload.update({key: value for key, value in existing.items() if key.startswith("mediaLayout")})
     payload = redact_snapshot(payload)
     if error:
         payload["note"] = redact_secrets(error[:180])
@@ -833,7 +859,7 @@ def store_feed_snapshot(
         except (json.JSONDecodeError, OSError):
             pass
     images = download_images(item, image_refs)
-    write_snapshot(item, body, "feed", images=images if media_scope_found or images else None, videos=videos or None)
+    write_snapshot(item, body, "feed", images=images if media_scope_found or images else None, videos=videos or None, media_source=(feed_html, "html"))
     return True
 
 
@@ -1030,6 +1056,7 @@ def fetch_community_text(url: str) -> tuple[str, str]:
 
 
 def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
+    MEDIA_SOURCE_CONTEXT.value = None
     validate_public_url(url)
     request = urllib.request.Request(
         url,
@@ -1058,6 +1085,7 @@ def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     if has_corrupted_text(body):
         raise ValueError("page body contains corrupted text")
     FETCHED_VIDEO_REFS[resolved_url] = videos
+    record_media_source(resolved_url, document, "html")
     return body, resolved_url, images
 
 
@@ -1069,6 +1097,7 @@ def fetch_page_text(url: str) -> tuple[str, str]:
 
 def fetch_reader_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     global READER_LAST_REQUEST
+    MEDIA_SOURCE_CONTEXT.value = None
     validate_public_url(url)
     reader_url = f"{READER_PREFIX}{url}"
     request = urllib.request.Request(
@@ -1093,6 +1122,7 @@ def fetch_reader_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
         raise ValueError("reader body not found")
     if has_corrupted_text(body):
         raise ValueError("reader body contains corrupted text")
+    record_media_source(url, reader_text, "markdown")
     return body, url, extract_markdown_image_refs(reader_text, url)
 
 

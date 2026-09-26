@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse, parse_qs
 
 MEDIA_FORMAT_VERSION = 2
 VOID = set('area base br col embed hr img input link meta param source track wbr'.split())
-BODY_CLASSES = {'entry-content', 'article-body', 'article-content', 'post-content', 'post__content', 'post-body'}
+BODY_CLASSES = {'entry-content', 'article-body', 'article-content', 'post-content', 'post__content', 'post-body', 'article'}
 NOISE = re.compile(r'(?:^|[\s_-])(?:related|recommendations?|recommended|author|avatar|sidebar|social|share|newsletter|navigation|menu|post-card|tease-text)(?:$|[\s_-])', re.I)
 
 
@@ -28,6 +28,10 @@ class Document(HTMLParser):
         self.stack[-1].children.append(node)
         if tag not in VOID:
             self.stack.append(node)
+
+    def handle_data(self, data):
+        node = Node('#text', [('text', data)])
+        self.stack[-1].children.append(node)
 
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
@@ -84,7 +88,7 @@ def walk(n):
         yield from walk(child)
 
 
-def extract_media_refs(value, base_url='', limit=12):
+def media_roots(value, base_url=''):
     parser = Document()
     parser.feed(value or '')
     nodes = list(walk(parser.root))
@@ -100,6 +104,20 @@ def extract_media_refs(value, base_url='', limit=12):
         if full_document:
             raise ValueError('article media scope not found')
         roots = [parser.root]
+    # Process disjoint roots in document order (including a GitHub cover header).
+    ordered = {id(n): index for index, n in enumerate(nodes)}
+    # Prefer outer selected containers; never serialize nested roots twice.
+    descendants = {id(c) for n in roots for child in n.children for c in walk(child)}
+    roots = [n for n in roots if id(n) not in descendants]
+    return sorted(roots, key=lambda n: ordered[id(n)]), nodes
+
+
+def extract_media_refs(value, base_url='', limit=12):
+    roots, nodes = media_roots(value, base_url)
+    full_document = any(n.tag in {'html', 'head', 'body'} for n in nodes)
+    explicit = any(BODY_CLASSES.intersection((n.attrs.get('class') or '').split()) for n in nodes)
+    articles = any(n.tag == 'article' for n in nodes)
+    mains = any(n.tag == 'main' for n in nodes)
     images, videos, seen_i, seen_v = [], [], set(), set()
     for root in roots:
         selected = list(walk(root))

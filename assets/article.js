@@ -355,77 +355,19 @@ async function loadTranslation(articleId, location) {
   return record;
 }
 
-function renderVideos() {
-  const videos = Array.isArray(readingState.item?.videos) ? readingState.item.videos : [];
-  const seen = new Set();
-  videos.forEach((video) => {
-    let url;
-    try { url = new URL(video.src); } catch { return; }
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || seen.has(url.href)) return;
-    let element;
-    if (video.kind === "embed") {
-      const youtube = url.hostname === "www.youtube-nocookie.com" && /^\/embed\/[\w-]{11}$/.test(url.pathname);
-      const vimeo = url.hostname === "player.vimeo.com" && /^\/video\/\d+$/.test(url.pathname);
-      if (url.protocol !== "https:" || (!youtube && !vimeo)) return;
-      url.search = "";
-      element = document.createElement("iframe");
-      element.title = String(video.title || "原文视频");
-      element.loading = "lazy";
-      element.allow = "encrypted-media; picture-in-picture; fullscreen";
-      element.allowFullscreen = true;
-      element.referrerPolicy = "strict-origin-when-cross-origin";
-    } else if (video.kind === "video" && /\.(mp4|webm|ogv|ogg)$/i.test(url.pathname)) {
-      element = document.createElement("video");
-      element.controls = true;
-      element.preload = "none";
-      element.playsInline = true;
-      if (/^https?:\/\//i.test(video.poster || "")) element.poster = video.poster;
-    } else return;
-    seen.add(url.href);
-    element.src = url.href;
-    const figure = document.createElement("figure");
-    figure.className = "reader-figure reader-video";
-    figure.append(element);
-    const caption = document.createElement("figcaption");
-    const link = document.createElement("a");
-    link.textContent = "打开原视频 ↗";
-    link.href = /^https?:\/\//i.test(video.originalUrl || "") ? video.originalUrl : url.href;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    caption.append(link);
-    figure.append(caption);
-    elements.articleBody.append(figure);
-  });
-}
-
 function renderBody(body) {
   elements.articleBody.replaceChildren();
-  renderVideos();
-  const images = Array.isArray(readingState.item?.images) ? readingState.item.images : [];
-  images.forEach((image) => {
-    const source = String(image?.src || "");
-    if (!source.startsWith("data/article-media/") && !/^https?:\/\//i.test(source)) return;
-    const figure = document.createElement("figure");
-    figure.className = "reader-figure";
-    const element = document.createElement("img");
-    element.src = source;
-    element.alt = String(image?.alt || "文章配图");
-    element.loading = "lazy";
-    element.decoding = "async";
-    element.addEventListener("error", () => figure.remove(), { once: true });
-    figure.append(element);
-    if (image?.alt) {
-      const caption = document.createElement("figcaption");
-      caption.textContent = image.alt;
-      figure.append(caption);
-    }
-    elements.articleBody.append(figure);
-  });
   const proseLines = [];
   let codeLines = null;
   let codeLanguage = "";
   let rendered = false;
   let blockNumber = 0;
+  let codeNumber = 0;
+  const appendCode = (text, language) => {
+    const element = renderCode(text, language);
+    element.dataset.blockId = `c${String(++codeNumber).padStart(4, "0")}`;
+    elements.articleBody.append(element);
+  };
   const translations = translatedBlocks();
   const wiseEntries = wordWiseEntries();
   const usedTerms = new Set();
@@ -435,7 +377,11 @@ function renderBody(body) {
     if (!text) return;
     const blockId = nextBlockId();
     const tags = parseTags(text);
-    if (tags.length) elements.articleBody.append(renderTags(tags));
+    if (tags.length) {
+      const element = renderTags(tags);
+      element.dataset.blockId = blockId;
+      elements.articleBody.append(element);
+    }
     else {
       const paragraph = document.createElement("p");
       appendReadableText(paragraph, text, blockId, translations, wiseEntries, usedTerms);
@@ -503,7 +449,7 @@ function renderBody(body) {
         codeLines = [];
         codeLanguage = trimmed.slice(3).trim();
       } else {
-        elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
+        appendCode(codeLines.join("\n"), codeLanguage);
         codeLines = null;
         codeLanguage = "";
         rendered = true;
@@ -521,7 +467,7 @@ function renderBody(body) {
     proseLines.push(normalizeProseMarkup(trimmed));
   });
   if (codeLines !== null) {
-    elements.articleBody.append(renderCode(codeLines.join("\n"), codeLanguage));
+    appendCode(codeLines.join("\n"), codeLanguage);
     elements.articleBody.append(document.createTextNode(""));
     rendered = true;
   }
@@ -532,6 +478,7 @@ function renderBody(body) {
     empty.textContent = "暂无可用的内部正文，请查看原文。";
     elements.articleBody.append(empty);
   }
+  void window.LLMMediaLayout?.render(readingState.item, body, elements.articleBody);
   applyReadingPreferences();
 }
 
