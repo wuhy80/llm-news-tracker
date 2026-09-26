@@ -97,7 +97,9 @@ def extract_media_refs(value, base_url='', limit=12):
         roots += [c for main in mains for c in main.children if c.tag == 'header']
     full_document = any(n.tag in {'html', 'head', 'body'} for n in nodes)
     if not roots:
-        roots = [] if full_document else [parser.root]
+        if full_document:
+            raise ValueError('article media scope not found')
+        roots = [parser.root]
     images, videos, seen_i, seen_v = [], [], set(), set()
     for root in roots:
         selected = list(walk(root))
