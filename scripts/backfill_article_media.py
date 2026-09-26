@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import threading
 import json
 import os
 import urllib.parse
@@ -20,15 +22,65 @@ from article_store import (
     download_images,
     fetch_community_text,
     fetch_page_text,
+    fetch_reader_text,
+    take_media_source,
     is_browser_incompatible_image,
     is_site_chrome_image,
     snapshot_path,
     utc_now,
 )
 from news_store import load_news
+from media_layout import LAYOUT_VERSION, build_layout, layout_current, body_digest
 
 NEWS_FILE = ROOT / "data" / "news.json"
 READABLE_KINDS = {"community", "feed", "page", "reader"}
+
+
+LAYOUT_READER_LOCK = threading.Lock()
+LAYOUT_READER_REMAINING = int(os.getenv("ARTICLE_LAYOUT_READER_LIMIT", "10"))
+
+
+def layout_backfill_item(item: dict, recheck: bool = True, path: Path | None = None) -> str:
+    global LAYOUT_READER_REMAINING
+    path = path or snapshot_path(item)
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    if layout_current(snapshot) or not (snapshot.get("images") or snapshot.get("videos")):
+        return "skip"
+    target = snapshot.get("resolvedUrl") or item.get("url")
+    best = None
+    errors = []
+    methods = [fetch_reader_text, fetch_page_text] if snapshot.get("contentKind") == "reader" else [fetch_page_text, fetch_reader_text]
+    for method in methods:
+        if method is fetch_reader_text:
+            with LAYOUT_READER_LOCK:
+                if LAYOUT_READER_REMAINING <= 0:
+                    continue
+                LAYOUT_READER_REMAINING -= 1
+        try:
+            _, resolved = method(target)
+            source = take_media_source(resolved)
+            FETCHED_IMAGE_REFS.pop(resolved, None)
+            FETCHED_VIDEO_REFS.pop(resolved, None)
+            if not source:
+                continue
+            candidate = copy.deepcopy(snapshot)
+            candidate.update(build_layout(snapshot.get("body", ""), candidate.get("images", []), candidate.get("videos", []), source[0], source[1], resolved))
+            if best is None or candidate['mediaLayoutMatched'] > best['mediaLayoutMatched']:
+                best = candidate
+            if candidate['mediaLayoutStatus'] == 'complete':
+                break
+        except Exception as error:
+            errors.append(type(error).__name__)
+    if best is None:
+        return 'error:' + (','.join(errors) or 'source_unavailable')
+    if (snapshot.get('mediaLayoutBodyHash') == body_digest(snapshot.get('body', ''))
+            and snapshot.get('mediaLayoutMatched', 0) > best['mediaLayoutMatched']):
+        return 'partial:' + str(snapshot['mediaLayoutMatched'])
+    best['mediaLayoutCheckedAt'] = utc_now()
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(best, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    temporary.replace(path)
+    return ('layout:' if best['mediaLayoutStatus'] == 'complete' else 'partial:') + str(best['mediaLayoutMatched'])
 
 
 def has_problematic_images(snapshot: dict) -> bool:
@@ -87,6 +139,10 @@ def media_backfill_item(item: dict, recheck: bool = False, path: Path | None = N
             "images": images, "videos": videos,
             "mediaCheckedAt": utc_now(), "mediaFormatVersion": MEDIA_FORMAT_VERSION,
         })
+        source = take_media_source(resolved_url)
+        if source:
+            snapshot.update(build_layout(snapshot.get("body", ""), snapshot["images"], snapshot["videos"], source[0], source[1], resolved_url))
+            snapshot["mediaLayoutCheckedAt"] = utc_now()
         if recheck:
             snapshot["mediaRecheckedAt"] = utc_now()
         # Media repair must not re-normalize text, drop unknown fields or change fetchedAt.
@@ -99,7 +155,7 @@ def media_backfill_item(item: dict, recheck: bool = False, path: Path | None = N
         return f"error:{type(error).__name__}"
 
 
-def archive_candidates(directory: Path, state: dict, retry_days: int = 7, year: int = 0, domain: str = "") -> list[tuple[dict, Path]]:
+def archive_candidates(directory: Path, state: dict, retry_days: int = 7, year: int = 0, domain: str = "", layout: bool = False) -> list[tuple[dict, Path]]:
     candidates = []
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retry_days)).isoformat().replace("+00:00", "Z")
     failures = state.get("failures", {})
@@ -114,7 +170,10 @@ def archive_candidates(directory: Path, state: dict, retry_days: int = 7, year: 
             continue
         if not matches_domain(snapshot, snapshot, domain):
             continue
-        if snapshot.get("mediaFormatVersion", 0) >= MEDIA_FORMAT_VERSION and not has_problematic_images(snapshot):
+        if layout:
+            if layout_current(snapshot) or not (snapshot.get("images") or snapshot.get("videos")):
+                continue
+        elif snapshot.get("mediaFormatVersion", 0) >= MEDIA_FORMAT_VERSION and not has_problematic_images(snapshot):
             continue
         key = path.relative_to(directory).as_posix()
         failed = failures.get(key, {})
@@ -135,16 +194,21 @@ def main() -> int:
     parser.add_argument("--recheck", action="store_true")
     parser.add_argument("--all-snapshots", action="store_true", help="Repair all archive years, including files absent from the news index")
     parser.add_argument("--retry-days", type=int, default=7)
+    parser.add_argument("--layout", action="store_true", help="Restore media positions without rewriting archived text or media URLs")
     args = parser.parse_args()
+    if args.layout:
+        args.all_snapshots = True
     directory = ROOT / "data" / "articles"
-    state_path = ROOT / "data" / "media-repair-state.json"
+    state_path = ROOT / "data" / ("media-layout-state.json" if args.layout else "media-repair-state.json")
+    version_key = "mediaLayoutVersion" if args.layout else "mediaFormatVersion"
+    version = LAYOUT_VERSION if args.layout else MEDIA_FORMAT_VERSION
     state = {"failures": {}}
     if args.all_snapshots:
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("mediaFormatVersion") != MEDIA_FORMAT_VERSION:
+        if state.get(version_key) != version:
             state = {"failures": {}}
-        candidates = archive_candidates(directory, state, max(0, args.retry_days), args.year, args.domain)
+        candidates = archive_candidates(directory, state, max(0, args.retry_days), args.year, args.domain, args.layout)
     else:
         candidates = []
         for item in load_news(NEWS_FILE).get("items", []):
@@ -164,15 +228,18 @@ def main() -> int:
                 candidates.append((item, path))
     eligible = len(candidates)
     candidates = candidates[:max(0, args.limit)]
-    counts = {"repaired": 0, "failed": 0, "skipped": 0}
+    counts = {"repaired": 0, "partial": 0, "failed": 0, "skipped": 0}
     if candidates:
         with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(candidates)))) as pool:
-            futures = {pool.submit(media_backfill_item, item, args.recheck or args.all_snapshots, path): (item, path) for item, path in candidates}
+            futures = {pool.submit(layout_backfill_item if args.layout else media_backfill_item, item, args.recheck or args.all_snapshots, path): (item, path) for item, path in candidates}
             for future in as_completed(futures):
                 item, path = futures[future]
                 result = future.result()
                 key = path.relative_to(directory).as_posix()
-                if result.startswith("error:"):
+                if result.startswith("partial:"):
+                    counts["partial"] += 1
+                    state.setdefault("failures", {})[key] = {"attemptedAt": utc_now(), "error": result}
+                elif result.startswith("error:"):
                     counts["failed"] += 1
                     state.setdefault("failures", {})[key] = {"attemptedAt": utc_now(), "error": result}
                 elif result in {"skip", "missing"}:
@@ -183,7 +250,7 @@ def main() -> int:
                 print(f"[media:{result}] {item.get('id', '')} {item.get('title', '')[:80]}", flush=True)
     report = {"checkedAt": utc_now(), "eligibleBeforeBatch": eligible, "attempted": len(candidates), **counts, "remainingEligible": eligible - len(candidates)}
     if args.all_snapshots and (candidates or not state_path.exists()):
-        state.update({"mediaFormatVersion": MEDIA_FORMAT_VERSION, "lastBatch": report})
+        state.update({version_key: version, "lastBatch": report})
         state_path.parent.mkdir(parents=True, exist_ok=True)
         temp = state_path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
