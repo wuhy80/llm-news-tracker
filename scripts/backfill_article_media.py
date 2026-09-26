@@ -12,6 +12,8 @@ from pathlib import Path
 
 from article_store import (
     FETCHED_IMAGE_REFS,
+    FETCHED_VIDEO_REFS,
+    MEDIA_FORMAT_VERSION,
     ROOT,
     community_api_url,
     download_images,
@@ -82,54 +84,28 @@ def media_backfill_item(item: dict, recheck: bool = False) -> str:
         return "skip"
     if not recheck and (snapshot.get("images") or snapshot.get("mediaCheckedAt")):
         return "skip"
-    if recheck and snapshot.get("mediaRecheckedAt") and not has_problematic_images(snapshot):
+    if recheck and snapshot.get("mediaFormatVersion", 0) >= MEDIA_FORMAT_VERSION and not has_problematic_images(snapshot):
         return "skip"
     target_url = snapshot.get("resolvedUrl") or item.get("url")
     try:
         if community_api_url(target_url):
             _, resolved_url = fetch_community_text(target_url)
-        elif snapshot.get("contentKind") == "reader":
-            _, resolved_url = fetch_reader_text(target_url)
         else:
             _, resolved_url = fetch_page_text(target_url)
         image_refs = FETCHED_IMAGE_REFS.pop(resolved_url, [])
         images = download_images(item, image_refs)
-        if not images:
-            if not image_refs:
-                migrated_images = migrate_existing_images(snapshot)
-                write_snapshot(
-                    item,
-                    snapshot.get("body", ""),
-                    snapshot["contentKind"],
-                    resolved_url=resolved_url,
-                    images=migrated_images or None,
-                    media_checked_at=utc_now(),
-                    media_rechecked_at=utc_now() if recheck else None,
-                )
-            return "none"
+        videos = FETCHED_VIDEO_REFS.pop(resolved_url, [])
+        # A successful empty extraction must clear previously misattributed media.
         write_snapshot(
-            item,
-            snapshot.get("body", ""),
-            snapshot["contentKind"],
-            resolved_url=resolved_url,
-            images=images,
+            {**snapshot, **item}, snapshot.get("body", ""), snapshot["contentKind"],
+            resolved_url=resolved_url, images=images, videos=videos,
             media_checked_at=utc_now(),
             media_rechecked_at=utc_now() if recheck else None,
+            media_format_version=MEDIA_FORMAT_VERSION,
         )
-        return f"{len(images)} images"
+        return f"{len(images)} images, {len(videos)} videos"
     except Exception as error:
-        if recheck:
-            migrated_images = migrate_existing_images(snapshot)
-            if migrated_images:
-                write_snapshot(
-                    item,
-                    snapshot.get("body", ""),
-                    snapshot["contentKind"],
-                    resolved_url=target_url,
-                    images=migrated_images,
-                    media_rechecked_at=utc_now(),
-                )
-                return f"{len(migrated_images)} migrated after {type(error).__name__}"
+        # Keep old data on fetch failure; do not mark it as successfully rechecked.
         return f"error:{type(error).__name__}"
 
 
@@ -156,7 +132,7 @@ def main() -> int:
                 snapshot.get("contentKind") in READABLE_KINDS
                 and in_year
                 and in_domain
-                and (not snapshot.get("mediaRecheckedAt") or has_problematic_images(snapshot))
+                and (snapshot.get("mediaFormatVersion", 0) < MEDIA_FORMAT_VERSION or has_problematic_images(snapshot))
             )
         else:
             needs_media = (
@@ -186,3 +162,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
