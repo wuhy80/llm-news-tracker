@@ -147,3 +147,30 @@ python -m http.server 8000
 ## 许可
 
 [MIT](LICENSE)
+
+
+### Article images and videos
+
+Article media is extracted from the article body rather than the whole page. Navigation,
+related-post cards, author avatars, and video facade thumbnails are excluded. Supported
+video sources are YouTube/Vimeo embeds and MP4/WebM/Ogg direct URLs. The reader disables
+autoplay and always provides an original-video link; playback still depends on the
+source platform's network availability and embedding policy. Arbitrary source iframes
+and scripts are never copied into the reader. Video files remain hosted at their source.
+
+`mediaFormatVersion: 2` identifies snapshots checked with the scoped extractor. The
+scheduled `--recheck` jobs revisit older versions, including snapshots already marked
+`mediaRecheckedAt`. A successful empty result clears stale media; a fetch failure keeps
+the existing snapshot and leaves it eligible for retry. Media-only backfills preserve
+the article body and its translation block mapping.
+
+Historical repair uses `.github/workflows/repair-historical-media.yml` to scan
+`data/articles/**/*.json` across all years, including files absent from the news
+index. Each hourly batch processes up to 1,000 eligible readable snapshots with
+8 workers. Completed version-2 snapshots are skipped; failures are retained in
+`data/media-repair-state.json` and retried after 7 days. Never-attempted files take
+priority over retries. The Actions summary reports repaired, failed, and remaining
+eligible counts; summary-only records are not full-text media archives.
+Media-only repair preserves every non-media snapshot field, including the body,
+original fetch timestamp, custom fields and AI review. Unrecognized page scopes
+are treated as failures instead of clearing potentially valid historical images.
