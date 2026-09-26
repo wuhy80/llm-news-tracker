@@ -265,7 +265,11 @@ class ReadableTextParser(HTMLParser):
 
 
 def extract_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
-    return extract_media_refs(value, base_url, MAX_IMAGES_PER_ARTICLE)[0]
+    try:
+        return extract_media_refs(value, base_url, MAX_IMAGES_PER_ARTICLE)[0]
+    except ValueError:
+        # Feed HTML may lack a recognizable article container. Keep its text.
+        return []
 
 
 def extract_markdown_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
@@ -792,7 +796,12 @@ def store_feed_snapshot(
     body = text_from_html(feed_html)
     if len(body) < MIN_BODY_CHARS:
         return False
-    image_refs, videos = extract_media_refs(feed_html, item.get("url", ""))
+    media_scope_found = True
+    try:
+        image_refs, videos = extract_media_refs(feed_html, item.get("url", ""))
+    except ValueError:
+        image_refs, videos = [], []
+        media_scope_found = False
     for reference in extra_image_refs or []:
         if reference.get("url") and reference["url"] not in {item["url"] for item in image_refs}:
             image_refs.append(reference)
@@ -824,7 +833,7 @@ def store_feed_snapshot(
         except (json.JSONDecodeError, OSError):
             pass
     images = download_images(item, image_refs)
-    write_snapshot(item, body, "feed", images=images, videos=videos or None)
+    write_snapshot(item, body, "feed", images=images if media_scope_found or images else None, videos=videos or None)
     return True
 
 
