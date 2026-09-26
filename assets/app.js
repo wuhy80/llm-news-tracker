@@ -289,6 +289,7 @@ function renderFeed(items) {
       badge.setAttribute("aria-label", `${badge.textContent}：${itemReview.reasonZh}`);
     }
     badge.hidden = !badge.textContent;
+    window.LLMTranslationQueue?.mount(fragment.querySelector(".translation-request"), item, translationStatus(item) === "complete");
     const translationBadge = fragment.querySelector(".translation-badge");
     const translation = translationRecord(item);
     if (translation?.status === "complete") {
@@ -604,7 +605,19 @@ function renderTranslationProgress(data) {
   });
   const blocksPercent = data.totalBlocks ? Math.min(100, data.translatedBlocks / data.totalBlocks * 100).toFixed(2) : "0.00";
   document.getElementById("translationBlockSummary").textContent = `段落完成率 ${blocksPercent}% · 已译 ${number(data.translatedBlocks)} / ${number(data.totalBlocks)} 段`;
-  document.getElementById("translationScopeNote").textContent = `统计覆盖全部文档；完成率以有正文且需翻译的文档为分母。自动任务目前仅处理 4、5 级英文文章（${number(data.automaticEligibleDocuments)} 篇）。无需翻译含不符合现有英文翻译规则的正文（如中文、短文本或纯代码）；过期译文不计入已完成。`;
+  document.getElementById("translationScopeNote").textContent = `统计覆盖全部文档；完成率以有正文且需翻译的文档为分母。自动任务目前仅处理 4、5 级英文文章，手动优先请求除外（${number(data.automaticEligibleDocuments)} 篇）。无需翻译含不符合现有英文翻译规则的正文（如中文、短文本或纯代码）；过期译文不计入已完成。`;
+  const recent = document.getElementById("translationRecent");
+  recent.replaceChildren();
+  [["hour", "最近一小时"], ["day", "最近一天"], ["week", "最近一周"]].forEach(([key, label]) => {
+    const cell = document.createElement("div");
+    const caption = document.createElement("span");
+    const value = document.createElement("strong");
+    caption.textContent = label;
+    const count = data.recentCompleted?.[key];
+    value.textContent = Number.isFinite(count) ? `${number(count)} 篇完成` : "暂未统计";
+    cell.append(caption, value);
+    recent.append(cell);
+  });
   const updated = new Date(data.generatedAt);
   document.getElementById("translationProgressUpdated").textContent = Number.isNaN(updated.getTime()) ? "" : `统计更新于 ${updated.toLocaleString("zh-CN", { hour12: false })}`;
   details.hidden = false;
@@ -675,4 +688,5 @@ async function loadData() {
   renderHistory();
   loadData();
 })();
+
 
