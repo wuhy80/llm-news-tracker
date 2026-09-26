@@ -354,8 +354,52 @@ async function loadTranslation(articleId, location) {
   return record;
 }
 
+function renderVideos() {
+  const videos = Array.isArray(readingState.item?.videos) ? readingState.item.videos : [];
+  const seen = new Set();
+  videos.forEach((video) => {
+    let url;
+    try { url = new URL(video.src); } catch { return; }
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || seen.has(url.href)) return;
+    let element;
+    if (video.kind === "embed") {
+      const youtube = url.hostname === "www.youtube-nocookie.com" && /^\/embed\/[\w-]{11}$/.test(url.pathname);
+      const vimeo = url.hostname === "player.vimeo.com" && /^\/video\/\d+$/.test(url.pathname);
+      if (url.protocol !== "https:" || (!youtube && !vimeo)) return;
+      url.search = "";
+      element = document.createElement("iframe");
+      element.title = String(video.title || "原文视频");
+      element.loading = "lazy";
+      element.allow = "encrypted-media; picture-in-picture; fullscreen";
+      element.allowFullscreen = true;
+      element.referrerPolicy = "strict-origin-when-cross-origin";
+    } else if (video.kind === "video" && /\.(mp4|webm|ogv|ogg)$/i.test(url.pathname)) {
+      element = document.createElement("video");
+      element.controls = true;
+      element.preload = "none";
+      element.playsInline = true;
+      if (/^https?:\/\//i.test(video.poster || "")) element.poster = video.poster;
+    } else return;
+    seen.add(url.href);
+    element.src = url.href;
+    const figure = document.createElement("figure");
+    figure.className = "reader-figure reader-video";
+    figure.append(element);
+    const caption = document.createElement("figcaption");
+    const link = document.createElement("a");
+    link.textContent = "打开原视频 ↗";
+    link.href = /^https?:\/\//i.test(video.originalUrl || "") ? video.originalUrl : url.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    caption.append(link);
+    figure.append(caption);
+    elements.articleBody.append(figure);
+  });
+}
+
 function renderBody(body) {
   elements.articleBody.replaceChildren();
+  renderVideos();
   const images = Array.isArray(readingState.item?.images) ? readingState.item.images : [];
   images.forEach((image) => {
     const source = String(image?.src || "");
@@ -674,3 +718,4 @@ async function loadArticle() {
   });
   loadArticle();
 })();
+

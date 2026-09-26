@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 
+from article_media import MEDIA_FORMAT_VERSION, extract_media_refs
+
 ROOT = Path(__file__).resolve().parents[1]
 ARTICLES_DIR = ROOT / "data" / "articles"
 MEDIA_DIR = ROOT / "data" / "article-media"
@@ -35,6 +37,7 @@ READER_PREFIX = "https://r.jina.ai/"
 READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
 READER_LOCK = threading.Lock()
 READER_LAST_REQUEST = 0.0
+FETCHED_VIDEO_REFS: dict[str, list[dict[str, str]]] = {}
 FETCHED_IMAGE_REFS: dict[str, list[dict[str, str]]] = {}
 
 BLOCK_TAGS = {
@@ -261,81 +264,8 @@ class ReadableTextParser(HTMLParser):
             target.append(f"```\n{code}\n```")
 
 
-class ImageReferenceParser(HTMLParser):
-    def __init__(self, base_url: str = "") -> None:
-        super().__init__(convert_charrefs=True)
-        self.base_url = base_url
-        self.references: list[dict[str, str]] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag = tag.lower()
-        attributes = {key.lower(): value or "" for key, value in attrs}
-        if tag == "meta":
-            key = (attributes.get("property") or attributes.get("name") or attributes.get("itemprop") or "").casefold()
-            if key not in {"og:image", "og:image:url", "twitter:image", "twitter:image:src", "image"}:
-                return
-            source = attributes.get("content", "")
-        elif tag == "link":
-            rel = {part.casefold() for part in attributes.get("rel", "").split()}
-            if not rel & {"image_src", "preload"} or ("preload" in rel and attributes.get("as") != "image"):
-                return
-            source = attributes.get("href", "")
-        elif tag in {"img", "source"}:
-            source = (
-                attributes.get("src")
-                or attributes.get("data-src")
-                or attributes.get("data-original")
-                or attributes.get("data-lazy-src")
-                or attributes.get("data-original-src")
-                or attributes.get("data-url")
-            )
-            if not source:
-                srcset = (
-                    attributes.get("srcset")
-                    or attributes.get("data-srcset")
-                    or attributes.get("data-lazy-srcset")
-                )
-                if srcset:
-                    source = srcset.split(",", 1)[0].strip().rsplit(" ", 1)[0]
-        else:
-            return
-        if not source or source.startswith(("data:", "blob:", "#")):
-            return
-        url = urllib.parse.urljoin(self.base_url, html.unescape(source.strip()))
-        if urllib.parse.urlparse(url).scheme not in {"http", "https"}:
-            return
-        alt = attributes.get("alt") or attributes.get("title") or ""
-        classes = f"{attributes.get('class', '')} {attributes.get('id', '')}".casefold()
-        if any(token in classes for token in ("logo", "avatar", "icon", "favicon", "sprite", "tracking", "pixel")):
-            return
-        self.references.append({"url": url, "alt": re.sub(r"\s+", " ", alt).strip()})
-
-
 def extract_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
-    parser = ImageReferenceParser(base_url)
-    try:
-        parser.feed(value or "")
-        parser.close()
-    except Exception:
-        return []
-    refs = []
-    seen = set()
-    for reference in parser.references:
-        if reference["url"] in seen:
-            continue
-        seen.add(reference["url"])
-        refs.append(reference)
-    for match in re.finditer(
-        r'"(?:image|thumbnailUrl|contentUrl)"\s*:\s*"(https?[^"\\]+)"',
-        value or "",
-        re.IGNORECASE,
-    ):
-        url = html.unescape(match.group(1))
-        if url in seen:
-            continue
-        seen.add(url)
-        refs.append({"url": url, "alt": ""})
-    return refs[:MAX_IMAGES_PER_ARTICLE]
+    return extract_media_refs(value, base_url, MAX_IMAGES_PER_ARTICLE)[0]
 
 
 def extract_markdown_image_refs(value: str, base_url: str = "") -> list[dict[str, str]]:
@@ -796,6 +726,8 @@ def write_snapshot(
     images: list[dict[str, str]] | None = None,
     media_checked_at: str | None = None,
     media_rechecked_at: str | None = None,
+    videos: list[dict[str, str]] | None = None,
+    media_format_version: int | None = None,
 ) -> Path:
     path = snapshot_path(item)
     try:
@@ -817,10 +749,18 @@ def write_snapshot(
         "bodyFormatVersion": BODY_FORMAT_VERSION,
         "body": limit_body(normalize_article_body(body)),
     }
-    if images:
+    if images is not None:
         payload["images"] = images
     elif existing.get("images"):
         payload["images"] = existing["images"]
+    if videos is not None:
+        payload["videos"] = videos
+    elif "videos" in existing:
+        payload["videos"] = existing["videos"]
+    if media_format_version is not None:
+        payload["mediaFormatVersion"] = media_format_version
+    elif "mediaFormatVersion" in existing:
+        payload["mediaFormatVersion"] = existing["mediaFormatVersion"]
     if media_checked_at:
         payload["mediaCheckedAt"] = media_checked_at
     elif existing.get("mediaCheckedAt"):
@@ -852,7 +792,7 @@ def store_feed_snapshot(
     body = text_from_html(feed_html)
     if len(body) < MIN_BODY_CHARS:
         return False
-    image_refs = extract_image_refs(feed_html, item.get("url", ""))
+    image_refs, videos = extract_media_refs(feed_html, item.get("url", ""))
     for reference in extra_image_refs or []:
         if reference.get("url") and reference["url"] not in {item["url"] for item in image_refs}:
             image_refs.append(reference)
@@ -874,6 +814,7 @@ def store_feed_snapshot(
                 and len(current_body) >= len(body)
                 and current_paragraphs >= new_paragraphs
                 and (current.get("images") or not image_refs)
+                and (current.get("videos") or not videos)
             ):
                 return False
             if len(body) < max(MIN_BODY_CHARS, int(len(current_body) * 0.55)) and not image_refs:
@@ -883,7 +824,7 @@ def store_feed_snapshot(
         except (json.JSONDecodeError, OSError):
             pass
     images = download_images(item, image_refs)
-    write_snapshot(item, body, "feed", images=images)
+    write_snapshot(item, body, "feed", images=images, videos=videos or None)
     return True
 
 
@@ -1102,11 +1043,13 @@ def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
         charset = response.headers.get_content_charset() or "utf-8"
     document = payload.decode(charset, errors="replace")
     body = text_from_html(document, prefer_main=True)
-    if len(body) < MIN_BODY_CHARS:
+    images, videos = extract_media_refs(document, resolved_url)
+    if len(body) < MIN_BODY_CHARS and not videos:
         raise ValueError("readable body not found")
     if has_corrupted_text(body):
         raise ValueError("page body contains corrupted text")
-    return body, resolved_url, extract_image_refs(document, resolved_url)
+    FETCHED_VIDEO_REFS[resolved_url] = videos
+    return body, resolved_url, images
 
 
 def fetch_page_text(url: str) -> tuple[str, str]:
@@ -1167,7 +1110,7 @@ def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
             errors.append(error_note("community", error))
     try:
         body, resolved_url = fetch_page_text(target_url)
-        write_snapshot(item, body, "page", resolved_url=resolved_url, images=download_images(item, FETCHED_IMAGE_REFS.pop(resolved_url, [])))
+        write_snapshot(item, body, "page", resolved_url=resolved_url, images=download_images(item, FETCHED_IMAGE_REFS.pop(resolved_url, [])), videos=FETCHED_VIDEO_REFS.pop(resolved_url, []), media_format_version=MEDIA_FORMAT_VERSION)
         return item["id"], "page"
     except Exception as error:
         errors.append(error_note("page", error))
@@ -1181,3 +1124,4 @@ def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
     summary = (item.get("summary") or "").strip()
     write_snapshot(item, summary, "summary", resolved_url=target_url, error=" | ".join(errors))
     return item["id"], "summary"
+
