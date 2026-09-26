@@ -174,3 +174,26 @@ eligible counts; summary-only records are not full-text media archives.
 Media-only repair preserves every non-media snapshot field, including the body,
 original fetch timestamp, custom fields and AI review. Unrecognized page scopes
 are treated as failures instead of clearing potentially valid historical images.
+
+### Recent translation completions and manual priority
+
+The homepage reports fully translated articles completed in rolling 1-hour,
+24-hour, and 7-day windows, as of the statistics build time. It uses validated
+translations and `completedAt`; retries, partial translations, stale records,
+future dates, and missing completion timestamps do not inflate these counts.
+
+Use **优先翻译** on an article card or reader page, then confirm **Submit new issue**
+on GitHub. The prefilled `[优先翻译] <article-id>` issue is the durable request.
+Only repository users with write/maintain/admin permission may request priority
+work. No access token or model secret is sent to the browser.
+
+The translation workflow runs on matching issue events and also reconciles open
+requests on scheduled runs. Manual requests precede automatic work, newest issue
+first, including otherwise eligible articles below importance level 4.
+Duplicates are deduplicated by article ID. Existing global daily limits, API
+cooldowns, and per-article retry backoff still apply. Existing work is not
+interrupted; missing article bodies must be archived before translation.
+Closing an issue cancels it at the next queue reconciliation; reopening triggers
+another attempt. Queue statuses on the website reflect the last completed sync,
+not live execution. Completed request issues can be closed by the maintainer.
+

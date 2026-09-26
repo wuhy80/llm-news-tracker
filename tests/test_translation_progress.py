@@ -76,3 +76,32 @@ class ProgressTests(unittest.TestCase):
             result=build_progress(root)
             self.assertEqual(result['documents']['total'],1)
             self.assertEqual(result['translatedBlocks'],1)
+
+
+class RecentProgressTests(ProgressTests):
+    def test_rolling_completion_counts_and_future_timestamp(self):
+        from datetime import datetime, timezone, timedelta
+        now=datetime(2026,9,26,9,0,tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            self.write(root,'data/news.json',{'items':[]})
+            ages=[timedelta(minutes=30),timedelta(hours=1),timedelta(hours=23),timedelta(days=6),timedelta(days=8),timedelta(minutes=-1)]
+            for i,age in enumerate(ages):
+                ident=str(i);self.snapshot(root,ident);self.translation(root,ident,2)
+                p=root/f'data/translations/zh-CN/2020/01/01/{ident}.json'
+                record=json.loads(p.read_text());record['completedAt']=(now-age).isoformat();p.write_text(json.dumps(record))
+            result=build_progress(root,now)
+            self.assertEqual(result['recentCompleted'],{'hour':2,'day':3,'week':4})
+
+    def test_missing_completed_timestamp_not_inferred_from_attempt(self):
+        from datetime import datetime, timezone
+        now=datetime(2026,9,26,9,0,tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            self.write(root,'data/news.json',{'items':[]})
+            self.snapshot(root,'1');self.translation(root,'1',2)
+            p=root/'data/translations/zh-CN/2020/01/01/1.json'
+            record=json.loads(p.read_text());record['updatedAt']=now.isoformat();p.write_text(json.dumps(record))
+            result=build_progress(root,now)
+            self.assertEqual(result['recentCompleted'],{'hour':0,'day':0,'week':0})
+            self.assertEqual(result['completedWithoutTimestamp'],1)

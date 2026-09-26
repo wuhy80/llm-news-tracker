@@ -323,6 +323,7 @@ function applyReadingPreferences() {
 
 function updateTranslationToolbar() {
   const translations = translatedBlocks();
+  window.LLMTranslationQueue?.mount(document.getElementById("requestTranslation"), readingState.item, readingState.translation?.status === "complete");
   const wordWise = wordWiseEntries();
   const available = translations.size > 0 || wordWise.length > 0;
   elements.translationToolbar.hidden = !available;
@@ -600,6 +601,7 @@ function renderArticle(item, snapshot, historyEntry) {
   elements.articleSummary.textContent = snapshot?.summaryZh || item.aiReview?.summaryZh || fallbackSummary(item);
   renderGlossary(item, level);
   elements.originalLink.href = item.url;
+  window.LLMTranslationQueue?.mount(document.getElementById("requestTranslation"), item);
   elements.readerStatus.textContent = kind === "summary" ? "正文快照暂未取得" : "内部阅读已就绪";
   elements.readerNotice.hidden = kind !== "summary";
   elements.readerNotice.textContent = "该站点正文暂未成功下载，当前显示聚合摘要。自动任务会继续尝试补齐，也可直接查看原文。";
@@ -718,4 +720,5 @@ async function loadArticle() {
   });
   loadArticle();
 })();
+
 
