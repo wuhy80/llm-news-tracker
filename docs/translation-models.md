@@ -18,6 +18,10 @@ models may fail per run. Each attempt counts towards the same request/day budget
 Model failures do not add article backoff; switching models also bypasses the old
 model's article retry delay. Existing translated blocks are retained.
 
+Explicit `upstream_provider_shared_pool` 429 errors use model failover; unknown
+429 errors remain global pauses. The former handler's positively identified shared-pool
+pause is migrated automatically.
+
 401/403 stop the run. Account quota/credit errors (429/402) retain the existing
 global pause and are not bypassed by rotating models. Catalog failure fails closed.
 No-progress attempts and fatal model failures report a failed Actions run while

@@ -48,6 +48,14 @@ class ModelTests(unittest.TestCase):
             pool=ModelPool(Path(d)/'empty.json',catalog=[model('paid/model')])
             with self.assertRaises(RuntimeError): pool.select()
 
+    def test_shared_provider_limit_is_distinct_from_account_limits(self):
+        for source, expected in [('upstream_provider_shared_pool',True),('account_daily_quota',False),('',False)]:
+            detail=json.dumps({'error':{'metadata':{'limit_source':source}}}).encode()
+            error=urllib.error.HTTPError('https://example.com',429,'limit',{},io.BytesIO(detail))
+            message=tr.error_message(error)
+            self.assertEqual(tr.shared_pool_limit(error),expected)
+            self.assertEqual(tr.old_shared_pool_pause({'lastError':message}),expected)
+
     def test_request_enforces_zero_price(self):
         result={'choices':[{'message':{'content':'{"translations":[]}'}}]}
         class Response(io.BytesIO):
