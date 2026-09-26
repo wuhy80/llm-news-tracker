@@ -13,7 +13,8 @@ PREFERRED = ['qwen/qwen3.8-27b:free', 'google/gemma-4-31b-it:free',
 
 def free_text_model(model):
     ident = model.get('id', '')
-    if not (ident.endswith(':free') or ident == 'openrouter/free'):
+    # A free listing is not quality approval. Config overrides cannot bypass this.
+    if ident not in PREFERRED:
         return False
     pricing = model.get('pricing', {})
     try:
@@ -48,7 +49,7 @@ class ModelPool:
         self.health.setdefault('models', {})
         # Refresh each run, stronger than daily. Fail closed on catalog/network errors.
         available = {m['id'] for m in (fetch_catalog() if catalog is None else catalog) if free_text_model(m)}
-        order = [preferred] + PREFERRED + sorted(available - {'openrouter/free'}) + ['openrouter/free']
+        order = [preferred] + PREFERRED
         self.candidates = list(dict.fromkeys(m for m in order if m in available))
         self.attempted = set()
         self.health.update({'schemaVersion': 1, 'checkedAt': self.now.isoformat(), 'available': self.candidates})
@@ -66,7 +67,7 @@ class ModelPool:
                 self.health['selectedModel'] = model
                 self.save()
                 return model
-        raise RuntimeError('No healthy zero-price text model available; no paid fallback allowed')
+        raise RuntimeError('No healthy approved free translation model available; waiting instead of lowering quality')
 
     def failed(self, model, reason, permanent=False):
         self.attempted.add(model)
