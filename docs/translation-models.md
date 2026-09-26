@@ -2,12 +2,16 @@
 
 Every translation run refreshes OpenRouter's public model catalog before making
 inference requests. Eligible models must expose text input/output, adequate context
-and output limits, and zero prices. Only `:free` variants and `openrouter/free` are
-eligible. The request also sets `provider.max_price` for prompt/completion to zero.
+and output limits, and zero prices. Only the explicitly approved models below are eligible; free pricing alone
+is insufficient. Configuration overrides cannot bypass the allowlist. The request also sets `provider.max_price` for prompt/completion to zero.
 A configured paid, missing, or retired model is ignored; there is no paid fallback.
 
 Initial preference: Qwen3.8 27B, Gemma 4 31B, Gemma 4 26B, Nemotron 3 Super.
-Remaining eligible general models and the free router are fallback candidates.
+No other models or random free router may be selected automatically. If all
+approved models are unavailable, translation waits instead of lowering quality.
+Adding a model requires review of technical English-to-Chinese samples for
+omissions, mistranslations, terminology, numbers and code preservation. Current
+JSON/Chinese checks are structural validation, not proof of semantic quality.
 Directory presence is not a successful inference test: actual translation calls
 must pass existing block-ID and Chinese-output validation before being saved.
 
