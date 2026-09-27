@@ -1,5 +1,6 @@
 """Discover zero-price text models and persist bounded health-based failover."""
 import json
+import re
 import urllib.request
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,10 @@ class ModelPool:
         except (OSError, ValueError):
             self.health = {}
         self.health.setdefault('models', {})
+        # Older workers mistakenly disabled models globally for an article's content error.
+        for health in self.health['models'].values():
+            if re.fullmatch(r'block b[0-9]+ has no Chinese translation', health.get('lastError', '')):
+                health.pop('disabledUntil', None)
         # Refresh each run, stronger than daily. Fail closed on catalog/network errors.
         available = {m['id'] for m in (fetch_catalog() if catalog is None else catalog) if free_text_model(m)}
         order = [preferred] + PREFERRED
@@ -78,3 +83,32 @@ class ModelPool:
     def succeeded(self, model):
         self.health['models'][model] = {'lastSuccessAt': datetime.now(timezone.utc).isoformat()}
         self.save()
+
+
+
+class BigModelPool:
+    """Independent official API health; never consult OpenRouter's catalog or quota."""
+    model = 'glm-4.7-flash'
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            self.health = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            self.health = {}
+
+    def select(self):
+        blocked = self.health.get('disabledUntil')
+        if blocked and datetime.fromisoformat(blocked) > datetime.now(timezone.utc):
+            raise RuntimeError('BigModel is cooling down until ' + blocked)
+        return self.model
+
+    def failed(self, model, reason, permanent=False):
+        now = datetime.now(timezone.utc)
+        self.health = {'model': self.model, 'lastError': reason[:600], 'failedAt': now.isoformat(),
+                       'disabledUntil': (now + timedelta(minutes=1440 if permanent else 5)).isoformat()}
+        atomic_write_json(self.path, self.health)
+
+    def succeeded(self, model):
+        self.health = {'model': self.model, 'lastSuccessAt': datetime.now(timezone.utc).isoformat()}
+        atomic_write_json(self.path, self.health)
