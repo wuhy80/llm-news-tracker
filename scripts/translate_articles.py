@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,9 @@ from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
 from translation_models import ModelPool, BigModelPool
 from api_rate_control import RateControl, RateLimited
+from provider_limits import TokenRateControl, RequestTooLarge
+from provider_routing import (PROVIDERS, DirectModelPool, prepare_routing, read as read_routing,
+                              output_limit, reservation, record_attempt)
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
@@ -394,6 +398,20 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
             raise ValueError("Only the approved free BigModel model is allowed")
         payload.pop("provider", None)
         payload["response_format"] = {"type": "json_object"}
+    direct = next((name for name in ('groq', 'gemini') if endpoint == PROVIDERS[name]['endpoint']), None)
+    if direct:
+        if model not in PROVIDERS[direct]['models']:
+            raise ValueError('Model is not in the approved free-tier candidate list')
+        payload.pop('provider', None)
+        payload['max_tokens'] = output_limit(direct)
+        payload['response_format'] = {'type': 'json_object'}
+        if direct == 'gemini':
+            payload['reasoning_effort'] = 'low'
+        elif model.startswith('openai/'):
+            payload['reasoning_effort'] = 'low'
+            payload['include_reasoning'] = False
+        else:
+            payload['reasoning_effort'] = 'none'
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -587,6 +605,7 @@ def error_message(error: Exception) -> str:
                 parsed_error = json.loads(detail).get("error", {})
                 error.translation_limit_source = parsed_error.get("metadata", {}).get("limit_source")
                 error.translation_provider_code = str(parsed_error.get("code", ""))
+                error.translation_error_details = parsed_error.get("details", [])
             except (ValueError, AttributeError):
                 error.translation_limit_source = None
             message = f"HTTP {error.code}: {detail}"
@@ -629,9 +648,9 @@ def run_provider(provider: str = "openrouter") -> int:
     data["items"] = resolve_items(data.get("items", []), requests)
     publish_queue(requests, data["items"])
 
-    state_file = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name("bigmodel-state.json")
-    health_file = MODEL_HEALTH_FILE if provider == "openrouter" else MODEL_HEALTH_FILE.with_name("bigmodel-health.json")
-    token = os.getenv("BIGMODEL_API_KEY" if provider == "bigmodel" else "OPENROUTER_API_KEY", "").strip()
+    state_file = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name(f"{provider}-state.json")
+    health_file = MODEL_HEALTH_FILE if provider == "openrouter" else MODEL_HEALTH_FILE.with_name(f"{provider}-health.json")
+    token = os.getenv(PROVIDERS[provider]["key"], "").strip()
     if not token:
         print(f"[translate] {provider}: API key not configured")
         return 0
@@ -642,10 +661,26 @@ def run_provider(provider: str = "openrouter") -> int:
         args.daily_limit = int(os.getenv("BIGMODEL_TRANSLATION_DAILY_LIMIT", "1000"))
         # Pilot is deliberately bounded until representative translations are reviewed.
         args.request_limit = min(args.request_limit, int(os.getenv("BIGMODEL_TRANSLATION_REQUEST_LIMIT", "8")))
+    ranking = read_routing(STATE_FILE.with_name('provider-ranking.json'))
+    preferred = ranking.get('selectedModels', {}).get(provider)
+    if provider in ('groq', 'gemini'):
+        if preferred not in PROVIDERS[provider]['models']:
+            atomic_write_json(state_file, {'runStatus': 'unavailable', 'runRequests': 0,
+                'runModelBlocks': 0, 'runLocalBlocks': 0, 'runTranslatedBlocks': 0,
+                'runCompletedArticles': 0, 'runFinishedAt': utc_now()})
+            print(f'[translate] {provider}: awaiting a passing daily evaluation')
+            return 0
+        model, endpoint = preferred, PROVIDERS[provider]['endpoint']
+        args.request_limit = min(args.request_limit, int(os.getenv(provider.upper() + '_TRANSLATION_REQUEST_LIMIT', '16')))
+        args.daily_limit = int(os.getenv(provider.upper() + '_TRANSLATION_DAILY_LIMIT', '1000'))
+        args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 1200), min(args.chunk_blocks, 4)
+    elif preferred and provider == 'openrouter':
+        model = preferred
     state = load_state(state_file)
     now = datetime.now(timezone.utc)
     reset_daily_state(state, now)
-    control = RateControl(state_file.with_name(f"rate-{provider}.json"), provider, args.interval)
+    control = (TokenRateControl if provider in ('groq', 'gemini') else RateControl)(
+        state_file.with_name(f"rate-{provider}.json"), provider, args.interval)
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
@@ -668,7 +703,8 @@ def run_provider(provider: str = "openrouter") -> int:
         return 0
 
     try:
-        pool = BigModelPool(health_file) if provider == "bigmodel" else ModelPool(health_file, model)
+        pool = (BigModelPool(health_file) if provider == "bigmodel" else
+                DirectModelPool(health_file, model) if provider in ('groq', 'gemini') else ModelPool(health_file, model))
         model = pool.select()
         print(f"[translate:model] {provider}: selected {model}")
     except Exception as error:
@@ -684,7 +720,7 @@ def run_provider(provider: str = "openrouter") -> int:
     model_blocks_count = 0
     completed_articles = 0
     deferred_articles = set()
-    deadline = time.monotonic() + 20 * 60
+    deadline = time.monotonic() + 10 * 60
     while requests_made < request_limit and time.monotonic() < deadline:
         now = datetime.now(timezone.utc)
         reset_daily_state(state, now)
@@ -722,7 +758,14 @@ def run_provider(provider: str = "openrouter") -> int:
             continue
 
         try:
-            control.acquire(model, token)
+            if provider in ('groq', 'gemini'):
+                control.acquire(model, token, tokens=reservation(SYSTEM_PROMPT, chunk, provider))
+            else:
+                control.acquire(model, token)
+        except RequestTooLarge:
+            # Another provider can translate an unusually long source block.
+            deferred_articles.add(item['id'])
+            continue
         except RateLimited as limited:
             state.update(lastStatus="rate_limited", lastError=str(limited))
             if limited.scope.startswith("model:"):
@@ -754,10 +797,17 @@ def run_provider(provider: str = "openrouter") -> int:
 
         requested_model = model
         api_success = False
+        accepted_count = 0
+        outcome = 'error'
+        call_started = time.monotonic()
         try:
             response, actual_model, headers = request_translation(token, model, chunk, endpoint)
             api_success = True
+            if hasattr(control, 'observe'):
+                control.observe(model, headers)
             translated, word_wise, failures = normalize_partial_response(response, chunk)
+            accepted_count = len(translated)
+            outcome = 'success' if accepted_count == len(chunk) else 'content_error'
             for block in translated:
                 block.update(provider=provider, model=actual_model)
             if translated:
@@ -790,9 +840,11 @@ def run_provider(provider: str = "openrouter") -> int:
             failed_at = datetime.now(timezone.utc)
             message = error_message(error)
             code = error.code if isinstance(error, urllib.error.HTTPError) else None
-            if code in {402, 429}:
-                limited = control.penalize(model, code, error.headers,
-                    getattr(error, "translation_limit_source", ""), getattr(error, "translation_provider_code", ""))
+            if code in {402, 429} or (provider in ('groq', 'gemini') and code in {400, 401, 403, 404, 410, 500, 502, 503, 504}):
+                outcome = 'rate_limited' if code == 429 else 'error'
+                limited = (control.penalize_error(model, error) if hasattr(control, 'penalize_error') else
+                    control.penalize(model, code, error.headers,
+                    getattr(error, "translation_limit_source", ""), getattr(error, "translation_provider_code", "")))
                 state.update(lastStatus="rate_limited", lastError=message)
                 print(f"[translate:rate] {provider}: {limited}")
                 if limited.scope.startswith("model:"):
@@ -842,6 +894,8 @@ def run_provider(provider: str = "openrouter") -> int:
             print(f"[translate:warn] {item['id']}: {record['lastError']}")
         finally:
             control.finished(requested_model, success=api_success)
+            record_attempt(STATE_FILE.parent, provider, requested_model, accepted_count,
+                           len(chunk), time.monotonic() - call_started, outcome)
         atomic_write_json(path, record)
         atomic_write_json(state_file, state)
 
@@ -863,10 +917,18 @@ def run_provider(provider: str = "openrouter") -> int:
 
 
 def main() -> int:
-    providers = [p for p, key in [("bigmodel", "BIGMODEL_API_KEY"), ("openrouter", "OPENROUTER_API_KEY")]
-                 if os.getenv(key, "").strip()]
+    configured = [p for p, spec in PROVIDERS.items() if os.getenv(spec['key'], '').strip()]
+    try:
+        ranking = prepare_routing(STATE_FILE.parent, configured, sys.modules[__name__])
+    except Exception as error:
+        print(f'::warning::Daily evaluation unavailable: {type(error).__name__}; keeping established providers')
+        ranking = {'order': [p for p in configured if p in ('bigmodel', 'openrouter')]}
+    providers = [p for p in ranking.get('order', configured) if p in configured]
     runtime = {"schemaVersion": 1, "startedAt": utc_now(), "status": "running", "providers": {},
-               "bigmodelConfigured": "bigmodel" in providers,
+               "bigmodelConfigured": "bigmodel" in configured,
+               "configuredProviders": configured, "providerOrder": providers,
+               "evaluationDate": ranking.get('evaluationDate'),
+               "selectedModels": ranking.get('selectedModels', {}),
                "runUrl": (f"https://github.com/{os.getenv('GITHUB_REPOSITORY')}/actions/runs/{os.getenv('GITHUB_RUN_ID')}"
                           if os.getenv("GITHUB_REPOSITORY") and os.getenv("GITHUB_RUN_ID") else None)}
     atomic_write_json(RUNTIME_FILE, runtime)
@@ -879,7 +941,7 @@ def main() -> int:
             results.append(1)
             runtime["providers"][provider] = {"runStatus": "error"}
             continue
-        path = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name("bigmodel-state.json")
+        path = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name(f"{provider}-state.json")
         state = read_json(path) or {}
         runtime["providers"][provider] = {k: state.get(k) for k in (
             "runStatus", "runStartedAt", "runFinishedAt", "runRequests", "runTranslatedBlocks",
@@ -891,6 +953,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

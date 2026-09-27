@@ -627,7 +627,7 @@ function translationRuntimeText(data, now = Date.now()) {
   if (!data || data.schemaVersion !== 1) return "运行状态暂不可用";
   const ended = new Date(data.finishedAt || data.startedAt).getTime();
   const stamp = Number.isFinite(ended) ? new Date(ended).toLocaleString("zh-CN", { hour12: false }) : "未知";
-  const names = { bigmodel: "智谱", openrouter: "OpenRouter" };
+  const names = { bigmodel: "智谱", gemini: "Gemini", groq: "Groq", openrouter: "OpenRouter" };
   const labels = { progress: "有新增译文", waiting: "等待可重试段落", unavailable: "服务暂不可用",
     rate_limited: "限流等待", daily_limit: "已到当日请求上限", error: "运行出错", running: "运行中" };
   const states = Object.entries(data.providers || {}).map(([key, value]) =>
@@ -636,6 +636,7 @@ function translationRuntimeText(data, now = Date.now()) {
   const output = outputs.length ? new Date(Math.max(...outputs)).toLocaleString("zh-CN", { hour12: false }) : "暂无记录";
   const stale = Number.isFinite(ended) && now - ended > 3600000;
   return `最近一轮：${stamp} · ${states.join("；") || "尚未配置翻译通道"}。最后产出：${output}。`
+    + (Array.isArray(data.providerOrder) && data.providerOrder.length ? ` ${data.evaluationDate || "最近"}评估优先级：${data.providerOrder.map(p => names[p] || p).join(" → ")}（冷却或额度不足时跳过）。` : "")
     + (data.bigmodelConfigured ? " 智谱处于限量试运行。" : " 智谱待配置 API Key。")
     + (data.status === "interrupted" ? " 上一轮异常中断。" : "")
     + (stale ? " 超过一小时没有新的已发布运行记录，请检查任务调度。" : "")
