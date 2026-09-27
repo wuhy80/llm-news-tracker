@@ -93,6 +93,7 @@ class ModelTests(unittest.TestCase):
                  patch.object(sys,'argv',['translate','--request-limit','3','--interval','0']), \
                  patch.object(tr,'remove_stale_records',return_value=0), \
                  patch.object(tr,'load_news',return_value={'items':[]}), \
+                 patch.object(tr,'RateControl'), \
                  patch.object(tr,'sync_requests',return_value={}), \
                  patch.object(tr,'resolve_items',return_value=[]), \
                  patch.object(tr,'publish_queue'), \

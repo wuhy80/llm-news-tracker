@@ -16,6 +16,7 @@ from pathlib import Path
 
 from article_store import ROOT, snapshot_path
 from news_store import load_news, save_news
+from api_rate_control import RateControl, RateLimited
 
 NEWS_FILE = ROOT / "data" / "news.json"
 DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -351,20 +352,36 @@ def request_reviews(provider: str, endpoint: str, token: str, model: str, items:
         }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(endpoint, data=body, method="POST", headers=headers)
+    control = RateControl(ROOT / "data/translations/rate-openrouter.json", "openrouter") if provider == "openrouter" else None
     for attempt in range(max(1, attempts)):
+        if control:
+            control.acquire(model, token)
+        api_success = False
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+            api_success = True
             content = model_content(provider, payload)
             result = extract_json_object(content).get("reviews", [])
             if not isinstance(result, list):
                 raise ValueError("model response reviews must be an array")
             return [review for review in result if isinstance(review, dict)]
         except urllib.error.HTTPError as error:
+            if control and error.code in {402, 429, 500, 502, 503, 504}:
+                try:
+                    detail = json.loads(error.read(16384)).get("error", {})
+                except (ValueError, AttributeError):
+                    detail = {}
+                limited = control.penalize(model, error.code, error.headers,
+                                          detail.get("metadata", {}).get("limit_source", ""), str(detail.get("code", "")))
+                raise limited from None
             if error.code not in {429, 500, 502, 503, 504} or attempt + 1 >= max(1, attempts):
                 raise
             retry_after = error.headers.get("Retry-After", "") if error.headers else ""
             time.sleep(float(retry_after) if retry_after.isdigit() else 5 * (attempt + 1))
+        finally:
+            if control:
+                control.finished(model, success=api_success)
     return []
 
 
@@ -455,6 +472,9 @@ def main() -> int:
             completed += reviewed
             consecutive_failures = 0
             print(f"[ai] reviewed {reviewed}/{len(batch)} articles with {model}")
+        except RateLimited as error:
+            print(f"[ai:rate] stopping this run: {error}")
+            break
         except Exception as error:
             consecutive_failures += 1
             print(f"[ai:warn] batch {start // batch_size + 1}: {type(error).__name__}: {error}")
@@ -479,3 +499,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
