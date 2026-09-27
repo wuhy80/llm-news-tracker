@@ -17,12 +17,15 @@ from pathlib import Path
 from article_store import ROOT, normalize_fenced_body, publication_path, snapshot_path, utc_now
 from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
-from translation_models import ModelPool
+from translation_models import ModelPool, BigModelPool
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
 STATE_FILE = ROOT / "data" / "translations" / "state.json"
 INDEX_FILE = ROOT / "data" / "translations" / "index.json"
+BIGMODEL_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+BIGMODEL_MODEL = "glm-4.7-flash"
+RUNTIME_FILE = ROOT / "data" / "translations" / "runtime.json"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TRANSLATION_MODEL = "qwen/qwen3.8-27b:free"
 MODEL_HEALTH_FILE = ROOT / "data" / "translations" / "model-health.json"
@@ -201,7 +204,13 @@ def completed_ids(record: dict) -> set[str]:
 
 def pending_chunk(blocks: list[dict[str, str]], record: dict, max_chars: int, max_blocks: int) -> list[dict[str, str]]:
     completed = completed_ids(record)
-    pending = [block for block in translatable_blocks(blocks) if block["id"] not in completed]
+    now = datetime.now(timezone.utc)
+    pending = [block for block in translatable_blocks(blocks) if block["id"] not in completed
+               and (parse_time(record.get("blockFailures", {}).get(block["id"], {}).get("nextAttemptAt"))
+                    or datetime.min.replace(tzinfo=timezone.utc)) <= now]
+    # Previously rejected blocks are retried alone, not bundled with good text.
+    if pending and pending[0]["id"] in record.get("blockFailures", {}):
+        return pending[:1]
     chunk: list[dict[str, str]] = []
     chars = 0
     for block in pending:
@@ -260,6 +269,52 @@ def translation_entries(payload: dict) -> list[dict]:
     return [entry for entry in raw_translations if isinstance(entry, dict)]
 
 
+def reference_translation(source: str) -> str | None:
+    """Localize a narrowly defined label without asking a model to alter the identifier."""
+    match = re.fullmatch(r"HuggingFace:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", source)
+    if match:
+        return f"Hugging Face 模型：{match.group(1)}"
+    match = re.fullmatch(r"(Code|Full report):\s*((?:https?://)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[^\s]+)", source)
+    if match:
+        label = {"Code": "代码", "Full report": "完整报告"}[match.group(1)]
+        return f"{label}：{match.group(2)}"
+    return None
+
+
+def normalize_partial_response(payload: dict, chunk: list[dict]) -> tuple[list, list, dict]:
+    """Validate independently: one bad/missing/duplicate entry cannot discard good siblings."""
+    entries = translation_entries(payload)
+    translated, words, failures = [], [], {}
+    for block in chunk:
+        matching = [e for e in entries if str(e.get("id", "")) == block["id"]]
+        try:
+            if len(matching) != 1:
+                raise ValueError("missing or duplicate block id")
+            good, hints = normalize_response({"translations": matching, "wordWise": payload.get("wordWise", [])}, [block])
+            translated.extend(good)
+            words.extend(hints)
+        except (ValueError, KeyError, TypeError) as error:
+            # Store diagnostic facts, not model response text or untrusted instructions.
+            entry = matching[0] if matching else {}
+            output = normalize_translation(entry.get("translationZh") or entry.get("translation") or entry.get("zh"))
+            failures[block["id"]] = {"reason": str(error)[:160], "sourceHash": block["sourceHash"],
+                                      "outputChars": len(output), "outputHasChinese": contains_chinese(output)}
+    return translated, words, failures
+
+
+def defer_blocks(record: dict, failures: dict, model: str) -> None:
+    now = datetime.now(timezone.utc)
+    saved = record.setdefault("blockFailures", {})
+    for ident, diagnostic in failures.items():
+        count = saved.get(ident, {}).get("attempts", 0) + 1
+        saved[ident] = {**diagnostic, "attempts": count, "model": model, "failedAt": utc_now(),
+                        "nextAttemptAt": article_backoff(count, now).isoformat()}
+    record["status"] = "partial"
+    record.pop("completedAt", None)
+    record["updatedAt"] = utc_now()
+    record["lastError"] = f"{len(saved)} block(s) awaiting retry"
+
+
 def normalize_response(payload: dict, chunk: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     raw_translations = translation_entries(payload)
     expected = [block["id"] for block in chunk]
@@ -282,12 +337,9 @@ def normalize_response(payload: dict, chunk: list[dict[str, str]]) -> tuple[list
         if not contains_chinese(translated):
             # A repository reference may correctly remain in English. Localize
             # only its label, and only when the full identifier is unchanged.
-            reference = re.fullmatch(
-                r"HuggingFace:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
-                block["source"],
-            )
-            if reference and translated == block["source"]:
-                translated = f"Hugging Face 模型：{reference.group(1)}"
+            localized = reference_translation(block["source"])
+            if localized and translated == block["source"]:
+                translated = localized
             else:
                 raise ValueError(f"block {block['id']} has no Chinese translation")
         normalized.append({
@@ -336,6 +388,11 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
         "max_tokens": 8000,
         "provider": {"max_price": {"prompt": 0, "completion": 0}},
     }
+    if endpoint == BIGMODEL_ENDPOINT:
+        if model != BIGMODEL_MODEL:
+            raise ValueError("Only the approved free BigModel model is allowed")
+        payload.pop("provider", None)
+        payload["response_format"] = {"type": "json_object"}
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -506,6 +563,7 @@ def apply_chunk(record: dict, translated: list[dict[str, str]], word_wise: list[
     }
     for block in translated:
         by_id[block["id"]] = block
+        record.get("blockFailures", {}).pop(block["id"], None)
     record["blocks"] = [by_id[key] for key in sorted(by_id)]
     record["wordWise"] = merge_word_wise(record.get("wordWise", []), word_wise)
     record["translatedBlocks"] = len(record["blocks"])
@@ -549,7 +607,7 @@ def normalize_headers(headers: object) -> dict[str, str]:
     return {str(key).lower(): str(value) for key, value in dict(headers or {}).items()}
 
 
-def main() -> int:
+def run_provider(provider: str = "openrouter") -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "4")))
     parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "1000")))
@@ -568,36 +626,50 @@ def main() -> int:
     data["items"] = resolve_items(data.get("items", []), requests)
     publish_queue(requests, data["items"])
 
-    token = os.getenv("OPENROUTER_API_KEY", "").strip()
+    state_file = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name("bigmodel-state.json")
+    health_file = MODEL_HEALTH_FILE if provider == "openrouter" else MODEL_HEALTH_FILE.with_name("bigmodel-health.json")
+    token = os.getenv("BIGMODEL_API_KEY" if provider == "bigmodel" else "OPENROUTER_API_KEY", "").strip()
     if not token:
-        print("[translate] disabled: OPENROUTER_API_KEY is not available")
+        print(f"[translate] {provider}: API key not configured")
         return 0
     model = os.getenv("ARTICLE_TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL).strip() or DEFAULT_TRANSLATION_MODEL
     endpoint = os.getenv("ARTICLE_TRANSLATION_ENDPOINT", OPENROUTER_ENDPOINT).strip() or OPENROUTER_ENDPOINT
-    state = load_state()
+    if provider == "bigmodel":
+        model, endpoint = BIGMODEL_MODEL, BIGMODEL_ENDPOINT
+        args.daily_limit = int(os.getenv("BIGMODEL_TRANSLATION_DAILY_LIMIT", "1000"))
+        # Pilot is deliberately bounded until representative translations are reviewed.
+        args.request_limit = min(args.request_limit, int(os.getenv("BIGMODEL_TRANSLATION_REQUEST_LIMIT", "8")))
+    state = load_state(state_file)
     now = datetime.now(timezone.utc)
     reset_daily_state(state, now)
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
-        atomic_write_json(STATE_FILE, state)
+        atomic_write_json(state_file, state)
+    state.update(runStartedAt=utc_now(), runFinishedAt=None, runStatus="running", provider=provider,
+                 runRequests=0, runTranslatedBlocks=0, runCompletedArticles=0)
+    atomic_write_json(state_file, state)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
         publish_queue(requests, data["items"], pause_until.isoformat())
+        state.update(runStatus="rate_limited", runFinishedAt=utc_now())
+        atomic_write_json(state_file, state)
         print(f"[translate] paused until {pause_until.isoformat()}")
         return 0
     remaining = max(0, args.daily_limit - int(state.get("requestsToday", 0)))
     request_limit = min(max(0, args.request_limit), remaining)
     if request_limit <= 0:
+        state.update(runStatus="daily_limit", runFinishedAt=utc_now())
+        atomic_write_json(state_file, state)
         print(f"[translate] daily request budget exhausted ({state.get('requestsToday', 0)}/{args.daily_limit})")
         return 0
 
     try:
-        pool = ModelPool(MODEL_HEALTH_FILE, model)
+        pool = BigModelPool(health_file) if provider == "bigmodel" else ModelPool(health_file, model)
         model = pool.select()
         print(f"[translate:model] selected {model}; checked live free-model catalog")
     except Exception as error:
-        state.update(lastStatus="model_error", lastError=str(error)[:600])
-        atomic_write_json(STATE_FILE, state)
+        state.update(lastStatus="model_error", lastError=str(error)[:600], runStatus="unavailable", runFinishedAt=utc_now())
+        atomic_write_json(state_file, state)
         print(f"::error::Free-model availability check failed: {error}")
         return 1
 
@@ -605,14 +677,24 @@ def main() -> int:
     requests_made = 0
     translated_blocks_count = 0
     completed_articles = 0
-    while requests_made < request_limit:
+    deferred_articles = set()
+    deadline = time.monotonic() + 20 * 60
+    while requests_made < request_limit and time.monotonic() < deadline:
         now = datetime.now(timezone.utc)
+        reset_daily_state(state, now)
+        if state.get("requestsToday", 0) >= args.daily_limit:
+            break
         candidates = select_candidates(data.get("items", []), now, model, list(requests))
+        candidates = [c for c in candidates if c[0]["id"] not in deferred_articles]
         if not candidates:
             break
         item, _, blocks, path, record = candidates[0]
         chunk = pending_chunk(blocks, record, max(500, args.chunk_chars), max(1, args.chunk_blocks))
         if not chunk:
+            expected_ids = {b["id"] for b in translatable_blocks(blocks)}
+            if not expected_ids.issubset(completed_ids(record)):
+                deferred_articles.add(item["id"])
+                continue
             record["status"] = "complete"
             record["translatedBlocks"] = record.get("totalBlocks", 0)
             record["completedAt"] = utc_now()
@@ -621,11 +703,22 @@ def main() -> int:
             completed_articles += 1
             continue
 
+        references = [b for b in chunk if reference_translation(b["source"])]
+        if references:
+            localized = [{"id": b["id"], "kind": b["kind"], "sourceHash": b["sourceHash"],
+                          "translationZh": reference_translation(b["source"]), "provider": "local",
+                          "model": "reference-labels-v1"} for b in references]
+            apply_chunk(record, localized, [], record.get("model") or "reference-labels-v1")
+            translated_blocks_count += len(localized)
+            completed_articles += int(record.get("status") == "complete")
+            atomic_write_json(path, record)
+            continue
+
         last_request_at = parse_time(state.get("lastRequestAt"))
         if last_request_at:
             wait = args.interval - (datetime.now(timezone.utc) - last_request_at).total_seconds()
             if wait > 0:
-                print(f"[translate] waiting {wait:.0f}s before the next OpenRouter request")
+                print(f"[translate] waiting {wait:.0f}s before the next {provider} request")
                 time.sleep(wait)
 
         attempt_at = utc_now()
@@ -633,7 +726,7 @@ def main() -> int:
         state["requestsToday"] = int(state.get("requestsToday", 0)) + 1
         state["lastArticleId"] = item["id"]
         state["updatedAt"] = attempt_at
-        atomic_write_json(STATE_FILE, state)
+        atomic_write_json(state_file, state)
         record["requestedModel"] = model
         record["lastAttemptAt"] = attempt_at
         atomic_write_json(path, record)
@@ -641,13 +734,20 @@ def main() -> int:
 
         try:
             response, actual_model, headers = request_translation(token, model, chunk, endpoint)
-            translated, word_wise = normalize_response(response, chunk)
-            apply_chunk(record, translated, word_wise, actual_model)
-            pool.succeeded(model)
+            translated, word_wise, failures = normalize_partial_response(response, chunk)
+            for block in translated:
+                block.update(provider=provider, model=actual_model)
+            if translated:
+                apply_chunk(record, translated, word_wise, actual_model)
+                record["provider"] = provider
+                pool.succeeded(model)
+            if failures:
+                defer_blocks(record, failures, actual_model)
+                print(f"[translate:deferred] {item['id']}: {len(failures)} blocks; keeping {len(translated)} good blocks")
             translated_blocks_count += len(translated)
             if record.get("status") == "complete":
                 completed_articles += 1
-            state["lastStatus"] = "success"
+            state["lastStatus"] = "success" if translated else "content_error"
             state["lastModel"] = actual_model
             for header, field in (
                 ("x-ratelimit-limit", "reportedLimit"),
@@ -666,12 +766,19 @@ def main() -> int:
             failed_at = datetime.now(timezone.utc)
             message = error_message(error)
             code = error.code if isinstance(error, urllib.error.HTTPError) else None
-            if code in {404, 410, 502, 503, 504} or shared_pool_limit(error) or isinstance(error, (ValueError, KeyError, TimeoutError)):
+            if isinstance(error, (ValueError, KeyError, TypeError)):
+                defer_blocks(record, {b["id"]: {"reason": type(error).__name__, "sourceHash": b["sourceHash"]}
+                                      for b in chunk}, model)
+                state.update(lastStatus="content_error", lastError="Invalid translation response; blocks deferred")
+                atomic_write_json(path, record)
+                atomic_write_json(state_file, state)
+                continue
+            if code in {404, 410, 500, 502, 503, 504} or shared_pool_limit(error) or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
                 # Model/service failure is not an article failure. Retry the same
                 # pending text using another free model, within the same budget.
                 pool.failed(model, message, permanent=code in {404, 410})
                 state.update(lastStatus="model_error", lastError=message)
-                atomic_write_json(STATE_FILE, state)
+                atomic_write_json(state_file, state)
                 try:
                     previous = model
                     model = pool.select()
@@ -683,8 +790,8 @@ def main() -> int:
                     break
             if code in {401, 403}:
                 state.update(lastStatus="auth_error", lastError=message)
-                atomic_write_json(STATE_FILE, state)
-                print("::error::OpenRouter authentication/permission failure; stopping")
+                atomic_write_json(state_file, state)
+                print(f"::error::{provider} authentication/permission failure; stopping this provider")
                 fatal_error = True
                 break
             record["failureCount"] = int(record.get("failureCount", 0)) + 1
@@ -696,23 +803,60 @@ def main() -> int:
             print(f"[translate:warn] {item['id']}: {record['lastError']}")
             if isinstance(error, urllib.error.HTTPError) and error.code in {402, 429}:
                 paused = global_pause_until(error, failed_at)
+                if provider == "bigmodel" and code == 429 and not (error.headers or {}).get("Retry-After"):
+                    paused = failed_at + timedelta(minutes=5)
                 state["nextAttemptAt"] = paused.isoformat().replace("+00:00", "Z")
                 atomic_write_json(path, record)
-                atomic_write_json(STATE_FILE, state)
+                atomic_write_json(state_file, state)
                 break
         atomic_write_json(path, record)
-        atomic_write_json(STATE_FILE, state)
+        atomic_write_json(state_file, state)
 
     print(
         f"[translate] requests {requests_made}/{request_limit}; translated {translated_blocks_count} blocks; "
         f"completed {completed_articles} articles; daily {state.get('requestsToday', 0)}/{args.daily_limit}"
     )
+    state.update(runFinishedAt=utc_now(), runRequests=requests_made,
+                 runTranslatedBlocks=translated_blocks_count, runCompletedArticles=completed_articles,
+                 runStatus="unavailable" if fatal_error else "rate_limited" if state.get("nextAttemptAt")
+                 else "progress" if translated_blocks_count else "waiting")
+    if translated_blocks_count:
+        state["lastOutputAt"] = utc_now()
+    atomic_write_json(state_file, state)
     atomic_write_json(INDEX_FILE, build_translation_index())
-    publish_queue(requests, data["items"], state.get("nextAttemptAt"))
+    publish_queue(requests, data["items"])
     return 1 if fatal_error or (requests_made and not translated_blocks_count) else 0
+
+
+def main() -> int:
+    providers = [p for p, key in [("bigmodel", "BIGMODEL_API_KEY"), ("openrouter", "OPENROUTER_API_KEY")]
+                 if os.getenv(key, "").strip()]
+    runtime = {"schemaVersion": 1, "startedAt": utc_now(), "status": "running", "providers": {},
+               "bigmodelConfigured": "bigmodel" in providers,
+               "runUrl": (f"https://github.com/{os.getenv('GITHUB_REPOSITORY')}/actions/runs/{os.getenv('GITHUB_RUN_ID')}"
+                          if os.getenv("GITHUB_REPOSITORY") and os.getenv("GITHUB_RUN_ID") else None)}
+    atomic_write_json(RUNTIME_FILE, runtime)
+    results = []
+    for provider in providers:
+        try:
+            results.append(run_provider(provider))
+        except Exception as error:
+            print(f"::error::{provider} worker failed: {type(error).__name__}")
+            results.append(1)
+            runtime["providers"][provider] = {"runStatus": "error"}
+            continue
+        path = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name("bigmodel-state.json")
+        state = read_json(path) or {}
+        runtime["providers"][provider] = {k: state.get(k) for k in (
+            "runStatus", "runStartedAt", "runFinishedAt", "runRequests", "runTranslatedBlocks",
+            "runCompletedArticles", "lastOutputAt", "lastStatus", "lastModel", "nextAttemptAt")}
+    runtime.update(finishedAt=utc_now(), status="finished" if providers else "not_configured")
+    atomic_write_json(RUNTIME_FILE, runtime)
+    return int(bool(results) and any(results))
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

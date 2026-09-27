@@ -98,13 +98,14 @@ class ModelTests(unittest.TestCase):
                  patch.object(tr,'publish_queue'), \
                  patch.object(tr,'load_state',return_value=state), \
                  patch.object(tr,'STATE_FILE',path/'state.json'), \
+                 patch.object(tr,'RUNTIME_FILE',path/'runtime.json'), \
                  patch.object(tr,'INDEX_FILE',path/'index.json'), \
                  patch.object(tr,'MODEL_HEALTH_FILE',path/'health.json'), \
                  patch('translation_models.fetch_catalog',return_value=[model(x) for x in PREFERRED]), \
                  patch.object(tr,'select_candidates',side_effect=candidates), \
                  patch.object(tr,'pending_chunk',return_value=chunk), \
                  patch.object(tr,'request_translation',side_effect=request), \
-                 patch.object(tr,'normalize_response',return_value=([{}],[])), \
+                 patch.object(tr,'normalize_partial_response',return_value=([{}],[],{})), \
                  patch.object(tr,'apply_chunk',side_effect=apply), \
                  patch.object(tr,'build_translation_index',return_value={}):
                 self.assertEqual(tr.main(),0)
@@ -114,3 +115,4 @@ class ModelTests(unittest.TestCase):
             self.assertNotIn('nextAttemptAt',record)
 
 if __name__=='__main__': unittest.main()
+
