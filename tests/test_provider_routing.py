@@ -70,6 +70,20 @@ class ProviderTests(unittest.TestCase):
             routing.prepare_routing(Path(directory), ['gemini', 'groq'], tr, now + timedelta(days=1))
             self.assertEqual(call.call_count, 8)
 
+    def test_evaluation_latency_excludes_our_own_limiter_wait(self):
+        clock = [0.0]
+        def acquire(*args, **kwargs):
+            clock[0] += 30
+        def request(token, model, chunk, endpoint):
+            clock[0] += 2
+            return response(chunk), model, {}
+        with tempfile.TemporaryDirectory() as directory, patch.object(routing, 'TokenRateControl') as gate, \
+             patch.object(routing.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(tr, 'request_translation', side_effect=request):
+            gate.return_value.acquire.side_effect = acquire
+            report = routing.prepare_routing(Path(directory), ['gemini'], tr)
+            self.assertEqual([r['seconds'] for r in report['results']], [2, 2])
+
     def test_existing_cooldown_uses_no_probe_and_no_same_day_retries(self):
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as directory, patch.object(routing, 'TokenRateControl') as gate, \
