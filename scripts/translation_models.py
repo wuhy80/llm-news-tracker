@@ -74,10 +74,10 @@ class ModelPool:
                 return model
         raise RuntimeError('No healthy approved free translation model available; waiting instead of lowering quality')
 
-    def failed(self, model, reason, permanent=False):
+    def failed(self, model, reason, permanent=False, retry_at=None):
         self.attempted.add(model)
         self.health['models'][model] = {'lastError': reason[:600], 'failedAt': self.now.isoformat(),
-            'disabledUntil': (self.now + timedelta(hours=24 if permanent else 1)).isoformat()}
+            'disabledUntil': (retry_at or (self.now + timedelta(hours=24 if permanent else 1))).isoformat()}
         self.save()
 
     def succeeded(self, model):
@@ -103,10 +103,10 @@ class BigModelPool:
             raise RuntimeError('BigModel is cooling down until ' + blocked)
         return self.model
 
-    def failed(self, model, reason, permanent=False):
+    def failed(self, model, reason, permanent=False, retry_at=None):
         now = datetime.now(timezone.utc)
         self.health = {'model': self.model, 'lastError': reason[:600], 'failedAt': now.isoformat(),
-                       'disabledUntil': (now + timedelta(minutes=1440 if permanent else 5)).isoformat()}
+                       'disabledUntil': (retry_at or (now + timedelta(minutes=1440 if permanent else 5))).isoformat()}
         atomic_write_json(self.path, self.health)
 
     def succeeded(self, model):

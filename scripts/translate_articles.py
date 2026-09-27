@@ -18,6 +18,7 @@ from article_store import ROOT, normalize_fenced_body, publication_path, snapsho
 from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
 from translation_models import ModelPool, BigModelPool
+from api_rate_control import RateControl, RateLimited
 
 NEWS_FILE = ROOT / "data" / "news.json"
 TRANSLATIONS_DIR = ROOT / "data" / "translations" / "zh-CN"
@@ -644,6 +645,7 @@ def run_provider(provider: str = "openrouter") -> int:
     state = load_state(state_file)
     now = datetime.now(timezone.utc)
     reset_daily_state(state, now)
+    control = RateControl(state_file.with_name(f"rate-{provider}.json"), provider, args.interval)
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
@@ -719,12 +721,25 @@ def run_provider(provider: str = "openrouter") -> int:
             atomic_write_json(path, record)
             continue
 
-        last_request_at = parse_time(state.get("lastRequestAt"))
-        if last_request_at:
-            wait = args.interval - (datetime.now(timezone.utc) - last_request_at).total_seconds()
-            if wait > 0:
-                print(f"[translate] waiting {wait:.0f}s before the next {provider} request")
-                time.sleep(wait)
+        try:
+            control.acquire(model, token)
+        except RateLimited as limited:
+            state.update(lastStatus="rate_limited", lastError=str(limited))
+            if limited.scope.startswith("model:"):
+                pool.failed(model, str(limited), retry_at=limited.until)
+                try:
+                    model = pool.select()
+                    continue
+                except RuntimeError:
+                    pass
+            state["nextAttemptAt"] = limited.until.isoformat()
+            atomic_write_json(state_file, state)
+            break
+        except Exception as error:
+            state.update(lastStatus="quota_check_error", lastError=type(error).__name__)
+            print(f"::error::{provider}: quota/admission check failed; no inference sent ({type(error).__name__})")
+            fatal_error = True
+            break
 
         attempt_at = utc_now()
         state["lastRequestAt"] = attempt_at
@@ -737,8 +752,11 @@ def run_provider(provider: str = "openrouter") -> int:
         atomic_write_json(path, record)
         requests_made += 1
 
+        requested_model = model
+        api_success = False
         try:
             response, actual_model, headers = request_translation(token, model, chunk, endpoint)
+            api_success = True
             translated, word_wise, failures = normalize_partial_response(response, chunk)
             for block in translated:
                 block.update(provider=provider, model=actual_model)
@@ -772,6 +790,21 @@ def run_provider(provider: str = "openrouter") -> int:
             failed_at = datetime.now(timezone.utc)
             message = error_message(error)
             code = error.code if isinstance(error, urllib.error.HTTPError) else None
+            if code in {402, 429}:
+                limited = control.penalize(model, code, error.headers,
+                    getattr(error, "translation_limit_source", ""), getattr(error, "translation_provider_code", ""))
+                state.update(lastStatus="rate_limited", lastError=message)
+                print(f"[translate:rate] {provider}: {limited}")
+                if limited.scope.startswith("model:"):
+                    pool.failed(model, message, retry_at=limited.until)
+                    try:
+                        model = pool.select()
+                        continue
+                    except RuntimeError:
+                        pass
+                state["nextAttemptAt"] = limited.until.isoformat()
+                atomic_write_json(state_file, state)
+                break
             if isinstance(error, (ValueError, KeyError, TypeError)):
                 defer_blocks(record, {b["id"]: {"reason": type(error).__name__, "sourceHash": b["sourceHash"]}
                                       for b in chunk}, model)
@@ -779,7 +812,7 @@ def run_provider(provider: str = "openrouter") -> int:
                 atomic_write_json(path, record)
                 atomic_write_json(state_file, state)
                 continue
-            if code in {404, 410, 500, 502, 503, 504} or shared_pool_limit(error) or (provider == "bigmodel" and code == 429 and getattr(error, "translation_provider_code", "") == "1305") or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
+            if code in {404, 410, 500, 502, 503, 504} or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
                 # Model/service failure is not an article failure. Retry the same
                 # pending text using another free model, within the same budget.
                 pool.failed(model, message, permanent=code in {404, 410})
@@ -807,14 +840,8 @@ def run_provider(provider: str = "openrouter") -> int:
             state["lastStatus"] = "error"
             state["lastError"] = record["lastError"]
             print(f"[translate:warn] {item['id']}: {record['lastError']}")
-            if isinstance(error, urllib.error.HTTPError) and error.code in {402, 429}:
-                paused = global_pause_until(error, failed_at)
-                if provider == "bigmodel" and code == 429 and not (error.headers or {}).get("Retry-After"):
-                    paused = failed_at + timedelta(minutes=5)
-                state["nextAttemptAt"] = paused.isoformat().replace("+00:00", "Z")
-                atomic_write_json(path, record)
-                atomic_write_json(state_file, state)
-                break
+        finally:
+            control.finished(requested_model, success=api_success)
         atomic_write_json(path, record)
         atomic_write_json(state_file, state)
 
