@@ -631,7 +631,7 @@ function translationRuntimeText(data, now = Date.now()) {
   const labels = { progress: "有新增译文", waiting: "等待可重试段落", unavailable: "服务暂不可用",
     rate_limited: "限流等待", daily_limit: "已到当日请求上限", error: "运行出错", running: "运行中" };
   const states = Object.entries(data.providers || {}).map(([key, value]) =>
-    `${names[key] || key}：${labels[value.runStatus] || "状态未知"}（${Number(value.runTranslatedBlocks) || 0} 段、${Number(value.runCompletedArticles) || 0} 篇）`);
+    `${names[key] || key}：${labels[value.runStatus] || "状态未知"}（${Number.isFinite(value.runModelBlocks) ? `${value.runModelBlocks} 段模型译文、${Number(value.runLocalBlocks) || 0} 处本地引用处理` : `新增保存 ${Number(value.runTranslatedBlocks) || 0} 段，含本地处理`}、完成 ${Number(value.runCompletedArticles) || 0} 篇）`);
   const outputs = Object.values(data.providers || {}).map(v => new Date(v.lastOutputAt).getTime()).filter(Number.isFinite);
   const output = outputs.length ? new Date(Math.max(...outputs)).toLocaleString("zh-CN", { hour12: false }) : "暂无记录";
   const stale = Number.isFinite(ended) && now - ended > 3600000;

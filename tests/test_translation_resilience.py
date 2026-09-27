@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -142,7 +143,16 @@ class ResilienceTests(unittest.TestCase):
             self.assertFalse(any('disabledUntil' in x for x in health['models'].values()))
             state = json.loads((root/'state.json').read_text())
             self.assertEqual(state['runTranslatedBlocks'], 2)
+            self.assertEqual(state['runModelBlocks'], 2)
+            self.assertEqual(state['runLocalBlocks'], 0)
             self.assertEqual(state['runCompletedArticles'], 1)
+
+    def test_bigmodel_overload_code_is_preserved_for_service_classification(self):
+        error = urllib.error.HTTPError(tr.BIGMODEL_ENDPOINT, 429, 'busy', {},
+                                      io.BytesIO(b'{"error":{"code":"1305","message":"busy"}}'))
+        tr.error_message(error)
+        self.assertEqual(error.translation_provider_code, '1305')
+        self.assertFalse(tr.shared_pool_limit(error))
 
     def test_bigmodel_health_is_independent_of_catalog(self):
         with tempfile.TemporaryDirectory() as directory, patch('translation_models.fetch_catalog', side_effect=RuntimeError('offline')):
