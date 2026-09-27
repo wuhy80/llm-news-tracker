@@ -923,6 +923,8 @@ def main() -> int:
     except Exception as error:
         print(f'::warning::Daily evaluation unavailable: {type(error).__name__}; keeping established providers')
         ranking = {'order': [p for p in configured if p in ('bigmodel', 'openrouter')]}
+    if '--evaluate-only' in sys.argv:
+        return 0
     providers = [p for p in ranking.get('order', configured) if p in configured]
     runtime = {"schemaVersion": 1, "startedAt": utc_now(), "status": "running", "providers": {},
                "bigmodelConfigured": "bigmodel" in configured,
