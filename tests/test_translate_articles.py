@@ -12,6 +12,31 @@ import translate_articles
 
 
 class TranslateArticlesTests(unittest.TestCase):
+
+    def test_unchanged_huggingface_reference_localizes_label(self):
+        source = "HuggingFace: DreamFast/Qwen-3.8-27b-abliterlitics"
+        chunk = translate_articles.article_blocks("- " + source)
+        payload = {"translations": [{"id": "b0001", "translationZh": source}]}
+        blocks, _ = translate_articles.normalize_response(payload, chunk)
+        self.assertEqual(blocks[0]["translationZh"],
+                         "Hugging Face 模型：DreamFast/Qwen-3.8-27b-abliterlitics")
+        self.assertEqual(blocks[0]["sourceHash"], chunk[0]["sourceHash"])
+
+    def test_reference_exception_rejects_changed_identifiers_and_english_prose(self):
+        cases = [
+            ("HuggingFace: DreamFast/Qwen-3.8-27b-abliterlitics",
+             "HuggingFace: DreamFast/Qwen-3.8-7b-abliterlitics"),
+            ("This model preserves 82.2% accuracy.", "This model preserves 82.2% accuracy."),
+            ("HuggingFace: DreamFast/model is fast", "HuggingFace: DreamFast/model is fast"),
+        ]
+        for source, translated in cases:
+            with self.subTest(source=source):
+                chunk = translate_articles.article_blocks(source)
+                payload = {"translations": [{"id": "b0001", "translationZh": translated}]}
+                with self.assertRaises(ValueError):
+                    translate_articles.normalize_response(payload, chunk)
+
+
     def test_article_blocks_match_reader_structure_and_skip_code(self):
         body = (
             "# Heading\n\nFirst paragraph line\ncontinues here.\n\n"

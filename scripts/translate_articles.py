@@ -280,7 +280,16 @@ def normalize_response(payload: dict, chunk: list[dict[str, str]]) -> tuple[list
     for block in chunk:
         translated = by_id[block["id"]]
         if not contains_chinese(translated):
-            raise ValueError(f"block {block['id']} has no Chinese translation")
+            # A repository reference may correctly remain in English. Localize
+            # only its label, and only when the full identifier is unchanged.
+            reference = re.fullmatch(
+                r"HuggingFace:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+                block["source"],
+            )
+            if reference and translated == block["source"]:
+                translated = f"Hugging Face 模型：{reference.group(1)}"
+            else:
+                raise ValueError(f"block {block['id']} has no Chinese translation")
         normalized.append({
             "id": block["id"],
             "kind": block["kind"],
