@@ -120,6 +120,16 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(tr.main(), 1)
             self.assertEqual([c.args[0] for c in run.call_args_list], ['groq','gemini','bigmodel'])
 
+    def test_evaluate_only_never_runs_bulk_translation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'GEMINI_API_KEY':'fake'}, clear=True), \
+             patch.object(sys, 'argv', ['translate', '--evaluate-only']), \
+             patch.object(tr, 'STATE_FILE', Path(directory)/'state.json'), \
+             patch.object(tr, 'prepare_routing', return_value={'order':['gemini']}) as evaluate, \
+             patch.object(tr, 'run_provider') as run:
+            self.assertEqual(tr.main(), 0)
+            evaluate.assert_called_once()
+            run.assert_not_called()
+
     def test_groq_tokens_not_only_requests_and_reservations_persist(self):
         now = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
