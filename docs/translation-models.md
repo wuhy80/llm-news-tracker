@@ -53,9 +53,8 @@ claimed merely because structural checks pass. A missing key leaves OpenRouter
 operational and the homepage explicitly says BigModel is not configured.
 
 Provider state and circuit breakers are separate. BigModel outages do not consume
-OpenRouter's counters or stop its worker, and vice versa. BigModel's generic 429
-backs off five minutes (or uses Retry-After); OpenRouter's unknown/account 429
-retains its conservative pause. Authentication failures stop only that provider.
+OpenRouter's counters or stop its worker, and vice versa. BigModel's 429 and OpenRouter's account/model limits use the shared adaptive
+admission controller described below, always honoring longer server hints. Authentication failures stop only that provider.
 
 Each valid response block is saved independently. Invalid, missing or duplicate
 blocks have bounded retry backoff in `blockFailures`; retries are single-block
@@ -74,3 +73,41 @@ completion of a trusted main-branch news update is an additional translation
 trigger. Neither route is an exact scheduling guarantee. Historical runs show
 multi-hour schedule gaps, but do not establish a provider-side root cause.
 The shared archive writer lock remains in place to prevent data races.
+
+## Proactive shared admission control
+
+Official references:
+- https://docs.bigmodel.cn/cn/api/rate-limit
+- https://openrouter.ai/docs/api_reference/limits
+
+All repository OpenRouter inference (translation and AI review) shares
+`data/translations/rate-openrouter.json`; BigModel uses `rate-bigmodel.json`.
+The archive-writes lock serializes the workflows. Both commit rate state with
+progress, retaining cooldowns even across UTC midnight. External clients using
+the same account still share provider limits and are outside this local lock.
+
+After a response, wait at least 10 seconds for BigModel and 6 seconds for
+OpenRouter (one concurrent request, with jitter). These are conservative local
+floors, not advertised account entitlement. On rate errors, the gap doubles up
+to 60 seconds; it halves only after 10 successful responses.
+
+Before OpenRouter inference, read `/api/v1/key` and cache the documented
+`free_model_daily_requests` counters for at most five minutes. Reserve a request
+locally for every attempt; refreshed remote counts may only lower the same-day
+remaining balance. Missing/malformed quota or a failed quota check stops that
+worker without sending inference, rather than assuming that a configured 1000
+requests is the provider's actual allowance. Daily exhausted accounts stop until
+the next UTC day plus five minutes; the user-configured local budget also applies.
+
+Honor the later of exponential backoff and server Retry-After (seconds or HTTP
+date) / X-RateLimit-Reset (epoch seconds, milliseconds or ISO timestamp). Add
+positive jitter. BigModel 1302 is account rate limiting (initial backoff one
+minute); 1305 is model/platform overload (15, 30, 60 ... minutes). OpenRouter's
+explicit shared-pool errors use a model cooldown (30, 60 ... minutes); unknown
+429 uses an account cooldown (5, 10 ... minutes). Backoff base caps at six hours
+plus up to 20% jitter; longer server instructions always win. Do not rotate
+models to bypass account-level cooldowns. A model-scoped outage may use another
+approved model after the common pacing interval.
+
+The API review worker no longer retries OpenRouter 429 responses after a fixed
+5/10-second sleep; it persists the same admission state and stops that run.

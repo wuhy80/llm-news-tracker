@@ -123,6 +123,7 @@ class ResilienceTests(unittest.TestCase):
                 calls.append(chunk)
                 entries = [{'id': x['id'], 'translationZh': x['source'] if x['source'].startswith('Bad') else '合格的译文。'} for x in chunk]
                 return {'translations': entries}, model, {}
+            stack.enter_context(patch.object(tr, 'RateControl'))
             mocks = {'remove_stale_records': 0, 'load_news': {'items': []}, 'sync_requests': {},
                      'resolve_items': [], 'publish_queue': None, 'build_translation_index': {}}
             for name, value in mocks.items():
