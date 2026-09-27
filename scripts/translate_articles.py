@@ -583,7 +583,9 @@ def error_message(error: Exception) -> str:
         try:
             detail = error.read(16384).decode("utf-8", errors="replace")
             try:
-                error.translation_limit_source = json.loads(detail).get("error", {}).get("metadata", {}).get("limit_source")
+                parsed_error = json.loads(detail).get("error", {})
+                error.translation_limit_source = parsed_error.get("metadata", {}).get("limit_source")
+                error.translation_provider_code = str(parsed_error.get("code", ""))
             except (ValueError, AttributeError):
                 error.translation_limit_source = None
             message = f"HTTP {error.code}: {detail}"
@@ -646,7 +648,7 @@ def run_provider(provider: str = "openrouter") -> int:
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
     state.update(runStartedAt=utc_now(), runFinishedAt=None, runStatus="running", provider=provider,
-                 runRequests=0, runTranslatedBlocks=0, runCompletedArticles=0)
+                 runRequests=0, runTranslatedBlocks=0, runModelBlocks=0, runLocalBlocks=0, runCompletedArticles=0)
     atomic_write_json(state_file, state)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
@@ -666,7 +668,7 @@ def run_provider(provider: str = "openrouter") -> int:
     try:
         pool = BigModelPool(health_file) if provider == "bigmodel" else ModelPool(health_file, model)
         model = pool.select()
-        print(f"[translate:model] selected {model}; checked live free-model catalog")
+        print(f"[translate:model] {provider}: selected {model}")
     except Exception as error:
         state.update(lastStatus="model_error", lastError=str(error)[:600], runStatus="unavailable", runFinishedAt=utc_now())
         atomic_write_json(state_file, state)
@@ -676,6 +678,8 @@ def run_provider(provider: str = "openrouter") -> int:
     fatal_error = False
     requests_made = 0
     translated_blocks_count = 0
+    local_blocks_count = 0
+    model_blocks_count = 0
     completed_articles = 0
     deferred_articles = set()
     deadline = time.monotonic() + 20 * 60
@@ -710,6 +714,7 @@ def run_provider(provider: str = "openrouter") -> int:
                           "model": "reference-labels-v1"} for b in references]
             apply_chunk(record, localized, [], record.get("model") or "reference-labels-v1")
             translated_blocks_count += len(localized)
+            local_blocks_count += len(localized)
             completed_articles += int(record.get("status") == "complete")
             atomic_write_json(path, record)
             continue
@@ -745,6 +750,7 @@ def run_provider(provider: str = "openrouter") -> int:
                 defer_blocks(record, failures, actual_model)
                 print(f"[translate:deferred] {item['id']}: {len(failures)} blocks; keeping {len(translated)} good blocks")
             translated_blocks_count += len(translated)
+            model_blocks_count += len(translated)
             if record.get("status") == "complete":
                 completed_articles += 1
             state["lastStatus"] = "success" if translated else "content_error"
@@ -773,7 +779,7 @@ def run_provider(provider: str = "openrouter") -> int:
                 atomic_write_json(path, record)
                 atomic_write_json(state_file, state)
                 continue
-            if code in {404, 410, 500, 502, 503, 504} or shared_pool_limit(error) or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
+            if code in {404, 410, 500, 502, 503, 504} or shared_pool_limit(error) or (provider == "bigmodel" and code == 429 and getattr(error, "translation_provider_code", "") == "1305") or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
                 # Model/service failure is not an article failure. Retry the same
                 # pending text using another free model, within the same budget.
                 pool.failed(model, message, permanent=code in {404, 410})
@@ -817,7 +823,8 @@ def run_provider(provider: str = "openrouter") -> int:
         f"completed {completed_articles} articles; daily {state.get('requestsToday', 0)}/{args.daily_limit}"
     )
     state.update(runFinishedAt=utc_now(), runRequests=requests_made,
-                 runTranslatedBlocks=translated_blocks_count, runCompletedArticles=completed_articles,
+                 runTranslatedBlocks=translated_blocks_count, runModelBlocks=model_blocks_count,
+                 runLocalBlocks=local_blocks_count, runCompletedArticles=completed_articles,
                  runStatus="unavailable" if fatal_error else "rate_limited" if state.get("nextAttemptAt")
                  else "progress" if translated_blocks_count else "waiting")
     if translated_blocks_count:
@@ -849,7 +856,7 @@ def main() -> int:
         state = read_json(path) or {}
         runtime["providers"][provider] = {k: state.get(k) for k in (
             "runStatus", "runStartedAt", "runFinishedAt", "runRequests", "runTranslatedBlocks",
-            "runCompletedArticles", "lastOutputAt", "lastStatus", "lastModel", "nextAttemptAt")}
+            "runCompletedArticles", "runModelBlocks", "runLocalBlocks", "lastOutputAt", "lastStatus", "lastModel", "nextAttemptAt")}
     runtime.update(finishedAt=utc_now(), status="finished" if providers else "not_configured")
     atomic_write_json(RUNTIME_FILE, runtime)
     return int(bool(results) and any(results))
