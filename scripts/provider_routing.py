@@ -155,6 +155,8 @@ def prepare_routing(root, providers, worker, now=None):
                 else:
                     control.acquire(model, token)
                 admitted = True
+                # Compare API latency, excluding our own admission/pacing delay.
+                started = time.monotonic()
                 payload, actual, headers = worker.request_translation(token, model, chunk, spec['endpoint'])
                 if hasattr(control, 'observe'):
                     control.observe(model, headers)
