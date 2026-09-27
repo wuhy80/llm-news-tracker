@@ -109,11 +109,12 @@ class ModelTests(unittest.TestCase):
                  patch.object(tr,'normalize_partial_response',return_value=([{}],[],{})), \
                  patch.object(tr,'apply_chunk',side_effect=apply), \
                  patch.object(tr,'build_translation_index',return_value={}):
-                self.assertEqual(tr.main(),0)
+                self.assertEqual(tr.run_provider(),0)
             self.assertEqual(attempts,PREFERRED[:2])
             self.assertEqual(state['requestsToday'],2)
             self.assertNotIn('failureCount',record)
             self.assertNotIn('nextAttemptAt',record)
 
 if __name__=='__main__': unittest.main()
+
 

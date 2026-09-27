@@ -90,6 +90,7 @@ class ResilienceTests(unittest.TestCase):
     def test_one_provider_failure_does_not_stop_other_provider(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             'OPENROUTER_API_KEY': 'test-o', 'BIGMODEL_API_KEY': 'test-b'}, clear=True), \
+            patch.object(tr, 'prepare_routing', side_effect=lambda root, providers, worker: {'order': providers}), \
             patch.object(tr, 'RUNTIME_FILE', Path(directory) / 'runtime.json'), \
             patch.object(tr, 'STATE_FILE', Path(directory) / 'state.json'), \
             patch.object(tr, 'run_provider', side_effect=[RuntimeError('service unavailable'), 0]) as run:
@@ -101,6 +102,7 @@ class ResilienceTests(unittest.TestCase):
 
     def test_missing_bigmodel_key_keeps_openrouter_and_reports_not_configured(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test'}, clear=True), \
+            patch.object(tr, 'prepare_routing', side_effect=lambda root, providers, worker: {'order': providers}), \
             patch.object(tr, 'RUNTIME_FILE', Path(directory) / 'runtime.json'), \
             patch.object(tr, 'STATE_FILE', Path(directory) / 'state.json'), \
             patch.object(tr, 'run_provider', return_value=0) as run:
@@ -166,3 +168,4 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

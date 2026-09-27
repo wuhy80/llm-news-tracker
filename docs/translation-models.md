@@ -111,3 +111,56 @@ approved model after the common pacing interval.
 
 The API review worker no longer retries OpenRouter 429 responses after a fixed
 5/10-second sleep; it persists the same admission state and stops that run.
+
+
+## 每日服务优先级评估（2026-09-27）
+
+配置 Actions Secrets：`GEMINI_API_KEY`、`GROQ_API_KEY`；继续支持
+`BIGMODEL_API_KEY`、`OPENROUTER_API_KEY`。Gemini 项目/Groq 组织必须使用免费档；
+模型白名单本身不能保证付费账号不会计费。不会自动升级套餐或启用搜索、工具。
+
+候选组合：GLM-4.7-Flash、Gemini 3.5 Flash-Lite / 3.8 Flash、Groq Qwen3.8-27B /
+GPT-OSS-120B，以及 OpenRouter 当前健康且目录报价为零的白名单模型。
+
+每天按 `Asia/Shanghai` 日期最多评估一次，每个候选组合最多一次请求（总计最多 6 次），
+使用相同的三段短样本，检查中文、完整块 ID、数字、否定、文件路径、命令及 URL。
+样本译文保存在 `data/translations/provider-ranking.json`，便于人工核对。
+评估前写入日期检查点；重跑或中断后当天不重复消耗评估请求。
+既有冷却与额度限制适用于评估请求和生产请求，不通过评估绕过限流。
+每日 07:17（北京时间）的 cron 提供触发机会；其他翻译任务也会检查日期并补评。
+GitHub Actions 定时任务可能延迟，不保证准点执行。
+
+分数：60% 自动忠实度/格式代理指标（含近期有效块比例）、25% 成功率、10% 非 429
+可用性、5% 延迟；生产数据取最近 7 天并做小样本平滑。它不是人工语义质量评分，
+不能证明某模型所有文章都翻译得最好。新服务必须通过样本门槛才能处理正文；失败不会因
+速度快而胜出。已评估模型按服务选出最高分者，正文仍保留原有逐块校验与重试机制。
+仅因冷却未能复测时可沿用最近两天通过的模型；新模型质量失败不会被自动放行。
+排序每天更新，实时冷却与额度不足仍可跳过高分服务。站点显示本轮实际优先级。
+
+### 额度与 pacing
+
+- Groq 官方免费表（2026-09-27）：上述两个模型各列 RPM 30 / RPD 1000 /
+  TPM 8000 / TPD 200000；组织实际额度为准。默认仅使用 75%，按模型持久化滚动
+  60 秒、24 小时请求/token 预留。使用完整输出上限 + UTF-8 输入字节估算保守预算；
+  失败也不退回预留。解析 `x-ratelimit-remaining-*` 与形如 `2m59.56s` 的重置时间。
+  请求相关响应头指 RPD，token 相关响应头指 TPM。`GROQ_RPM/TPM/RPD/TPD`
+  可按组织控制台配置，观察到更低上限时取较小值。
+- Gemini 官方不承诺统一免费额度。默认 `GEMINI_RPM=1`、`GEMINI_TPM=8000`、
+  `GEMINI_RPD=8` 是本项目本地试运行预算，**不是官方账号配额**，同样保留 25%
+  余量（正数最少 1）。设置这些 Actions Variables 时应抄录项目/模型控制台额度。
+  未确认额度时保持小规模试用；处理 429 的 `QuotaFailure` / `RetryInfo`，学习更低
+  上限和等待时间。日界线使用 `America/Los_Angeles`，自动处理夏令时。
+- 同一提供商同一模型的每日评估、正文翻译共用 rate 文件；本项目各写任务串行。
+  其他应用若共用组织/项目也会消耗额度，应为它们留余量。未知 429 保守冻结整个服务，
+  不轮换密钥或模型绕过它。认证/参数错误暂停 24 小时，避免反复无效请求。
+- 新服务最多 16 次正文请求/轮，正文块批次上限 1200 字符 / 4 块、输出 2048 tokens；
+  超过保守 token 预算的单个长块交给其他提供商。每个服务最多运行约 10 分钟，单次
+  请求超时 180 秒；未完成内容仍保存在队列中。每日 token/请求预算先于每轮上限。
+
+官方参考：
+- https://console.groq.com/docs/rate-limits
+- https://console.groq.com/docs/openai
+- https://console.groq.com/docs/reasoning
+- https://ai.google.dev/gemini-api/docs/pricing
+- https://ai.google.dev/gemini-api/docs/rate-limits
+- https://ai.google.dev/gemini-api/docs/openai
