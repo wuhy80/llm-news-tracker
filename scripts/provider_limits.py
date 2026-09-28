@@ -33,7 +33,21 @@ class RequestTooLarge(ValueError):
     pass
 
 
+def is_content_error(provider, error):
+    return (provider == 'groq' and getattr(error, 'code', None) == 400
+            and getattr(error, 'translation_provider_code', '') == 'json_validate_failed')
+
+
 class TokenRateControl(RateControl):
+    def __init__(self, path, provider, interval=0):
+        super().__init__(path, provider, interval)
+        # Repair only the exact historical content-error misclassification.
+        # Keep token reservations, server budgets, and genuine cooldowns intact.
+        account = self.data['cooldowns'].get('account', {})
+        if provider == 'groq' and account.get('reason') == 'HTTP 400 / json_validate_failed':
+            del self.data['cooldowns']['account']
+            self.save()
+
     def limits(self, model):
         defaults = {'rpm': 30, 'tpm': 8000, 'rpd': 1000, 'tpd': 200000} if self.provider == 'groq' else {'rpm': 1, 'tpm': 8000, 'rpd': 8}
         result = {}

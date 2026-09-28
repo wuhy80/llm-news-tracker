@@ -104,6 +104,42 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(report['order'], [])
             self.assertEqual(len(report['results']), 1)
 
+    def test_json_generation_failure_is_quality_failure_not_account_limit(self):
+        error = urllib.error.HTTPError('https://example.com', 400, 'bad JSON', {},
+            io.BytesIO(b'{"error":{"code":"json_validate_failed"}}'))
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'GROQ_API_KEY':'fake'}, clear=True), \
+             patch.object(routing, 'TokenRateControl') as gate, \
+             patch.object(tr, 'request_translation', side_effect=[error, ({'translations': []}, 'm', {})]) as call:
+            report = routing.prepare_routing(Path(directory), ['groq'], tr)
+            self.assertEqual(call.call_count, 2)
+            self.assertEqual(report['results'][0]['status'], 'quality_failed')
+            self.assertEqual(report['results'][0]['score'], 0)
+            gate.return_value.penalize_error.assert_not_called()
+            gate.return_value.observe.assert_called()
+
+    def test_migration_only_removes_exact_groq_json_error(self):
+        for provider, reason, removed in [
+            ('groq', 'HTTP 400 / json_validate_failed', True),
+            ('groq', 'HTTP 429', False),
+            ('groq', 'HTTP 401', False),
+            ('gemini', 'HTTP 400 / json_validate_failed', False),
+        ]:
+            with self.subTest(provider=provider, reason=reason), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)/'rate.json'
+                until = (datetime.now(timezone.utc)+timedelta(hours=24)).isoformat()
+                state = {'cooldowns': {'account': {'reason':reason, 'until':until},
+                    'model:m': {'reason':'HTTP 429', 'until':until}},
+                    'reservations': {'m':[{'at':1, 'tokens':2000}]},
+                    'remote': {'m': {'tokensRemaining':0}}, 'requestsToday':41}
+                path.write_text(json.dumps(state))
+                gate = TokenRateControl(path, provider)
+                self.assertEqual('account' not in gate.data['cooldowns'], removed)
+                for key in ('reservations', 'remote', 'requestsToday'):
+                    self.assertEqual(gate.data[key], state[key])
+                self.assertEqual(gate.data['cooldowns']['model:m'], state['cooldowns']['model:m'])
+                with self.assertRaises(RateLimited):
+                    gate.blocked('m')
+
     def test_speed_cannot_overrule_quality_or_production_failure(self):
         good = {'status':'passed', 'fidelityProxy':1, 'seconds':20}
         fast_bad = {'status':'quality_failed', 'fidelityProxy':.7, 'seconds':.1}
