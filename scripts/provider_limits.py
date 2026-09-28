@@ -6,6 +6,7 @@ pilot caps, NOT claims about the account's entitlement. Configure console limits
 with GEMINI_RPM/TPM/RPD; observed lower limits always win.
 """
 import math
+import json
 import os
 import re
 import time
@@ -38,9 +39,38 @@ def is_content_error(provider, error):
             and getattr(error, 'translation_provider_code', '') == 'json_validate_failed')
 
 
+class UsageHeaders(dict):
+    """Transport usage beside headers without changing the response tuple API."""
+    def __init__(self, headers, usage=None):
+        super().__init__(headers)
+        self.usage = usage
+
+
+def repair_content_pause(provider, state):
+    """Migrate only the two known serializations of the Groq content error."""
+    if provider != 'groq':
+        return False
+    message = state.get('lastError', '')
+    raw_error = False
+    if message.startswith('HTTP 400: '):
+        try:
+            error = json.loads(message[len('HTTP 400: '):]).get('error', {})
+            raw_error = isinstance(error, dict) and error.get('code') == 'json_validate_failed'
+        except (ValueError, AttributeError):
+            pass
+    normalized = re.fullmatch(
+        r'account: HTTP 400 / json_validate_failed; next attempt after [0-9T:.+Z-]+', message)
+    if not (raw_error or normalized):
+        return False
+    state.pop('nextAttemptAt', None)
+    state.update(lastStatus='content_error', lastError='Groq JSON output failure; stale pause repaired')
+    return True
+
+
 class TokenRateControl(RateControl):
     def __init__(self, path, provider, interval=0):
         super().__init__(path, provider, interval)
+        self._pending = {}
         # Repair only the exact historical content-error misclassification.
         # Keep token reservations, server budgets, and genuine cooldowns intact.
         account = self.data['cooldowns'].get('account', {})
@@ -88,7 +118,7 @@ class TokenRateControl(RateControl):
             self.save()
             raise RateLimited(reset, scope, 'local daily budget exhausted')
         # Do not block a worker for minutes: resume on the next scheduled run.
-        if len(minute) >= limits['rpm'] or sum(e['tokens'] for e in minute) + tokens > limits['tpm']:
+        if len(minute) >= limits['rpm'] or sum(max(e['tokens'], e.get('reservedTokens', e['tokens'])) for e in minute) + tokens > limits['tpm']:
             reset = datetime.fromtimestamp(min(e['at'] for e in minute) + 61, timezone.utc)
             wait = (reset - now).total_seconds()
             if 0 < wait <= 60:
@@ -102,13 +132,36 @@ class TokenRateControl(RateControl):
                 raise RateLimited(until, scope, 'reported ' + kind + ' budget exhausted')
         super().acquire(model, token, now)
         # Keep the full conservative reservation even if the call errors or is cancelled.
-        events.append({'at': datetime.now(timezone.utc).timestamp(), 'tokens': tokens})
+        event = {'at': datetime.now(timezone.utc).timestamp(), 'tokens': tokens, 'reservedTokens': tokens}
+        events.append(event)
+        self._pending[model] = event
         for kind, needed in [('requests', 1), ('tokens', tokens)]:
             if kind + 'Remaining' in remote:
                 remote[kind + 'Remaining'] = max(0, remote[kind + 'Remaining'] - needed)
         self.save()
 
+    def settle(self, model, usage):
+        # Only this process's current request can be reconciled. Historical
+        # reservations and failed/unknown responses remain conservative.
+        event = self._pending.pop(model, None)
+        if event is None or self.provider != 'groq' or not isinstance(usage, dict):
+            return
+        total = usage.get('total_tokens')
+        prompt, completion = usage.get('prompt_tokens'), usage.get('completion_tokens')
+        if (type(total) is not int or total <= 0 or type(prompt) is not int
+                or type(completion) is not int or prompt < 0 or completion < 0
+                or total < prompt + completion):
+            return
+        event.update(tokens=total, actualTokens=total, promptTokens=prompt,
+                     completionTokens=completion, usageSource='api')
+        self.save()
+
+    def finished(self, model, success=False):
+        self._pending.pop(model, None)
+        super().finished(model, success=success)
+
     def observe(self, model, headers, now=None):
+        self.settle(model, getattr(headers, 'usage', None))
         now = now or datetime.now(timezone.utc)
         headers = {str(k).lower(): str(v) for k, v in dict(headers or {}).items()}
         remote = self.data.setdefault('remote', {}).setdefault(model, {})

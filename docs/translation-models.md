@@ -190,3 +190,33 @@ read/modify/write lock; the main thread updates runtime status and rebuilds the
 global index/queue after workers finish. The Actions archive-writes concurrency
 group remains mandatory: do not run multiple translation processes against the
 same directory. Git commit and deployment remain centralized in the workflow.
+
+## Groq accounting and bounded continuation
+
+Groq admission retains the 75% configured/observed quota safety margin. Requests
+reserve input bytes plus output capacity before calling the API. Successful parsed
+responses carrying valid prompt_tokens, completion_tokens and total_tokens settle
+the current reservation to actual total usage for the rolling daily budget.
+Minute admission retains max(reserved, actual) and observed server headers still
+win. Errors, missing usage, interruptions and historical reservations stay fully
+reserved; request counts are never refunded. Gemini accounting is unchanged.
+
+Both historical representations of Groq HTTP 400 json_validate_failed are repaired
+in worker state. Genuine account/model cooldowns and token ledgers remain intact.
+
+Groq defaults to at most 48 requests or 1200 seconds per worker run, also bounded
+by the common request limit and all provider quotas. Chunk size stays at 1200
+characters / 4 blocks until live usage and quality justify changing it.
+
+Cron remains best-effort. In the existing Actions job, a finished batch with model
+output stopped only by its per-run time/request budget can continue for up to two
+additional batches (three total). Each batch checkpoints validated-on-ingestion
+translations and consumed quota using existing contents permission before further
+API calls. No new Actions permission or workflow dispatch is used. The final
+sidecar validation and deployment remain in the existing workflow.
+
+No continuation for cooldowns, empty queues, failed-only output, stale runtime
+files or exhausted daily budgets. Existing request/daily/interval/model environment
+configuration remains in force. The archive-writes lock is held for the bounded
+job. This improves work per scheduled execution, but cannot eliminate cron delays
+or guarantee work between jobs; it may hold the archive lock for about an hour.
