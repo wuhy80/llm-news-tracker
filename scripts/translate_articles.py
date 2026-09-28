@@ -22,7 +22,7 @@ from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
 from translation_models import ModelPool, BigModelPool
 from api_rate_control import RateControl, RateLimited
-from provider_limits import TokenRateControl, RequestTooLarge, is_content_error
+from provider_limits import TokenRateControl, RequestTooLarge, is_content_error, repair_content_pause, UsageHeaders
 from provider_routing import (PROVIDERS, DirectModelPool, prepare_routing, read as read_routing,
                               output_limit, reservation, record_attempt)
 
@@ -429,7 +429,7 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
     )
     with urllib.request.urlopen(request, timeout=180) as response:
         response_payload = json.loads(response.read().decode("utf-8"))
-        headers = normalize_headers(response.headers)
+        headers = UsageHeaders(normalize_headers(response.headers), usage=response_payload.get("usage"))
     content = response_payload["choices"][0]["message"]["content"]
     return extract_json_object(content), str(response_payload.get("model") or model), headers
 
@@ -740,7 +740,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
             print(f'[translate] {provider}: awaiting a passing daily evaluation')
             return 0
         model, endpoint = preferred, PROVIDERS[provider]['endpoint']
-        args.request_limit = min(args.request_limit, int(os.getenv(provider.upper() + '_TRANSLATION_REQUEST_LIMIT', '16')))
+        args.request_limit = min(args.request_limit, int(os.getenv(provider.upper() + '_TRANSLATION_REQUEST_LIMIT', '48' if provider == 'groq' else '16')))
         args.daily_limit = int(os.getenv(provider.upper() + '_TRANSLATION_DAILY_LIMIT', '1000'))
         args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 1200), min(args.chunk_blocks, 4)
     elif preferred and provider == 'openrouter':
@@ -753,12 +753,12 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
-    if (provider == 'groq' and state.get('lastError', '').startswith('HTTP 400: ')
-            and re.search(r'"code"\s*:\s*"json_validate_failed"', state['lastError'])):
-        state.pop('nextAttemptAt', None)
-        state['lastStatus'] = 'content_error'
+    if repair_content_pause(provider, state):
+        print('[translate:repair] cleared stale Groq JSON content pause')
+        atomic_write_json(state_file, state)
     state.update(runStartedAt=utc_now(), runFinishedAt=None, runStatus="running", provider=provider,
-                 runRequests=0, runTranslatedBlocks=0, runModelBlocks=0, runLocalBlocks=0, runCompletedArticles=0)
+                 runRequests=0, runTranslatedBlocks=0, runModelBlocks=0, runLocalBlocks=0, runCompletedArticles=0,
+                 runStopReason=None)
     atomic_write_json(state_file, state)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
@@ -794,7 +794,9 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     model_blocks_count = 0
     completed_articles = 0
     deferred_articles = set()
-    deadline = time.monotonic() + 10 * 60
+    duration_seconds = max(60, min(1200, int(os.getenv(
+        provider.upper() + '_TRANSLATION_RUN_SECONDS', '1200' if provider == 'groq' else '600'))))
+    deadline = time.monotonic() + duration_seconds
     while requests_made < request_limit and time.monotonic() < deadline:
         now = datetime.now(timezone.utc)
         reset_daily_state(state, now)
@@ -990,6 +992,11 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
                  runLocalBlocks=local_blocks_count, runCompletedArticles=completed_articles,
                  runStatus="unavailable" if fatal_error else "rate_limited" if state.get("nextAttemptAt")
                  else "progress" if translated_blocks_count else "waiting")
+    state['runStopReason'] = ('error' if fatal_error else
+        'rate_limited' if state.get('nextAttemptAt') else
+        'daily_limit' if state.get('requestsToday', 0) >= args.daily_limit else
+        'request_limit' if requests_made >= request_limit else
+        'time_limit' if time.monotonic() >= deadline else 'queue_empty')
     if translated_blocks_count:
         state["lastOutputAt"] = utc_now()
     atomic_write_json(state_file, state)
@@ -1038,7 +1045,7 @@ def main() -> int:
                 path = STATE_FILE if provider == 'openrouter' else STATE_FILE.with_name(f'{provider}-state.json')
                 state = read_json(path) or {}
                 runtime['providers'][provider] = {k: state.get(k) for k in (
-                    'runStatus', 'runStartedAt', 'runFinishedAt', 'runRequests', 'runTranslatedBlocks',
+                    'runStatus', 'runStopReason', 'runStartedAt', 'runFinishedAt', 'runRequests', 'runTranslatedBlocks',
                     'runCompletedArticles', 'runModelBlocks', 'runLocalBlocks', 'lastOutputAt', 'lastStatus', 'lastModel', 'nextAttemptAt')}
             atomic_write_json(RUNTIME_FILE, runtime)
     coordinator.finish()
@@ -1049,5 +1056,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

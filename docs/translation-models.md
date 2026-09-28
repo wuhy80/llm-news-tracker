@@ -190,3 +190,28 @@ read/modify/write lock; the main thread updates runtime status and rebuilds the
 global index/queue after workers finish. The Actions archive-writes concurrency
 group remains mandatory: do not run multiple translation processes against the
 same directory. Git commit and deployment remain centralized in the workflow.
+
+## Groq accounting and bounded continuation
+
+Groq admission retains the 75% configured/observed quota safety margin. Requests
+reserve input bytes plus output capacity before calling the API. Successful parsed
+responses carrying valid prompt_tokens, completion_tokens and total_tokens settle
+the current reservation to actual total usage for the rolling daily budget.
+Minute admission retains max(reserved, actual) and observed server headers still
+win. Errors, missing usage, interruptions and historical reservations stay fully
+reserved; request counts are never refunded. Gemini accounting is unchanged.
+
+Both historical representations of Groq HTTP 400 json_validate_failed are repaired
+in worker state. Genuine account/model cooldowns and token ledgers remain intact.
+
+Groq defaults to at most 48 requests or 1200 seconds per worker run, also bounded
+by the common request limit and all provider quotas. Chunk size stays at 1200
+characters / 4 blocks until live usage and quality justify changing it.
+
+Cron remains best-effort. After validated progress is committed, a finished run
+with model output stopped only by its per-run time/request budget can dispatch
+a successor, up to three successors per chain. No continuation for cooldowns,
+empty queues, failed-only output, stale runtime files or exhausted daily budgets.
+Manual request/daily/interval/model inputs are preserved. The workflow requires
+actions: write for dispatch and retains archive-writes serialization. Dispatch
+does not guarantee immediate runner availability or eliminate cron delays.
