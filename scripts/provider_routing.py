@@ -8,6 +8,7 @@ import math
 import os
 import re
 import time
+import threading
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -66,7 +67,16 @@ class DirectModelPool(BigModelPool):
             self.health = {}
 
 
+_METRICS_LOCK = threading.Lock()
+
+
 def record_attempt(root, provider, model, accepted, expected, elapsed, outcome, now=None):
+    # Lock the entire read/modify/write, not only the atomic file replacement.
+    with _METRICS_LOCK:
+        _record_attempt(root, provider, model, accepted, expected, elapsed, outcome, now)
+
+
+def _record_attempt(root, provider, model, accepted, expected, elapsed, outcome, now=None):
     now = now or datetime.now(timezone.utc)
     path = root / 'provider-metrics.json'
     data = read(path)

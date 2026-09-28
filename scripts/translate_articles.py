@@ -10,6 +10,8 @@ import os
 import re
 import time
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -629,7 +631,71 @@ def normalize_headers(headers: object) -> dict[str, str]:
     return {str(key).lower(): str(value) for key, value in dict(headers or {}).items()}
 
 
-def run_provider(provider: str = "openrouter") -> int:
+
+class ArticleCoordinator:
+    """One Actions process, one owner per article, one worker per provider.
+
+    Ownership spans chunks to keep an article on the same provider. Network calls
+    and provider admission waits never hold the queue lock. The Actions-wide
+    archive-writes lock still excludes news/other translation processes.
+    """
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.owners = {}
+        self.prepared = False
+
+    def prepare(self):
+        with self.condition:
+            if not self.prepared:
+                remove_stale_records()
+                self.data = load_news(NEWS_FILE)
+                self.requests = sync_requests()
+                self.data['items'] = resolve_items(self.data.get('items', []), self.requests)
+                publish_queue(self.requests, self.data['items'])
+                self.prepared = True
+            return self.data, self.requests
+
+    def release(self, provider):
+        with self.condition:
+            self.owners = {key: owner for key, owner in self.owners.items() if owner != provider}
+            self.condition.notify_all()
+
+    def claim(self, provider, model, deferred, deadline):
+        with self.condition:
+            while time.monotonic() < deadline:
+                items = [item for item in self.data['items']
+                         if item['id'] not in deferred
+                         and self.owners.get(item['id'], provider) == provider]
+                candidates = select_candidates(items, datetime.now(timezone.utc), model, list(self.requests))
+                if candidates:
+                    # Prefer finishing the current article before claiming another.
+                    candidate = next((c for c in candidates if self.owners.get(c[0]['id']) == provider), candidates[0])
+                    self.release(provider)
+                    self.owners[candidate[0]['id']] = provider
+                    return candidate
+                self.release(provider)
+                if not self.owners:
+                    return None
+                # Another provider may release a partially translated article.
+                self.condition.wait(timeout=min(1.0, max(0, deadline - time.monotonic())))
+            self.release(provider)
+            return None
+
+    def finish(self):
+        if self.prepared:
+            atomic_write_json(INDEX_FILE, build_translation_index())
+            publish_queue(self.requests, self.data['items'])
+
+
+def run_provider(provider: str = "openrouter", coordinator=None) -> int:
+    try:
+        return _run_provider(provider, coordinator)
+    finally:
+        if coordinator is not None:
+            coordinator.release(provider)
+
+
+def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "4")))
     parser.add_argument("--daily-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_DAILY_LIMIT", "1000")))
@@ -638,15 +704,18 @@ def run_provider(provider: str = "openrouter") -> int:
     parser.add_argument("--chunk-blocks", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_CHUNK_BLOCKS", "20")))
     args = parser.parse_args()
 
-    stale_records = remove_stale_records()
-    if stale_records:
-        print(f"[translate] removed {stale_records} stale translation records")
-        atomic_write_json(INDEX_FILE, build_translation_index())
+    if coordinator is not None:
+        data, requests = coordinator.prepare()
+    else:
+        stale_records = remove_stale_records()
+        if stale_records:
+            print(f"[translate] removed {stale_records} stale translation records")
+            atomic_write_json(INDEX_FILE, build_translation_index())
 
-    data = load_news(NEWS_FILE)
-    requests = sync_requests()
-    data["items"] = resolve_items(data.get("items", []), requests)
-    publish_queue(requests, data["items"])
+        data = load_news(NEWS_FILE)
+        requests = sync_requests()
+        data["items"] = resolve_items(data.get("items", []), requests)
+        publish_queue(requests, data["items"])
 
     state_file = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name(f"{provider}-state.json")
     health_file = MODEL_HEALTH_FILE if provider == "openrouter" else MODEL_HEALTH_FILE.with_name(f"{provider}-health.json")
@@ -693,7 +762,8 @@ def run_provider(provider: str = "openrouter") -> int:
     atomic_write_json(state_file, state)
     pause_until = parse_time(state.get("nextAttemptAt"))
     if pause_until and pause_until > now:
-        publish_queue(requests, data["items"], pause_until.isoformat())
+        if coordinator is None:
+            publish_queue(requests, data["items"], pause_until.isoformat())
         state.update(runStatus="rate_limited", runFinishedAt=utc_now())
         atomic_write_json(state_file, state)
         print(f"[translate] paused until {pause_until.isoformat()}")
@@ -730,11 +800,15 @@ def run_provider(provider: str = "openrouter") -> int:
         reset_daily_state(state, now)
         if state.get("requestsToday", 0) >= args.daily_limit:
             break
-        candidates = select_candidates(data.get("items", []), now, model, list(requests))
-        candidates = [c for c in candidates if c[0]["id"] not in deferred_articles]
-        if not candidates:
+        if coordinator is None:
+            candidates = select_candidates(data.get("items", []), now, model, list(requests))
+            candidates = [c for c in candidates if c[0]["id"] not in deferred_articles]
+            candidate = candidates[0] if candidates else None
+        else:
+            candidate = coordinator.claim(provider, model, deferred_articles, deadline)
+        if candidate is None:
             break
-        item, _, blocks, path, record = candidates[0]
+        item, _, blocks, path, record = candidate
         chunk = pending_chunk(blocks, record, max(500, args.chunk_chars), max(1, args.chunk_blocks))
         if not chunk:
             expected_ids = {b["id"] for b in translatable_blocks(blocks)}
@@ -919,8 +993,9 @@ def run_provider(provider: str = "openrouter") -> int:
     if translated_blocks_count:
         state["lastOutputAt"] = utc_now()
     atomic_write_json(state_file, state)
-    atomic_write_json(INDEX_FILE, build_translation_index())
-    publish_queue(requests, data["items"])
+    if coordinator is None:
+        atomic_write_json(INDEX_FILE, build_translation_index())
+        publish_queue(requests, data["items"])
     return 1 if fatal_error or (requests_made and not translated_blocks_count) else 0
 
 
@@ -943,19 +1018,30 @@ def main() -> int:
                           if os.getenv("GITHUB_REPOSITORY") and os.getenv("GITHUB_RUN_ID") else None)}
     atomic_write_json(RUNTIME_FILE, runtime)
     results = []
-    for provider in providers:
-        try:
-            results.append(run_provider(provider))
-        except Exception as error:
-            print(f"::error::{provider} worker failed: {type(error).__name__}")
-            results.append(1)
-            runtime["providers"][provider] = {"runStatus": "error"}
-            continue
-        path = STATE_FILE if provider == "openrouter" else STATE_FILE.with_name(f"{provider}-state.json")
-        state = read_json(path) or {}
-        runtime["providers"][provider] = {k: state.get(k) for k in (
-            "runStatus", "runStartedAt", "runFinishedAt", "runRequests", "runTranslatedBlocks",
-            "runCompletedArticles", "runModelBlocks", "runLocalBlocks", "lastOutputAt", "lastStatus", "lastModel", "nextAttemptAt")}
+    coordinator = ArticleCoordinator()
+    runtime.update(executionMode='parallel', maxConcurrentProviders=len(providers))
+    runtime['providers'] = {p: {'runStatus': 'running'} for p in providers}
+    atomic_write_json(RUNTIME_FILE, runtime)
+    # Exactly one worker owns each provider's quota/health files. Evaluation has
+    # already finished; it cannot race with these workers for the same allowance.
+    with ThreadPoolExecutor(max_workers=max(1, len(providers))) as executor:
+        futures = {executor.submit(run_provider, provider, coordinator): provider for provider in providers}
+        for future in as_completed(futures):
+            provider = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as error:
+                print(f"::error::{provider} worker failed: {type(error).__name__}")
+                results.append(1)
+                runtime['providers'][provider] = {'runStatus': 'error'}
+            else:
+                path = STATE_FILE if provider == 'openrouter' else STATE_FILE.with_name(f'{provider}-state.json')
+                state = read_json(path) or {}
+                runtime['providers'][provider] = {k: state.get(k) for k in (
+                    'runStatus', 'runStartedAt', 'runFinishedAt', 'runRequests', 'runTranslatedBlocks',
+                    'runCompletedArticles', 'runModelBlocks', 'runLocalBlocks', 'lastOutputAt', 'lastStatus', 'lastModel', 'nextAttemptAt')}
+            atomic_write_json(RUNTIME_FILE, runtime)
+    coordinator.finish()
     runtime.update(finishedAt=utc_now(), status="finished" if providers else "not_configured")
     atomic_write_json(RUNTIME_FILE, runtime)
     return int(bool(results) and any(results))

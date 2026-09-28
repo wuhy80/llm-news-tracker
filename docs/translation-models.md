@@ -166,3 +166,27 @@ GitHub Actions 定时任务可能延迟，不保证准点执行。
 - https://ai.google.dev/gemini-api/docs/pricing
 - https://ai.google.dev/gemini-api/docs/rate-limits
 - https://ai.google.dev/gemini-api/docs/openai
+
+## Parallel provider execution
+
+After the once-daily evaluation, eligible providers run concurrently in one Actions
+process, with exactly one worker per provider (at most four). Each keeps its existing
+request/token admission checks, free-model allowlist, quota accounting and cooldowns.
+Evaluation completes before workers start. Ranking determines eligibility/model
+selection and submission order; it does not serialize providers or guarantee which
+thread claims the first article.
+
+A shared coordinator initializes the queue once and exclusively assigns each article
+to one provider across chunks. Network calls and rate-control waits do not hold the
+queue lock. Completion, deferral or worker exit releases ownership. Idle workers
+wait for active owners to release unfinished work, bounded by the worker deadline;
+all previously saved blocks are reloaded before another provider resumes. Content
+backoff remains in force. Process interruption discards only in-memory ownership,
+so the next workflow can resume persisted progress without stale leases.
+
+Each worker exclusively owns its provider's state, rate and health files. Article
+sidecars are saved incrementally under article ownership. Shared metrics use a
+read/modify/write lock; the main thread updates runtime status and rebuilds the
+global index/queue after workers finish. The Actions archive-writes concurrency
+group remains mandatory: do not run multiple translation processes against the
+same directory. Git commit and deployment remain centralized in the workflow.
