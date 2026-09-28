@@ -48,10 +48,15 @@ def read(path):
 
 
 def output_limit(provider):
-    return 2048 if provider in ('gemini', 'groq') else 8000
+    # The live Groq account enforces 1000 output tokens/minute separately
+    # from combined TPM. Keep 25% headroom; never infer this from public TPM.
+    return 750 if provider == 'groq' else 2048 if provider == 'gemini' else 8000
 
 
 def reservation(prompt, chunk, provider):
+    if provider == 'groq' and sum(len(b['source']) for b in chunk) > 500:
+        # Do not truncate source blocks: leave them for another approved provider.
+        raise RequestTooLarge('Source needs a larger output budget than Groq permits')
     # UTF-8 bytes are a deliberately conservative token upper estimate. Include
     # serialization/roles and the full output cap (including reasoning tokens).
     source = json.dumps({'blocks': [{k: b[k] for k in ('id', 'kind', 'source')} for b in chunk]}, ensure_ascii=False)

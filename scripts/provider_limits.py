@@ -69,6 +69,10 @@ def repair_content_pause(provider, state):
 
 class TokenRateControl(RateControl):
     def __init__(self, path, provider, interval=0):
+        # One completion per rolling minute across this provider, including
+        # evaluation/model changes and restarts. 750 <= observed OTPM 1000.
+        if provider == 'groq':
+            interval = max(interval, 61)
         super().__init__(path, provider, interval)
         self._pending = {}
         # Repair only the exact historical content-error misclassification.
