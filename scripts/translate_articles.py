@@ -20,7 +20,7 @@ from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
 from translation_models import ModelPool, BigModelPool
 from api_rate_control import RateControl, RateLimited
-from provider_limits import TokenRateControl, RequestTooLarge
+from provider_limits import TokenRateControl, RequestTooLarge, is_content_error
 from provider_routing import (PROVIDERS, DirectModelPool, prepare_routing, read as read_routing,
                               output_limit, reservation, record_attempt)
 
@@ -684,6 +684,10 @@ def run_provider(provider: str = "openrouter") -> int:
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
+    if (provider == 'groq' and state.get('lastError', '').startswith('HTTP 400: ')
+            and re.search(r'"code"\s*:\s*"json_validate_failed"', state['lastError'])):
+        state.pop('nextAttemptAt', None)
+        state['lastStatus'] = 'content_error'
     state.update(runStartedAt=utc_now(), runFinishedAt=None, runStatus="running", provider=provider,
                  runRequests=0, runTranslatedBlocks=0, runModelBlocks=0, runLocalBlocks=0, runCompletedArticles=0)
     atomic_write_json(state_file, state)
@@ -839,6 +843,10 @@ def run_provider(provider: str = "openrouter") -> int:
         except Exception as error:
             failed_at = datetime.now(timezone.utc)
             message = error_message(error)
+            if is_content_error(provider, error):
+                control.observe(model, error.headers)
+                outcome = 'content_error'
+                error = ValueError('Provider could not generate valid translation JSON')
             code = error.code if isinstance(error, urllib.error.HTTPError) else None
             if code in {402, 429} or (provider in ('groq', 'gemini') and code in {400, 401, 403, 404, 410, 500, 502, 503, 504}):
                 outcome = 'rate_limited' if code == 429 else 'error'
@@ -955,7 +963,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 
 

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from api_rate_control import RateControl, RateLimited, timestamp
 from news_store import atomic_write_json
-from provider_limits import TokenRateControl, RequestTooLarge
+from provider_limits import TokenRateControl, RequestTooLarge, is_content_error
 from translation_models import BigModelPool, ModelPool
 
 PROVIDERS = {
@@ -169,7 +169,10 @@ def prepare_routing(root, providers, worker, now=None):
             except Exception as error:
                 worker.error_message(error)
                 result.update(status='error', reason=type(error).__name__, httpStatus=getattr(error, 'code', None))
-                if isinstance(error, urllib.error.HTTPError):
+                if is_content_error(provider, error):
+                    control.observe(model, error.headers)
+                    result.update(status='quality_failed', fidelityProxy=0)
+                elif isinstance(error, urllib.error.HTTPError):
                     if hasattr(control, 'penalize_error'):
                         limited = control.penalize_error(model, error)
                     else:

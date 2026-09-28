@@ -150,6 +150,53 @@ class ResilienceTests(unittest.TestCase):
             self.assertEqual(state['runLocalBlocks'], 0)
             self.assertEqual(state['runCompletedArticles'], 1)
 
+    def test_groq_json_failure_defers_blocks_without_disabling_account(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            (root/'provider-ranking.json').write_text(json.dumps({'selectedModels': {'groq':'openai/gpt-oss-120b'}}))
+            (root/'groq-state.json').write_text(json.dumps({
+                'nextAttemptAt':'2099-01-01T00:00:00+00:00',
+                'lastError':'HTTP 400: {"error":{"code":"json_validate_failed"}}'}))
+            a = tr.article_blocks('Bad paragraph.\n\nGood paragraph.')
+            b = tr.article_blocks('Another article.')
+            one = {'status': 'partial', 'totalBlocks': 2, 'translatedBlocks': 0, 'blocks': []}
+            two = {'status': 'partial', 'totalBlocks': 1, 'translatedBlocks': 0, 'blocks': []}
+            records = [({'id': 'one'}, {}, a, root/'one.json', one), ({'id': 'two'}, {}, b, root/'two.json', two)]
+            def candidates(*args):
+                return [r for r in records if r[-1]['status'] != 'complete']
+            calls = []
+            def request(token, model, chunk, endpoint):
+                calls.append(chunk)
+                if len(calls) == 1:
+                    raise urllib.error.HTTPError('https://example.com', 400, 'bad JSON', {},
+                        io.BytesIO(b'{"error":{"code":"json_validate_failed"}}'))
+                entries = [{'id': x['id'], 'translationZh': x['source'] if x['source'].startswith('Bad') else '合格的译文。'} for x in chunk]
+                return {'translations': entries}, model, {}
+            stack.enter_context(patch.object(tr, 'TokenRateControl'))
+            mocks = {'remove_stale_records': 0, 'load_news': {'items': []}, 'sync_requests': {},
+                     'resolve_items': [], 'publish_queue': None, 'build_translation_index': {}}
+            for name, value in mocks.items():
+                stack.enter_context(patch.object(tr, name, return_value=value))
+            for name, filename in [('STATE_FILE', 'state.json'), ('MODEL_HEALTH_FILE', 'health.json'), ('INDEX_FILE', 'index.json')]:
+                stack.enter_context(patch.object(tr, name, root/filename))
+            stack.enter_context(patch.dict(os.environ, {'GROQ_API_KEY': 'test'}, clear=True))
+            stack.enter_context(patch.object(sys, 'argv', ['translate', '--request-limit', '5', '--interval', '0']))
+            stack.enter_context(patch.object(tr, 'select_candidates', side_effect=candidates))
+            stack.enter_context(patch.object(tr, 'request_translation', side_effect=request))
+            stack.enter_context(patch('translation_models.fetch_catalog', return_value=catalog()))
+            self.assertEqual(tr.run_provider('groq'), 0)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(one['translatedBlocks'], 0)
+            self.assertEqual(one['status'], 'partial')
+            self.assertEqual(two['status'], 'complete')
+            tr.TokenRateControl.return_value.penalize_error.assert_not_called()
+            self.assertTrue(one.get('blockFailures'))
+            state = json.loads((root/'groq-state.json').read_text())
+            self.assertEqual(state['runTranslatedBlocks'], 1)
+            self.assertEqual(state['runModelBlocks'], 1)
+            self.assertEqual(state['runLocalBlocks'], 0)
+            self.assertEqual(state['runCompletedArticles'], 1)
+
     def test_bigmodel_overload_code_is_preserved_for_service_classification(self):
         error = urllib.error.HTTPError(tr.BIGMODEL_ENDPOINT, 429, 'busy', {},
                                       io.BytesIO(b'{"error":{"code":"1305","message":"busy"}}'))
