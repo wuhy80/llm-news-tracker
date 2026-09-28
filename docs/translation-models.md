@@ -208,10 +208,15 @@ Groq defaults to at most 48 requests or 1200 seconds per worker run, also bounde
 by the common request limit and all provider quotas. Chunk size stays at 1200
 characters / 4 blocks until live usage and quality justify changing it.
 
-Cron remains best-effort. After validated progress is committed, a finished run
-with model output stopped only by its per-run time/request budget can dispatch
-a successor, up to three successors per chain. No continuation for cooldowns,
-empty queues, failed-only output, stale runtime files or exhausted daily budgets.
-Manual request/daily/interval/model inputs are preserved. The workflow requires
-actions: write for dispatch and retains archive-writes serialization. Dispatch
-does not guarantee immediate runner availability or eliminate cron delays.
+Cron remains best-effort. In the existing Actions job, a finished batch with model
+output stopped only by its per-run time/request budget can continue for up to two
+additional batches (three total). Each batch checkpoints validated-on-ingestion
+translations and consumed quota using existing contents permission before further
+API calls. No new Actions permission or workflow dispatch is used. The final
+sidecar validation and deployment remain in the existing workflow.
+
+No continuation for cooldowns, empty queues, failed-only output, stale runtime
+files or exhausted daily budgets. Existing request/daily/interval/model environment
+configuration remains in force. The archive-writes lock is held for the bounded
+job. This improves work per scheduled execution, but cannot eliminate cron delays
+or guarantee work between jobs; it may hold the archive lock for about an hour.

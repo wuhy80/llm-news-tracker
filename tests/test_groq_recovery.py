@@ -13,6 +13,8 @@ from api_rate_control import RateControl, RateLimited
 from provider_limits import TokenRateControl, UsageHeaders, repair_content_pause
 from continue_translation import continuation_inputs
 import translate_articles as tr
+import continue_translation as batches
+from types import SimpleNamespace
 
 
 class GroqRecoveryTests(unittest.TestCase):
@@ -109,6 +111,24 @@ class GroqRecoveryTests(unittest.TestCase):
             gate.observe('openai/gpt-oss-120b', headers)
             self.assertEqual(gate.data['reservations']['openai/gpt-oss-120b'][0]['tokens'], 800)
             self.assertNotIn('usage', dict(headers))
+
+    def test_in_job_batches_checkpoint_before_next_calls_and_stop_at_three(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'data/translations').mkdir(parents=True)
+            runtime = {'runUrl': 'https://github.com/a/b/actions/runs/123', 'status': 'finished',
+                       'providers': {'groq': {'runStatus': 'progress', 'runStopReason': 'request_limit', 'runModelBlocks': 1}}}
+            (root/'data/translations/runtime.json').write_text(json.dumps(runtime))
+            actions = []
+            def run(command, **kwargs):
+                actions.append(Path(command[-1]).name)
+                return SimpleNamespace(returncode=0)
+            with patch.object(batches, '__file__', str(root/'scripts/continue_translation.py')), \
+                 patch.dict(os.environ, {'GITHUB_REPOSITORY': 'a/b', 'GITHUB_RUN_ID': '123'}, clear=True), \
+                 patch.object(batches.subprocess, 'run', side_effect=run), \
+                 patch.object(batches, 'checkpoint', side_effect=lambda _: actions.append('checkpoint')):
+                self.assertEqual(batches.main(), 0)
+            self.assertEqual(actions, ['translate_articles.py', 'validate_translations.py', 'checkpoint'] * 3)
 
     def test_bounded_continuation_preserves_inputs_and_rejects_stale_or_idle_runs(self):
         runtime = {'runUrl': 'current', 'status': 'finished', 'providers': {'groq': {
