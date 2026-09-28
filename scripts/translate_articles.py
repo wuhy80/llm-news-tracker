@@ -430,6 +430,8 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
     with urllib.request.urlopen(request, timeout=180) as response:
         response_payload = json.loads(response.read().decode("utf-8"))
         headers = UsageHeaders(normalize_headers(response.headers), usage=response_payload.get("usage"))
+    if response_payload['choices'][0].get('finish_reason') == 'length':
+        raise ValueError('Translation response reached output limit; do not accept truncated text')
     content = response_payload["choices"][0]["message"]["content"]
     return extract_json_object(content), str(response_payload.get("model") or model), headers
 
@@ -743,6 +745,8 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         args.request_limit = min(args.request_limit, int(os.getenv(provider.upper() + '_TRANSLATION_REQUEST_LIMIT', '48' if provider == 'groq' else '16')))
         args.daily_limit = int(os.getenv(provider.upper() + '_TRANSLATION_DAILY_LIMIT', '1000'))
         args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 1200), min(args.chunk_blocks, 4)
+        if provider == 'groq':
+            args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 500), 1
     elif preferred and provider == 'openrouter':
         model = preferred
     state = load_state(state_file)
