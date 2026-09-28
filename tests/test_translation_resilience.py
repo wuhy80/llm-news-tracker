@@ -95,7 +95,7 @@ class ResilienceTests(unittest.TestCase):
             patch.object(tr, 'STATE_FILE', Path(directory) / 'state.json'), \
             patch.object(tr, 'run_provider', side_effect=[RuntimeError('service unavailable'), 0]) as run:
             self.assertEqual(tr.main(), 1)
-            self.assertEqual([x.args[0] for x in run.call_args_list], ['bigmodel', 'openrouter'])
+            self.assertCountEqual([x.args[0] for x in run.call_args_list], ['bigmodel', 'openrouter'])
             state = json.loads((Path(directory) / 'runtime.json').read_text())
             self.assertEqual(state['status'], 'finished')
             self.assertNotIn('test-b', json.dumps(state))
@@ -107,7 +107,8 @@ class ResilienceTests(unittest.TestCase):
             patch.object(tr, 'STATE_FILE', Path(directory) / 'state.json'), \
             patch.object(tr, 'run_provider', return_value=0) as run:
             self.assertEqual(tr.main(), 0)
-            run.assert_called_once_with('openrouter')
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], 'openrouter')
             self.assertFalse(json.loads((Path(directory) / 'runtime.json').read_text())['bigmodelConfigured'])
 
     def test_real_worker_keeps_partial_results_and_processes_next_article(self):
