@@ -156,8 +156,9 @@ class ResilienceTests(unittest.TestCase):
             root = Path(directory)
             (root/'provider-ranking.json').write_text(json.dumps({'selectedModels': {'groq':'openai/gpt-oss-120b'}}))
             (root/'groq-state.json').write_text(json.dumps({
+                'utcDate':datetime.now(timezone.utc).date().isoformat(),
                 'nextAttemptAt':'2099-01-01T00:00:00+00:00',
-                'lastError':'HTTP 400: {"error":{"code":"json_validate_failed"}}'}))
+                'lastError':'account: HTTP 400 / json_validate_failed; next attempt after 2099-01-01T00:00:00+00:00'}))
             a = tr.article_blocks('Bad paragraph.\n\nGood paragraph.')
             b = tr.article_blocks('Another article.')
             one = {'status': 'partial', 'totalBlocks': 2, 'translatedBlocks': 0, 'blocks': []}
@@ -216,4 +217,3 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
