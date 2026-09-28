@@ -27,6 +27,33 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_groq_output_budget_defers_long_blocks_without_mutating_them(self):
+        chunk = tr.article_blocks('A' * 501)
+        original = json.dumps(chunk)
+        with self.assertRaises(RequestTooLarge):
+            routing.reservation(tr.SYSTEM_PROMPT, chunk, 'groq')
+        self.assertEqual(json.dumps(chunk), original)
+        self.assertGreater(routing.reservation(tr.SYSTEM_PROMPT, chunk, 'gemini'), 0)
+
+    def test_groq_output_pacing_survives_restart_and_model_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'rate.json'
+            gate = TokenRateControl(path, 'groq')
+            gate.finished('qwen/qwen3.8-27b', success=True)
+            restored = TokenRateControl(path, 'groq')
+            with patch('api_rate_control.time.sleep') as sleep:
+                restored.acquire('openai/gpt-oss-120b', tokens=1000)
+            self.assertGreaterEqual(restored.minimum, 61)
+            self.assertGreater(sleep.call_args.args[0], 60)
+
+    def test_valid_json_with_length_finish_is_never_accepted(self):
+        class Response(io.BytesIO):
+            headers = {}
+        body = {'choices': [{'finish_reason': 'length', 'message': {'content': '{"translations":[]}'}}]}
+        with patch.object(tr.urllib.request, 'urlopen', return_value=Response(json.dumps(body).encode())):
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                tr.request_translation('fake', 'qwen/qwen3.8-27b', [], routing.PROVIDERS['groq']['endpoint'])
+
     def test_direct_payloads_use_own_endpoint_key_no_paid_router_or_tools(self):
         class Response(io.BytesIO):
             headers = {}
@@ -40,7 +67,7 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(req.headers['Authorization'], 'Bearer fake')
                 self.assertNotIn('provider', payload)
                 self.assertNotIn('tools', payload)
-                self.assertEqual(payload['max_tokens'], 2048)
+                self.assertEqual(payload['max_tokens'], 750 if provider == 'groq' else 2048)
                 self.assertEqual(payload['response_format'], {'type': 'json_object'})
         with self.assertRaises(ValueError):
             tr.request_translation('fake', 'paid-other-model', [], routing.PROVIDERS['groq']['endpoint'])
@@ -233,7 +260,7 @@ class ProviderTests(unittest.TestCase):
         chunk = tr.article_blocks('\n\n'.join(row[0] for row in routing.FIXTURE))
         groq = routing.reservation(tr.SYSTEM_PROMPT, chunk, 'groq')
         gemini = routing.reservation(tr.SYSTEM_PROMPT, chunk, 'gemini')
-        self.assertEqual(groq-gemini, 2048)
+        self.assertEqual(groq-gemini, 750)
         self.assertLess(groq, 6000)
         self.assertGreater(gemini, len(tr.SYSTEM_PROMPT))
 
