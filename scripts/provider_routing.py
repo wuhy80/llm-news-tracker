@@ -3,6 +3,8 @@
 Scores are automatic fidelity/format proxies, not human semantic-quality grades.
 No external judge, arbitrary model discovery, or additional account keys.
 """
+from token_usage import usage_purpose
+
 import json
 import math
 import os
@@ -172,7 +174,8 @@ def prepare_routing(root, providers, worker, now=None):
                 admitted = True
                 # Compare API latency, excluding our own admission/pacing delay.
                 started = time.monotonic()
-                payload, actual, headers = worker.request_translation(token, model, chunk, spec['endpoint'])
+                with usage_purpose('evaluation'):
+                    payload, actual, headers = worker.request_translation(token, model, chunk, spec['endpoint'])
                 if hasattr(control, 'observe'):
                     control.observe(model, headers)
                 quality, translations = grade(payload, chunk, worker)
@@ -234,3 +237,4 @@ def prepare_routing(root, providers, worker, now=None):
     report.update(order=order, selectedModels=selected, status='finished', finishedAt=datetime.now(timezone.utc).isoformat())
     atomic_write_json(path, report)
     return report
+

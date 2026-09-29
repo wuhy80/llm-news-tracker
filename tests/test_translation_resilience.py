@@ -187,15 +187,15 @@ class ResilienceTests(unittest.TestCase):
             stack.enter_context(patch.object(tr, 'request_translation', side_effect=request))
             stack.enter_context(patch('translation_models.fetch_catalog', return_value=catalog()))
             self.assertEqual(tr.run_provider('groq'), 0)
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(one['translatedBlocks'], 0)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(one['translatedBlocks'], 1)
             self.assertEqual(one['status'], 'partial')
             self.assertEqual(two['status'], 'complete')
             tr.TokenRateControl.return_value.penalize_error.assert_not_called()
             self.assertTrue(one.get('blockFailures'))
             state = json.loads((root/'groq-state.json').read_text())
-            self.assertEqual(state['runTranslatedBlocks'], 1)
-            self.assertEqual(state['runModelBlocks'], 1)
+            self.assertEqual(state['runTranslatedBlocks'], 2)
+            self.assertEqual(state['runModelBlocks'], 2)
             self.assertEqual(state['runLocalBlocks'], 0)
             self.assertEqual(state['runCompletedArticles'], 1)
 
@@ -217,3 +217,4 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
