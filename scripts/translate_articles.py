@@ -21,6 +21,7 @@ from article_store import ROOT, normalize_fenced_body, publication_path, snapsho
 from news_store import atomic_write_json, load_news
 from translation_queue import sync_requests, resolve_items, publish_queue
 from translation_models import ModelPool, BigModelPool
+from token_usage import track_request
 from api_rate_control import RateControl, RateLimited
 from provider_limits import TokenRateControl, RequestTooLarge, is_content_error, repair_content_pause, UsageHeaders
 from provider_routing import (PROVIDERS, DirectModelPool, prepare_routing, read as read_routing,
@@ -427,9 +428,12 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
             "User-Agent": "LLM-Pulse/1.0",
         },
     )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        response_payload = json.loads(response.read().decode("utf-8"))
-        headers = UsageHeaders(normalize_headers(response.headers), usage=response_payload.get("usage"))
+    provider = direct or ('bigmodel' if endpoint == BIGMODEL_ENDPOINT else 'openrouter')
+    with track_request(provider, model) as accounting:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+            accounting['usage'] = response_payload.get('usage', response_payload.get('usageMetadata'))
+            headers = UsageHeaders(normalize_headers(response.headers), usage=response_payload.get("usage"))
     if response_payload['choices'][0].get('finish_reason') == 'length':
         raise ValueError('Translation response reached output limit; do not accept truncated text')
     content = response_payload["choices"][0]["message"]["content"]
@@ -1060,3 +1064,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
