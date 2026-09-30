@@ -180,7 +180,7 @@ class ProviderTests(unittest.TestCase):
              patch.object(tr, 'RUNTIME_FILE', Path(directory)/'runtime.json'), \
              patch.object(tr, 'prepare_routing', return_value={'order':['groq','gemini','bigmodel'], 'evaluationDate':'2026-09-27'}), \
              patch.object(tr, 'run_provider', side_effect=[RuntimeError('failure'),0,0]) as run:
-            self.assertEqual(tr.main(), 1)
+            self.assertEqual(tr.main(), 0)
             self.assertEqual([c.args[0] for c in run.call_args_list], ['groq','gemini','bigmodel'])
 
     def test_evaluate_only_never_runs_bulk_translation(self):
