@@ -1059,7 +1059,7 @@ def main() -> int:
     coordinator.finish()
     runtime.update(finishedAt=utc_now(), status="finished" if providers else "not_configured")
     atomic_write_json(RUNTIME_FILE, runtime)
-    return int(bool(results) and any(results))
+    # Providers are isolated: a temporary outage in one service must not turn a\n    # productive multi-provider run into a failed workflow. Keep every\n    # provider's error in runtime.json/model health so monitoring can report the\n    # degradation, but only fail the process when no configured provider could\n    # run successfully.\n    return int(bool(results) and all(results))
 
 
 if __name__ == "__main__":
