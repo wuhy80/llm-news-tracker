@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-01T16:44:54.245559Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# We got local models to triage the OpenClaw repo for FREE!*\n\n*Free as in beer, excluding the cost of electricity, and assuming you already own the hardware\n\nJune 2026 will go down as the moment that people realized closed models can be taken away. With the removal of Anthropic's latest flagship model Claude Fable 5 fresh in memory, one can see why it is more important than ever to own your AI stack and be able to run models locally, especially if you are building your business on top of AI.\n\nIn that light, we wanted to share how we use local models like Gemma and Qwen in an agent harness, to run classification tasks [1] . This approach is different from using a model like BERT for classification. A local model in an agent harness like Pi can be used in tandem with structured outputs, to assign labels. We chose this approach because we already had local models and the harness on hand, and have conviction that similar setups will increase in popularity as local models improve in capability. [2]\n\nOur starting point was open source contributions in the OpenClaw repo. OpenClaw gets hundreds of issues and PRs every day, which need to be triaged, prioritized and routed to maintainers. I, Onur, am working to make local models work well with OpenClaw. Being a maintainer of this specific vertical, I need to react quickly to any P0 issues.\n\nWith SOTA closed models like GPT-5, Opus, or Sonnet, this is a pretty straightforward task. But I happen to sit on 128 GB of unified memory, namely an NVIDIA GB10. So I took on the task:\n\nCan I build a real-time notification system that filters and notifies me for only the issues that I am responsible for... with local open-weight models?\n\nThis tiny box, a.k.a. DGX Spark, can run gemma-4-26b-a4b with high concurrency and generate hundreds of tokens per second.\n\nIf I set up my OpenClaw main agent running on a 200/mo ChatGPT Pro plan to trigger a job on every new issue or PR, that would use up my quota. I might instead set it to run every 2 hours, or 6 hours. This would batch issues over longer periods, so we would be trading real-time notifications for delayed processing.\n\nIf I were to run this on a local model on the hardware I already have up and running, I would not only have near-instantaneous notifications, I would also be able to do it for free (or rather, for the cost of electricity).\n\n## Categorizing issues and PRs\n\nWe came up with a finite set of labels representing the categories of issues we need to triage, and then use a local model to classify each issue into one of those categories, like local_models , self_hosted_inference , acp , agent_runtime , codex , ui_tui and so on. [3]\n\nBut how do we classify pull requests? A simple single request to a Chat Completions endpoint with a tool JSON schema, with the topics as an enum?\n\nKind of. But this is 2026, not 2023, and we have AGENTS. We can do better!\n\nFor the local model choices, we tested gemma-4-26b-a4b and qwen3.6-35b-a3b . With performance optimizations, both can generate hundreds of tokens per second locally.\n\nWe use an agent harness to drive the classification run. For this, we bundle pi as a harness that can call local model endpoints.\n\nThe agent by default receives the PR title, body and a truncated excerpt of the PR diff in the first prompt. Then, it can choose to use the bash tool to perform read-only operations on the OpenClaw repo (in case it needs to look at the codebase), or the final_json tool to submit the final classification result.\n\nYou wouldn't want to give full bash access to a local model running in this high-throughput setting, because a prompt-injected issue or PR could otherwise steer the model into doing something unrelated to classification.\n\nFor that reason, we use reposhell instead of bash : a restricted bash -like shell that only allows read-only operations ( ls , find , cat , grep , etc.) on the OpenClaw repo. The model thinks it is using bash , but any operation that is not allowed is rejected:\n\n```\nreposhell bound cwd=/repo/openclaw repos=openclaw\ntype help for allowed commands; exit or quit to leave\n\nreposhell /repo/openclaw> help\nallowed: pwd, ls, find, rg, grep, sed -n, cat, head, tail, wc -l, git status --short, git show --name-only, git grep, git ls-files\nsearch: rg -n -i \"lm studio\" or grep -R -n -i \"lm studio\" .\nfiles: rg --files -g \"*.ts\" or git ls-files src\nexamples: rg -n reposhell README.md | sed is not allowed; use one simple command at a time\n\nreposhell /repo/openclaw> head README.md\n# 🦞 OpenClaw — Personal AI Assistant\n\n<p align=\"center\">\n    <picture>\n        <source media=\"(prefers-color-scheme: light)\" srcset=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.svg\">\n        <img src=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.svg\" alt=\"OpenClaw\" width=\"500\">\n    </picture>\n</p>\n\n<p align=\"center\">\n\nreposhell /repo/openclaw> curl localhost\nreposhell policy denied command: unsupported command \"curl\"\nexit_code=2\n\nreposhell /repo/openclaw>\n```\n\nHere is a concrete example where this mattered. In one saved session example , qwen3.6-35b-a3b was classifying openclaw/openclaw#84621 , titled Fix Kimi tool-call rewriting stop reason handling . The thinking block shows the model initially considering coding_agent_integrations because the changed path extensions/kimi-coding made it look plausible. The model used reposhell to inspect the local repo with simple read-only commands like ls extensions , ls extensions/kimi-coding , and cat extensions/kimi-coding/package.json . That package metadata showed the extension was actually @openclaw/kimi-provider , an OpenClaw Kimi provider plugin. So the model corrected the final labels to inference_api and tool_calling , and explicitly excluded coding_agent_integrations .\n\nWe have mentioned earlier that we bundle a specific pi configuration that can only perform read-only operations and return classification output. We call it localpager-agent , named after localpager , the main project here. Each PR and issue generates a prompt, which is then passed to the CLI like below, alongside other args:\n\n```\nlocalpager-agent \\\n  --model \"<model-id>\" \\\n  --base-url \"<openai-compatible-base-url>\" \\\n  --session-dir \"<session-output-dir>\" \\\n  --final-schema \"<runtime-schema.json>\" \\\n  --tools bash,final_json \\\n  --reposhell-socket \"<reposhell.sock>\" \\\n  --reposhell-default-repo \"<repo-id>\" \\\n  --reposhell-visible-repos \"<repo-id>[,<repo-id>...]\" \\\n  -p \"$(cat <rendered-prompt.md>)\"\n```\n\n## Processing incoming PRs and issues\n\nSo then what orchestrates everything in between the incoming PR/issue and the final notification on Discord?\n\nThis is what the final filtered Discord notification looks like: a PR about the desired vertical gets routed to me.\n\nThe orchestration around this is very simple; only the classification step involves an LLM:\n\n- We use openclaw/gitcrawl to act as a local mirror for the repo. Whenever there is a new PR or issue, each item is normalized into the same shape and written into localpager's own SQLite database. If the item is new, localpager creates a classification job for it.\n\n- A worker then claims jobs from that queue. It builds a GitHub context object containing the issue or PR title, body, labels, author, state, and optionally comments, changed files, and selected diff excerpts. That means the local model does not need to browse GitHub or open the URL itself most of the time. It is handed all the relevant context.\n\n- The context object is rendered into a prompt and passed to localpager-agent as described in the previous section. The agent can think and use reposhell, but must eventually output a classification result in the defined schema.\n\n- The output is stored back in localpager SQLite database, and relayed to Discord based on the notification policy configured by the user (i.e. notify me for these topics, but not these other ones).\n\nBelow is a figure showing the overall architecture of localpager:\n\nThe architecture is semi-agentic. Labeling is done agentically, while sending a notification is handled by deterministic rules. This is to make the notification pipeline faster by removing the need for inference for the most straightforward parts of the task. Local inference is free but each task has a resource contention cost: GPU bandwidth should be reserved for tasks where inference is absolutely needed. This also reduces chance of errors from notification.\n\n## Can local models triage PRs?\n\nLet's be frank: the first local versions of this system were noisy. The first model tested - gemma-4-e4b-it was useful for getting the end-to-end local pipeline working, but it also had a tendency to put too many unrelated labels on a PR or issue. False positive labels make the Discord feed noisy and don't focus my attention on the right issues. That pushed us toward testing larger local models, including gemma-4-26b-a4b and qwen3.6-35b-a3b , on the 330-row evaluation set below.\n\nFor early prompt work, we also used DeepSeek-V4-Flash through the antirez DS4 implementation [4] to create the earlier dataset labels. That setup used the DS4 server over CUDA. We eventually gave up on DS4 as the labeler because it was not labeling consistently across runs. We also did not consider it as the main localpager-agent model because it was too big to get enough throughput on our hardware: the DS4 server gave us around 14 tokens per second, with maximum concurrency of 1.\n\nTo test model performance, we selected and generated labels for 330 GitHub issues and PRs. Each item was labelled five times (3x GPT-5.5 and 2x Opus 4.8) with the models needing to be in agreement to be accepted. This process involved hand adjudicating, improving label definitions and highlighting internal product design choices for the models. This gave us a set of stable, reproducible labels to compare our smaller models against.\n\nWe did not need to do prompt optimization for gemma-4-26b-a4b or qwen3.6-35b-a3b before getting useful results on this evaluation set. Using the same routing prompt, Gemma had higher recall and lower wall-clock time per row, while Qwen had higher precision, higher exact match, and fewer false positives. We also ran DeepSeek-V4-Flash on the same set as a reference. It had the fewest false positives, but the model size and throughput make it impractical for executing these tasks in real time on the NVIDIA GB10. Since each row can have multiple labels, false positives and false negatives are total label counts across all rows. The Qwen results below are after retrying structured-output failures where the model ran out of output tokens before calling final_json . For Gemma and Qwen, repeated-run metrics report mean ± sample standard deviation across three runs. DeepSeek-V4-Flash was run once as a reference.\n\nMetric gemma-4-26b-a4b qwen3.6-35b-a3b DeepSeek-V4-Flash\n\nThe throughput and wall-clock numbers here are not definitive maximum performance numbers for these models on this hardware. They are the settings we used at the time with the optimizations we had available. For example, in a separate probe, gemma-4-26b-a4b also supported concurrency 32 and reached over 700 aggregate output tokens per second.\n\nBenchmark comparison across the 330-row label set. Each panel uses its own vertical scale; blue marks the best value for that metric. Error bars on Precision and Recall show sample standard deviation across three runs for Gemma and Qwen.\n\nFor the Gemma benchmark, we served gemma-4-26b-a4b with vLLM using the optimizations we found available for this setup. A big part of that is the NVFP4 quantization: on GB10-class Blackwell hardware, it is not just a smaller model file, but a hardware-friendly format that can use the NVIDIA/vLLM execution path more directly than a portable GGUF quantization like Q4_K_M. In practice, that means less memory traffic and more room for batching. We also enabled prefix caching, FP8 KV cache, the CUTLASS MoE backend, and language-model-only mode. The full 330-row run finished in about 7.5 minutes at concurrency 16.\n\n## Tracking and validating real-time performance using OpenClaw\n\nWe have mentioned earlier that instead of running a job with a local model for every new issue or PR, we can run a batch job with a SOTA cloud model, like GPT-5.5 running in OpenClaw, every n hours (e.g. every 2 hours) to achieve the same end. [5]\n\nIn that case, we would need a ChatGPT Pro plan. Since the model is SOTA, we can still expect it to perform reasonably well, despite batching 2 hours of issues/PRs together.\n\nBecause we want to see how well the local classifier performs against GPT-5.5, we run both simultaneously, and let GPT-5.5 be the judge of false positives and negatives, every 2 hours.\n\nTo be safe, we run the OpenClaw job in a sandbox, with only access to the public repo we report results to. In our case, we let the OpenClaw job update a machine-readable file, then a simple script reads the Codex-assigned labels and computes the false positive/negative status. Example output:\n\n- Issue #88499 openai-responses provider: 404 on previous_response_id when store=false (default)\n\n- inventory area: OpenAI-compatible/proxy; notifier topics: agent_runtime, api_surface, sessions; notification: none\n\n- PR #88275 fix(models-config): allow self-hosted providers without apiKey in models.json (#88267)\n\n- notifier interest: i0; topics: self_hosted_inference, local_model_providers, config; notification: sent\n\n- PR #88266 refactor: extract model catalog core package\n\n- notifier interest: i1; topics: config, api_surface, local_model_providers; notification: sent\n\n- PR #88247 feat: add hosted model providers\n\n- notifier interest: i0; topics: local_model_providers, model_serving, docs, api_surface; notification: sent\n\nThe instructions on how to classify, edit the machine-readable file, get the false positives and false negatives using a script are present in an agent skill which is referenced in an OpenClaw cron job that runs every 2 hours. The OpenClaw agent then ingests any new issues or PRs, adds them to the JSON file with appropriate labels, runs the scripts and reports back in the same Discord channel. This way, we can observe the local model's performance every few hours, and get notified of the misses.\n\nWe think that the issue/PR triage task is a specific case of a broader set of tasks which we call \"high throughput triage\". This post explored the idea of using a local model to filter out information in real time in only one domain, that is, open source contributions. The ability of medium-sized local models like gemma-4-26b-a4b and qwen3.6-35b-a3b to zero-shot classify with good accuracy without any need for fine-tuning makes them a good first choice for quick prototyping, before one moves on to more cost-efficient traditional classifier models.\n\nHowever, the same approach can be applied to other domains as well:\n\n- News categorization in journalism\n\n- Filtering for posts of interest in social media and forums like X or Reddit\n\n- Triaging customer support tickets\n\n- Triaging content moderation appeals\n\n- Filtering potential outreach while doing sales\n\n- Filtering for certain topics on arXiv while doing research\n\nThe list can be extended, but we think that the idea should be clear.\n\nBesides triaging, we have also explored how classification can be performed with agent harnesses running fast local models in a secure manner. A good naming for the approach would be agentic classification : the model is not fed the entire body of information upfront, but can search for more context before returning structured data. While we cannot exactly call this a novel approach, we hope for this blog post to be a good reference for the specific Pi +a restricted shell+ final_json recipe.\n\n- For the use case in this post, we have discovered that breaking down a PR/Issue in a way that means the product surface is understood and labelled correctly is a hard problem. back\n\n- Although in our testing we didn't---it would be quite reasonable for a model to conclude a next-step to gather info, use an external classifier. The agentic approach and the traditional approach are not mutually exclusive. back\n\n- See full list of topics and other configuration here . back\n\n- We used DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf from antirez/deepseek-v4-gguf . back\n\n- While we are aware that using an LLM as a judge negates the \"free\" aspect, our specific implementation does this for research purposes. In practice, a bigger and more expensive model can be used in tandem during a trial period for calibration, after which the system would transition fully to the smaller one. In recent runs, this audit loop used roughly 40k total GPT-5.5 tokens per 2-hour check, mostly cached context, costing about 2-3 cents per run at API pricing, or roughly 9/month at 12 runs per day. This was a single batch audit across all new items, not one judge call per item; doing it per item would likely be several times more expensive. back\n\n## Datasets mentioned in this article 1\n\nMore Articles from our Blog\n\nguide partnerships open-source-collab\n\n## Run AI workloads on any cloud, store on Hugging Face: zero-egress storage with SkyPilot\n\ndeployment open-source-collab bentoml\n\n## Deploying Hugging Face Models with BentoML: DeepFloyd IF in Action\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "\\*Free as in beer, excluding the cost of electricity, and assuming you already own the hardware\n\nJune 2026 will go down as the moment that people realized closed models can be taken away. With the removal of Anthropic's latest flagship model Claude Fable 5 fresh in memory, one can see why it is more important than ever to own your AI stack and be able to run models locally, especially if you are building your business on top of AI.\n\nIn that light, we wanted to share how we use local models like Gemma and Qwen in an agent harness, to run classification tasks[1]. This approach is different from using a model like BERT for classification. A local model in an agent harness like Pi can be used in tandem with structured outputs, to assign labels. We chose this approach because we already had local models and the harness on hand, and have conviction that similar setups will increase in popularity as local models improve in capability.[2]\n\nOur starting point was open source contributions in the OpenClaw repo. OpenClaw gets hundreds of issues and PRs every day, which need to be triaged, prioritized and routed to maintainers. I, Onur, am working to make local models work well with OpenClaw. Being a maintainer of this specific vertical, I need to react quickly to any P0 issues.\n\nWith SOTA closed models like GPT-5, Opus, or Sonnet, this is a pretty straightforward task. But I happen to sit on 128 GB of unified memory, namely an NVIDIA GB10. So I took on the task:\n\nCan I build a real-time notification system that filters and notifies me for only the issues that I am responsible for... with local open-weight models?\n\nThis tiny box, a.k.a. DGX Spark, can run gemma-4-26b-a4b with high concurrency and generate hundreds of tokens per second.\n\nIf I set up my OpenClaw main agent running on a $200/mo ChatGPT Pro plan to trigger a job on every new issue or PR, that would use up my quota. I might instead set it to run every 2 hours, or 6 hours. This would batch issues over longer periods, so we would be trading real-time notifications for delayed processing.\n\nIf I were to run this on a local model on the hardware I already have up and running, I would not only have near-instantaneous notifications, I would also be able to do it for free (or rather, for the cost of electricity).\n\n## Categorizing issues and PRs\n\nWe came up with a finite set of labels representing the categories of issues we need to triage, and then use a local model to classify each issue into one of those categories, like local_models, self_hosted_inference, acp, agent_runtime, codex, ui_tui and so on.[3]\n\nBut how do we classify pull requests? A simple single request to a Chat Completions endpoint with a tool JSON schema, with the topics as an enum?\n\nKind of. But this is 2026, not 2023, and we have AGENTS. We can do better!\n\nFor the local model choices, we tested gemma-4-26b-a4b and qwen3.6-35b-a3b. With performance optimizations, both can generate hundreds of tokens per second locally.\n\nWe use an agent harness to drive the classification run. For this, we bundle pi as a harness that can call local model endpoints.\n\nThe agent by default receives the PR title, body and a truncated excerpt of the PR diff in the first prompt. Then, it can choose to use the bash tool to perform read-only operations on the OpenClaw repo (in case it needs to look at the codebase), or the final_json tool to submit the final classification result.\n\nYou wouldn't want to give full bash access to a local model running in this high-throughput setting, because a prompt-injected issue or PR could otherwise steer the model into doing something unrelated to classification.\n\nFor that reason, we use reposhell instead of bash: a restricted bash-like shell that only allows read-only operations (ls, find, cat, grep, etc.) on the OpenClaw repo. The model thinks it is using bash, but any operation that is not allowed is rejected:\n\n```\nreposhell bound cwd=/repo/openclaw repos=openclaw\ntype help for allowed commands; exit or quit to leave\n\nreposhell /repo/openclaw> help\nallowed: pwd, ls, find, rg, grep, sed -n, cat, head, tail, wc -l, git status --short, git show --name-only, git grep, git ls-files\nsearch: rg -n -i \"lm studio\" or grep -R -n -i \"lm studio\" .\nfiles: rg --files -g \"*.ts\" or git ls-files src\nexamples: rg -n reposhell README.md | sed is not allowed; use one simple command at a time\n\nreposhell /repo/openclaw> head README.md\n# 🦞 OpenClaw — Personal AI Assistant\n\n<p align=\"center\">\n    <picture>\n        <source media=\"(prefers-color-scheme: light)\" srcset=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.svg\">\n        <img src=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.svg\" alt=\"OpenClaw\" width=\"500\">\n    </picture>\n</p>\n\n<p align=\"center\">\n\nreposhell /repo/openclaw> curl localhost\nreposhell policy denied command: unsupported command \"curl\"\nexit_code=2\n\nreposhell /repo/openclaw>\n```\n\nHere is a concrete example where this mattered. In one saved session example, qwen3.6-35b-a3b was classifying openclaw/openclaw#84621, titled Fix Kimi tool-call rewriting stop reason handling. The thinking block shows the model initially considering coding_agent_integrations because the changed path extensions/kimi-coding made it look plausible. The model used reposhell to inspect the local repo with simple read-only commands like ls extensions, ls extensions/kimi-coding, and cat extensions/kimi-coding/package.json. That package metadata showed the extension was actually @openclaw/kimi-provider, an OpenClaw Kimi provider plugin. So the model corrected the final labels to inference_api and tool_calling, and explicitly excluded coding_agent_integrations.\n\nWe have mentioned earlier that we bundle a specific pi configuration that can only perform read-only operations and return classification output. We call it localpager-agent, named after localpager, the main project here. Each PR and issue generates a prompt, which is then passed to the CLI like below, alongside other args:\n\n```\nlocalpager-agent \\\n  --model \"<model-id>\" \\\n  --base-url \"<openai-compatible-base-url>\" \\\n  --session-dir \"<session-output-dir>\" \\\n  --final-schema \"<runtime-schema.json>\" \\\n  --tools bash,final_json \\\n  --reposhell-socket \"<reposhell.sock>\" \\\n  --reposhell-default-repo \"<repo-id>\" \\\n  --reposhell-visible-repos \"<repo-id>[,<repo-id>...]\" \\\n  -p \"$(cat <rendered-prompt.md>)\"\n```\n\n## Processing incoming PRs and issues\n\nSo then what orchestrates everything in between the incoming PR/issue and the final notification on Discord?\n\nThis is what the final filtered Discord notification looks like: a PR about the desired vertical gets routed to me.\n\nThe orchestration around this is very simple; only the classification step involves an LLM:\n\n- We use openclaw/gitcrawl to act as a local mirror for the repo. Whenever there is a new PR or issue, each item is normalized into the same shape and written into localpager's own SQLite database. If the item is new, localpager creates a classification job for it.\n\n- A worker then claims jobs from that queue. It builds a GitHub context object containing the issue or PR title, body, labels, author, state, and optionally comments, changed files, and selected diff excerpts. That means the local model does not need to browse GitHub or open the URL itself most of the time. It is handed all the relevant context.\n\n- The context object is rendered into a prompt and passed to localpager-agent as described in the previous section. The agent can think and use reposhell, but must eventually output a classification result in the defined schema.\n\n- The output is stored back in localpager SQLite database, and relayed to Discord based on the notification policy configured by the user (i.e. notify me for these topics, but not these other ones).\n\nBelow is a figure showing the overall architecture of localpager:\n\nThe architecture is semi-agentic. Labeling is done agentically, while sending a notification is handled by deterministic rules. This is to make the notification pipeline faster by removing the need for inference for the most straightforward parts of the task. Local inference is free but each task has a resource contention cost: GPU bandwidth should be reserved for tasks where inference is absolutely needed. This also reduces chance of errors from notification.\n\n## Can local models triage PRs?\n\nLet's be frank: the first local versions of this system were noisy. The first model tested - gemma-4-e4b-it was useful for getting the end-to-end local pipeline working, but it also had a tendency to put too many unrelated labels on a PR or issue. False positive labels make the Discord feed noisy and don't focus my attention on the right issues. That pushed us toward testing larger local models, including gemma-4-26b-a4b and qwen3.6-35b-a3b, on the 330-row evaluation set below.\n\nFor early prompt work, we also used DeepSeek-V4-Flash through the antirez DS4 implementation[4] to create the earlier dataset labels. That setup used the DS4 server over CUDA. We eventually gave up on DS4 as the labeler because it was not labeling consistently across runs. We also did not consider it as the main localpager-agent model because it was too big to get enough throughput on our hardware: the DS4 server gave us around 14 tokens per second, with maximum concurrency of 1.\n\nTo test model performance, we selected and generated labels for 330 GitHub issues and PRs. Each item was labelled five times (3x GPT-5.5 and 2x Opus 4.8) with the models needing to be in agreement to be accepted. This process involved hand adjudicating, improving label definitions and highlighting internal product design choices for the models. This gave us a set of stable, reproducible labels to compare our smaller models against.\n\nWe did not need to do prompt optimization for gemma-4-26b-a4b or qwen3.6-35b-a3b before getting useful results on this evaluation set. Using the same routing prompt, Gemma had higher recall and lower wall-clock time per row, while Qwen had higher precision, higher exact match, and fewer false positives. We also ran DeepSeek-V4-Flash on the same set as a reference. It had the fewest false positives, but the model size and throughput make it impractical for executing these tasks in real time on the NVIDIA GB10. Since each row can have multiple labels, false positives and false negatives are total label counts across all rows. The Qwen results below are after retrying structured-output failures where the model ran out of output tokens before calling final_json. For Gemma and Qwen, repeated-run metrics report mean ± sample standard deviation across three runs. DeepSeek-V4-Flash was run once as a reference.\n\nMetric\n\ngemma-4-26b-a4b\n\nqwen3.6-35b-a3b\n\nDeepSeek-V4-Flash\n\nPrecision\n\n0.716 ± 0.010\n\n0.831 ± 0.007\n\n0.938\n\nRecall\n\n0.905 ± 0.004\n\n0.818 ± 0.006\n\n0.714\n\nF1\n\n0.800 ± 0.008\n\n0.824 ± 0.002\n\n0.811\n\nExact match\n\n0.410 ± 0.014\n\n0.540 ± 0.014\n\n0.509\n\nFalse positives\n\n227.0 ± 10.5\n\n105.7 ± 6.4\n\n30\n\nFalse negatives\n\n60.0 ± 2.6\n\n115.3 ± 4.0\n\n181\n\nWall seconds / row\n\n1.41 ± 0.04\n\n13.51 ± 0.79\n\n144.14\n\nOutput tok/s / worker\n\n25\n\n50\n\n13\n\nOutput tok/s aggregate\n\n402.6\n\n145.3\n\n13\n\nConcurrency\n\n16\n\n4\n\n1\n\nTotal parameters\n\n26B\n\n35B\n\n284B\n\nActive parameters\n\n4B\n\n3B\n\n13B\n\nThe throughput and wall-clock numbers here are not definitive maximum performance numbers for these models on this hardware. They are the settings we used at the time with the optimizations we had available. For example, in a separate probe, gemma-4-26b-a4b also supported concurrency 32 and reached over 700 aggregate output tokens per second.\n\nBenchmark comparison across the 330-row label set. Each panel uses its own vertical scale; blue marks the best value for that metric. Error bars on Precision and Recall show sample standard deviation across three runs for Gemma and Qwen.\n\nFor the Gemma benchmark, we served gemma-4-26b-a4b with vLLM using the optimizations we found available for this setup. A big part of that is the NVFP4 quantization: on GB10-class Blackwell hardware, it is not just a smaller model file, but a hardware-friendly format that can use the NVIDIA/vLLM execution path more directly than a portable GGUF quantization like Q4_K_M. In practice, that means less memory traffic and more room for batching. We also enabled prefix caching, FP8 KV cache, the CUTLASS MoE backend, and language-model-only mode. The full 330-row run finished in about 7.5 minutes at concurrency 16.\n\n## Tracking and validating real-time performance using OpenClaw\n\nWe have mentioned earlier that instead of running a job with a local model for every new issue or PR, we can run a batch job with a SOTA cloud model, like GPT-5.5 running in OpenClaw, every n hours (e.g. every 2 hours) to achieve the same end.[5]\n\nIn that case, we would need a ChatGPT Pro plan. Since the model is SOTA, we can still expect it to perform reasonably well, despite batching 2 hours of issues/PRs together.\n\nBecause we want to see how well the local classifier performs against GPT-5.5, we run both simultaneously, and let GPT-5.5 be the judge of false positives and negatives, every 2 hours.\n\nTo be safe, we run the OpenClaw job in a sandbox, with only access to the public repo we report results to. In our case, we let the OpenClaw job update a machine-readable file, then a simple script reads the Codex-assigned labels and computes the false positive/negative status. Example output:\n\nFalse negatives\n\nIssue #88499 openai-responses provider: 404 on previous_response_id when store=false (default)\n\n- inventory area: OpenAI-compatible/proxy; notifier topics: agent_runtime, api_surface, sessions; notification: none\n\nFalse positives\n\nPR #88275 fix(models-config): allow self-hosted providers without apiKey in models.json (#88267)\n\n- notifier interest: i0; topics: self_hosted_inference, local_model_providers, config; notification: sent\n\nPR #88266 refactor: extract model catalog core package\n\n- notifier interest: i1; topics: config, api_surface, local_model_providers; notification: sent\n\nPR #88247 feat: add hosted model providers\n\n- notifier interest: i0; topics: local_model_providers, model_serving, docs, api_surface; notification: sent\n\nThe instructions on how to classify, edit the machine-readable file, get the false positives and false negatives using a script are present in an agent skill which is referenced in an OpenClaw cron job that runs every 2 hours. The OpenClaw agent then ingests any new issues or PRs, adds them to the JSON file with appropriate labels, runs the scripts and reports back in the same Discord channel. This way, we can observe the local model's performance every few hours, and get notified of the misses.\n\n## Conclusion\n\nWe think that the issue/PR triage task is a specific case of a broader set of tasks which we call \"high throughput triage\". This post explored the idea of using a local model to filter out information in real time in only one domain, that is, open source contributions. The ability of medium-sized local models like gemma-4-26b-a4b and qwen3.6-35b-a3b to zero-shot classify with good accuracy without any need for fine-tuning makes them a good first choice for quick prototyping, before one moves on to more cost-efficient traditional classifier models.\n\nHowever, the same approach can be applied to other domains as well:\n\n- News categorization in journalism\n\n- Filtering for posts of interest in social media and forums like X or Reddit\n\n- Triaging customer support tickets\n\n- Triaging content moderation appeals\n\n- Filtering potential outreach while doing sales\n\n- Filtering for certain topics on arXiv while doing research\n\nThe list can be extended, but we think that the idea should be clear.\n\nBesides triaging, we have also explored how classification can be performed with agent harnesses running fast local models in a secure manner. A good naming for the approach would be agentic classification: the model is not fed the entire body of information upfront, but can search for more context before returning structured data. While we cannot exactly call this a novel approach, we hope for this blog post to be a good reference for the specific Pi+a restricted shell+final_json recipe.\n\n## Footnotes\n\n- For the use case in this post, we have discovered that breaking down a PR/Issue in a way that means the product surface is understood and labelled correctly is a hard problem. back\n\n- Although in our testing we didn't---it would be quite reasonable for a model to conclude a next-step to gather info, use an external classifier. The agentic approach and the traditional approach are not mutually exclusive. back\n\n- See full list of topics and other configuration here. back\n\n- We used DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf from antirez/deepseek-v4-gguf. back\n\n- While we are aware that using an LLM as a judge negates the \"free\" aspect, our specific implementation does this for research purposes. In practice, a bigger and more expensive model can be used in tandem during a trial period for calibration, after which the system would transition fully to the smaller one. In recent runs, this audit loop used roughly 40k total GPT-5.5 tokens per 2-hour check, mostly cached context, costing about 2-3 cents per run at API pricing, or roughly $9/month at 12 runs per day. This was a single batch audit across all new items, not one judge call per item; doing it per item would likely be several times more expensive. back",
   "summaryZh": "随着闭源模型访问受限，开源本地模型在实际工程中的应用备受关注。本文展示了如何利用本地部署的开源模型结合代理框架（Agent Harness），在私有硬件上实现对大规模代码仓库工单（Issue和PR）的实时自动化分诊与过滤。",
   "summaryGeneratedAt": "2026-08-30T10:44:17.503507Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -55,5 +55,1558 @@
     "summaryZh": "随着闭源模型访问受限，开源本地模型在实际工程中的应用备受关注。本文展示了如何利用本地部署的开源模型结合代理框架（Agent Harness），在私有硬件上实现对大规模代码仓库工单（Issue和PR）的实时自动化分诊与过滤。",
     "glossary": [],
     "duplicateKey": "local-models-triage-openclaw-repo"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/local-models-pr-triage/dgx-spark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/local-models-pr-triage/dgx-spark.png",
+      "alt": "NVIDIA DGX Spark",
+      "id": "image_1b39e5851e61864e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/local-models-pr-triage/discord-notification.jpg",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/local-models-pr-triage/discord-notification.jpg",
+      "alt": "Localpager Discord notification",
+      "id": "image_0c4a52b4e4973a59"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/local-models-pr-triage/localpager-architecture.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/local-models-pr-triage/localpager-architecture.svg",
+      "alt": "Localpager architecture",
+      "id": "image_5c847514a91c90eb"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/local-models-pr-triage/benchmark-comparison.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/local-models-pr-triage/benchmark-comparison.svg",
+      "alt": "Benchmark comparison across the 330-row label set",
+      "id": "image_4f8b6fd6f8c0211e"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "*Free as in beer, excluding the cost of electricity, and assuming you already own the hardware",
+      "spans": [
+        {
+          "start": 0,
+          "end": 94,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "June 2026 will go down as the moment that people realized closed models can be taken away. With the removal of Anthropic's latest flagship model Claude Fable 5 fresh in memory, one can see why it is more important than ever to own your AI stack and be able to run models locally, especially if you are building your business on top of AI.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In that light, we wanted to share how we use local models like Gemma and Qwen in an agent harness, to run classification tasks[1]. This approach is different from using a model like BERT for classification. A local model in an agent harness like Pi can be used in tandem with structured outputs, to assign labels. We chose this approach because we already had local models and the harness on hand, and have conviction that similar setups will increase in popularity as local models improve in capability.[2]",
+      "spans": [
+        {
+          "start": 126,
+          "end": 129,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-1"
+        },
+        {
+          "start": 504,
+          "end": 507,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-2"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Our starting point was open source contributions in the OpenClaw repo. OpenClaw gets hundreds of issues and PRs every day, which need to be triaged, prioritized and routed to maintainers. I, Onur, am working to make local models work well with OpenClaw. Being a maintainer of this specific vertical, I need to react quickly to any P0 issues.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "With SOTA closed models like GPT-5, Opus, or Sonnet, this is a pretty straightforward task. But I happen to sit on 128 GB of unified memory, namely an NVIDIA GB10. So I took on the task:",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Can I build a real-time notification system that filters and notifies me for only the issues that I am responsible for... with local open-weight models?",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "This tiny box, a.k.a. DGX Spark, can run gemma-4-26b-a4b with high concurrency and generate hundreds of tokens per second.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "If I set up my OpenClaw main agent running on a $200/mo ChatGPT Pro plan to trigger a job on every new issue or PR, that would use up my quota. I might instead set it to run every 2 hours, or 6 hours. This would batch issues over longer periods, so we would be trading real-time notifications for delayed processing.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "If I were to run this on a local model on the hardware I already have up and running, I would not only have near-instantaneous notifications, I would also be able to do it for free (or rather, for the cost of electricity).",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Categorizing issues and PRs",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "We came up with a finite set of labels representing the categories of issues we need to triage, and then use a local model to classify each issue into one of those categories, like local_models, self_hosted_inference, acp, agent_runtime, codex, ui_tui and so on.[3]",
+      "spans": [
+        {
+          "start": 181,
+          "end": 193,
+          "kind": "code"
+        },
+        {
+          "start": 195,
+          "end": 216,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 221,
+          "kind": "code"
+        },
+        {
+          "start": 223,
+          "end": 236,
+          "kind": "code"
+        },
+        {
+          "start": 238,
+          "end": 243,
+          "kind": "code"
+        },
+        {
+          "start": 245,
+          "end": 251,
+          "kind": "code"
+        },
+        {
+          "start": 262,
+          "end": 265,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-3"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "But how do we classify pull requests? A simple single request to a Chat Completions endpoint with a tool JSON schema, with the topics as an enum?",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Kind of. But this is 2026, not 2023, and we have AGENTS. We can do better!",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "For the local model choices, we tested gemma-4-26b-a4b and qwen3.6-35b-a3b. With performance optimizations, both can generate hundreds of tokens per second locally.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "We use an agent harness to drive the classification run. For this, we bundle pi as a harness that can call local model endpoints.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 79,
+          "kind": "a",
+          "href": "https://pi.dev"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "The agent by default receives the PR title, body and a truncated excerpt of the PR diff in the first prompt. Then, it can choose to use the bash tool to perform read-only operations on the OpenClaw repo (in case it needs to look at the codebase), or the final_json tool to submit the final classification result.",
+      "spans": [
+        {
+          "start": 140,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 254,
+          "end": 264,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "You wouldn't want to give full bash access to a local model running in this high-throughput setting, because a prompt-injected issue or PR could otherwise steer the model into doing something unrelated to classification.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "For that reason, we use reposhell instead of bash: a restricted bash-like shell that only allows read-only operations (ls, find, cat, grep, etc.) on the OpenClaw repo. The model thinks it is using bash, but any operation that is not allowed is rejected:",
+      "spans": [
+        {
+          "start": 24,
+          "end": 33,
+          "kind": "code"
+        },
+        {
+          "start": 24,
+          "end": 33,
+          "kind": "a",
+          "href": "https://github.com/osolmaz/localpager/tree/main/reposhell"
+        },
+        {
+          "start": 45,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 68,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 121,
+          "kind": "code"
+        },
+        {
+          "start": 123,
+          "end": 127,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 132,
+          "kind": "code"
+        },
+        {
+          "start": 134,
+          "end": 138,
+          "kind": "code"
+        },
+        {
+          "start": 197,
+          "end": 201,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Here is a concrete example where this mattered. In one saved session example, qwen3.6-35b-a3b was classifying openclaw/openclaw#84621, titled Fix Kimi tool-call rewriting stop reason handling. The thinking block shows the model initially considering coding_agent_integrations because the changed path extensions/kimi-coding made it look plausible. The model used reposhell to inspect the local repo with simple read-only commands like ls extensions, ls extensions/kimi-coding, and cat extensions/kimi-coding/package.json. That package metadata showed the extension was actually @openclaw/kimi-provider, an OpenClaw Kimi provider plugin. So the model corrected the final labels to inference_api and tool_calling, and explicitly excluded coding_agent_integrations.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 76,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/dutifuldev/openclaw-classification-dataset/blob/main/session-examples/README.md"
+        },
+        {
+          "start": 78,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 110,
+          "end": 133,
+          "kind": "code"
+        },
+        {
+          "start": 110,
+          "end": 133,
+          "kind": "a",
+          "href": "https://github.com/openclaw/openclaw/pull/84621"
+        },
+        {
+          "start": 142,
+          "end": 191,
+          "kind": "code"
+        },
+        {
+          "start": 250,
+          "end": 275,
+          "kind": "code"
+        },
+        {
+          "start": 301,
+          "end": 323,
+          "kind": "code"
+        },
+        {
+          "start": 435,
+          "end": 448,
+          "kind": "code"
+        },
+        {
+          "start": 450,
+          "end": 475,
+          "kind": "code"
+        },
+        {
+          "start": 481,
+          "end": 520,
+          "kind": "code"
+        },
+        {
+          "start": 578,
+          "end": 601,
+          "kind": "code"
+        },
+        {
+          "start": 680,
+          "end": 693,
+          "kind": "code"
+        },
+        {
+          "start": 698,
+          "end": 710,
+          "kind": "code"
+        },
+        {
+          "start": 736,
+          "end": 761,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "We have mentioned earlier that we bundle a specific pi configuration that can only perform read-only operations and return classification output. We call it localpager-agent, named after localpager, the main project here. Each PR and issue generates a prompt, which is then passed to the CLI like below, alongside other args:",
+      "spans": [
+        {
+          "start": 52,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 157,
+          "end": 173,
+          "kind": "code"
+        },
+        {
+          "start": 157,
+          "end": 173,
+          "kind": "a",
+          "href": "https://github.com/osolmaz/localpager/tree/main/localpager-agent"
+        },
+        {
+          "start": 187,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Processing incoming PRs and issues",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "So then what orchestrates everything in between the incoming PR/issue and the final notification on Discord?",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "This is what the final filtered Discord notification looks like: a PR about the desired vertical gets routed to me.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "The orchestration around this is very simple; only the classification step involves an LLM:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "We use openclaw/gitcrawl to act as a local mirror for the repo. Whenever there is a new PR or issue, each item is normalized into the same shape and written into localpager's own SQLite database. If the item is new, localpager creates a classification job for it.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 24,
+          "kind": "a",
+          "href": "http://github.com/openclaw/gitcrawl"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "A worker then claims jobs from that queue. It builds a GitHub context object containing the issue or PR title, body, labels, author, state, and optionally comments, changed files, and selected diff excerpts. That means the local model does not need to browse GitHub or open the URL itself most of the time. It is handed all the relevant context.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "The context object is rendered into a prompt and passed to localpager-agent as described in the previous section. The agent can think and use reposhell, but must eventually output a classification result in the defined schema.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 75,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "The output is stored back in localpager SQLite database, and relayed to Discord based on the notification policy configured by the user (i.e. notify me for these topics, but not these other ones).",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Below is a figure showing the overall architecture of localpager:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "The architecture is semi-agentic. Labeling is done agentically, while sending a notification is handled by deterministic rules. This is to make the notification pipeline faster by removing the need for inference for the most straightforward parts of the task. Local inference is free but each task has a resource contention cost: GPU bandwidth should be reserved for tasks where inference is absolutely needed. This also reduces chance of errors from notification.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Can local models triage PRs?",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Let's be frank: the first local versions of this system were noisy. The first model tested - gemma-4-e4b-it was useful for getting the end-to-end local pipeline working, but it also had a tendency to put too many unrelated labels on a PR or issue. False positive labels make the Discord feed noisy and don't focus my attention on the right issues. That pushed us toward testing larger local models, including gemma-4-26b-a4b and qwen3.6-35b-a3b, on the 330-row evaluation set below.",
+      "spans": [
+        {
+          "start": 93,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 409,
+          "end": 424,
+          "kind": "code"
+        },
+        {
+          "start": 429,
+          "end": 444,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "For early prompt work, we also used DeepSeek-V4-Flash through the antirez DS4 implementation[4] to create the earlier dataset labels. That setup used the DS4 server over CUDA. We eventually gave up on DS4 as the labeler because it was not labeling consistently across runs. We also did not consider it as the main localpager-agent model because it was too big to get enough throughput on our hardware: the DS4 server gave us around 14 tokens per second, with maximum concurrency of 1.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 53,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 95,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-4"
+        },
+        {
+          "start": 314,
+          "end": 330,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "To test model performance, we selected and generated labels for 330 GitHub issues and PRs. Each item was labelled five times (3x GPT-5.5 and 2x Opus 4.8) with the models needing to be in agreement to be accepted. This process involved hand adjudicating, improving label definitions and highlighting internal product design choices for the models. This gave us a set of stable, reproducible labels to compare our smaller models against.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "We did not need to do prompt optimization for gemma-4-26b-a4b or qwen3.6-35b-a3b before getting useful results on this evaluation set. Using the same routing prompt, Gemma had higher recall and lower wall-clock time per row, while Qwen had higher precision, higher exact match, and fewer false positives. We also ran DeepSeek-V4-Flash on the same set as a reference. It had the fewest false positives, but the model size and throughput make it impractical for executing these tasks in real time on the NVIDIA GB10. Since each row can have multiple labels, false positives and false negatives are total label counts across all rows. The Qwen results below are after retrying structured-output failures where the model ran out of output tokens before calling final_json. For Gemma and Qwen, repeated-run metrics report mean ± sample standard deviation across three runs. DeepSeek-V4-Flash was run once as a reference.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 61,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 317,
+          "end": 334,
+          "kind": "code"
+        },
+        {
+          "start": 757,
+          "end": 767,
+          "kind": "code"
+        },
+        {
+          "start": 869,
+          "end": 886,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Metric",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "gemma-4-26b-a4b",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "qwen3.6-35b-a3b",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "DeepSeek-V4-Flash",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "Precision",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "0.716 ± 0.010",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "0.831 ± 0.007",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "0.938",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Recall",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "0.905 ± 0.004",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "0.818 ± 0.006",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "0.714",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "F1",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "0.800 ± 0.008",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "0.824 ± 0.002",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "0.811",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Exact match",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "0.410 ± 0.014",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "0.540 ± 0.014",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "0.509",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "False positives",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "227.0 ± 10.5",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "105.7 ± 6.4",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "30",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "False negatives",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "60.0 ± 2.6",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "115.3 ± 4.0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "181",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "Wall seconds / row",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "1.41 ± 0.04",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "13.51 ± 0.79",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "144.14",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "Output tok/s / worker",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "25",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "50",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "Output tok/s aggregate",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 9,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "402.6",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 9,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "145.3",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 9,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 9,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "Concurrency",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 10,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "16",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 10,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 10,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 10,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "Total parameters",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 11,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "26B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 11,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "35B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 11,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "284B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 11,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "Active parameters",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 12,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "4B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 12,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "3B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 12,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "13B",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 12,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "The throughput and wall-clock numbers here are not definitive maximum performance numbers for these models on this hardware. They are the settings we used at the time with the optimizations we had available. For example, in a separate probe, gemma-4-26b-a4b also supported concurrency 32 and reached over 700 aggregate output tokens per second.",
+      "spans": [
+        {
+          "start": 242,
+          "end": 257,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Benchmark comparison across the 330-row label set. Each panel uses its own vertical scale; blue marks the best value for that metric. Error bars on Precision and Recall show sample standard deviation across three runs for Gemma and Qwen.",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "For the Gemma benchmark, we served gemma-4-26b-a4b with vLLM using the optimizations we found available for this setup. A big part of that is the NVFP4 quantization: on GB10-class Blackwell hardware, it is not just a smaller model file, but a hardware-friendly format that can use the NVIDIA/vLLM execution path more directly than a portable GGUF quantization like Q4_K_M. In practice, that means less memory traffic and more room for batching. We also enabled prefix caching, FP8 KV cache, the CUTLASS MoE backend, and language-model-only mode. The full 330-row run finished in about 7.5 minutes at concurrency 16.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 50,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "Tracking and validating real-time performance using OpenClaw",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "We have mentioned earlier that instead of running a job with a local model for every new issue or PR, we can run a batch job with a SOTA cloud model, like GPT-5.5 running in OpenClaw, every n hours (e.g. every 2 hours) to achieve the same end.[5]",
+      "spans": [
+        {
+          "start": 243,
+          "end": 246,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-5"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "In that case, we would need a ChatGPT Pro plan. Since the model is SOTA, we can still expect it to perform reasonably well, despite batching 2 hours of issues/PRs together.",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "Because we want to see how well the local classifier performs against GPT-5.5, we run both simultaneously, and let GPT-5.5 be the judge of false positives and negatives, every 2 hours.",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "To be safe, we run the OpenClaw job in a sandbox, with only access to the public repo we report results to. In our case, we let the OpenClaw job update a machine-readable file, then a simple script reads the Codex-assigned labels and computes the false positive/negative status. Example output:",
+      "spans": [
+        {
+          "start": 74,
+          "end": 85,
+          "kind": "a",
+          "href": "https://github.com/osolmaz/onurclaw"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "False negatives",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "Issue #88499 openai-responses provider: 404 on previous_response_id when store=false (default)",
+      "spans": []
+    },
+    {
+      "id": "b0098",
+      "source": "inventory area: OpenAI-compatible/proxy; notifier topics: agent_runtime, api_surface, sessions; notification: none",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "False positives",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "PR #88275 fix(models-config): allow self-hosted providers without apiKey in models.json (#88267)",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "notifier interest: i0; topics: self_hosted_inference, local_model_providers, config; notification: sent",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "PR #88266 refactor: extract model catalog core package",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "notifier interest: i1; topics: config, api_surface, local_model_providers; notification: sent",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "PR #88247 feat: add hosted model providers",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "notifier interest: i0; topics: local_model_providers, model_serving, docs, api_surface; notification: sent",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "The instructions on how to classify, edit the machine-readable file, get the false positives and false negatives using a script are present in an agent skill which is referenced in an OpenClaw cron job that runs every 2 hours. The OpenClaw agent then ingests any new issues or PRs, adds them to the JSON file with appropriate labels, runs the scripts and reports back in the same Discord channel. This way, we can observe the local model's performance every few hours, and get notified of the misses.",
+      "spans": [
+        {
+          "start": 146,
+          "end": 157,
+          "kind": "a",
+          "href": "https://github.com/osolmaz/onurclaw/blob/main/.agents/skills/openclaw-onur-inventory/SKILL.md"
+        },
+        {
+          "start": 184,
+          "end": 201,
+          "kind": "a",
+          "href": "https://docs.openclaw.ai/automation/cron-jobs"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "We think that the issue/PR triage task is a specific case of a broader set of tasks which we call \"high throughput triage\". This post explored the idea of using a local model to filter out information in real time in only one domain, that is, open source contributions. The ability of medium-sized local models like gemma-4-26b-a4b and qwen3.6-35b-a3b to zero-shot classify with good accuracy without any need for fine-tuning makes them a good first choice for quick prototyping, before one moves on to more cost-efficient traditional classifier models.",
+      "spans": [
+        {
+          "start": 316,
+          "end": 331,
+          "kind": "code"
+        },
+        {
+          "start": 336,
+          "end": 351,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "However, the same approach can be applied to other domains as well:",
+      "spans": []
+    },
+    {
+      "id": "b0110",
+      "source": "News categorization in journalism",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "Filtering for posts of interest in social media and forums like X or Reddit",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "Triaging customer support tickets",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "Triaging content moderation appeals",
+      "spans": []
+    },
+    {
+      "id": "b0114",
+      "source": "Filtering potential outreach while doing sales",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "Filtering for certain topics on arXiv while doing research",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "The list can be extended, but we think that the idea should be clear.",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "Besides triaging, we have also explored how classification can be performed with agent harnesses running fast local models in a secure manner. A good naming for the approach would be agentic classification: the model is not fed the entire body of information upfront, but can search for more context before returning structured data. While we cannot exactly call this a novel approach, we hope for this blog post to be a good reference for the specific Pi+a restricted shell+final_json recipe.",
+      "spans": [
+        {
+          "start": 183,
+          "end": 205,
+          "kind": "em"
+        },
+        {
+          "start": 453,
+          "end": 455,
+          "kind": "a",
+          "href": "https://pi.dev"
+        },
+        {
+          "start": 475,
+          "end": 485,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "Footnotes",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "For the use case in this post, we have discovered that breaking down a PR/Issue in a way that means the product surface is understood and labelled correctly is a hard problem. back",
+      "spans": [
+        {
+          "start": 176,
+          "end": 180,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-1-ref"
+        }
+      ]
+    },
+    {
+      "id": "b0120",
+      "source": "Although in our testing we didn't---it would be quite reasonable for a model to conclude a next-step to gather info, use an external classifier. The agentic approach and the traditional approach are not mutually exclusive. back",
+      "spans": [
+        {
+          "start": 223,
+          "end": 227,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-2-ref"
+        }
+      ]
+    },
+    {
+      "id": "b0121",
+      "source": "See full list of topics and other configuration here. back",
+      "spans": [
+        {
+          "start": 48,
+          "end": 52,
+          "kind": "a",
+          "href": "https://github.com/osolmaz/localpager/blob/main/examples/profiles/openclaw-routing-topics.json"
+        },
+        {
+          "start": 54,
+          "end": 58,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-3-ref"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "We used DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf from antirez/deepseek-v4-gguf. back",
+      "spans": [
+        {
+          "start": 8,
+          "end": 72,
+          "kind": "code"
+        },
+        {
+          "start": 78,
+          "end": 102,
+          "kind": "a",
+          "href": "https://huggingface.co/antirez/deepseek-v4-gguf"
+        },
+        {
+          "start": 104,
+          "end": 108,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-4-ref"
+        }
+      ]
+    },
+    {
+      "id": "b0123",
+      "source": "While we are aware that using an LLM as a judge negates the \"free\" aspect, our specific implementation does this for research purposes. In practice, a bigger and more expensive model can be used in tandem during a trial period for calibration, after which the system would transition fully to the smaller one. In recent runs, this audit loop used roughly 40k total GPT-5.5 tokens per 2-hour check, mostly cached context, costing about 2-3 cents per run at API pricing, or roughly $9/month at 12 runs per day. This was a single batch audit across all new items, not one judge call per item; doing it per item would likely be several times more expensive. back",
+      "spans": [
+        {
+          "start": 654,
+          "end": 658,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/local-models-pr-triage#note-5-ref"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "86b57dfe6fa59d4452d6d5790341d64f7fe147fc49fe5d05e715d3b2fc2ecb5d",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "reposhell bound cwd=/repo/openclaw repos=openclaw\ntype help for allowed commands; exit or quit to leave\n\nreposhell /repo/openclaw> help\nallowed: pwd, ls, find, rg, grep, sed -n, cat, head, tail, wc -l, git status --short, git show --name-only, git grep, git ls-files\nsearch: rg -n -i \"lm studio\" or grep -R -n -i \"lm studio\" .\nfiles: rg --files -g \"*.ts\" or git ls-files src\nexamples: rg -n reposhell README.md | sed is not allowed; use one simple command at a time\n\nreposhell /repo/openclaw> head README.md\n# 🦞 OpenClaw — Personal AI Assistant\n\n<p align=\"center\">\n    <picture>\n        <source media=\"(prefers-color-scheme: light)\" srcset=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text-dark.svg\">\n        <img src=\"https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/openclaw-logo-text.svg\" alt=\"OpenClaw\" width=\"500\">\n    </picture>\n</p>\n\n<p align=\"center\">\n\nreposhell /repo/openclaw> curl localhost\nreposhell policy denied command: unsupported command \"curl\"\nexit_code=2\n\nreposhell /repo/openclaw>"
+    },
+    {
+      "id": "c0002",
+      "source": "localpager-agent \\\n  --model \"<model-id>\" \\\n  --base-url \"<openai-compatible-base-url>\" \\\n  --session-dir \"<session-output-dir>\" \\\n  --final-schema \"<runtime-schema.json>\" \\\n  --tools bash,final_json \\\n  --reposhell-socket \"<reposhell.sock>\" \\\n  --reposhell-default-repo \"<repo-id>\" \\\n  --reposhell-visible-repos \"<repo-id>[,<repo-id>...]\" \\\n  -p \"$(cat <rendered-prompt.md>)\""
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "86b57dfe6fa59d4452d6d5790341d64f7fe147fc49fe5d05e715d3b2fc2ecb5d",
+  "mediaLayout": [
+    {
+      "mediaId": "image_1b39e5851e61864e",
+      "type": "image",
+      "afterBlockId": "b0006",
+      "order": 0
+    },
+    {
+      "mediaId": "image_0c4a52b4e4973a59",
+      "type": "image",
+      "afterBlockId": "b0022",
+      "order": 1
+    },
+    {
+      "mediaId": "image_5c847514a91c90eb",
+      "type": "image",
+      "afterBlockId": "b0029",
+      "order": 2
+    },
+    {
+      "mediaId": "image_4f8b6fd6f8c0211e",
+      "type": "image",
+      "afterBlockId": "b0088",
+      "order": 3
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 4,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 4,
+    "savedImages": 4,
+    "sourceImageOccurrences": 4,
+    "placedImageOccurrences": 4,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:10.611599Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:10.611615Z"
 }

@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:13.095084Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Make your ZeroGPU Spaces go brrr with ahead-of-time compilation\n\nPublished September 2, 2025\n\nApolinário from multimodal AI art\n\nThis article is also available in Chinese 简体中文 .\n\nZeroGPU lets anyone spin up powerful Nvidia H200 hardware in Hugging Face Spaces without keeping a GPU locked for idle traffic. It’s efficient, flexible, and ideal for demos but it doesn’t always make full use of everything the GPU and CUDA stack can offer. Generating images or videos can take a significant amount of time. Being able to squeeze out more performance, taking advantage of the H200 hardware, does matter in this case.\n\nThis is where PyTorch ahead-of-time (AoT) compilation comes in. Instead of compiling models on the fly (which doesn’t play nicely with ZeroGPU’s short-lived processes), AoT lets you optimize once and reload instantly.\n\nThe result : snappier demos and a smoother experience, with speedups ranging from 1.3×–1.8× on models like Flux, Wan, and LTX 🔥\n\nIn this post, we’ll show how to wire up Ahead-of-Time (AoT) compilation in ZeroGPU Spaces. We'll explore advanced tricks like FP8 quantization and dynamic shapes, and share working demos you can try right away. If you cannot wait, we invite you to check out some ZeroGPU-powered demos on the zerogpu-aoti organization.\n\nPro users and Team / Enterprise org members can create ZeroGPU Spaces, while anyone can freely use them (Pro, Team and Enterprise users get 8x more ZeroGPU quota)\n\nAhead-of-time compilation on ZeroGPU\n\nMulti-compile / shared weights\n\nUse a compiled graph from the Hub\n\nAoT compiled ZeroGPU Spaces demos\n\nSpaces is a platform powered by Hugging Face that allows ML practitioners to easily publish demo apps.\n\nTypical demo apps on Spaces look like:\n\n```\nimport gradio as gr\nfrom diffusers import DiffusionPipeline\n\npipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nThis works great, but ends up reserving a GPU for the Space during its entire lifetime – even when it has no user activity.\n\nWhen executing .to('cuda') on this line:\n\n```\npipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n```\n\nPyTorch initializes the NVIDIA driver, which sets up the process on CUDA forever. This is not very resource-efficient given that app traffic is not perfectly smooth, but is rather extremely sparse and spiky.\n\nZeroGPU takes a just-in-time approach to GPU initialization. Instead of setting up the main process on CUDA, it automatically forks the process, sets it up on CUDA, runs the GPU tasks, and finally kills the fork when the GPU needs to be released.\n\nWhen the app does not receive traffic, it doesn't use any GPU\n\nWhen it is actually performing a task, it will use one GPU\n\nIt can use multiple GPUs as needed to perform tasks concurrently\n\nThanks to the Python spaces package, the only code change needed to get this behaviour is as follows:\n\n```\n  import gradio as gr\n+ import spaces\n  from diffusers import DiffusionPipeline\n\n  pipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\n+ @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n\n  gr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nBy importing spaces and adding the @spaces.GPU decorator, we:\n\nIntercept PyTorch API calls to postpone CUDA operations\n\nMake the decorated function run in a fork when later called\n\n(Call an internal API to make the right device visible to the fork but this is not in the scope of this blogpost)\n\nZeroGPU currently allocates an MIG slice of H200 ( 3g.71gb profile). Additional MIG sizes including full slice ( 7g.141gb profile) will come in late 2025.\n\nModern ML frameworks like PyTorch and JAX have the concept of compilation that can be used to optimize model latency or inference time. Behind the scenes, compilation applies a series of (often hardware-dependent) optimization steps such as operator fusion, constant folding, etc.\n\nPyTorch (from 2.0 onwards) currently has two major interfaces for compilation:\n\nJust-in-time with torch.compile\n\nAhead-of-time with torch.export + AOTInductor\n\ntorch.compile works great in standard environments: it compiles your model the first time it runs, and reuses the optimized version for subsequent calls.\n\nHowever, on ZeroGPU, given that the process is freshly spun up for (almost) every GPU task, it means that torch.compile can’t efficiently re-use compilation and is thus forced to rely on its filesystem cache to restore compiled models. Depending on the model being compiled, this process takes from a few dozen seconds to a couple of minutes, which is way too much for practical GPU tasks in Spaces.\n\nThis is where ahead-of-time (AoT) compilation shines.\n\nWith AoT, we can export a compiled model once, save it, and later reload it instantly in any process, which is exactly what we need for ZeroGPU. This helps us reduce framework overhead and also eliminates cold-start timings typically incurred in just-in-time compilation.\n\nBut how can we do ahead-of-time compilation on ZeroGPU? Let’s dive in.\n\nLet's go back to our ZeroGPU base example and unpack what we need to enable AoT compilation. For the purpose of this demo, we will use the black-forest-labs/FLUX.1-dev model:\n\n```\nimport gradio as gr\nimport spaces\nimport torch\nfrom diffusers import DiffusionPipeline\n\nMODEL_ID = 'black-forest-labs/FLUX.1-dev'\n\npipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\npipe.to('cuda')\n\n@spaces.GPU\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nIn the discussion below, we only compile the transformer component of pipe since, in these generative models, the transformer (or more generally, the denoiser) is the most computationally heavy component.\n\nCompiling a model ahead-of-time with PyTorch involves multiple steps:\n\n1. Getting example inputs\n\nRecall that we’re going to compile the model ahead of time. Therefore, we need to derive example inputs for the model. Note that these are the same kinds of inputs we expect to see during the actual runs. To capture those inputs, we will leverage the spaces.aoti_capture helper from the spaces package:\n\n```\nwith spaces.aoti_capture(pipe.transformer) as call:\n    pipe(\"arbitrary example prompt\")\n```\n\nWhen used as a context manager, aoti_capture intercepts the call to any callable ( pipe.transformer in our case), prevents it from executing, captures the input arguments that would have been passed to it, and stores their values in call.args and call.kwargs .\n\nNow that we have example args and kwargs for our transformer component, we can export it to a PyTorch ExportedProgram by using torch.export.export utility:\n\n```\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)\n```\n\nAn exported PyTorch program is a computation graph that represents the tensor computations along with the original model parameter values.\n\n3. Compiling the exported model\n\nOnce the model is exported, compiling it is pretty straightforward.\n\nA traditional AoT compilation in PyTorch often requires saving the model on disk so it can be later reloaded. In our case, we’ll leverage a helper function part of the spaces package: spaces.aoti_compile . It's a tiny wrapper around torch._inductor.aot_compile that manages saving and lazy-loading the model as needed. It's meant to be used like this:\n\n```\ncompiled_transformer = spaces.aoti_compile(exported_transformer)\n```\n\nThis compiled_transformer is now an AoT-compiled binary ready to be used for inference.\n\n4. Using the compiled model in the pipeline\n\nNow we need to bind our compiled transformer to our original pipeline, i.e., the pipeline .\n\nA naive and almost working approach is to simply patch our pipeline like pipe.transformer = compiled_transformer . Unfortunately, this approach does not work because it deletes important attributes like dtype , config , etc. Only patching the forward method does not work well either because we are then keeping original model parameters in memory, often leading to OOM errors at runtime.\n\nspaces package provides a utility for this, too -- spaces.aoti_apply :\n\n```\nspaces.aoti_apply(compiled_transformer, pipe.transformer)\n```\n\nEt voilà! It will take care of patching pipe.transformer.forward with our compiled model, as well as cleaning old model parameters out of memory .\n\n5. Wrapping it all together\n\nTo perform the first three steps (intercepting input examples, exporting the model, and compiling it with PyTorch inductor), we need a real GPU. CUDA emulation that you get outside of @spaces.GPU function is not enough because compilation is truly hardware-dependent, for instance, relying on micro-benchmark runs to tune the generated code. This is why we need to wrap it all inside a @spaces.GPU function and then get our compiled model back to the root of our app. Starting from our original demo code, this gives:\n\n```\n  import gradio as gr\n  import spaces\n  import torch\n  from diffusers import DiffusionPipeline\n  \n  MODEL_ID = 'black-forest-labs/FLUX.1-dev'\n  \n  pipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\n  pipe.to('cuda')\n  \n+ @spaces.GPU(duration=1500) # maximum duration allowed during startup\n+ def compile_transformer():\n+     with spaces.aoti_capture(pipe.transformer) as call:\n+         pipe(\"arbitrary example prompt\")\n+ \n+     exported = torch.export.export(\n+         pipe.transformer,\n+         args=call.args,\n+         kwargs=call.kwargs,\n+     )\n+     return spaces.aoti_compile(exported)\n+ \n+ compiled_transformer = compile_transformer()\n+ spaces.aoti_apply(compiled_transformer, pipe.transformer)\n  \n  @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n  \n  gr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nWith just a dozen lines of additional code, we’ve successfully made our demo quite faster ( 1.7x faster in the case of FLUX.1-dev).\n\nIf you want to learn more about AoT compilation, you can read PyTorch's AOTInductor tutorial\n\nNow that we have demonstrated the speedups one can realize under the constraints of operating with ZeroGPUs, we will discuss a few gotchas that came up while working with this setup.\n\nAoT can be combined with quantization to deliver even greater speedups. For image and video generation, the FP8 post-training dynamic quantization schemes deliver good speed-quality trade-offs. However, FP8 requires a CUDA compute capability of at least 9.0 to work. Thankfully, for ZeroGPUs, since they’re based on H200s, we can already take advantage of the FP8 quantization schemes.\n\nTo enable FP8 quantization within our AoT compilation workflow, we can leverage the APIs provided by torchao like so:\n\n```\n+ from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig\n\n+ # Quantize the transformer just before the export step.\n+ quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())\n\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)\n```\n\n(You can find more details about TorchAO here .)\n\nAnd we can then proceed with the rest of the steps as outlined above. Using quantization provides another 1.2x of speedup.\n\nImages and videos can come in different shapes and sizes. Hence, it’s important to also account for shape dynamism when performing AoT compilation. The primitives provided by torch.export.export make it easily configurable to provide what inputs should be treated accordingly for dynamic shapes, as shown below.\n\nFor the case of Flux.1-Dev transformer, changes in different image resolutions will affect two of its forward arguments:\n\nhidden_states : The noisy input latents, which the transformer is supposed to denoise. It’s a 3D tensor, representing batch_size, flattened_latent_dim, embed_dim . When the batch size is fixed, it’s the flattened_latent_dim that will change for any changes made to image resolutions.\n\nimg_ids : A 2D array of encoded pixel coordinates having a shape of height * width, 3 . In this case, we want to make height * width dynamic.\n\nWe start by defining a range in which we want to let the (latent) image resolutions vary. To derive these value ranges, we inspected the shapes of hidden_states in the pipeline with respect to varied image resolutions. The exact values are model-dependent and require manual inspection and some intuition. For Flux.1-Dev, we ended up with:\n\n```\ntransformer_hidden_dim = torch.export.Dim('hidden', min=4096, max=8212)\n```\n\nWe then define a map of argument names and which dimensions in their input values we expect to be dynamic:\n\n```\ntransformer_dynamic_shapes = {\n    \"hidden_states\": {1: transformer_hidden_dim}, \n    \"img_ids\": {0: transformer_hidden_dim},\n}\n```\n\nThen we need to make our dynamic shapes object replicate the structure of our example inputs. The inputs that do not need dynamic shapes must be set to None . This can be done very easily with PyTorch tree_map utility:\n\n```\nfrom torch.utils._pytree import tree_map\n\ndynamic_shapes = tree_map(lambda v: None, call.kwargs)\ndynamic_shapes |= transformer_dynamic_shapes\n```\n\nNow, when performing the export step, we simply supply transformer_dynamic_shapes to torch.export.export :\n\n```\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n    dynamic_shapes=dynamic_shapes,\n)\n```\n\nCheck out this Space that shows how to use both quantization and dynamic shapes during the export step.\n\nDynamic shapes is sometimes not enough when dynamism is too important.\n\nThis is, for instance, the case with the Wan family of video generation models if you want your compiled model to generate different resolutions. One thing can be done in this case: compile one model per resolution while keeping the model parameters shared and dispatching the right one at runtime\n\nHere is a minimal example of this approach: zerogpu-aoti-multi.py . You can also see a fully working implementation of this paradigm in the Wan 2.2 Space .\n\nSince the ZeroGPU hardware and CUDA drivers are perfectly compatible with Flash-Attention 3 (FA3), we can use it in our ZeroGPU Spaces to speed things up even further. FA3 works with ahead-of-time compilation. So, this is ideal for our case.\n\nCompiling and building FA3 from source can take several minutes, and this process is hardware-dependent. As users, we wouldn’t want to lose precious ZeroGPU compute hours. This is where Hugging Face kernels library comes to the rescue. It provides access to pre-built kernels that are compatible for a given hardware. For example, when we try to run:\n\n```\nfrom kernels import get_kernel\n\nvllm_flash_attn3 = get_kernel(\"kernels-community/vllm-flash-attn3\")\n```\n\nIt tries to load a kernel from the kernels-community/vllm-flash-attn3 repository, which is compatible with the current setup. Otherwise, it will error out due to incompatibility issues. Luckily for us, this works seamlessly on the ZeroGPU Spaces. This means we can leverage the power of FA3 on ZeroGPU, using the kernels library.\n\nHere is a fully working example of an FA3 attention processor for the Qwen-Image model.\n\nSo far, we have been compiling the full model. Depending on the model, full model compilation can lead to significantly long cold start times. Long cold start times make the development experience unpleasant.\n\nWe can also choose to compile regions within a model, significantly reducing the cold start times, while retaining almost all the benefits of full model compilation. Regional compilation becomes promising when a model has repeated blocks of computation. A standard language model, for example, has a number of identically structured Transformer blocks.\n\nIn our example, we can compile the repeated blocks of the Flux transformer ahead of time, and propagate the compiled graph to the remaining repeated blocks. The Flux Transformer has two kinds of repeated blocks: FluxTransformerBlock and FluxSingleTransformerBlock .\n\nYou can check out this Space for a complete example.\n\n💡 For Flux.1-Dev, switching to regional compilation reduces the compilation time from 6 minutes to just 30 seconds while delivering identical speedups.\n\nOnce a model (or even a model block) is compiled ahead of time, we can serialize the compiled graph module as an artifact and reuse later. In the context of a ZeroGPU-powered demo on Spaces, this will significantly cut down the demo startup time by skipping the compilation time.\n\nTo keep the storage light, we can just save the compiled model graph without including any model parameters inside the artifact.\n\nCheck out this collection that shows a full workflow of obtaining compiled model graph, pushing it to the Hub, and then using it to build a demo.\n\nFLUX.1-dev with AoTI and FA3 ( 1.75x speedup)\n\nRegional compilation recipe\n\nRegional compilation with AOT\n\nNative integration in Diffusers\n\nMore performance numbers\n\nZeroGPU within Hugging Face Spaces is a powerful feature that enables AI builders by providing access to powerful compute. In this post, we showed how users can benefit from PyTorch’s ahead-of-time compilation techniques to speed up their applications that leverage ZeroGPU.\n\nWe demonstrate speedups with Flux.1-Dev, but these techniques are not limited to just this model. Therefore, we encourage you to give these techniques a try and provide us with feedback in this community discussion .\n\nVisit our ZeroGPU-AOTI org on the Hub to refer to a collection of demos that leverage the techniques discussed in this post.\n\nBrowse spaces.aoti_* APIs source code to learn more about the interface\n\nCheck out Kernels Community org on the hub\n\nLearn more about regional compilation from here\n\nUpgrade to Pro on Hugging Face to create your own ZeroGPU Spaces (and get 25 minutes of H200 usage every day)\n\nAcknowledgements: Thanks to ChunTe Lee for creating an awesome thumbnail for this post. Thanks to Pedro and Vaibhav for providing feedback on the post. Thanks to Angela Yi from the PyTorch team for helping us with AOT guidance.\n\nModels mentioned in this article 1\n\nSpaces mentioned in this article 6\n\nCollections mentioned in this article 1\n\nMore Articles from our Blog\n\ntransformers pytorch optimization\n\nTricks from OpenAI gpt-oss YOU 🫵 can use with transformers\n\nUnlocking asynchronicity in continuous batching\n\nThis comment has been hidden\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "ZeroGPU lets anyone spin up powerful Nvidia H200 hardware in Hugging Face Spaces without keeping a GPU locked for idle traffic. It’s efficient, flexible, and ideal for demos but it doesn’t always make full use of everything the GPU and CUDA stack can offer. Generating images or videos can take a significant amount of time. Being able to squeeze out more performance, taking advantage of the H200 hardware, does matter in this case.\n\nThis is where PyTorch ahead-of-time (AoT) compilation comes in. Instead of compiling models on the fly (which doesn’t play nicely with ZeroGPU’s short-lived processes), AoT lets you optimize once and reload instantly.\n\nThe result: snappier demos and a smoother experience, with speedups ranging from 1.3×–1.8× on models like Flux, Wan, and LTX 🔥\n\nIn this post, we’ll show how to wire up Ahead-of-Time (AoT) compilation in ZeroGPU Spaces. We'll explore advanced tricks like FP8 quantization and dynamic shapes, and share working demos you can try right away. If you cannot wait, we invite you to check out some ZeroGPU-powered demos on the zerogpu-aoti organization.\n\nPro users and Team / Enterprise org members can create ZeroGPU Spaces, while anyone can freely use them (Pro, Team and Enterprise users get 8x more ZeroGPU quota)\n\n## Table of Contents\n\n- What is ZeroGPU\n\n- PyTorch compilation\n\n- Ahead-of-time compilation on ZeroGPU\n\nGotchas\n\n- Quantization\n\n- Dynamic shapes\n\n- Multi-compile / shared weights\n\n- FlashAttention-3\n\n- Regional compilation\n\n- Use a compiled graph from the Hub\n\n- AoT compiled ZeroGPU Spaces demos\n\n- Conclusion\n\n- Resources\n\n## What is ZeroGPU\n\nSpaces is a platform powered by Hugging Face that allows ML practitioners to easily publish demo apps.\n\nTypical demo apps on Spaces look like:\n\n```\nimport gradio as gr\nfrom diffusers import DiffusionPipeline\n\npipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nThis works great, but ends up reserving a GPU for the Space during its entire lifetime – even when it has no user activity.\n\nWhen executing .to('cuda') on this line:\n\n```\npipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n```\n\nPyTorch initializes the NVIDIA driver, which sets up the process on CUDA forever. This is not very resource-efficient given that app traffic is not perfectly smooth, but is rather extremely sparse and spiky.\n\nZeroGPU takes a just-in-time approach to GPU initialization. Instead of setting up the main process on CUDA, it automatically forks the process, sets it up on CUDA, runs the GPU tasks, and finally kills the fork when the GPU needs to be released.\n\nThis means that:\n\n- When the app does not receive traffic, it doesn't use any GPU\n\n- When it is actually performing a task, it will use one GPU\n\n- It can use multiple GPUs as needed to perform tasks concurrently\n\nThanks to the Python spaces package, the only code change needed to get this behaviour is as follows:\n\n```\n  import gradio as gr\n+ import spaces\n  from diffusers import DiffusionPipeline\n\n  pipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\n+ @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n\n  gr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nBy importing spaces and adding the @spaces.GPU decorator, we:\n\n- Intercept PyTorch API calls to postpone CUDA operations\n\n- Make the decorated function run in a fork when later called\n\n- (Call an internal API to make the right device visible to the fork but this is not in the scope of this blogpost)\n\nZeroGPU currently allocates an MIG slice of H200 (3g.71gb profile). Additional MIG sizes including full slice (7g.141gb profile) will come in late 2025.\n\n## PyTorch compilation\n\nModern ML frameworks like PyTorch and JAX have the concept of compilation that can be used to optimize model latency or inference time. Behind the scenes, compilation applies a series of (often hardware-dependent) optimization steps such as operator fusion, constant folding, etc.\n\nPyTorch (from 2.0 onwards) currently has two major interfaces for compilation:\n\n- Just-in-time with torch.compile\n\n- Ahead-of-time with torch.export + AOTInductor\n\ntorch.compile works great in standard environments: it compiles your model the first time it runs, and reuses the optimized version for subsequent calls.\n\nHowever, on ZeroGPU, given that the process is freshly spun up for (almost) every GPU task, it means that torch.compile can’t efficiently re-use compilation and is thus forced to rely on its filesystem cache to restore compiled models. Depending on the model being compiled, this process takes from a few dozen seconds to a couple of minutes, which is way too much for practical GPU tasks in Spaces.\n\nThis is where ahead-of-time (AoT) compilation shines.\n\nWith AoT, we can export a compiled model once, save it, and later reload it instantly in any process, which is exactly what we need for ZeroGPU. This helps us reduce framework overhead and also eliminates cold-start timings typically incurred in just-in-time compilation.\n\nBut how can we do ahead-of-time compilation on ZeroGPU? Let’s dive in.\n\n## Ahead-of-time compilation on ZeroGPU\n\nLet's go back to our ZeroGPU base example and unpack what we need to enable AoT compilation. For the purpose of this demo, we will use the black-forest-labs/FLUX.1-dev model:\n\n```\nimport gradio as gr\nimport spaces\nimport torch\nfrom diffusers import DiffusionPipeline\n\nMODEL_ID = 'black-forest-labs/FLUX.1-dev'\n\npipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\npipe.to('cuda')\n\n@spaces.GPU\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nIn the discussion below, we only compile the transformer component of pipe since, in these generative models, the transformer (or more generally, the denoiser) is the most computationally heavy component.\n\nCompiling a model ahead-of-time with PyTorch involves multiple steps:\n\n### 1. Getting example inputs\n\nRecall that we’re going to compile the model ahead of time. Therefore, we need to derive example inputs for the model. Note that these are the same kinds of inputs we expect to see during the actual runs. To capture those inputs, we will leverage the spaces.aoti_capture helper from the spaces package:\n\n```\nwith spaces.aoti_capture(pipe.transformer) as call:\n    pipe(\"arbitrary example prompt\")\n```\n\nWhen used as a context manager, aoti_capture intercepts the call to any callable (pipe.transformer in our case), prevents it from executing, captures the input arguments that would have been passed to it, and stores their values in call.args and call.kwargs.\n\n### 2. Exporting the model\n\nNow that we have example args and kwargs for our transformer component, we can export it to a PyTorch ExportedProgram by using torch.export.export utility:\n\n```\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)\n```\n\nAn exported PyTorch program is a computation graph that represents the tensor computations along with the original model parameter values.\n\n### 3. Compiling the exported model\n\nOnce the model is exported, compiling it is pretty straightforward.\n\nA traditional AoT compilation in PyTorch often requires saving the model on disk so it can be later reloaded. In our case, we’ll leverage a helper function part of the spaces package: spaces.aoti_compile. It's a tiny wrapper around torch._inductor.aot_compile that manages saving and lazy-loading the model as needed. It's meant to be used like this:\n\n```\ncompiled_transformer = spaces.aoti_compile(exported_transformer)\n```\n\nThis compiled_transformer is now an AoT-compiled binary ready to be used for inference.\n\n### 4. Using the compiled model in the pipeline\n\nNow we need to bind our compiled transformer to our original pipeline, i.e., the pipeline.\n\nA naive and almost working approach is to simply patch our pipeline like pipe.transformer = compiled_transformer. Unfortunately, this approach does not work because it deletes important attributes like dtype, config, etc. Only patching the forward method does not work well either because we are then keeping original model parameters in memory, often leading to OOM errors at runtime.\n\nspaces package provides a utility for this, too -- spaces.aoti_apply:\n\n```\nspaces.aoti_apply(compiled_transformer, pipe.transformer)\n```\n\nEt voilà! It will take care of patching pipe.transformer.forward with our compiled model, as well as cleaning old model parameters out of memory.\n\n### 5. Wrapping it all together\n\nTo perform the first three steps (intercepting input examples, exporting the model, and compiling it with PyTorch inductor), we need a real GPU. CUDA emulation that you get outside of @spaces.GPU function is not enough because compilation is truly hardware-dependent, for instance, relying on micro-benchmark runs to tune the generated code. This is why we need to wrap it all inside a @spaces.GPU function and then get our compiled model back to the root of our app. Starting from our original demo code, this gives:\n\n```\n  import gradio as gr\n  import spaces\n  import torch\n  from diffusers import DiffusionPipeline\n  \n  MODEL_ID = 'black-forest-labs/FLUX.1-dev'\n  \n  pipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\n  pipe.to('cuda')\n  \n+ @spaces.GPU(duration=1500) # maximum duration allowed during startup\n+ def compile_transformer():\n+     with spaces.aoti_capture(pipe.transformer) as call:\n+         pipe(\"arbitrary example prompt\")\n+ \n+     exported = torch.export.export(\n+         pipe.transformer,\n+         args=call.args,\n+         kwargs=call.kwargs,\n+     )\n+     return spaces.aoti_compile(exported)\n+ \n+ compiled_transformer = compile_transformer()\n+ spaces.aoti_apply(compiled_transformer, pipe.transformer)\n  \n  @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n  \n  gr.Interface(generate, \"text\", \"gallery\").launch()\n```\n\nWith just a dozen lines of additional code, we’ve successfully made our demo quite faster (1.7x faster in the case of FLUX.1-dev).\n\nIf you want to learn more about AoT compilation, you can read PyTorch's AOTInductor tutorial\n\n## Gotchas\n\nNow that we have demonstrated the speedups one can realize under the constraints of operating with ZeroGPUs, we will discuss a few gotchas that came up while working with this setup.\n\n### Quantization\n\nAoT can be combined with quantization to deliver even greater speedups. For image and video generation, the FP8 post-training dynamic quantization schemes deliver good speed-quality trade-offs. However, FP8 requires a CUDA compute capability of at least 9.0 to work. Thankfully, for ZeroGPUs, since they’re based on H200s, we can already take advantage of the FP8 quantization schemes.\n\nTo enable FP8 quantization within our AoT compilation workflow, we can leverage the APIs provided by torchao like so:\n\n```\n+ from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig\n\n+ # Quantize the transformer just before the export step.\n+ quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())\n\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)\n```\n\n(You can find more details about TorchAO here.)\n\nAnd we can then proceed with the rest of the steps as outlined above. Using quantization provides another 1.2x of speedup.\n\n### Dynamic shapes\n\nImages and videos can come in different shapes and sizes. Hence, it’s important to also account for shape dynamism when performing AoT compilation. The primitives provided by torch.export.export make it easily configurable to provide what inputs should be treated accordingly for dynamic shapes, as shown below.\n\nFor the case of Flux.1-Dev transformer, changes in different image resolutions will affect two of its forward arguments:\n\n- hidden_states: The noisy input latents, which the transformer is supposed to denoise. It’s a 3D tensor, representing batch_size, flattened_latent_dim, embed_dim. When the batch size is fixed, it’s the flattened_latent_dim that will change for any changes made to image resolutions.\n\n- img_ids: A 2D array of encoded pixel coordinates having a shape of height * width, 3. In this case, we want to make height * width dynamic.\n\nWe start by defining a range in which we want to let the (latent) image resolutions vary. To derive these value ranges, we inspected the shapes of hidden_states in the pipeline with respect to varied image resolutions. The exact values are model-dependent and require manual inspection and some intuition. For Flux.1-Dev, we ended up with:\n\n```\ntransformer_hidden_dim = torch.export.Dim('hidden', min=4096, max=8212)\n```\n\nWe then define a map of argument names and which dimensions in their input values we expect to be dynamic:\n\n```\ntransformer_dynamic_shapes = {\n    \"hidden_states\": {1: transformer_hidden_dim}, \n    \"img_ids\": {0: transformer_hidden_dim},\n}\n```\n\nThen we need to make our dynamic shapes object replicate the structure of our example inputs. The inputs that do not need dynamic shapes must be set to None. This can be done very easily with PyTorch tree_map utility:\n\n```\nfrom torch.utils._pytree import tree_map\n\ndynamic_shapes = tree_map(lambda v: None, call.kwargs)\ndynamic_shapes |= transformer_dynamic_shapes\n```\n\nNow, when performing the export step, we simply supply transformer_dynamic_shapes to torch.export.export:\n\n```\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n    dynamic_shapes=dynamic_shapes,\n)\n```\n\nCheck out this Space that shows how to use both quantization and dynamic shapes during the export step.\n\n### Multi-compile / shared weights\n\nDynamic shapes is sometimes not enough when dynamism is too important.\n\nThis is, for instance, the case with the Wan family of video generation models if you want your compiled model to generate different resolutions. One thing can be done in this case: compile one model per resolution while keeping the model parameters shared and dispatching the right one at runtime\n\nHere is a minimal example of this approach: zerogpu-aoti-multi.py. You can also see a fully working implementation of this paradigm in the Wan 2.2 Space.\n\n### FlashAttention-3\n\nSince the ZeroGPU hardware and CUDA drivers are perfectly compatible with Flash-Attention 3 (FA3), we can use it in our ZeroGPU Spaces to speed things up even further. FA3 works with ahead-of-time compilation. So, this is ideal for our case.\n\nCompiling and building FA3 from source can take several minutes, and this process is hardware-dependent. As users, we wouldn’t want to lose precious ZeroGPU compute hours. This is where Hugging Face kernels library comes to the rescue. It provides access to pre-built kernels that are compatible for a given hardware. For example, when we try to run:\n\n```\nfrom kernels import get_kernel\n\nvllm_flash_attn3 = get_kernel(\"kernels-community/vllm-flash-attn3\")\n```\n\nIt tries to load a kernel from the kernels-community/vllm-flash-attn3 repository, which is compatible with the current setup. Otherwise, it will error out due to incompatibility issues. Luckily for us, this works seamlessly on the ZeroGPU Spaces. This means we can leverage the power of FA3 on ZeroGPU, using the kernels library.\n\nHere is a fully working example of an FA3 attention processor for the Qwen-Image model.\n\n### Regional compilation\n\nSo far, we have been compiling the full model. Depending on the model, full model compilation can lead to significantly long cold start times. Long cold start times make the development experience unpleasant.\n\nWe can also choose to compile regions within a model, significantly reducing the cold start times, while retaining almost all the benefits of full model compilation. Regional compilation becomes promising when a model has repeated blocks of computation. A standard language model, for example, has a number of identically structured Transformer blocks.\n\nIn our example, we can compile the repeated blocks of the Flux transformer ahead of time, and propagate the compiled graph to the remaining repeated blocks. The Flux Transformer has two kinds of repeated blocks: FluxTransformerBlock and FluxSingleTransformerBlock.\n\nYou can check out this Space for a complete example.\n\n💡 For Flux.1-Dev, switching to regional compilation reduces the compilation time from 6 minutes to just 30 seconds while delivering identical speedups.\n\n### Use a compiled graph from the Hub\n\nOnce a model (or even a model block) is compiled ahead of time, we can serialize the compiled graph module as an artifact and reuse later. In the context of a ZeroGPU-powered demo on Spaces, this will significantly cut down the demo startup time by skipping the compilation time.\n\nTo keep the storage light, we can just save the compiled model graph without including any model parameters inside the artifact.\n\nCheck out this collection that shows a full workflow of obtaining compiled model graph, pushing it to the Hub, and then using it to build a demo.\n\n## AoT compiled ZeroGPU Spaces demos\n\n### Speedup comparison\n\n- FLUX.1-dev without AoTI\n\n- FLUX.1-dev with AoTI and FA3 (1.75x speedup)\n\n### Featured AoTI Spaces\n\n- FLUX.1 Kontext\n\n- QwenImage Edit\n\n- Wan 2.2\n\n### Regional compilation\n\n- Regional compilation recipe\n\n- Regional compilation with AOT\n\n- Native integration in Diffusers\n\n- More performance numbers\n\n## Conclusion\n\nZeroGPU within Hugging Face Spaces is a powerful feature that enables AI builders by providing access to powerful compute. In this post, we showed how users can benefit from PyTorch’s ahead-of-time compilation techniques to speed up their applications that leverage ZeroGPU.\n\nWe demonstrate speedups with Flux.1-Dev, but these techniques are not limited to just this model. Therefore, we encourage you to give these techniques a try and provide us with feedback in this community discussion.\n\n## Resources\n\n- Visit our ZeroGPU-AOTI org on the Hub to refer to a collection of demos that leverage the techniques discussed in this post.\n\n- Browse spaces.aoti_* APIs source code to learn more about the interface\n\n- Check out Kernels Community org on the hub\n\n- Learn more about regional compilation from here\n\n- Upgrade to Pro on Hugging Face to create your own ZeroGPU Spaces (and get 25 minutes of H200 usage every day)\n\nAcknowledgements: Thanks to ChunTe Lee for creating an awesome thumbnail for this post. Thanks to Pedro and Vaibhav for providing feedback on the post. Thanks to Angela Yi from the PyTorch team for helping us with AOT guidance.",
   "summaryZh": "Hugging Face推出针对ZeroGPU Spaces的Ahead-of-Time（AoT）编译技术支持。通过提前编译模型，替代运行时的动态编译，能够有效解决ZeroGPU短生命周期进程的痛点。该技术可在Flux、Wan和LTX等模型上实现1.3倍至1.8倍的性能提升，并结合FP8量化与动态形状等高级技巧，大幅优化多媒体生成演示的运行流畅度与硬件利用率。",
   "summaryGeneratedAt": "2026-09-01T11:58:32.279717Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -71,5 +71,1468 @@
       }
     ],
     "duplicateKey": "huggingface-zerogpu-aot-compilation"
-  }
+  },
+  "images": [],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "ZeroGPU lets anyone spin up powerful Nvidia H200 hardware in Hugging Face Spaces without keeping a GPU locked for idle traffic. It’s efficient, flexible, and ideal for demos but it doesn’t always make full use of everything the GPU and CUDA stack can offer. Generating images or videos can take a significant amount of time. Being able to squeeze out more performance, taking advantage of the H200 hardware, does matter in this case.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 48,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This is where PyTorch ahead-of-time (AoT) compilation comes in. Instead of compiling models on the fly (which doesn’t play nicely with ZeroGPU’s short-lived processes), AoT lets you optimize once and reload instantly.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "The result: snappier demos and a smoother experience, with speedups ranging from 1.3×–1.8× on models like Flux, Wan, and LTX 🔥",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        },
+        {
+          "start": 81,
+          "end": 90,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "In this post, we’ll show how to wire up Ahead-of-Time (AoT) compilation in ZeroGPU Spaces. We'll explore advanced tricks like FP8 quantization and dynamic shapes, and share working demos you can try right away. If you cannot wait, we invite you to check out some ZeroGPU-powered demos on the zerogpu-aoti organization.",
+      "spans": [
+        {
+          "start": 292,
+          "end": 304,
+          "kind": "a",
+          "href": "https://huggingface.co/zerogpu-aoti"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Pro users and Team / Enterprise org members can create ZeroGPU Spaces, while anyone can freely use them (Pro, Team and Enterprise users get 8x more ZeroGPU quota)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "a",
+          "href": "https://huggingface.co/pro"
+        },
+        {
+          "start": 14,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/enterprise"
+        },
+        {
+          "start": 140,
+          "end": 142,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "What is ZeroGPU",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#what-is-zerogpu"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "PyTorch compilation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#pytorch-compilation"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Ahead-of-time compilation on ZeroGPU",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#ahead-of-time-compilation-on-zerogpu"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Gotchas",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#gotchas"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#quantization"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Dynamic shapes",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#dynamic-shapes"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Multi-compile / shared weights",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#multi-compile--shared-weights"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "FlashAttention-3",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#flashattention-3"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Regional compilation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#regional-compilation"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Use a compiled graph from the Hub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#use-a-compiled-graph-from-the-hub"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "AoT compiled ZeroGPU Spaces demos",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#aot-compiled-zerogpu-spaces-demos"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Conclusion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#conclusion"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zerogpu-aoti#resources"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "What is ZeroGPU",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Spaces is a platform powered by Hugging Face that allows ML practitioners to easily publish demo apps.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Typical demo apps on Spaces look like:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "This works great, but ends up reserving a GPU for the Space during its entire lifetime – even when it has no user activity.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "When executing .to('cuda') on this line:",
+      "spans": [
+        {
+          "start": 15,
+          "end": 26,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "PyTorch initializes the NVIDIA driver, which sets up the process on CUDA forever. This is not very resource-efficient given that app traffic is not perfectly smooth, but is rather extremely sparse and spiky.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "ZeroGPU takes a just-in-time approach to GPU initialization. Instead of setting up the main process on CUDA, it automatically forks the process, sets it up on CUDA, runs the GPU tasks, and finally kills the fork when the GPU needs to be released.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "This means that:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "When the app does not receive traffic, it doesn't use any GPU",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "When it is actually performing a task, it will use one GPU",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "It can use multiple GPUs as needed to perform tasks concurrently",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Thanks to the Python spaces package, the only code change needed to get this behaviour is as follows:",
+      "spans": [
+        {
+          "start": 21,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "By importing spaces and adding the @spaces.GPU decorator, we:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 35,
+          "end": 46,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Intercept PyTorch API calls to postpone CUDA operations",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Make the decorated function run in a fork when later called",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "(Call an internal API to make the right device visible to the fork but this is not in the scope of this blogpost)",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "ZeroGPU currently allocates an MIG slice of H200 (3g.71gb profile). Additional MIG sizes including full slice (7g.141gb profile) will come in late 2025.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 34,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/datacenter/tesla/mig-user-guide/#h200-mig-profiles"
+        },
+        {
+          "start": 50,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 119,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "PyTorch compilation",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Modern ML frameworks like PyTorch and JAX have the concept of compilation that can be used to optimize model latency or inference time. Behind the scenes, compilation applies a series of (often hardware-dependent) optimization steps such as operator fusion, constant folding, etc.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 73,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "PyTorch (from 2.0 onwards) currently has two major interfaces for compilation:",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Just-in-time with torch.compile",
+      "spans": [
+        {
+          "start": 18,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Ahead-of-time with torch.export + AOTInductor",
+      "spans": [
+        {
+          "start": 19,
+          "end": 31,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 45,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "torch.compile works great in standard environments: it compiles your model the first time it runs, and reuses the optimized version for subsequent calls.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "However, on ZeroGPU, given that the process is freshly spun up for (almost) every GPU task, it means that torch.compile can’t efficiently re-use compilation and is thus forced to rely on its filesystem cache to restore compiled models. Depending on the model being compiled, this process takes from a few dozen seconds to a couple of minutes, which is way too much for practical GPU tasks in Spaces.",
+      "spans": [
+        {
+          "start": 106,
+          "end": 119,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 207,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html#modular-caching-of-torchdynamo-torchinductor-and-triton"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "This is where ahead-of-time (AoT) compilation shines.",
+      "spans": [
+        {
+          "start": 14,
+          "end": 45,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "With AoT, we can export a compiled model once, save it, and later reload it instantly in any process, which is exactly what we need for ZeroGPU. This helps us reduce framework overhead and also eliminates cold-start timings typically incurred in just-in-time compilation.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "But how can we do ahead-of-time compilation on ZeroGPU? Let’s dive in.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Ahead-of-time compilation on ZeroGPU",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Let's go back to our ZeroGPU base example and unpack what we need to enable AoT compilation. For the purpose of this demo, we will use the black-forest-labs/FLUX.1-dev model:",
+      "spans": [
+        {
+          "start": 139,
+          "end": 167,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "In the discussion below, we only compile the transformer component of pipe since, in these generative models, the transformer (or more generally, the denoiser) is the most computationally heavy component.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Compiling a model ahead-of-time with PyTorch involves multiple steps:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "1. Getting example inputs",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Recall that we’re going to compile the model ahead of time. Therefore, we need to derive example inputs for the model. Note that these are the same kinds of inputs we expect to see during the actual runs. To capture those inputs, we will leverage the spaces.aoti_capture helper from the spaces package:",
+      "spans": [
+        {
+          "start": 45,
+          "end": 50,
+          "kind": "em"
+        },
+        {
+          "start": 251,
+          "end": 270,
+          "kind": "code"
+        },
+        {
+          "start": 287,
+          "end": 293,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "When used as a context manager, aoti_capture intercepts the call to any callable (pipe.transformer in our case), prevents it from executing, captures the input arguments that would have been passed to it, and stores their values in call.args and call.kwargs.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 82,
+          "end": 98,
+          "kind": "code"
+        },
+        {
+          "start": 232,
+          "end": 241,
+          "kind": "code"
+        },
+        {
+          "start": 246,
+          "end": 257,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "2. Exporting the model",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Now that we have example args and kwargs for our transformer component, we can export it to a PyTorch ExportedProgram by using torch.export.export utility:",
+      "spans": [
+        {
+          "start": 102,
+          "end": 117,
+          "kind": "code"
+        },
+        {
+          "start": 102,
+          "end": 117,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/stable/export.html#torch.export.ExportedProgram"
+        },
+        {
+          "start": 127,
+          "end": 146,
+          "kind": "code"
+        },
+        {
+          "start": 127,
+          "end": 146,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/stable/export.html#torch.export.export"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "An exported PyTorch program is a computation graph that represents the tensor computations along with the original model parameter values.",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "3. Compiling the exported model",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Once the model is exported, compiling it is pretty straightforward.",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "A traditional AoT compilation in PyTorch often requires saving the model on disk so it can be later reloaded. In our case, we’ll leverage a helper function part of the spaces package: spaces.aoti_compile. It's a tiny wrapper around torch._inductor.aot_compile that manages saving and lazy-loading the model as needed. It's meant to be used like this:",
+      "spans": [
+        {
+          "start": 168,
+          "end": 174,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 203,
+          "kind": "code"
+        },
+        {
+          "start": 232,
+          "end": 259,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "This compiled_transformer is now an AoT-compiled binary ready to be used for inference.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "4. Using the compiled model in the pipeline",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "Now we need to bind our compiled transformer to our original pipeline, i.e., the pipeline.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 89,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "A naive and almost working approach is to simply patch our pipeline like pipe.transformer = compiled_transformer. Unfortunately, this approach does not work because it deletes important attributes like dtype, config, etc. Only patching the forward method does not work well either because we are then keeping original model parameters in memory, often leading to OOM errors at runtime.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 112,
+          "kind": "code"
+        },
+        {
+          "start": 202,
+          "end": 207,
+          "kind": "code"
+        },
+        {
+          "start": 209,
+          "end": 215,
+          "kind": "code"
+        },
+        {
+          "start": 240,
+          "end": 247,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "spaces package provides a utility for this, too -- spaces.aoti_apply:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 51,
+          "end": 68,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "Et voilà! It will take care of patching pipe.transformer.forward with our compiled model, as well as cleaning old model parameters out of memory.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 101,
+          "end": 144,
+          "kind": "a",
+          "href": "https://pypi-browser.org/package/spaces/spaces-0.40.1-py3-none-any.whl/spaces/zero/torch/aoti.py#L87"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "5. Wrapping it all together",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "To perform the first three steps (intercepting input examples, exporting the model, and compiling it with PyTorch inductor), we need a real GPU. CUDA emulation that you get outside of @spaces.GPU function is not enough because compilation is truly hardware-dependent, for instance, relying on micro-benchmark runs to tune the generated code. This is why we need to wrap it all inside a @spaces.GPU function and then get our compiled model back to the root of our app. Starting from our original demo code, this gives:",
+      "spans": [
+        {
+          "start": 184,
+          "end": 195,
+          "kind": "code"
+        },
+        {
+          "start": 386,
+          "end": 397,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "With just a dozen lines of additional code, we’ve successfully made our demo quite faster (1.7x faster in the case of FLUX.1-dev).",
+      "spans": [
+        {
+          "start": 91,
+          "end": 95,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "If you want to learn more about AoT compilation, you can read PyTorch's AOTInductor tutorial",
+      "spans": [
+        {
+          "start": 72,
+          "end": 92,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/tutorials/recipes/torch_export_aoti_python.html"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "Gotchas",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Now that we have demonstrated the speedups one can realize under the constraints of operating with ZeroGPUs, we will discuss a few gotchas that came up while working with this setup.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Quantization",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "AoT can be combined with quantization to deliver even greater speedups. For image and video generation, the FP8 post-training dynamic quantization schemes deliver good speed-quality trade-offs. However, FP8 requires a CUDA compute capability of at least 9.0 to work. Thankfully, for ZeroGPUs, since they’re based on H200s, we can already take advantage of the FP8 quantization schemes.",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "To enable FP8 quantization within our AoT compilation workflow, we can leverage the APIs provided by torchao like so:",
+      "spans": [
+        {
+          "start": 101,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 101,
+          "end": 108,
+          "kind": "a",
+          "href": "https://github.com/pytorch/ao"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "(You can find more details about TorchAO here.)",
+      "spans": [
+        {
+          "start": 41,
+          "end": 45,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/ao/stable/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "And we can then proceed with the rest of the steps as outlined above. Using quantization provides another 1.2x of speedup.",
+      "spans": [
+        {
+          "start": 106,
+          "end": 110,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0077",
+      "source": "Dynamic shapes",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Images and videos can come in different shapes and sizes. Hence, it’s important to also account for shape dynamism when performing AoT compilation. The primitives provided by torch.export.export make it easily configurable to provide what inputs should be treated accordingly for dynamic shapes, as shown below.",
+      "spans": [
+        {
+          "start": 175,
+          "end": 194,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "For the case of Flux.1-Dev transformer, changes in different image resolutions will affect two of its forward arguments:",
+      "spans": [
+        {
+          "start": 102,
+          "end": 109,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "hidden_states: The noisy input latents, which the transformer is supposed to denoise. It’s a 3D tensor, representing batch_size, flattened_latent_dim, embed_dim. When the batch size is fixed, it’s the flattened_latent_dim that will change for any changes made to image resolutions.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 160,
+          "kind": "code"
+        },
+        {
+          "start": 201,
+          "end": 221,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "img_ids: A 2D array of encoded pixel coordinates having a shape of height * width, 3. In this case, we want to make height * width dynamic.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 67,
+          "end": 84,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 130,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "We start by defining a range in which we want to let the (latent) image resolutions vary. To derive these value ranges, we inspected the shapes of hidden_states in the pipeline with respect to varied image resolutions. The exact values are model-dependent and require manual inspection and some intuition. For Flux.1-Dev, we ended up with:",
+      "spans": [
+        {
+          "start": 147,
+          "end": 160,
+          "kind": "code"
+        },
+        {
+          "start": 147,
+          "end": 160,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/blob/0ff1aa910cf3d87193af79ec1ae4487be542e872/src/diffusers/pipelines/flux/pipeline_flux.py#L920"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "We then define a map of argument names and which dimensions in their input values we expect to be dynamic:",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Then we need to make our dynamic shapes object replicate the structure of our example inputs. The inputs that do not need dynamic shapes must be set to None. This can be done very easily with PyTorch tree_map utility:",
+      "spans": [
+        {
+          "start": 152,
+          "end": 156,
+          "kind": "code"
+        },
+        {
+          "start": 200,
+          "end": 208,
+          "kind": "a",
+          "href": "https://github.com/pytorch/pytorch/blob/2f0de0ff9361ca4f2b1e6f9edbc600b5fb6abcd6/torch/utils/_pytree.py#L1341-L1373"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Now, when performing the export step, we simply supply transformer_dynamic_shapes to torch.export.export:",
+      "spans": [
+        {
+          "start": 55,
+          "end": 81,
+          "kind": "code"
+        },
+        {
+          "start": 85,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "Check out this Space that shows how to use both quantization and dynamic shapes during the export step.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/FLUX.1-Kontext-Dev-fp8-dynamic"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "Multi-compile / shared weights",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Dynamic shapes is sometimes not enough when dynamism is too important.",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "This is, for instance, the case with the Wan family of video generation models if you want your compiled model to generate different resolutions. One thing can be done in this case: compile one model per resolution while keeping the model parameters shared and dispatching the right one at runtime",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "Here is a minimal example of this approach: zerogpu-aoti-multi.py. You can also see a fully working implementation of this paradigm in the Wan 2.2 Space.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 65,
+          "kind": "a",
+          "href": "https://gist.github.com/cbensimon/8dc0ffcd7ee024d91333f6df01907916"
+        },
+        {
+          "start": 139,
+          "end": 152,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/wan2-2-fp8da-aoti-faster/blob/main/optimization.py"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "FlashAttention-3",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "Since the ZeroGPU hardware and CUDA drivers are perfectly compatible with Flash-Attention 3 (FA3), we can use it in our ZeroGPU Spaces to speed things up even further. FA3 works with ahead-of-time compilation. So, this is ideal for our case.",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "Compiling and building FA3 from source can take several minutes, and this process is hardware-dependent. As users, we wouldn’t want to lose precious ZeroGPU compute hours. This is where Hugging Face kernels library comes to the rescue. It provides access to pre-built kernels that are compatible for a given hardware. For example, when we try to run:",
+      "spans": [
+        {
+          "start": 199,
+          "end": 206,
+          "kind": "code"
+        },
+        {
+          "start": 199,
+          "end": 214,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels"
+        }
+      ]
+    },
+    {
+      "id": "b0094",
+      "source": "It tries to load a kernel from the kernels-community/vllm-flash-attn3 repository, which is compatible with the current setup. Otherwise, it will error out due to incompatibility issues. Luckily for us, this works seamlessly on the ZeroGPU Spaces. This means we can leverage the power of FA3 on ZeroGPU, using the kernels library.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 69,
+          "kind": "code"
+        },
+        {
+          "start": 35,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels-community/vllm-flash-attn3"
+        },
+        {
+          "start": 313,
+          "end": 320,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "Here is a fully working example of an FA3 attention processor for the Qwen-Image model.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 61,
+          "kind": "a",
+          "href": "https://gist.github.com/sayakpaul/ff715f979793d4d44beb68e5e08ee067#file-fa3_qwen-py"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "Regional compilation",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "So far, we have been compiling the full model. Depending on the model, full model compilation can lead to significantly long cold start times. Long cold start times make the development experience unpleasant.",
+      "spans": []
+    },
+    {
+      "id": "b0098",
+      "source": "We can also choose to compile regions within a model, significantly reducing the cold start times, while retaining almost all the benefits of full model compilation. Regional compilation becomes promising when a model has repeated blocks of computation. A standard language model, for example, has a number of identically structured Transformer blocks.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 37,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "In our example, we can compile the repeated blocks of the Flux transformer ahead of time, and propagate the compiled graph to the remaining repeated blocks. The Flux Transformer has two kinds of repeated blocks: FluxTransformerBlock and FluxSingleTransformerBlock.",
+      "spans": [
+        {
+          "start": 161,
+          "end": 177,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/blob/c2e5ece08bf22d249c62e964f91bc326cf9e3759/src/diffusers/models/transformers/transformer_flux.py"
+        },
+        {
+          "start": 212,
+          "end": 232,
+          "kind": "code"
+        },
+        {
+          "start": 237,
+          "end": 263,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "You can check out this Space for a complete example.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/cbensimon/FLUX.1-dev-fa3-aoti/tree/main"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "💡 For Flux.1-Dev, switching to regional compilation reduces the compilation time from 6 minutes to just 30 seconds while delivering identical speedups.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 95,
+          "kind": "em"
+        },
+        {
+          "start": 104,
+          "end": 114,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "Use a compiled graph from the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "Once a model (or even a model block) is compiled ahead of time, we can serialize the compiled graph module as an artifact and reuse later. In the context of a ZeroGPU-powered demo on Spaces, this will significantly cut down the demo startup time by skipping the compilation time.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "To keep the storage light, we can just save the compiled model graph without including any model parameters inside the artifact.",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "Check out this collection that shows a full workflow of obtaining compiled model graph, pushing it to the Hub, and then using it to build a demo.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/zerogpu-aoti/using-compiled-graph-from-the-hub-68c2afcc03de7609f9f91e35"
+        }
+      ]
+    },
+    {
+      "id": "b0106",
+      "source": "AoT compiled ZeroGPU Spaces demos",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "Speedup comparison",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "FLUX.1-dev without AoTI",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/FLUX.1-dev-base"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "FLUX.1-dev with AoTI and FA3 (1.75x speedup)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/FLUX.1-dev-fa3-aoti"
+        },
+        {
+          "start": 30,
+          "end": 35,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "Featured AoTI Spaces",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "FLUX.1 Kontext",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/FLUX.1-Kontext-Dev"
+        }
+      ]
+    },
+    {
+      "id": "b0112",
+      "source": "QwenImage Edit",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/multimodalart/Qwen-Image-Edit-Fast"
+        }
+      ]
+    },
+    {
+      "id": "b0113",
+      "source": "Wan 2.2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/wan2-2-fp8da-aoti-faster"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "Regional compilation",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "Regional compilation recipe",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/tutorials/recipes/regional_compilation.html"
+        }
+      ]
+    },
+    {
+      "id": "b0116",
+      "source": "Regional compilation with AOT",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/tutorials/recipes/regional_aot.html"
+        }
+      ]
+    },
+    {
+      "id": "b0117",
+      "source": "Native integration in Diffusers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/optimization/fp16"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "More performance numbers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/torch-compile-and-diffusers-a-hands-on-guide-to-peak-performance/"
+        }
+      ]
+    },
+    {
+      "id": "b0119",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "ZeroGPU within Hugging Face Spaces is a powerful feature that enables AI builders by providing access to powerful compute. In this post, we showed how users can benefit from PyTorch’s ahead-of-time compilation techniques to speed up their applications that leverage ZeroGPU.",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "We demonstrate speedups with Flux.1-Dev, but these techniques are not limited to just this model. Therefore, we encourage you to give these techniques a try and provide us with feedback in this community discussion.",
+      "spans": [
+        {
+          "start": 194,
+          "end": 214,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zerogpu-aoti/README/discussions/1"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "Visit our ZeroGPU-AOTI org on the Hub to refer to a collection of demos that leverage the techniques discussed in this post.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/zerogpu-aoti"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "Browse spaces.aoti_* APIs source code to learn more about the interface",
+      "spans": [
+        {
+          "start": 7,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 37,
+          "kind": "a",
+          "href": "https://pypi-browser.org/package/spaces/spaces-0.40.1-py3-none-any.whl/spaces/zero/torch/aoti.py"
+        }
+      ]
+    },
+    {
+      "id": "b0125",
+      "source": "Check out Kernels Community org on the hub",
+      "spans": [
+        {
+          "start": 10,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels-community"
+        }
+      ]
+    },
+    {
+      "id": "b0126",
+      "source": "Learn more about regional compilation from here",
+      "spans": [
+        {
+          "start": 43,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/pytorch.org/tutorials/recipes/regional_compilation.html"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "Upgrade to Pro on Hugging Face to create your own ZeroGPU Spaces (and get 25 minutes of H200 usage every day)",
+      "spans": [
+        {
+          "start": 11,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/pro"
+        }
+      ]
+    },
+    {
+      "id": "b0128",
+      "source": "Acknowledgements: Thanks to ChunTe Lee for creating an awesome thumbnail for this post. Thanks to Pedro and Vaibhav for providing feedback on the post. Thanks to Angela Yi from the PyTorch team for helping us with AOT guidance.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 227,
+          "kind": "em"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "597f3d3af21822b2bfea5b4ecd531364dd2b204b26375a4ced23458967df1510",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import gradio as gr\nfrom diffusers import DiffusionPipeline\n\npipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()"
+    },
+    {
+      "id": "c0002",
+      "source": "pipe = DiffusionPipeline.from_pretrained(...).to('cuda')"
+    },
+    {
+      "id": "c0003",
+      "source": "  import gradio as gr\n+ import spaces\n  from diffusers import DiffusionPipeline\n\n  pipe = DiffusionPipeline.from_pretrained(...).to('cuda')\n\n+ @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n\n  gr.Interface(generate, \"text\", \"gallery\").launch()"
+    },
+    {
+      "id": "c0004",
+      "source": "import gradio as gr\nimport spaces\nimport torch\nfrom diffusers import DiffusionPipeline\n\nMODEL_ID = 'black-forest-labs/FLUX.1-dev'\n\npipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\npipe.to('cuda')\n\n@spaces.GPU\ndef generate(prompt):\n    return pipe(prompt).images\n\ngr.Interface(generate, \"text\", \"gallery\").launch()"
+    },
+    {
+      "id": "c0005",
+      "source": "with spaces.aoti_capture(pipe.transformer) as call:\n    pipe(\"arbitrary example prompt\")"
+    },
+    {
+      "id": "c0006",
+      "source": "exported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)"
+    },
+    {
+      "id": "c0007",
+      "source": "compiled_transformer = spaces.aoti_compile(exported_transformer)"
+    },
+    {
+      "id": "c0008",
+      "source": "spaces.aoti_apply(compiled_transformer, pipe.transformer)"
+    },
+    {
+      "id": "c0009",
+      "source": "  import gradio as gr\n  import spaces\n  import torch\n  from diffusers import DiffusionPipeline\n  \n  MODEL_ID = 'black-forest-labs/FLUX.1-dev'\n  \n  pipe = DiffusionPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)\n  pipe.to('cuda')\n  \n+ @spaces.GPU(duration=1500) # maximum duration allowed during startup\n+ def compile_transformer():\n+     with spaces.aoti_capture(pipe.transformer) as call:\n+         pipe(\"arbitrary example prompt\")\n+ \n+     exported = torch.export.export(\n+         pipe.transformer,\n+         args=call.args,\n+         kwargs=call.kwargs,\n+     )\n+     return spaces.aoti_compile(exported)\n+ \n+ compiled_transformer = compile_transformer()\n+ spaces.aoti_apply(compiled_transformer, pipe.transformer)\n  \n  @spaces.GPU\n  def generate(prompt):\n      return pipe(prompt).images\n  \n  gr.Interface(generate, \"text\", \"gallery\").launch()"
+    },
+    {
+      "id": "c0010",
+      "source": "+ from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig\n\n+ # Quantize the transformer just before the export step.\n+ quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig())\n\nexported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n)"
+    },
+    {
+      "id": "c0011",
+      "source": "transformer_hidden_dim = torch.export.Dim('hidden', min=4096, max=8212)"
+    },
+    {
+      "id": "c0012",
+      "source": "transformer_dynamic_shapes = {\n    \"hidden_states\": {1: transformer_hidden_dim}, \n    \"img_ids\": {0: transformer_hidden_dim},\n}"
+    },
+    {
+      "id": "c0013",
+      "source": "from torch.utils._pytree import tree_map\n\ndynamic_shapes = tree_map(lambda v: None, call.kwargs)\ndynamic_shapes |= transformer_dynamic_shapes"
+    },
+    {
+      "id": "c0014",
+      "source": "exported_transformer = torch.export.export(\n    pipe.transformer,\n    args=call.args,\n    kwargs=call.kwargs,\n    dynamic_shapes=dynamic_shapes,\n)"
+    },
+    {
+      "id": "c0015",
+      "source": "from kernels import get_kernel\n\nvllm_flash_attn3 = get_kernel(\"kernels-community/vllm-flash-attn3\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "597f3d3af21822b2bfea5b4ecd531364dd2b204b26375a4ced23458967df1510",
+  "mediaLayout": [],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 0,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:22.196898Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:22.196914Z"
 }
