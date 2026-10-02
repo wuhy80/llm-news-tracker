@@ -23,8 +23,6 @@ python scripts/repair_huggingface.py --cache-dir /path/to/cache --offline --retr
 
 Only matching HTML files are processed; uncached articles remain pending. A completed migration means `remaining: 0`, not merely a successful workflow exit.
 
-Each translation run also advances a 20-article repair batch under the same archive-write lock, committing repaired sources and translation mappings before translation starts. This prevents frequent translation schedules from starving the hourly repair: GitHub replaces older pending runs in a shared concurrency group even with `cancel-in-progress: false`.
-
 ## Validation
 
 ```sh
