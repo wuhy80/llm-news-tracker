@@ -32,12 +32,23 @@
       const src = String(media.src || '');
       if (!/^data\/article-media\/[a-zA-Z0-9_./-]+$/.test(src) && !httpUrl(src)) return null;
       if (src.split('/').includes('..')) return null;
+      const mapped = resolveMedia(src);
       element = document.createElement('img');
-      element.src = resolveMedia(src);
+      element.src = mapped;
       element.alt = String(media.alt || '文章配图');
       element.loading = 'lazy';
       element.decoding = 'async';
-      element.addEventListener('error', () => figure.remove(), {once: true});
+      element.addEventListener('error', () => {
+        // While the media still exists in the repository, a misconfigured
+        // external base must not blank the figure: retry the repository path
+        // once before giving up.
+        if (mapped !== src && element.dataset.mediaFallback !== '1') {
+          element.dataset.mediaFallback = '1';
+          element.src = src;
+          return;
+        }
+        figure.remove();
+      });
     } else {
       const url = httpUrl(media.src);
       if (!url) return null;
