@@ -19,8 +19,8 @@
   "fetchedAt": "2026-09-02T11:27:23.937244Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Building the Hugging Face MCP Server\n\nTL;DR: The Hugging Face Official MCP Server offers unique customization options for AI Assistants accessing the Hub, along with access to thousands of AI applications through one simple URL. We used MCPs \"Streamable HTTP\" transport for deployment, and examine in detail the trade-offs that Server Developers have.\n\nWe've learned many things about building a useful MCP server in the last month - we'll describe our journey here.\n\nThe Model Context Protocol (MCP) is fulfilling its promise of being the standard to connect AI Assistants to the outside world.\n\nAt Hugging Face, providing access to the Hub via MCP is an obvious choice, and this article shares our experience developing the hf.co/mcp MCP Server.\n\nThe community uses the Hub for research, development, content creation and more. We wanted to let people customize the server for their own needs, as well as easily access thousands of AI applications available on Spaces. This meant making the MCP Server dynamic by adjusting users' tools on the fly.\n\nThe Hugging Face MCP Settings Page where Users can configure their tools.\n\nWe also wanted to make access simple by avoiding complicated downloads and configuration, so making it remotely accessible via a simple URL was a must.\n\nWhen building a remote MCP Server, the first decision is deciding how clients will connect to it. MCP offers several transport options, with different trade-offs. TL;DR: our open source code supports all variants, but for production we chose to go with the most modern one. This section goes through the different options in detail.\n\nSince its launch in November 2024, MCP has undergone rapid evolution with 3 protocol revisions in 9 months. This has seen the replacement of the SSE Transport with Streamable HTTP, as well as the introduction and rework of authorization.\n\nThese rapid changes mean support for different MCP Features and revisions in Client applications varies, providing extra challenges for our design choices.\n\nHere is a brief summary of the Transport Options offered by the Model Context Protocol and associated SDKs:\n\nTypically used when the MCP Server is running on the same computer as the Client. Able to access local resources such as files if needed.\n\nUsed for remote connections over HTTP. Deprecated in the 2025-03-26 version of MCP but still in use.\n\nA more flexible remote HTTP transport that provides more options for deployment than the outgoing SSE version\n\nBoth STDIO and HTTP with SSE are fully bi-directional by default - meaning that Client and Server maintain an open connection and can send messages to each other at any time.\n\nSSE refers to \"Server Sent Events\" - a way for HTTP Servers to maintain an open connection and send events in response to a request.\n\n#### Understanding Streamable HTTP\n\nMCP Server Developers face a lot of choices when setting up the Streamable HTTP transport.\n\nThere are 3 main communication patterns to choose from:\n\n- Direct Response - Simple Request/Response (like standard REST APIs). This is perfect for straightforward, stateless operations like simple searches.\n\n- Request Scoped Streams - Temporary SSE Streams associated with a single Request. This is useful for sending Progress Updates if the Tool Call takes a long time - such as Video Generation. Additionally the Server may need to request information from the user with an Elicitation , or conduct a Sampling request.\n\n- Server Push Streams - Long-lived SSE connection supporting server-initiated messages. This enables Resource, Tool and Prompt List change notifications or ad-hoc Sampling and Elicitations. These connections need extra management such as keep-alive and resumption mechanics on re-connection.\n\nWhen using Request Scoped Streams with the official SDKs, use the sendNotification() and sendRequest() methods provided in the RequestHandlerExtra parameter (TypeScript) or set the related_request_id (Python) to send messages to the correct stream.\n\nAn additional factor to consider is whether or not the MCP Server itself needs to maintain state for each connection. This is decided by the Server when the Client sends its Initialize request:\n\nServer responds with an mcp-session-id\n\nEach request is independent\n\nServer maintains client context\n\nSimple horizontal scaling: any instance can handle any request\n\nNeed session affinity or shared state mechanisms\n\nMay replay messages for broken connections\n\nThe table below summarizes the MCP Features and their supported communication pattern:\n\nMCP Feature Server Push Request Scoped Direct Response\n\nTools, Prompts, Resources\n\nServer Initiated at any time\n\nRelated to a Client initiated request\n\nTool/Prompt List Changes\n\nTool Progress Notification\n\nWith Request Scoped streams, Sampling and Elicitation requests need a Stateful connection so that the mcp-session-id can be used for response association.\n\nThe Hugging Face MCP Server is Open Source - and supports STDIO, SSE and Streamable HTTP deployment in both Direct Response and Server Push mode. You can configure keep-alive and last activity timeouts when using Server Push Streams. There's also a built-in observability dashboard that you can use to understand how different Clients manage connections, and handle Tool List change notifications.\n\nThe following picture shows our MCP Server connection dashboard running in \"Server Push\" Streamable HTTP mode:\n\nThe Hugging Face MCP Server Connection Dashboard.\n\n### Production Deployment\n\nFor production, we decided to launch our MCP Server with Streamable HTTP in a Stateless, Direct Response configuration for the following reasons:\n\nStateless For anonymous users we supply a standard set of Tools for using the Hub along with an Image Generator. For authenticated users our state comprises their selected tools and chosen Gradio applications. We also make sure that users ZeroGPU quota is correctly applied for their account. This is managed using the supplied HF_TOKEN or OAuth credentials that we look up on request. None of our existing tools require us to maintain any other state between requests.\n\nYou can use OAuth login by adding ?login to the MCP Server url - e.g. https://huggingface.co/mcp?login . We may make this the default once the claude.ai remote integration supports the latest OAuth spec.\n\nDirect Response provides the lowest deployment resource overhead - and we don't currently have any Tools that require Sampling or Elicitation during execution.\n\nFuture Support At launch, the \"HTTP with SSE\" transport was still the remote default in a lot of MCP Clients. However, we didn't want to invest heavily in managing it due to its imminent deprecation. Fortunately, popular clients had already started making the switch (VSCode and Cursor), and within a week of launch claude.ai also added support. If you need to connect with SSE, feel free to deploy a copy of our Server on a FreeCPU Hugging Face Space .\n\n#### Tool List Change Notifications\n\nIn the future, we would like to support real-time Tool List Changed notifications when users update their settings on the Hub. However, this raises a couple of practical issues:\n\nFirst, users tend to configure their favourite MCP Servers in their Client and leave them enabled. This means that the Client remains connected whilst the application is open. Sending notifications would mean maintaining as many open connections as there were currently active Clients - regardless of active usage - on the chance the user updates their tool configuration.\n\nSecond, most MCP Servers and Clients disconnect after a period of inactivity, resuming when necessary. This inevitably means that immediate push notifications would be missed - as the notification channel will have been closed. In practice, it is far simpler for the Client to refresh the connection and Tool List as needed.\n\nUnless you have reasonable control over the Client/Server pair, using Server Push Streams adds a lot of complexity to a public deployment, when lower-resource solutions for refreshing the Tool List exist.\n\n#### URL User Experience\n\nJust before launch, @julien-c submitted a PR to include friendly instructions for users visiting hf.co/mcp . This hugely improves the User Experience - the default response is otherwise an unfriendly bit of JSON.\n\nInitially, we found this generated an enormous amount of traffic. After a bit of investigation we found that when returning a web page rather than an HTTP 405 error, VSCode would poll the endpoint multiple times per second!\n\nThe fix suggested by @coyotte508 was to properly detect browsers and only return the page in that circumstance. Thanks also to the VSCode team who rapidly fixed it .\n\nAlthough not specifically stated - returning a page in this manner does seem acceptable within the MCP Specification.\n\n#### MCP Client Behaviour\n\nThe MCP Protocol sends several requests during initialization. A typical connection sequence is: Initialize , Notifications/Initialize , tools/list and then prompts/list .\n\nGiven that MCP Clients will connect and reconnect whilst open, and the fact that users make periodic calls, we find there is a ratio of around 100 MCP Control messages for each Tool Call.\n\nSome clients also send requests that don't make sense for our Stateless, Direct Response configuration - for example Pings, Cancellations or attempts to list Resources (which isn't a capability we currently advertise).\n\nThe first week of July 2025 saw an astonishing 164 different Clients accessing our Server. Interestingly, one of the most popular tools is mcp-remote . Approximately half of all Clients use it as a bridge to connect to our remote server.\n\nMCP is rapidly evolving, and we're excited about what has already been achieved across Chat Applications, IDEs, Agents and MCP Servers over the last few months.\n\nWe can already see how powerful integrating the Hugging Face Hub has been and support for Gradio Spaces now makes it possible for LLMs to be easily extended with the latest Machine Learning applications .\n\nHere are some great examples of things people have been doing with our MCP Server so far:\n\n- Orchestrating Video Production\n\n- AI Application Development\n\n- Adding Reasoning to existing Models\n\nWe hope that this post has provided insights to the decisions that need to be made building Remote MCP Servers, and encourage you to try some of the examples in your favourite MCP Client.\n\nTake a look at our Open Source MCP Server , and try some of the different transport options with your Client, or open an Issue or Pull Request to make improvements or suggest new functionality.\n\nLet us know your thoughts, feedback and questions on this discussion thread .\n\nMore Articles from our Blog\n\nmultimodal nlp community\n\n## Training and Finetuning Multimodal Embedding & Reranker Models with Sentence Transformers\n\n## Multimodal Embedding & Reranker Models with Sentence Transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "TL;DR: The Hugging Face Official MCP Server offers unique customization options for AI Assistants accessing the Hub, along with access to thousands of AI applications through one simple URL. We used MCPs \"Streamable HTTP\" transport for deployment, and examine in detail the trade-offs that Server Developers have.\n\nWe've learned many things about building a useful MCP server in the last month - we'll describe our journey here.\n\n## Introduction\n\nThe Model Context Protocol (MCP) is fulfilling its promise of being the standard to connect AI Assistants to the outside world.\n\nAt Hugging Face, providing access to the Hub via MCP is an obvious choice, and this article shares our experience developing the hf.co/mcp MCP Server.\n\n## Design Choices\n\nThe community uses the Hub for research, development, content creation and more. We wanted to let people customize the server for their own needs, as well as easily access thousands of AI applications available on Spaces. This meant making the MCP Server dynamic by adjusting users' tools on the fly.\n\nThe Hugging Face MCP Settings Page where Users can configure their tools.\n\nWe also wanted to make access simple by avoiding complicated downloads and configuration, so making it remotely accessible via a simple URL was a must.\n\n## Remote Servers\n\nWhen building a remote MCP Server, the first decision is deciding how clients will connect to it. MCP offers several transport options, with different trade-offs. TL;DR: our open source code supports all variants, but for production we chose to go with the most modern one. This section goes through the different options in detail.\n\nSince its launch in November 2024, MCP has undergone rapid evolution with 3 protocol revisions in 9 months. This has seen the replacement of the SSE Transport with Streamable HTTP, as well as the introduction and rework of authorization.\n\nThese rapid changes mean support for different MCP Features and revisions in Client applications varies, providing extra challenges for our design choices.\n\nHere is a brief summary of the Transport Options offered by the Model Context Protocol and associated SDKs:\n\nTransport\n\nNotes\n\nSTDIO\n\nTypically used when the MCP Server is running on the same computer as the Client. Able to access local resources such as files if needed.\n\nHTTP with SSE\n\nUsed for remote connections over HTTP. Deprecated in the 2025-03-26 version of MCP but still in use.\n\nStreamable HTTP\n\nA more flexible remote HTTP transport that provides more options for deployment than the outgoing SSE version\n\nBoth STDIO and HTTP with SSE are fully bi-directional by default - meaning that Client and Server maintain an open connection and can send messages to each other at any time.\n\nSSE refers to \"Server Sent Events\" - a way for HTTP Servers to maintain an open connection and send events in response to a request.\n\n#### Understanding Streamable HTTP\n\nMCP Server Developers face a lot of choices when setting up the Streamable HTTP transport.\n\nThere are 3 main communication patterns to choose from:\n\n- Direct Response - Simple Request/Response (like standard REST APIs). This is perfect for straightforward, stateless operations like simple searches.\n\n- Request Scoped Streams - Temporary SSE Streams associated with a single Request. This is useful for sending Progress Updates if the Tool Call takes a long time - such as Video Generation. Additionally the Server may need to request information from the user with an Elicitation, or conduct a Sampling request.\n\n- Server Push Streams - Long-lived SSE connection supporting server-initiated messages. This enables Resource, Tool and Prompt List change notifications or ad-hoc Sampling and Elicitations. These connections need extra management such as keep-alive and resumption mechanics on re-connection.\n\nWhen using Request Scoped Streams with the official SDKs, use the sendNotification() and sendRequest() methods provided in the RequestHandlerExtra parameter (TypeScript) or set the related_request_id (Python) to send messages to the correct stream.\n\nAn additional factor to consider is whether or not the MCP Server itself needs to maintain state for each connection. This is decided by the Server when the Client sends its Initialize request:\n\n—\n\nStateless\n\nStateful\n\nSession IDs\n\nNot needed\n\nServer responds with an mcp-session-id\n\nWhat it means\n\nEach request is independent\n\nServer maintains client context\n\nScaling\n\nSimple horizontal scaling: any instance can handle any request\n\nNeed session affinity or shared state mechanisms\n\nResumption\n\nNot needed\n\nMay replay messages for broken connections\n\nThe table below summarizes the MCP Features and their supported communication pattern:\n\nMCP Feature\n\nServer Push\n\nRequest Scoped\n\nDirect Response\n\nTools, Prompts, Resources\n\nY\n\nY\n\nY\n\nSampling/Elicitation\n\nServer Initiated at any time\n\nRelated to a Client initiated request\n\nN\n\nResource Subscriptions\n\nY\n\nN\n\nN\n\nTool/Prompt List Changes\n\nY\n\nN\n\nN\n\nTool Progress Notification\n\n\\-\n\nY\n\nN\n\nWith Request Scoped streams, Sampling and Elicitation requests need a Stateful connection so that the mcp-session-id can be used for response association.\n\nThe Hugging Face MCP Server is Open Source - and supports STDIO, SSE and Streamable HTTP deployment in both Direct Response and Server Push mode. You can configure keep-alive and last activity timeouts when using Server Push Streams. There's also a built-in observability dashboard that you can use to understand how different Clients manage connections, and handle Tool List change notifications.\n\nThe following picture shows our MCP Server connection dashboard running in \"Server Push\" Streamable HTTP mode:\n\nThe Hugging Face MCP Server Connection Dashboard.\n\n### Production Deployment\n\nFor production, we decided to launch our MCP Server with Streamable HTTP in a Stateless, Direct Response configuration for the following reasons:\n\nStateless For anonymous users we supply a standard set of Tools for using the Hub along with an Image Generator. For authenticated users our state comprises their selected tools and chosen Gradio applications. We also make sure that users ZeroGPU quota is correctly applied for their account. This is managed using the supplied HF_TOKEN or OAuth credentials that we look up on request. None of our existing tools require us to maintain any other state between requests.\n\nYou can use OAuth login by adding ?login to the MCP Server url - e.g. https://huggingface.co/mcp?login. We may make this the default once the claude.ai remote integration supports the latest OAuth spec.\n\nDirect Response provides the lowest deployment resource overhead - and we don't currently have any Tools that require Sampling or Elicitation during execution.\n\nFuture Support At launch, the \"HTTP with SSE\" transport was still the remote default in a lot of MCP Clients. However, we didn't want to invest heavily in managing it due to its imminent deprecation. Fortunately, popular clients had already started making the switch (VSCode and Cursor), and within a week of launch claude.ai also added support. If you need to connect with SSE, feel free to deploy a copy of our Server on a FreeCPU Hugging Face Space.\n\n#### Tool List Change Notifications\n\nIn the future, we would like to support real-time Tool List Changed notifications when users update their settings on the Hub. However, this raises a couple of practical issues:\n\nFirst, users tend to configure their favourite MCP Servers in their Client and leave them enabled. This means that the Client remains connected whilst the application is open. Sending notifications would mean maintaining as many open connections as there were currently active Clients - regardless of active usage - on the chance the user updates their tool configuration.\n\nSecond, most MCP Servers and Clients disconnect after a period of inactivity, resuming when necessary. This inevitably means that immediate push notifications would be missed - as the notification channel will have been closed. In practice, it is far simpler for the Client to refresh the connection and Tool List as needed.\n\nUnless you have reasonable control over the Client/Server pair, using Server Push Streams adds a lot of complexity to a public deployment, when lower-resource solutions for refreshing the Tool List exist.\n\n#### URL User Experience\n\nJust before launch, @julien-c submitted a PR to include friendly instructions for users visiting hf.co/mcp. This hugely improves the User Experience - the default response is otherwise an unfriendly bit of JSON.\n\nInitially, we found this generated an enormous amount of traffic. After a bit of investigation we found that when returning a web page rather than an HTTP 405 error, VSCode would poll the endpoint multiple times per second!\n\nThe fix suggested by @coyotte508 was to properly detect browsers and only return the page in that circumstance. Thanks also to the VSCode team who rapidly fixed it.\n\nAlthough not specifically stated - returning a page in this manner does seem acceptable within the MCP Specification.\n\n#### MCP Client Behaviour\n\nThe MCP Protocol sends several requests during initialization. A typical connection sequence is: Initialize, Notifications/Initialize, tools/list and then prompts/list.\n\nGiven that MCP Clients will connect and reconnect whilst open, and the fact that users make periodic calls, we find there is a ratio of around 100 MCP Control messages for each Tool Call.\n\nSome clients also send requests that don't make sense for our Stateless, Direct Response configuration - for example Pings, Cancellations or attempts to list Resources (which isn't a capability we currently advertise).\n\nThe first week of July 2025 saw an astonishing 164 different Clients accessing our Server. Interestingly, one of the most popular tools is mcp-remote. Approximately half of all Clients use it as a bridge to connect to our remote server.\n\n## Conclusion\n\nMCP is rapidly evolving, and we're excited about what has already been achieved across Chat Applications, IDEs, Agents and MCP Servers over the last few months.\n\nWe can already see how powerful integrating the Hugging Face Hub has been and support for Gradio Spaces now makes it possible for LLMs to be easily extended with the latest Machine Learning applications.\n\nHere are some great examples of things people have been doing with our MCP Server so far:\n\n- Orchestrating Video Production\n\n- Image Editing\n\n- Document Searching\n\n- AI Application Development\n\n- Adding Reasoning to existing Models\n\nWe hope that this post has provided insights to the decisions that need to be made building Remote MCP Servers, and encourage you to try some of the examples in your favourite MCP Client.\n\nTake a look at our Open Source MCP Server, and try some of the different transport options with your Client, or open an Issue or Pull Request to make improvements or suggest new functionality.\n\nLet us know your thoughts, feedback and questions on this discussion thread.",
   "summaryZh": "Hugging Face发布了官方MCP（Model Context Protocol）服务器，旨在通过标准化协议将AI助手与Hugging Face Hub及Spaces上的数千个AI应用连接起来。该服务器支持动态工具配置，并采用了Streamable HTTP传输方式，为开发者提供了一种无需复杂配置即可远程访问和调用AI工具的标准化方案，进一步推动了AI Agent生态的互联互通。",
   "summaryGeneratedAt": "2026-09-01T21:15:58.287121Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -67,5 +67,1331 @@
       }
     ],
     "duplicateKey": "hf-mcp-server"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mcp-remote/hf-mcp-settings.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mcp-remote/hf-mcp-settings.png",
+      "alt": "The Hugging Face MCP Settings Page",
+      "id": "image_0a4c9ac3d2dd1d27"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mcp-remote/hf-mcp-connections.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hf-mcp-remote/hf-mcp-connections.png",
+      "alt": "The Hugging Face MCP Server Connection Dashboard",
+      "id": "image_02989ab729b35718"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "TL;DR: The Hugging Face Official MCP Server offers unique customization options for AI Assistants accessing the Hub, along with access to thousands of AI applications through one simple URL. We used MCPs \"Streamable HTTP\" transport for deployment, and examine in detail the trade-offs that Server Developers have.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "We've learned many things about building a useful MCP server in the last month - we'll describe our journey here.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "The Model Context Protocol (MCP) is fulfilling its promise of being the standard to connect AI Assistants to the outside world.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "At Hugging Face, providing access to the Hub via MCP is an obvious choice, and this article shares our experience developing the hf.co/mcp MCP Server.",
+      "spans": [
+        {
+          "start": 129,
+          "end": 138,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 138,
+          "kind": "a",
+          "href": "https://hf.co/mcp"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Design Choices",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "The community uses the Hub for research, development, content creation and more. We wanted to let people customize the server for their own needs, as well as easily access thousands of AI applications available on Spaces. This meant making the MCP Server dynamic by adjusting users' tools on the fly.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "The Hugging Face MCP Settings Page where Users can configure their tools.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/settings/mcp"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "We also wanted to make access simple by avoiding complicated downloads and configuration, so making it remotely accessible via a simple URL was a must.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Remote Servers",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "When building a remote MCP Server, the first decision is deciding how clients will connect to it. MCP offers several transport options, with different trade-offs. TL;DR: our open source code supports all variants, but for production we chose to go with the most modern one. This section goes through the different options in detail.",
+      "spans": [
+        {
+          "start": 163,
+          "end": 169,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Since its launch in November 2024, MCP has undergone rapid evolution with 3 protocol revisions in 9 months. This has seen the replacement of the SSE Transport with Streamable HTTP, as well as the introduction and rework of authorization.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "These rapid changes mean support for different MCP Features and revisions in Client applications varies, providing extra challenges for our design choices.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Here is a brief summary of the Transport Options offered by the Model Context Protocol and associated SDKs:",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Transport",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0016",
+      "source": "Notes",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0017",
+      "source": "STDIO",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "Typically used when the MCP Server is running on the same computer as the Client. Able to access local resources such as files if needed.",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "HTTP with SSE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "Used for remote connections over HTTP. Deprecated in the 2025-03-26 version of MCP but still in use.",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Streamable HTTP",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "A more flexible remote HTTP transport that provides more options for deployment than the outgoing SSE version",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "Both STDIO and HTTP with SSE are fully bi-directional by default - meaning that Client and Server maintain an open connection and can send messages to each other at any time.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 10,
+          "kind": "code"
+        },
+        {
+          "start": 15,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "SSE refers to \"Server Sent Events\" - a way for HTTP Servers to maintain an open connection and send events in response to a request.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Understanding Streamable HTTP",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "MCP Server Developers face a lot of choices when setting up the Streamable HTTP transport.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "There are 3 main communication patterns to choose from:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Direct Response - Simple Request/Response (like standard REST APIs). This is perfect for straightforward, stateless operations like simple searches.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Request Scoped Streams - Temporary SSE Streams associated with a single Request. This is useful for sending Progress Updates if the Tool Call takes a long time - such as Video Generation. Additionally the Server may need to request information from the user with an Elicitation, or conduct a Sampling request.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "strong"
+        },
+        {
+          "start": 108,
+          "end": 124,
+          "kind": "a",
+          "href": "https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/progress"
+        },
+        {
+          "start": 266,
+          "end": 277,
+          "kind": "a",
+          "href": "https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Server Push Streams - Long-lived SSE connection supporting server-initiated messages. This enables Resource, Tool and Prompt List change notifications or ad-hoc Sampling and Elicitations. These connections need extra management such as keep-alive and resumption mechanics on re-connection.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 236,
+          "end": 246,
+          "kind": "a",
+          "href": "https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/ping"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "When using Request Scoped Streams with the official SDKs, use the sendNotification() and sendRequest() methods provided in the RequestHandlerExtra parameter (TypeScript) or set the related_request_id (Python) to send messages to the correct stream.",
+      "spans": [
+        {
+          "start": 66,
+          "end": 84,
+          "kind": "code"
+        },
+        {
+          "start": 89,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 127,
+          "end": 146,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 199,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "An additional factor to consider is whether or not the MCP Server itself needs to maintain state for each connection. This is decided by the Server when the Client sends its Initialize request:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "Stateless",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "Stateful",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "Session IDs",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "Not needed",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Server responds with an mcp-session-id",
+      "spans": [
+        {
+          "start": 24,
+          "end": 38,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "What it means",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "Each request is independent",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "Server maintains client context",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "Scaling",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "Simple horizontal scaling: any instance can handle any request",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Need session affinity or shared state mechanisms",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "Resumption",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "Not needed",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "May replay messages for broken connections",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "The table below summarizes the MCP Features and their supported communication pattern:",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "MCP Feature",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "Server Push",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "Request Scoped",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Direct Response",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "Tools, Prompts, Resources",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "Sampling/Elicitation",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "Server Initiated at any time",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "Related to a Client initiated request",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "Resource Subscriptions",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "Tool/Prompt List Changes",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Tool Progress Notification",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "Y",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "N",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "With Request Scoped streams, Sampling and Elicitation requests need a Stateful connection so that the mcp-session-id can be used for response association.",
+      "spans": [
+        {
+          "start": 102,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "The Hugging Face MCP Server is Open Source - and supports STDIO, SSE and Streamable HTTP deployment in both Direct Response and Server Push mode. You can configure keep-alive and last activity timeouts when using Server Push Streams. There's also a built-in observability dashboard that you can use to understand how different Clients manage connections, and handle Tool List change notifications.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 27,
+          "kind": "a",
+          "href": "https://github.com/evalstate/hf-mcp-server"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "The following picture shows our MCP Server connection dashboard running in \"Server Push\" Streamable HTTP mode:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "The Hugging Face MCP Server Connection Dashboard.",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Production Deployment",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "For production, we decided to launch our MCP Server with Streamable HTTP in a Stateless, Direct Response configuration for the following reasons:",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "Stateless For anonymous users we supply a standard set of Tools for using the Hub along with an Image Generator. For authenticated users our state comprises their selected tools and chosen Gradio applications. We also make sure that users ZeroGPU quota is correctly applied for their account. This is managed using the supplied HF_TOKEN or OAuth credentials that we look up on request. None of our existing tools require us to maintain any other state between requests.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 163,
+          "end": 177,
+          "kind": "a",
+          "href": "https://huggingface.co/settings/mcp"
+        },
+        {
+          "start": 328,
+          "end": 336,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "You can use OAuth login by adding ?login to the MCP Server url - e.g. https://huggingface.co/mcp?login. We may make this the default once the claude.ai remote integration supports the latest OAuth spec.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 142,
+          "end": 151,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Direct Response provides the lowest deployment resource overhead - and we don't currently have any Tools that require Sampling or Elicitation during execution.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "Future Support At launch, the \"HTTP with SSE\" transport was still the remote default in a lot of MCP Clients. However, we didn't want to invest heavily in managing it due to its imminent deprecation. Fortunately, popular clients had already started making the switch (VSCode and Cursor), and within a week of launch claude.ai also added support. If you need to connect with SSE, feel free to deploy a copy of our Server on a FreeCPU Hugging Face Space.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 316,
+          "end": 325,
+          "kind": "code"
+        },
+        {
+          "start": 425,
+          "end": 451,
+          "kind": "a",
+          "href": "https://huggingface.co/new-space"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "Tool List Change Notifications",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "In the future, we would like to support real-time Tool List Changed notifications when users update their settings on the Hub. However, this raises a couple of practical issues:",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "First, users tend to configure their favourite MCP Servers in their Client and leave them enabled. This means that the Client remains connected whilst the application is open. Sending notifications would mean maintaining as many open connections as there were currently active Clients - regardless of active usage - on the chance the user updates their tool configuration.",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "Second, most MCP Servers and Clients disconnect after a period of inactivity, resuming when necessary. This inevitably means that immediate push notifications would be missed - as the notification channel will have been closed. In practice, it is far simpler for the Client to refresh the connection and Tool List as needed.",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Unless you have reasonable control over the Client/Server pair, using Server Push Streams adds a lot of complexity to a public deployment, when lower-resource solutions for refreshing the Tool List exist.",
+      "spans": [
+        {
+          "start": 70,
+          "end": 89,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "URL User Experience",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Just before launch, @julien-c submitted a PR to include friendly instructions for users visiting hf.co/mcp. This hugely improves the User Experience - the default response is otherwise an unfriendly bit of JSON.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/julien-c"
+        },
+        {
+          "start": 97,
+          "end": 106,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Initially, we found this generated an enormous amount of traffic. After a bit of investigation we found that when returning a web page rather than an HTTP 405 error, VSCode would poll the endpoint multiple times per second!",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "The fix suggested by @coyotte508 was to properly detect browsers and only return the page in that circumstance. Thanks also to the VSCode team who rapidly fixed it.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/coyotte508"
+        },
+        {
+          "start": 155,
+          "end": 163,
+          "kind": "a",
+          "href": "https://github.com/microsoft/vscode/pull/251288/files"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "Although not specifically stated - returning a page in this manner does seem acceptable within the MCP Specification.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 71,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "MCP Client Behaviour",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "The MCP Protocol sends several requests during initialization. A typical connection sequence is: Initialize, Notifications/Initialize, tools/list and then prompts/list.",
+      "spans": [
+        {
+          "start": 97,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 109,
+          "end": 133,
+          "kind": "code"
+        },
+        {
+          "start": 135,
+          "end": 145,
+          "kind": "code"
+        },
+        {
+          "start": 155,
+          "end": 167,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "Given that MCP Clients will connect and reconnect whilst open, and the fact that users make periodic calls, we find there is a ratio of around 100 MCP Control messages for each Tool Call.",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "Some clients also send requests that don't make sense for our Stateless, Direct Response configuration - for example Pings, Cancellations or attempts to list Resources (which isn't a capability we currently advertise).",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "The first week of July 2025 saw an astonishing 164 different Clients accessing our Server. Interestingly, one of the most popular tools is mcp-remote. Approximately half of all Clients use it as a bridge to connect to our remote server.",
+      "spans": [
+        {
+          "start": 139,
+          "end": 149,
+          "kind": "code"
+        },
+        {
+          "start": 139,
+          "end": 149,
+          "kind": "a",
+          "href": "https://github.com/geelen/mcp-remote"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "MCP is rapidly evolving, and we're excited about what has already been achieved across Chat Applications, IDEs, Agents and MCP Servers over the last few months.",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "We can already see how powerful integrating the Hugging Face Hub has been and support for Gradio Spaces now makes it possible for LLMs to be easily extended with the latest Machine Learning applications.",
+      "spans": [
+        {
+          "start": 173,
+          "end": 202,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/gradio-mcp-servers"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "Here are some great examples of things people have been doing with our MCP Server so far:",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "Orchestrating Video Production",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://x.com/victormustar/status/1937095435316822244"
+        }
+      ]
+    },
+    {
+      "id": "b0103",
+      "source": "Image Editing",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://x.com/reach_vb/status/1942247029515735263"
+        }
+      ]
+    },
+    {
+      "id": "b0104",
+      "source": "Document Searching",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "a",
+          "href": "https://x.com/NielsRogge/status/1940472422790242561"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "AI Application Development",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "a",
+          "href": "https://x.com/llmindsetuk/status/1940358288220336514"
+        }
+      ]
+    },
+    {
+      "id": "b0106",
+      "source": "Adding Reasoning to existing Models",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "a",
+          "href": "https://www.linkedin.com/posts/ben-burtenshaw_im-a-big-fan-of-local-models-in-lmstudio-activity-7344001099533590528-zNyw"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "We hope that this post has provided insights to the decisions that need to be made building Remote MCP Servers, and encourage you to try some of the examples in your favourite MCP Client.",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "Take a look at our Open Source MCP Server, and try some of the different transport options with your Client, or open an Issue or Pull Request to make improvements or suggest new functionality.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 41,
+          "kind": "a",
+          "href": "https://github.com/evalstate/hf-mcp-server"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "Let us know your thoughts, feedback and questions on this discussion thread.",
+      "spans": [
+        {
+          "start": 58,
+          "end": 75,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/huggingface/README/discussions/26"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "ea252d04e04eb3553ebd9a36224698cd659964678637a8b3e4b21aa205303bab",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "ea252d04e04eb3553ebd9a36224698cd659964678637a8b3e4b21aa205303bab",
+  "mediaLayout": [
+    {
+      "mediaId": "image_0a4c9ac3d2dd1d27",
+      "type": "image",
+      "afterBlockId": "b0007",
+      "order": 0
+    },
+    {
+      "mediaId": "image_02989ab729b35718",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T15:48:48.060669Z",
+  "mediaLayoutCheckedAt": "2026-10-02T15:48:48.060684Z"
 }
