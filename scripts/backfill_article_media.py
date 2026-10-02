@@ -25,6 +25,7 @@ from article_store import (
     fetch_reader_text,
     take_media_source,
     is_browser_incompatible_image,
+    is_managed_media_src,
     is_site_chrome_image,
     snapshot_path,
     utc_now,
@@ -88,7 +89,11 @@ def has_problematic_images(snapshot: dict) -> bool:
         if not isinstance(image, dict):
             continue
         source = str(image.get("originalUrl") or image.get("src") or "")
-        if is_site_chrome_image(source) or (is_browser_incompatible_image(source) and not str(image.get("src", "")).startswith("data/article-media/")):
+        if is_site_chrome_image(source):
+            return True
+        # A source Chromium cannot load is only a problem while we do not host
+        # the bytes ourselves; see article_store.is_managed_media_src.
+        if is_browser_incompatible_image(source) and not is_managed_media_src(image.get("src")):
             return True
     return False
 
