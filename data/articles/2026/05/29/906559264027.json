@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:06.872310Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler\n\nThis article is also available in Chinese 简体中文 .\n\nWhat you cannot profile, you cannot optimize.\n\nWhether you are trying to squeeze more tokens per second out of a Large Language Model (LLM), shave milliseconds off inference, or just understand why your training loop runs slower than the spec sheet promises, the path eventually runs through profiling.\n\nThe catch is that profiling has a steep on-ramp. The traces are dense walls of colored rectangles. The events carry intimidating names. Most tutorials assume you can already read them. So even when we know we should be profiling, opening a trace can feel like a chore best left for later (or for someone else). This post, and the series it kicks off, is our attempt to lower that on-ramp.\n\nThis is the opening post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:\n\nProfiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler (current)\n\nProfiling in PyTorch (Part 2): From nn.Linear to a Fused MLP\n\nProfiling in PyTorch (Part 3): Attention is all you profile\n\nWe document the journey from a beginner's point of view. No prerequisites apart from basic PyTorch. Treat this as a leisurely read with some \"Aha!\" moments. The structure of the post is intentionally question-led: we open a trace, ask \"wait, why is that happening?\", and chase the answer until something clicks. By the end you should know:\n\nhow to set up torch.profiler and what it actually hands back,\n\nhow to read the profiler table and the trace (CPU lane, GPU lane, and the suspicious gaps in between),\n\nthe chain of events from a Python call all the way down to a CUDA kernel,\n\nwhat changes (and, more interestingly, what does not change) when you slap torch.compile on top.\n\nBefore we begin, two definitions that will make everything below read better:\n\nA GPU kernel is a program that runs in parallel on many threads of the GPU.\n\nThe CPU schedules and launches these kernels.\n\nYou don't usually have to write GPU kernels yourself; when you use a PyTorch operation, it is automatically translated to one or more kernels that do the job on GPU.\n\nWith those two ideas in your back pocket, let's start asking questions.\n\nHere is the entire script that we use for the post: 01_matmul_add.py . We recommend opening this script in a separate tab and walk through the code step by step. We use the NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to setup a GPU on the Hugging Face infrastructure and experiment with the scripts using the Dev Mode with Spaces . One could also run the scripts with the Hugging Face Jobs pipeline .\n\nThe matrix multiplication and addition operation\n\nAs correctly quipped by Dr. Sara Hooker , just as we are primarily made up of water, Deep Neural Networks are primarily made up of matrix multiplies. As fundamental as they are, it would be a shame to start our profiling journey with anything else.\n\n```\ndef fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)\n```\n\nThe matrix addition along with the matrix multiplication mimics how weights and biases interact in a neuron. This addition (pun intended) will help us understand how it paves the way for compilation later in the post .\n\nTo profile, we will be using the torch.profiler module. The steps involved are:\n\nHave the code to profile ready (here def fn , which wraps the matrix multiplication and matrix addition)\n\nAnnotate the algorithm. While this is completely optional, we recommend doing this. The record_function annotates our function as matmul_add , which will be easy to navigate in the traces (as we note later)\n\n```\ndef step():\n  with torch.profiler.record_function(\"matmul_add\"):\n    return fn(x, w, b)\n```\n\nWrap the code with the torch.profiler.profile context manager\n\n```\n  with torch.profiler.profile(\n    activities=[\n        torch.profiler.ProfilerActivity.CPU,  # the cpu activities\n        torch.profiler.ProfilerActivity.CUDA, # the gpu activities\n    ],\n  ) as prof:\n    # it is recommended to run events multiple times to warm up the GPUs\n    for _ in range(5):\n      step()\n      prof.step()\n```\n\n```\n# the profiler table\nprof.key_averages().table(sort_by=\"cuda_time_total\", row_limit=15)\n\n# the profiler trace\nprof.export_chrome_trace(trace_path)\n```\n\nThe profiler exports two distinct artifacts:\n\nThe profiler table: Provides the statistical summary of the algorithm. It answers \"What is taking the most time\". This becomes really helpful to figure out hotspots. A hotspot would be events that take the most amount of time, can be a bottleneck of the pipeline, or an event that is triggered a lot of times.\n\nThe profiler trace: Provides the temporal execution view. Answers \"When and Why an operation happened\", depicting the activities taking place on the CPU and the GPU. This is helpful when we want to investigate the kernel(s) that were launched, any delays in launching them, any overlap between CPU and GPU activities, etc.\n\nLet's see the two in action with our first execution. ( Here is the entire 01_matmul_add.py script )\n\nIt is recommended to run this script on a machine with a GPU.\n\n```\nuv run 01_matmul_add.py --size 64\n```\n\nIf you run the above script (on a GPU machine) you will find a folder traces/01_matmul_add with the two artifacts:\n\n```\n64_bf16_cold_eager.json\n64_bf16_cold_eager.txt\n```\n\nFigure 1: Profiler table for matmul add on 64 sized matrices\n\nThe .txt file holds the profiler table. Upon opening the file, as shown in Figure 1, one would be greeted with a big table with the first column consisting of the events that were triggered inside the scope of profile.\n\nThe other columns are related to the time the event takes on the CPU or GPU or any other device(s) specified in activities within torch.profiler.profile . Look at which events take the most amount of time, and try to intuitively understand if that event should in fact take that time. It is also important to look at the column \"# of Calls\" which dictates how many times the event was triggered.\n\nWhile we are at it, let's also talk about \"Self CPU/CUDA\" vs \"CPU/CUDA total\". The \"Self\" columns measure time spent only inside the event itself, excluding its children. The \"total\" columns include the event and all of its children together. So if you look at the \"CPU total\" of matmul_add , it consists of the time it took on self plus the children events it triggered. This is an important nuance to note.\n\nIf you look at the last two lines out of the table you would notice that the profiler tells us that\n\n```\nSelf CPU time total: 2.314ms\nSelf CUDA time total: 23.104us\n```\n\nThe CPU time is in ms while the GPU time is in us . To put things in perspective, the time spent on GPUs (the kernel ampere_bf16_s16816gemm... ) is less than 1% of the time spent on the CPU (the matmul_add operation). The GPU stays idle most of the time, which is an immediate red flag. The reason this happens is that the GPU can compute a small matmul very quickly, so our code spends most of the time preparing the kernels, launching them on the GPU, sending the data to multiply and gathering the results. This concept is known as an overhead-bound algorithm.\n\nThe easiest way to move out of this regime is to use bigger matrix multiplications.\n\n```\nuv run 01_matmul_add.py --size 4096\n```\n\nFigure 2: Profiler table for matmul add on 4096 sized matrices\n\nThe last two lines in Figure 2 are:\n\n```\nSelf CPU time total: 4.908ms\nSelf CUDA time total: 4.495ms\n```\n\nBoth times are in ms, which means we have materialized more GPU time just by increasing the size of the matrix multiplications. If you look at Figure 2 you would also notice that the most CUDA time is now taken by the GPU kernel ( ampere_bf16_s16816gemm_.. ) and not by the CPU operation that launched it ( matmul_add ). This means that we were indeed able to move from overhead bound to compute bound.\n\nWe now move into visualising the dispatch chain, which lives inside the .json artifacts. You can upload them to Perfetto UI and see the traces, or you can use uvx trace-util -f traces -b <hf_uname>/traces to generate the Perfetto links directly.\n\nFigure 3: Profiler trace for matmul and add on 64 sized matrices\n\nIn Figure 3, we see the profiler trace for the matrix multiplication and addition. Here the bar width indicates the duration of an event, the vertical nesting is the call hierarchy, the CPU lane denotes the events that happen on the CPU, while the GPU lane shows the actual kernel executions. One might also notice the empty spaces which are the waiting or idle time.\n\nThe script was run with default configurations which are:\n\nsize 64: The inputs, weights and biases are sized (64, 64)\n\ndtype bf16: The data type is bfloat16\n\nno compile: We have not compiled the torch operations\n\nno warmup: We have not warmed up the GPU before profiling\n\nWith Perfetto we suggest using the keyboard for quicker access to the trace. One could use \"W A S D\" for navigating the trace.\n\nFigure 4: The CPU and GPU lanes of a PyTorch profiler trace\n\nThere are two lanes in Figure 4, one for the CPU activity and one for the GPU activity. In the CPU lane one would notice three profile steps (starting from ProfilerStep#2 ). This comes from the schedule .\n\n```\nschedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n```\n\nThe wait skips noisy initializations ( ProfilerStep#0 ), warmup runs through the profiler without recording ( ProfilerStep#1 ), and active is what shows up in trace. One can find the schedule being used in the script here .\n\nLet's put on our detective hats and investigate the trace and ask some questions.\n\nWhy does the ProfilerStep#2 take so long?\n\nFigure 5: ProfileStep#2 is visibly wider than the steps that follow it\n\nIn Figure 5, we notice that ProfileStep#2 takes more time compared to the other steps, and upon looking closely you would see a similar pattern with the matmul_add annotation as well. The smoking gun is inside the annotation, not the annotation itself:\n\nStep matmul_add start aten::matmul start gap\n\nFigure 6: The ~228 µs dead window between record_function(\"matmul_add\") and aten::matmul\n\nThat ~228 µs shown in Figure 6 is the \"dead window\" between entering record_function(\"matmul_add\") and PyTorch actually dispatching aten::matmul . This can happen for multiple reasons, including workspace allocations, cuBLAS (NVIDIA’s proprietary, GPU-accelerated library for performing fundamental linear algebra operations) heuristics, or lazy module loading. We can either look away or run some more warmup steps before we profile (which is the standard)\n\nIn terms of profiling, warmup is when you run the events a couple of times before actually profiling it. The pre-work done by the GPU (including the above pointers) are one time efforts which we do not want to profile. In our example, we have two warmup stages, one where we actually loop over the function before entering the profiler, and two inside the profiler which is achieved by the warmup argument. In this section, we have enabled the actual iterations along with the schedule.\n\n```\nuv run 01_matmul_add.py --warmup\n```\n\nPerfetto Trace for 64x64 with Warmup\n\nFigure 7: After warming up, every profile step takes a similar amount of time\n\nIn Figure 7 we see that each profile step takes a similar time, but this does not mean we were able to optimize the one time overheads. We warmed up the runs so that the overheads were not profiled. We think that closing this section abruptly without a hint to solving this would do injustice to the reader, so here is a link to read about further optimizing launch overheads.\n\nWhy is there an offset of ~2.5 ms between the CPU and GPU lanes?\n\nFigure 8: The ~2.5 ms offset between the CPU and GPU lanes\n\nIn Figure 8, we see that the CPU and GPU lanes have an offset of around 2.5 ms: this is the delay after the CPU submits the CUDA kernels and the time they actually start executing. One might think the warmup stage combined with the schedule's wait and warmup should keep a GPU busy and would diminish the offset.\n\nTo uncover what is really happening, let's change our schedule a little:\n\n```\n- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=3, repeat=1)\n```\n\nFigure 9: With wait=0 and warmup=0 , the trace reveals an Activity Buffer Request\n\nFigure 9 shows us that there is an Activity Buffer Request in the GPU lane before any operation. Let's zoom in a little more.\n\nFigure 10: A gap appears between the matmul and add kernels on profile step 1\n\nUpon zooming into the GPU trace, we notice that the matmul and add kernels for ProfileStep#0 (the CPU trace of which is not visible in the Figure) happen one after the other, while the kernels for ProfileStep#1 have a window in between. The best explanation for this is that there was an overflow of buffers, and another buffer request (a request to allocate some memory on the GPU VRAM) was issued during the kernel execution.\n\nThe best way to rule out other possibilities is to profile for more iterations and see whether a similar window appears in other parts of the trace. To do that we run with active=20 .\n\nFigure 11: With 20 active steps the gap only shows up once, confirming it is a buffer request\n\nAs shown in Figure 11, we see a similar trend in ProfileStep#1 . This is aligned with our previous findings, and we can safely conclude that it was indeed another buffer request.\n\nFigure 12: The chain of dispatch\n\nIn Figure 12, we see the nested CPU calls. This is an important visualization, where one gets to understand what a chain of dispatch really looks like.\n\nWe begin with ProfileStep#<id> which encapsulates the profiling step. Due to us annotating the step, we see the matmul_add row. The matmul_add consists of two aten calls, one for matrix multiplication and one for matrix addition.\n\nThe aten::matmul is the ATen-level dispatch that those user-facing PyTorch matmul calls land on. aten::mm is the 2D matrix-matrix multiply backend.\n\nIt is very interesting to note how PyTorch calls aten::bmm (batched matrix multiplication) if we add the batch axis to our matrices. Let's take a detour and see the aten::bmm in action.\n\n```\n- x = torch.randn(args.size, args.size, device=device, dtype=dtype)\n- w = torch.randn( args.size, args.size, device=device, dtype=dtype)\n- b = torch.randn(args.size, args.size, device=device, dtype=dtype)\n\n+ # adding a batch size of 8\n+ x = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ w = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ b = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n```\n\nFigure 13: Batched Matrix Multiplication\n\nIn Figure 13, upon adding the batch axis to the inputs, aten::matmul now encapsulates a bunch of other prerequisite CUDA runtime calls along with aten::bmm (instead of aten::mm ). This also hints at the heuristics that cuBLAS needs to do in order to dispatch the right (most suitable) kernel for the program.\n\nIn the rest of the post, we will be working with simple 2D matrices, unless otherwise mentioned.\n\nWhy does matmul have an extra CUDA runtime call?\n\nFigure 14: A CUDA occupancy query fires before the matmul kernel launch\n\nWe notice that for aten::mm there are two CUDA Runtime calls, namely cudaOccupancyMaxActiveBlocksPerMultiprocessor (boxed in Figure 14) and cudaLaunchKernel , while for aten::add there is only the cudaLaunchKernel .\n\ncudaOccupancyMaxActiveBlocksPerMultiprocessor is a planning call and is purely CPU side. It asks: \"given a kernel function, a chosen block size, and a chosen dynamic shared memory size, how many blocks of this kernel can simultaneously reside on one SM (Streaming Multiprocessor)?\"\n\nThis begs the question, why do we need planning for matmul and not for add?\n\nTo understand this, we have to look at the kernel's resource footprint. If you click on the GPU kernels, you will be able to inspect the resource footprint for the respective kernel.\n\nFigure 15: Matmul footprint\n\nFigure 16: Add footprint\n\nIn Figure 15, we note that for matrix multiplication the registers per thread and shared memory are dynamic (based on the size of the matrix). cuBLAS ships hundreds of kernel variants, and each has a heuristic-driven launch path that needs runtime information about hardware capacity. The occupancy query is part of that heuristic. Conceptually, we can think of GPU-accelerated matmuls as working on independent tiles : how many tiles we use and how big each tile needs to be depends on the matrices and the hardware. Modern algorithms are way more complicated than that, but this is still a good reference framework.\n\nFrom Figure 16 we see that the footprint of addition says 32 registers and zero shared memory. That fits trivially. There's nothing to query, because no hardware resource is going to limit occupancy. The kernel is, by design, resource-light.\n\nYou can use this as a quick diagnostic when reading any trace. Scan the CPU lane for cudaOccupancyMaxActiveBlocksPerMultiprocessor . Each occurrence flags a \"heavyweight, adaptively launched\" kernel, usually a GEMM (GEneral Matrix Multiplication), conv, or similar. The kernels without a preceding occupancy query are the elementwise/reduction crowd that PyTorch launches mechanically.\n\nWhy is cudaDeviceSynchronize so big (~1.78 ms)?\n\ncudaDeviceSynchronize blocks the CPU until all GPU work on this device finishes. The profiler emits this sync at the end of the active window to flush events. Without it, kernel timings would be missing.\n\nA 1.78 ms sync covering 26 µs of real GPU work tells you this run was 98% idle. That's the textbook overhead-bound symptom.\n\nWe already know from the profiler table analysis (above) that providing bigger matrices to our algorithm moves it out from the overhead-bound region to being compute-bound.\n\nLet's run the command and dive deeper into the traces.\n\n```\nuv run 01_matmul_add.py --size 4096 --warmup\n```\n\nWhy does the same kernel take more time compared to others?\n\nFigure 17: One matmul kernel runs longer than the others despite identical inputs\n\nIn Figure 17, we notice that the matmul kernel for ProfileStep#3 takes longer on the GPU than the other steps. This is particularly interesting to note, because the other kernels launched were the exact same, which means there were no cuBLAS heuristics involved. There are no scheduling gaps, the CPU launches are normal, and it is not a profiler artifact.\n\nThis trace in Figure 17 makes a useful point that's easy to miss in idealized examples: kernel runtimes are not constants, even on the same hardware environment running identical code on identical data.\n\nLet's make this more concrete by modifying the script a little. We run the iteration 20 times, capturing each of the steps.\n\n```\n- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=20, repeat=1)\n\n- for _ in range(5):\n+ for _ in range(20):\n```\n\nFigure 18: Across 20 iterations the same matmul kernel runs at different speeds\n\nFigure 18 reveals a similar finding. While each kernel was the exact same, they time differently. The different compute times can be blamed on a bunch of reasons:\n\nGPU clocks on idle and boost\n\nDriver side housekeeping\n\nA reader who only saw the average would conclude that a matmul took ~1 ms (mean of 5 = 1084 µs); a reader who looked at the trace would see that the matmul takes ~580 µs except when the GPU throws a fit. Those are very different mental models, and only one of them is correct.\n\nLet's see some torch.compile at work\n\nWorking with torch.compile has always amazed us. One writes normal eager PyTorch code, but PyTorch tries to capture tensor-heavy regions, turn them into graphs, optimize them, and run generated code. The default backend is usually TorchInductor , and the broad pipeline is:\n\nTorchDynamo captures Python execution into an FX graph\n\nAOTAutograd prepares forward/backward graphs when gradients are involved\n\nInductor lowers the graph into optimized CPU or GPU code.\n\nIn this section, we talk about compilation and look at the profiler traces.\n\n```\nuv run 01_matmul_add.py --size 4096 --warmup --compile\n```\n\nThe args.compile flag triggers the following code:\n\n```\ndef fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)\n\nfn = torch.compile(fn) if args.compile else fn\n```\n\nFigure 19: The compiled regions show up as TorchDynamo and Inductor frames in the trace\n\nIn Figure 19, we see the new CPU rows named Torch-Compiled Region: 0/0 which points us to the compiled functions being used.\n\nDid we fuse the matmul and add kernels into one?\n\nFigure 20: Compiled run dispatches a single aten::addmm\n\nLooking at Figure 20 we ask the question, did we actually fuse the multiplication and addition operations together into one?\n\nThis is operator fusion at the graph level. Inductor took our torch.add(torch.matmul(x, w), b) and rewrote it into a single aten::addmm(b, x, w) call. The important thing to note here is that it did not produce a new fused CUDA kernel. The actual GPU work is still ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_nn , the same cuBLAS kernel eager mode used. So the \"fusion\" here is at the dispatcher level, not at the kernel level.\n\nPyTorch provides the torch.addmm function that does what we did in two steps, that is multiply and add. We encourage the reader to look at the traces of this function and comment your observations in the comments below!\n\ntorch.compile's runtime architecture\n\nWhile we know in theory what happens when we compile our functions it is equally important to see it in action. Let's look at the CPU-side hierarchy which reflects torch.compile 's runtime architecture.\n\nTorchDynamo Cache Lookup is where Dynamo checks that the current call still matches what was compiled with the same input shapes, dtypes, devices, and tensor metadata. If anything mismatched, Dynamo would recompile. This cost is paid every call, even after compilation.\n\nTorch-Compiled Region is the wrapper that \"enters\" the compiled version. AOTDispatcher Runtime Wrapper Prologue is AOT Autograd's runtime wrapper. Even though we don't need gradients here, AOTDispatcher is always in the stack handling tensor metadata, view tracking, and would set up the backward pass if requires_grad were true.\n\n## Call CompiledFxGraph is where the actual generated code runs. The string after \"CompiledFxGraph\" is the content hash of the FX graph. It's the same across all three active steps, confirming cache hits.\n\nYou can find the generated code on disk under /tmp/torchinductor_<user>/fxgraph keyed by this hash, useful when you want to read the Triton/C++ that Inductor actually produced.\n\nDo the CUDA launches go down by half?\n\nFigure 21: Each compiled step still launches two GPU kernels, a Device-to-Device memcpy and the GEMM\n\nLooking at the traces in Figure 21, we were really happy to notice only one cudaLaunchKernel per step. This observation was directly contradicting what we were seeing in the GPU trace. There were still two kernels being launched per step, namely the Memcpy DtoD (Device -> Device) and the GEMM. Going back to the CPU trace, we noticed that we had completely missed the cudaMemcpyAsync dispatch.\n\naddmm computes out = α·A·B + β·C , and cuBLAS's GEMM-with-bias-add epilogue writes into a destination buffer that needs to already contain the bias. An epilogues can be thought of all the operations that happen after a GEMM. In the world of deep-learning we constantly come up with GEMM-Epilogues like activations, bias addition, normalization and many more. This is why there are cuBLAS GEMM-with- kernel variants.\n\nIf you use different mode s for torch.compile you would notice different kernel variants being launched. You can try it for yourself and add a comment below about your observations!\n\nSo Inductor-generated code does:\n\nout = copy(C) ← that's the DtoD memcpy (32 MB, takes ~33 µs)\n\nout = α·(A·B) + β·out ← GEMM with α=β=1 , fusing the bias add into the writeback\n\nThe result is mathematically still the same. The bias add isn't free, as we pay a memcpy upfront plus a slightly more expensive GEMM epilogue.\n\nThe fusion one might have hoped for, where x·w + b (here out = α·A·B + β·C ) collapses into a single kernel with no extra memory traffic, isn't what happened. Inductor preserved the two memory-touching operations, it just relabeled the bias copy as a memcpy and the addition as a GEMM epilogue.\n\nA truly fused implementation would skip the memcpy. That's what FlashAttention-style hand-written kernels do, and what Inductor can do via Triton codegen, but for a 4096×4096 bf16 matmul , Inductor evidently decided \"use cuBLAS, do the bias via epilogue setup\" was the best path.\n\nCPU overhead went up, not down\n\nThis is the easiest thing to miss when comparing an eager and a compiled run:\n\nstep eager dur (ms) compile dur (ms)\n\ntorch.compile is roughly 2× more expensive on the CPU per step. That's because every call walks the full Dynamo > AOTAutograd > Inductor stack, on top of the same aten::addmm dispatch we have anyway. The compile pipeline is built for ML models with dozens of ops where the per-call overhead amortizes (for a single op it's a tax).\n\ntorch.compile has a mode argument. It is for the reader to take home as an assignment to read the documentation and come up with a mode that could take the CPU overhead down. 🤗\n\nTrace reading cheatsheet\n\nA quick reference for the patterns we walked through. The idea is: if you see this in a trace, this is what it usually means.\n\nWhat you see What it usually means\n\nSelf CPU time total ≫ Self CUDA time total (CPU in ms, GPU in µs)\n\nOverhead-bound. The CPU spends more time dispatching than the GPU spends computing. Make the work bigger (larger matrices, batched ops) or fuse calls.\n\nSelf CPU time total ≈ Self CUDA time total , both in ms\n\nCompute-bound. The GPU is the bottleneck, which is usually what you want.\n\nOne event dominates CUDA total\n\nThat's your hotspot. Start the optimization there.\n\nOne event has a huge # of Calls\n\nA potential bottleneck even if each call is cheap. Check whether it can be fused or batched.\n\nCPU total ≫ Self CPU for a row\n\nMost of the cost lives in children. Drill into the nested events, not the parent.\n\nFirst ProfileStep much wider than the rest\n\nCold-start overhead: workspace allocation, cuBLAS heuristics, lazy module loading. Add warmup iterations and/or the schedule's warmup argument.\n\nBig gap between record_function(\"...\") start and the first aten::* inside it\n\nSame cold-start tax, just zoomed in. The annotation entered, but the dispatch hadn't happened yet.\n\ncudaOccupancyMaxActiveBlocksPerMultiprocessor before a cudaLaunchKernel\n\nA heavyweight, adaptively-launched kernel (GEMM, conv, etc.). cuBLAS is asking the driver how many blocks fit on an SM so it can pick a kernel variant.\n\ncudaLaunchKernel with no preceding occupancy query\n\nAn elementwise or reduction kernel with a fixed, resource-light footprint. Nothing to plan.\n\nA long cudaDeviceSynchronize at the end of the active window\n\nThe profiler flushing events. Its duration is mostly the GPU finishing pending work, not a real CPU cost. A sync covering tiny GPU work is a classic overhead-bound symptom.\n\nA cudaMemcpyAsync you didn't write\n\nOften a hidden Device-to-Device copy. Common when addmm seeds its destination buffer with the bias before the GEMM epilogue.\n\nActivity Buffer Request on the GPU lane\n\nThe profiler is allocating/refilling its own event buffer. The first one usually accounts for the initial CPU↔GPU lane offset.\n\nA gap between two kernels in a single step\n\nLikely another buffer request mid-execution. Confirm by running more iterations: if it appears only once, it's the profiler, not your code.\n\nThe same kernel timing differently across steps\n\nGPU clocks, thermals, power management, driver housekeeping. Read the trace, not just the mean.\n\nA kernel named like ampere_bf16_s16816gemm_...\n\nThe actual cuBLAS GPU work for a matmul. The kernel name is typically the same in eager and compiled mode for the same shapes/dtypes.\n\nMemcpy DtoD immediately before a GEMM\n\nThe bias copy for an addmm epilogue. The \"fusion\" is at the dispatcher level, not in the kernel.\n\nProfileStep#N → <record_function name> → aten::* → aten::mm / aten::bmm / aten::add\n\nThe canonical nested call hierarchy. Self time excludes children; Total time includes them.\n\naten::matmul resolving to aten::mm\n\n2D × 2D matrix multiply.\n\naten::matmul resolving to aten::bmm (with extra CUDA runtime calls)\n\nBatched matmul on 3D+ tensors. cuBLAS does more heuristic work to pick the variant.\n\naten::addmm(b, x, w) instead of a separate aten::add + aten::mm pair\n\nOperator fusion at the dispatcher level. The GPU kernel is still the same GEMM, with the bias add folded into the epilogue.\n\nA Torch-Compiled Region: K/M row in the CPU lane\n\nYou're inside a compiled function.\n\nTorchDynamo Cache Lookup on every step\n\nDynamo is verifying shapes/dtypes/devices match the cached compile. Paid on every call, even after compilation.\n\nAOTDispatcher Runtime Wrapper Prologue even with no grads\n\nAOTAutograd's runtime wrapper is always in the stack, handling tensor metadata and view tracking.\n\n## Call CompiledFxGraph <hash> with the same hash across steps\n\nCache hits on the generated code. The generated source lives under /tmp/torchinductor_<user>/fxgraph/<hash> .\n\nPer-step CPU time higher under torch.compile than eager for a tiny op\n\nExpected. The Dynamo → AOTAutograd → Inductor stack is a tax that only amortizes over many ops.\n\nWe started with a tiny matmul + add and used it as an excuse to learn how to read a PyTorch profiler. Along the way we picked up a few mental models that travel well to bigger workloads. This was the first stop in the Profiling PyTorch series. In the posts that follow, we will gradually leave this two-op toy behind and walk up the ladder of complexity, looki",
+  "bodyFormatVersion": 3,
+  "body": "What you cannot profile, you cannot optimize.\n\nWhether you are trying to squeeze more tokens per second out of a Large Language Model (LLM), shave milliseconds off inference, or just understand why your training loop runs slower than the spec sheet promises, the path eventually runs through profiling.\n\nThe catch is that profiling has a steep on-ramp. The traces are dense walls of colored rectangles. The events carry intimidating names. Most tutorials assume you can already read them. So even when we know we should be profiling, opening a trace can feel like a chore best left for later (or for someone else). This post, and the series it kicks off, is our attempt to lower that on-ramp.\n\nThis is the opening post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:\n\n- Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler (current)\n\n- Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP\n\n- Profiling in PyTorch (Part 3): Attention is all you profile\n\nWe document the journey from a beginner's point of view. No prerequisites apart from basic PyTorch. Treat this as a leisurely read with some \"Aha!\" moments. The structure of the post is intentionally question-led: we open a trace, ask \"wait, why is that happening?\", and chase the answer until something clicks. By the end you should know:\n\n- how to set up torch.profiler and what it actually hands back,\n\n- how to read the profiler table and the trace (CPU lane, GPU lane, and the suspicious gaps in between),\n\n- the chain of events from a Python call all the way down to a CUDA kernel,\n\n- what changes (and, more interestingly, what does not change) when you slap torch.compile on top.\n\nBefore we begin, two definitions that will make everything below read better:\n\n- A GPU kernel is a program that runs in parallel on many threads of the GPU.\n\n- The CPU schedules and launches these kernels.\n\nYou don't usually have to write GPU kernels yourself; when you use a PyTorch operation, it is automatically translated to one or more kernels that do the job on GPU.\n\nWith those two ideas in your back pocket, let's start asking questions.\n\nHere is the entire script that we use for the post: 01_matmul_add.py. We recommend opening this script in a separate tab and walk through the code step by step. We use the NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to setup a GPU on the Hugging Face infrastructure and experiment with the scripts using the Dev Mode with Spaces. One could also run the scripts with the Hugging Face Jobs pipeline. (Note: The traces in this blog were generated using PyTorch 2.13. If you are using a different version, some trace details like CompiledFxGraph might differ or be absent.)\n\n## The matrix multiplication and addition operation\n\nAs correctly quipped by Dr. Sara Hooker, just as we are primarily made up of water, Deep Neural Networks are primarily made up of matrix multiplies. As fundamental as they are, it would be a shame to start our profiling journey with anything else.\n\n```\ndef fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)\n```\n\nThe matrix addition along with the matrix multiplication mimics how weights and biases interact in a neuron. This addition (pun intended) will help us understand how it paves the way for compilation later in the post.\n\nTo profile, we will be using the torch.profiler module. The steps involved are:\n\n- Have the code to profile ready (here def fn, which wraps the matrix multiplication and matrix addition)\n\n- Annotate the algorithm. While this is completely optional, we recommend doing this. The record_function annotates our function as matmul_add, which will be easy to navigate in the traces (as we note later)\n\n```\ndef step():\n  with torch.profiler.record_function(\"matmul_add\"):\n    return fn(x, w, b)\n```\n\n- Wrap the code with the torch.profiler.profile context manager\n\n```\n  with torch.profiler.profile(\n    activities=[\n        torch.profiler.ProfilerActivity.CPU,  # the cpu activities\n        torch.profiler.ProfilerActivity.CUDA, # the gpu activities\n    ],\n  ) as prof:\n    # it is recommended to run events multiple times to warm up the GPUs\n    for _ in range(5):\n      step()\n      prof.step()\n```\n\n- Export the profile\n\n```\n# the profiler table\nprof.key_averages().table(sort_by=\"cuda_time_total\", row_limit=15)\n\n# the profiler trace\nprof.export_chrome_trace(trace_path)\n```\n\nThe profiler exports two distinct artifacts:\n\n- The profiler table: Provides the statistical summary of the algorithm. It answers \"What is taking the most time\". This becomes really helpful to figure out hotspots. A hotspot would be events that take the most amount of time, can be a bottleneck of the pipeline, or an event that is triggered a lot of times.\n\n- The profiler trace: Provides the temporal execution view. Answers \"When and Why an operation happened\", depicting the activities taking place on the CPU and the GPU. This is helpful when we want to investigate the kernel(s) that were launched, any delays in launching them, any overlap between CPU and GPU activities, etc.\n\nLet's see the two in action with our first execution. (Here is the entire 01_matmul_add.py script)\n\nIt is recommended to run this script on a machine with a GPU.\n\n```\nuv run 01_matmul_add.py --size 64\n```\n\nIf you run the above script (on a GPU machine) you will find a folder traces/01_matmul_add with the two artifacts:\n\n```\n64_bf16_cold_eager.json\n64_bf16_cold_eager.txt\n```\n\n—\n\nFigure 1: Profiler table for matmul add on 64 sized matrices\n\nThe .txt file holds the profiler table. Upon opening the file, as shown in Figure 1, one would be greeted with a big table with the first column consisting of the events that were triggered inside the scope of profile.\n\nThe other columns are related to the time the event takes on the CPU or GPU or any other device(s) specified in activities within torch.profiler.profile. Look at which events take the most amount of time, and try to intuitively understand if that event should in fact take that time. It is also important to look at the column \"# of Calls\" which dictates how many times the event was triggered.\n\nWhile we are at it, let's also talk about \"Self CPU/CUDA\" vs \"CPU/CUDA total\". The \"Self\" columns measure time spent only inside the event itself, excluding its children. The \"total\" columns include the event and all of its children together. So if you look at the \"CPU total\" of matmul_add, it consists of the time it took on self plus the children events it triggered. This is an important nuance to note.\n\nIf you look at the last two lines out of the table you would notice that the profiler tells us that\n\n```\nSelf CPU time total: 2.314ms\nSelf CUDA time total: 23.104us\n```\n\nThe CPU time is in ms while the GPU time is in us. To put things in perspective, the time spent on GPUs (the kernel ampere_bf16_s16816gemm...) is less than 1% of the time spent on the CPU (the matmul_add operation). The GPU stays idle most of the time, which is an immediate red flag. The reason this happens is that the GPU can compute a small matmul very quickly, so our code spends most of the time preparing the kernels, launching them on the GPU, sending the data to multiply and gathering the results. This concept is known as an overhead-bound algorithm.\n\nThe easiest way to move out of this regime is to use bigger matrix multiplications.\n\n```\nuv run 01_matmul_add.py --size 4096 \n```\n\n—\n\nFigure 2: Profiler table for matmul add on 4096 sized matrices\n\nThe last two lines in Figure 2 are:\n\n```\nSelf CPU time total: 4.908ms\nSelf CUDA time total: 4.495ms\n```\n\nBoth times are in ms, which means we have materialized more GPU time just by increasing the size of the matrix multiplications. If you look at Figure 2 you would also notice that the most CUDA time is now taken by the GPU kernel (ampere_bf16_s16816gemm_..) and not by the CPU operation that launched it (matmul_add). This means that we were indeed able to move from overhead bound to compute bound.\n\nWe now move into visualising the dispatch chain, which lives inside the .json artifacts. You can upload them to Perfetto UI and see the traces, or you can use uvx trace-util -f traces -b <hf_uname>/traces to generate the Perfetto links directly.\n\n## 64x64 traces\n\n—\n\nFigure 3: Profiler trace for matmul and add on 64 sized matrices\n\nIn Figure 3, we see the profiler trace for the matrix multiplication and addition. Here the bar width indicates the duration of an event, the vertical nesting is the call hierarchy, the CPU lane denotes the events that happen on the CPU, while the GPU lane shows the actual kernel executions. One might also notice the empty spaces which are the waiting or idle time.\n\nThe script was run with default configurations which are:\n\n- size 64: The inputs, weights and biases are sized (64, 64)\n\n- dtype bf16: The data type is bfloat16\n\n- no compile: We have not compiled the torch operations\n\n- no warmup: We have not warmed up the GPU before profiling\n\nWith Perfetto we suggest using the keyboard for quicker access to the trace. One could use \"W A S D\" for navigating the trace.\n\n—\n\nFigure 4: The CPU and GPU lanes of a PyTorch profiler trace\n\nThere are two lanes in Figure 4, one for the CPU activity and one for the GPU activity. In the CPU lane one would notice three profile steps (starting from ProfilerStep#2). This comes from the schedule.\n\n```\nschedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n```\n\nThe wait skips noisy initializations (ProfilerStep#0), warmup runs through the profiler without recording (ProfilerStep#1), and active is what shows up in trace. One can find the schedule being used in the script here.\n\nLet's put on our detective hats and investigate the trace and ask some questions.\n\n### Why does the ProfilerStep#2 take so long?\n\n—\n\nFigure 5: ProfileStep#2 is visibly wider than the steps that follow it\n\nIn Figure 5, we notice that ProfileStep#2 takes more time compared to the other steps, and upon looking closely you would see a similar pattern with the matmul_add annotation as well. The smoking gun is inside the annotation, not the annotation itself:\n\nStep\n\nmatmul_add start\n\naten::matmul start\n\ngap\n\n\\#2\n\n138.736\n\n366.493\n\n227.757 µs\n\n\\#3\n\n517.926\n\n523.447\n\n5.521 µs\n\n\\#4\n\n610.039\n\n614.527\n\n4.488 µs\n\n—\n\nFigure 6: The ~228 µs dead window between record_function(\"matmul_add\") and aten::matmul\n\nThat ~228 µs shown in Figure 6 is the \"dead window\" between entering record_function(\"matmul_add\") and PyTorch actually dispatching aten::matmul. This can happen for multiple reasons, including workspace allocations, cuBLAS (NVIDIA’s proprietary, GPU-accelerated library for performing fundamental linear algebra operations) heuristics, or lazy module loading. We can either look away or run some more warmup steps before we profile (which is the standard)\n\nIn terms of profiling, warmup is when you run the events a couple of times before actually profiling it. The pre-work done by the GPU (including the above pointers) are one time efforts which we do not want to profile. In our example, we have two warmup stages, one where we actually loop over the function before entering the profiler, and two inside the profiler which is achieved by the warmup argument. In this section, we have enabled the actual iterations along with the schedule.\n\n```\nuv run 01_matmul_add.py --warmup\n```\n\nPerfetto Trace for 64x64 with Warmup\n\n—\n\nFigure 7: After warming up, every profile step takes a similar amount of time\n\nIn Figure 7 we see that each profile step takes a similar time, but this does not mean we were able to optimize the one time overheads. We warmed up the runs so that the overheads were not profiled. We think that closing this section abruptly without a hint to solving this would do injustice to the reader, so here is a link to read about further optimizing launch overheads.\n\n### Why is there an offset of ~2.5 ms between the CPU and GPU lanes?\n\n—\n\nFigure 8: The ~2.5 ms offset between the CPU and GPU lanes\n\nIn Figure 8, we see that the CPU and GPU lanes have an offset of around 2.5 ms: this is the delay after the CPU submits the CUDA kernels and the time they actually start executing. One might think the warmup stage combined with the schedule's wait and warmup should keep a GPU busy and would diminish the offset.\n\nTo uncover what is really happening, let's change our schedule a little:\n\n```\n- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=3, repeat=1)\n```\n\n—\n\nFigure 9: With wait=0 and warmup=0, the trace reveals an Activity Buffer Request\n\nFigure 9 shows us that there is an Activity Buffer Request in the GPU lane before any operation. Let's zoom in a little more.\n\n—\n\nFigure 10: A gap appears between the matmul and add kernels on profile step 1\n\nUpon zooming into the GPU trace, we notice that the matmul and add kernels for ProfileStep#0 (the CPU trace of which is not visible in the Figure) happen one after the other, while the kernels for ProfileStep#1 have a window in between. The best explanation for this is that there was an overflow of buffers, and another buffer request (a request to allocate some memory on the GPU VRAM) was issued during the kernel execution.\n\nThe best way to rule out other possibilities is to profile for more iterations and see whether a similar window appears in other parts of the trace. To do that we run with active=20.\n\n—\n\nFigure 11: With 20 active steps the gap only shows up once, confirming it is a buffer request\n\nAs shown in Figure 11, we see a similar trend in ProfileStep#1. This is aligned with our previous findings, and we can safely conclude that it was indeed another buffer request.\n\n### The chain of events\n\n—\n\nFigure 12: The chain of dispatch\n\nIn Figure 12, we see the nested CPU calls. This is an important visualization, where one gets to understand what a chain of dispatch really looks like.\n\nWe begin with ProfileStep#<id> which encapsulates the profiling step. Due to us annotating the step, we see the matmul_add row. The matmul_add consists of two aten calls, one for matrix multiplication and one for matrix addition.\n\nThe aten::matmul is the ATen-level dispatch that those user-facing PyTorch matmul calls land on. aten::mm is the 2D matrix-matrix multiply backend.\n\nIt is very interesting to note how PyTorch calls aten::bmm (batched matrix multiplication) if we add the batch axis to our matrices. Let's take a detour and see the aten::bmm in action.\n\n```\n- x = torch.randn(args.size, args.size, device=device, dtype=dtype)\n- w = torch.randn( args.size, args.size, device=device, dtype=dtype)\n- b = torch.randn(args.size, args.size, device=device, dtype=dtype)\n\n+ # adding a batch size of 8\n+ x = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ w = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ b = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n```\n\n—\n\nFigure 13: Batched Matrix Multiplication\n\nIn Figure 13, upon adding the batch axis to the inputs, aten::matmul now encapsulates a bunch of other prerequisite CUDA runtime calls along with aten::bmm (instead of aten::mm). This also hints at the heuristics that cuBLAS needs to do in order to dispatch the right (most suitable) kernel for the program.\n\nIn the rest of the post, we will be working with simple 2D matrices, unless otherwise mentioned.\n\n### Why does matmul have an extra CUDA runtime call?\n\n—\n\nFigure 14: A CUDA occupancy query fires before the matmul kernel launch\n\nWe notice that for aten::mm there are two CUDA Runtime calls, namely cudaOccupancyMaxActiveBlocksPerMultiprocessor (boxed in Figure 14) and cudaLaunchKernel, while for aten::add there is only the cudaLaunchKernel.\n\ncudaOccupancyMaxActiveBlocksPerMultiprocessor is a planning call and is purely CPU side. It asks: \"given a kernel function, a chosen block size, and a chosen dynamic shared memory size, how many blocks of this kernel can simultaneously reside on one SM (Streaming Multiprocessor)?\"\n\nThis begs the question, why do we need planning for matmul and not for add?\n\nTo understand this, we have to look at the kernel's resource footprint. If you click on the GPU kernels, you will be able to inspect the resource footprint for the respective kernel.\n\n—\n\n—\n\nFigure 15: Matmul footprint\n\nFigure 16: Add footprint\n\nIn Figure 15, we note that for matrix multiplication the registers per thread and shared memory are dynamic (based on the size of the matrix). cuBLAS ships hundreds of kernel variants, and each has a heuristic-driven launch path that needs runtime information about hardware capacity. The occupancy query is part of that heuristic. Conceptually, we can think of GPU-accelerated matmuls as working on independent tiles: how many tiles we use and how big each tile needs to be depends on the matrices and the hardware. Modern algorithms are way more complicated than that, but this is still a good reference framework.\n\nFrom Figure 16 we see that the footprint of addition says 32 registers and zero shared memory. That fits trivially. There's nothing to query, because no hardware resource is going to limit occupancy. The kernel is, by design, resource-light.\n\nYou can use this as a quick diagnostic when reading any trace. Scan the CPU lane for cudaOccupancyMaxActiveBlocksPerMultiprocessor. Each occurrence flags a \"heavyweight, adaptively launched\" kernel, usually a GEMM (GEneral Matrix Multiplication), conv, or similar. The kernels without a preceding occupancy query are the elementwise/reduction crowd that PyTorch launches mechanically.\n\n### Why is cudaDeviceSynchronize so big (~1.78 ms)?\n\ncudaDeviceSynchronize blocks the CPU until all GPU work on this device finishes. The profiler emits this sync at the end of the active window to flush events. Without it, kernel timings would be missing.\n\nA 1.78 ms sync covering 26 µs of real GPU work tells you this run was 98% idle. That's the textbook overhead-bound symptom.\n\n## 4096x4096 traces\n\nWe already know from the profiler table analysis (above) that providing bigger matrices to our algorithm moves it out from the overhead-bound region to being compute-bound.\n\nLet's run the command and dive deeper into the traces.\n\n```\nuv run 01_matmul_add.py --size 4096 --warmup\n```\n\n### Why does the same kernel take more time compared to others?\n\n—\n\nFigure 17: One matmul kernel runs longer than the others despite identical inputs\n\nIn Figure 17, we notice that the matmul kernel for ProfileStep#3 takes longer on the GPU than the other steps. This is particularly interesting to note, because the other kernels launched were the exact same, which means there were no cuBLAS heuristics involved. There are no scheduling gaps, the CPU launches are normal, and it is not a profiler artifact.\n\nThis trace in Figure 17 makes a useful point that's easy to miss in idealized examples: kernel runtimes are not constants, even on the same hardware environment running identical code on identical data.\n\nLet's make this more concrete by modifying the script a little. We run the iteration 20 times, capturing each of the steps.\n\n```\n- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=20, repeat=1)\n\n- for _ in range(5):\n+ for _ in range(20):\n```\n\n—\n\nFigure 18: Across 20 iterations the same matmul kernel runs at different speeds\n\nFigure 18 reveals a similar finding. While each kernel was the exact same, they time differently. The different compute times can be blamed on a bunch of reasons:\n\n- GPU clocks on idle and boost\n\n- GPU heating\n\n- GPU power management\n\n- Driver side housekeeping\n\nA reader who only saw the average would conclude that a matmul took ~1 ms (mean of 5 = 1084 µs); a reader who looked at the trace would see that the matmul takes ~580 µs except when the GPU throws a fit. Those are very different mental models, and only one of them is correct.\n\n## Let's see some torch.compile at work\n\nWorking with torch.compile has always amazed us. One writes normal eager PyTorch code, but PyTorch tries to capture tensor-heavy regions, turn them into graphs, optimize them, and run generated code. The default backend is usually TorchInductor, and the broad pipeline is:\n\n- TorchDynamo captures Python execution into an FX graph\n\n- AOTAutograd prepares forward/backward graphs when gradients are involved\n\n- Inductor lowers the graph into optimized CPU or GPU code.\n\nIn this section, we talk about compilation and look at the profiler traces.\n\n```\nuv run 01_matmul_add.py --size 4096 --warmup --compile\n```\n\nThe args.compile flag triggers the following code:\n\n```\ndef fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)\n\nfn = torch.compile(fn) if args.compile else fn\n```\n\n—\n\nFigure 19: The compiled regions show up as TorchDynamo and Inductor frames in the trace\n\nIn Figure 19, we see the new CPU rows named Torch-Compiled Region: 0/0 which points us to the compiled functions being used.\n\n### Did we fuse the matmul and add kernels into one?\n\n—\n\nFigure 20: Compiled run dispatches a single aten::addmm\n\nLooking at Figure 20 we ask the question, did we actually fuse the multiplication and addition operations together into one?\n\nThis is operator fusion at the graph level. Inductor took our torch.add(torch.matmul(x, w), b) and rewrote it into a single aten::addmm(b, x, w) call. The important thing to note here is that it did not produce a new fused CUDA kernel. The actual GPU work is still ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_nn, the same cuBLAS kernel eager mode used. So the \"fusion\" here is at the dispatcher level, not at the kernel level.\n\nPyTorch provides the torch.addmm function that does what we did in two steps, that is multiply and add. We encourage the reader to look at the traces of this function and comment your observations in the comments below!\n\n### torch.compile's runtime architecture\n\nWhile we know in theory what happens when we compile our functions it is equally important to see it in action. Let's look at the CPU-side hierarchy which reflects torch.compile's runtime architecture.\n\nTorchDynamo Cache Lookup is where Dynamo checks that the current call still matches what was compiled with the same input shapes, dtypes, devices, and tensor metadata. If anything mismatched, Dynamo would recompile. This cost is paid every call, even after compilation.\n\nTorch-Compiled Region is the wrapper that \"enters\" the compiled version. AOTDispatcher Runtime Wrapper Prologue is AOT Autograd's runtime wrapper. Even though we don't need gradients here, AOTDispatcher is always in the stack handling tensor metadata, view tracking, and would set up the backward pass if requires_grad were true.\n\n\\## Call CompiledFxGraph is where the actual generated code runs. The string after \"CompiledFxGraph\" is the content hash of the FX graph. It's the same across all three active steps, confirming cache hits.\n\nYou can find the generated code on disk under /tmp/torchinductor_<user>/fxgraph keyed by this hash, useful when you want to read the Triton/C++ that Inductor actually produced.\n\n### Do the CUDA launches go down by half?\n\n—\n\nFigure 21: Each compiled step still launches two GPU kernels, a Device-to-Device memcpy and the GEMM\n\nLooking at the traces in Figure 21, we were really happy to notice only one cudaLaunchKernel per step. This observation was directly contradicting what we were seeing in the GPU trace. There were still two kernels being launched per step, namely the Memcpy DtoD (Device -> Device) and the GEMM. Going back to the CPU trace, we noticed that we had completely missed the cudaMemcpyAsync dispatch.\n\naddmm computes out = α·A·B + β·C, and cuBLAS's GEMM-with-bias-add epilogue writes into a destination buffer that needs to already contain the bias. An epilogues can be thought of all the operations that happen after a GEMM. In the world of deep-learning we constantly come up with GEMM-Epilogues like activations, bias addition, normalization and many more. This is why there are cuBLAS GEMM-with- kernel variants.\n\nIf you use different modes for torch.compile you would notice different kernel variants being launched. You can try it for yourself and add a comment below about your observations!\n\nSo Inductor-generated code does:\n\n- out = copy(C) ← that's the DtoD memcpy (32 MB, takes ~33 µs)\n\n- out = α·(A·B) + β·out ← GEMM with α=β=1, fusing the bias add into the writeback\n\nThe result is mathematically still the same. The bias add isn't free, as we pay a memcpy upfront plus a slightly more expensive GEMM epilogue.\n\nThe fusion one might have hoped for, where x·w + b (here out = α·A·B + β·C) collapses into a single kernel with no extra memory traffic, isn't what happened. Inductor preserved the two memory-touching operations, it just relabeled the bias copy as a memcpy and the addition as a GEMM epilogue.\n\nA truly fused implementation would skip the memcpy. That's what FlashAttention-style hand-written kernels do, and what Inductor can do via Triton codegen, but for a 4096×4096 bf16 matmul, Inductor evidently decided \"use cuBLAS, do the bias via epilogue setup\" was the best path.\n\n### CPU overhead went up, not down\n\nThis is the easiest thing to miss when comparing an eager and a compiled run:\n\nstep\n\neager dur (ms)\n\ncompile dur (ms)\n\n\\#2\n\n0.1\n\n0.2\n\n\\#3\n\n0.07\n\n0.1\n\n\\#4\n\n0.07\n\n0.1\n\ntorch.compile is roughly 2× more expensive on the CPU per step. That's because every call walks the full Dynamo > AOTAutograd > Inductor stack, on top of the same aten::addmm dispatch we have anyway. The compile pipeline is built for ML models with dozens of ops where the per-call overhead amortizes (for a single op it's a tax).\n\ntorch.compile has a mode argument. It is for the reader to take home as an assignment to read the documentation and come up with a mode that could take the CPU overhead down. 🤗\n\n## Trace reading cheatsheet\n\nA quick reference for the patterns we walked through. The idea is: if you see this in a trace, this is what it usually means.\n\n### Profiler table\n\nWhat you see\n\nWhat it usually means\n\nSelf CPU time total ≫ Self CUDA time total (CPU in ms, GPU in µs)\n\nOverhead-bound. The CPU spends more time dispatching than the GPU spends computing. Make the work bigger (larger matrices, batched ops) or fuse calls.\n\nSelf CPU time total ≈ Self CUDA time total, both in ms\n\nCompute-bound. The GPU is the bottleneck, which is usually what you want.\n\nOne event dominates CUDA total\n\nThat's your hotspot. Start the optimization there.\n\nOne event has a huge # of Calls\n\nA potential bottleneck even if each call is cheap. Check whether it can be fused or batched.\n\nCPU total ≫ Self CPU for a row\n\nMost of the cost lives in children. Drill into the nested events, not the parent.\n\n### CPU lane\n\nWhat you see\n\nWhat it usually means\n\nFirst ProfileStep much wider than the rest\n\nCold-start overhead: workspace allocation, cuBLAS heuristics, lazy module loading. Add warmup iterations and/or the schedule's warmup argument.\n\nBig gap between record_function(\"...\") start and the first aten::* inside it\n\nSame cold-start tax, just zoomed in. The annotation entered, but the dispatch hadn't happened yet.\n\ncudaOccupancyMaxActiveBlocksPerMultiprocessor before a cudaLaunchKernel\n\nA heavyweight, adaptively-launched kernel (GEMM, conv, etc.). cuBLAS is asking the driver how many blocks fit on an SM so it can pick a kernel variant.\n\ncudaLaunchKernel with no preceding occupancy query\n\nAn elementwise or reduction kernel with a fixed, resource-light footprint. Nothing to plan.\n\nA long cudaDeviceSynchronize at the end of the active window\n\nThe profiler flushing events. Its duration is mostly the GPU finishing pending work, not a real CPU cost. A sync covering tiny GPU work is a classic overhead-bound symptom.\n\nA cudaMemcpyAsync you didn't write\n\nOften a hidden Device-to-Device copy. Common when addmm seeds its destination buffer with the bias before the GEMM epilogue.\n\n### GPU lane\n\nWhat you see\n\nWhat it usually means\n\nActivity Buffer Request on the GPU lane\n\nThe profiler is allocating/refilling its own event buffer. The first one usually accounts for the initial CPU↔GPU lane offset.\n\nA gap between two kernels in a single step\n\nLikely another buffer request mid-execution. Confirm by running more iterations: if it appears only once, it's the profiler, not your code.\n\nThe same kernel timing differently across steps\n\nGPU clocks, thermals, power management, driver housekeeping. Read the trace, not just the mean.\n\nA kernel named like ampere_bf16_s16816gemm_...\n\nThe actual cuBLAS GPU work for a matmul. The kernel name is typically the same in eager and compiled mode for the same shapes/dtypes.\n\nMemcpy DtoD immediately before a GEMM\n\nThe bias copy for an addmm epilogue. The \"fusion\" is at the dispatcher level, not in the kernel.\n\n### Dispatch chain\n\nWhat you see\n\nWhat it usually means\n\nProfileStep#N → <record_function name> → aten::* → aten::mm / aten::bmm / aten::add\n\nThe canonical nested call hierarchy. Self time excludes children; Total time includes them.\n\naten::matmul resolving to aten::mm\n\n2D × 2D matrix multiply.\n\naten::matmul resolving to aten::bmm (with extra CUDA runtime calls)\n\nBatched matmul on 3D+ tensors. cuBLAS does more heuristic work to pick the variant.\n\naten::addmm(b, x, w) instead of a separate aten::add + aten::mm pair\n\nOperator fusion at the dispatcher level. The GPU kernel is still the same GEMM, with the bias add folded into the epilogue.\n\n### torch.compile\n\nWhat you see\n\nWhat it usually means\n\nA Torch-Compiled Region: K/M row in the CPU lane\n\nYou're inside a compiled function.\n\nTorchDynamo Cache Lookup on every step\n\nDynamo is verifying shapes/dtypes/devices match the cached compile. Paid on every call, even after compilation.\n\nAOTDispatcher Runtime Wrapper Prologue even with no grads\n\nAOTAutograd's runtime wrapper is always in the stack, handling tensor metadata and view tracking.\n\n\\## Call CompiledFxGraph <hash> with the same hash across steps\n\nCache hits on the generated code. The generated source lives under /tmp/torchinductor_<user>/fxgraph/<hash>.\n\nPer-step CPU time higher under torch.compile than eager for a tiny op\n\nExpected. The Dynamo → AOTAutograd → Inductor stack is a tax that only amortizes over many ops.\n\n## Conclusion\n\nWe started with a tiny matmul + add and used it as an excuse to learn how to read a PyTorch profiler. Along the way we picked up a few mental models that travel well to bigger workloads. This was the first stop in the Profiling PyTorch series. In the posts that follow, we will gradually leave this two-op toy behind and walk up the ladder of complexity, looking at larger building blocks and, eventually, real models.\n\nThanks to Noe Flandre, Suvaditya Mukherjee, and Vidit Ostwal for their reviews on the early draft of the post!\n\nThe blog post was polished using an LLM. This in no way means that we have let an agent run in the background and let it generate the blog. Some of us in the team are non-english speakers and think LLMs (which are mostly trained in the English Language) can rectify silly grammar mistakes or rephrase sentences that sound less intimidating and cleaner. Hope this helps with the idea of \"why should I read, if this was LLM generated\". 🤗",
   "summaryZh": "本文是PyTorch性能分析系列教程的第一篇，旨在帮助开发者降低使用torch.profiler的门槛。文章通过问题导向的方式，演示了如何通过profiler捕获和解读CPU与GPU通道的trace，分析CUDA内核执行情况，从而为大模型训练和推理中的性能瓶颈诊断与优化提供核心指导。",
   "summaryGeneratedAt": "2026-08-30T11:02:01.488869Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -55,5 +55,3833 @@
     "summaryZh": "本文是PyTorch性能分析系列教程的第一篇，旨在帮助开发者降低使用torch.profiler的门槛。文章通过问题导向的方式，演示了如何通过profiler捕获和解读CPU与GPU通道的trace，分析CUDA内核执行情况，从而为大模型训练和推理中的性能瓶颈诊断与优化提供核心指导。",
     "glossary": [],
     "duplicateKey": "pytorch-profiler-guide-part1"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/thumbnail.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/thumbnail.png",
+      "alt": "Thumbnail of the blog post",
+      "id": "image_4446f047e4de57f3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/profile-table-64.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/profile-table-64.png",
+      "alt": "Profiler table for matmul add on 64 sized matrices",
+      "id": "image_2c4bc92a11bbd46c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/profiler-table-4096.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/profiler-table-4096.png",
+      "alt": "Profiler table for matmul add algorithm on 4096 sized matrices",
+      "id": "image_390e78150feb537d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/64-matmul-add.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/64-matmul-add.png",
+      "alt": "PyTorch profiler trace of a 64×64 bf16 matmul followed by an add on a CUDA GPU",
+      "id": "image_791e3bb398f132f8"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gpu-cpu-trace.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gpu-cpu-trace.png",
+      "alt": "PyTorch profiler trace with the CPU lane and GPU lane labelled side by side in Perfetto",
+      "id": "image_d891e011fa7a56ca"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/why-is-step-2-big.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/why-is-step-2-big.png",
+      "alt": "ProfileStep#2 in a PyTorch profiler trace appears wider than ProfileStep#3 and ProfileStep#4",
+      "id": "image_065ea9f77454c86c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gap-227.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gap-227.png",
+      "alt": "228 microsecond gap between record_function matmul_add and the aten::matmul dispatch in profile step 2",
+      "id": "image_3bd05ae0affb4083"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/warmup.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/warmup.png",
+      "alt": "PyTorch profiler trace after warmup steps where ProfileStep#2 no longer shows cold-start overhead",
+      "id": "image_12d3b2f1eb566839"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gap-bw-kernel-launch.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/gap-bw-kernel-launch.png",
+      "alt": "2.32 millisecond offset between the CPU lane and the GPU lane in a PyTorch profiler trace",
+      "id": "image_b295e922526cc3da"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/full-profile.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/full-profile.png",
+      "alt": "PyTorch profiler trace with wait=0 warmup=0 showing an Activity Buffer Request between steps",
+      "id": "image_22e1e35f48568736"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/mat-add-gap.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/mat-add-gap.png",
+      "alt": "gap between matmul and add CUDA kernels caused by profiler buffer request",
+      "id": "image_2245eda98df0d21d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/20-iters.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/20-iters.png",
+      "alt": "PyTorch profiler trace of 20 active iterations confirming the buffer-request gap only appears once",
+      "id": "image_298f91d0536300de"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/cpu-nests.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/cpu-nests.png",
+      "alt": "nested CPU dispatch chain in PyTorch profiler: ProfileStep, matmul_add, aten::matmul, aten::mm",
+      "id": "image_4755670078af1f06"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/bmm.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/bmm.png",
+      "alt": "PyTorch profiler trace showing aten::matmul dispatching aten::bmm for 3D batched tensors",
+      "id": "image_56998be5f39a1f9d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/cudaoccupancy.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/cudaoccupancy.png",
+      "alt": "CPU lane showing cudaOccupancyMaxActiveBlocksPerMultiprocessor preceding the matmul cudaLaunchKernel",
+      "id": "image_e35477dcf8953def"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/matmul-footprint.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/matmul-footprint.png",
+      "alt": "cuBLAS matmul kernel resource footprint: registers, shared memory and block size in Perfetto",
+      "id": "image_be1fa17eba2be120"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/add-footprint.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/add-footprint.png",
+      "alt": "elementwise add CUDA kernel resource footprint with 32 registers and zero shared memory",
+      "id": "image_5033c2520280a819"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/kernel-time.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/kernel-time.png",
+      "alt": "4096x4096 bf16 matmul kernel timings varying across profiler steps on the same GPU",
+      "id": "image_1e377b43496a440e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/20-iters-kernels.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/20-iters-kernels.png",
+      "alt": "PyTorch profiler trace of 20 matmul iterations showing kernel runtime variance",
+      "id": "image_69bf8debe6008889"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/compilation-region.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/compilation-region.png",
+      "alt": "torch.compile region highlighted in a PyTorch profiler trace, showing TorchDynamo and Inductor frames",
+      "id": "image_0996eff9b001327c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/fused-ops.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/fused-ops.png",
+      "alt": "Compiled trace showing aten::addmm replacing the eager aten::add and aten::mm pair",
+      "id": "image_d54693b5b4a98084"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/memcpy.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-profiler/memcpy.png",
+      "alt": "compiled matmul trace showing Memcpy DtoD and GEMM kernels launched per step",
+      "id": "image_46667ae4e0a08bed"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "What you cannot profile, you cannot optimize.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Whether you are trying to squeeze more tokens per second out of a Large Language Model (LLM), shave milliseconds off inference, or just understand why your training loop runs slower than the spec sheet promises, the path eventually runs through profiling.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "The catch is that profiling has a steep on-ramp. The traces are dense walls of colored rectangles. The events carry intimidating names. Most tutorials assume you can already read them. So even when we know we should be profiling, opening a trace can feel like a chore best left for later (or for someone else). This post, and the series it kicks off, is our attempt to lower that on-ramp.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 39,
+          "kind": "strong"
+        },
+        {
+          "start": 201,
+          "end": 205,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This is the opening post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler (current)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 67,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler"
+        },
+        {
+          "start": 68,
+          "end": 77,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP",
+      "spans": [
+        {
+          "start": 0,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-mlp-fusion"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Profiling in PyTorch (Part 3): Attention is all you profile",
+      "spans": [
+        {
+          "start": 0,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-attention-profile"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "We document the journey from a beginner's point of view. No prerequisites apart from basic PyTorch. Treat this as a leisurely read with some \"Aha!\" moments. The structure of the post is intentionally question-led: we open a trace, ask \"wait, why is that happening?\", and chase the answer until something clicks. By the end you should know:",
+      "spans": [
+        {
+          "start": 249,
+          "end": 253,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "how to set up torch.profiler and what it actually hands back,",
+      "spans": [
+        {
+          "start": 14,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "how to read the profiler table and the trace (CPU lane, GPU lane, and the suspicious gaps in between),",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "the chain of events from a Python call all the way down to a CUDA kernel,",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "what changes (and, more interestingly, what does not change) when you slap torch.compile on top.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 52,
+          "kind": "strong"
+        },
+        {
+          "start": 75,
+          "end": 88,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Before we begin, two definitions that will make everything below read better:",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "A GPU kernel is a program that runs in parallel on many threads of the GPU.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 12,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "The CPU schedules and launches these kernels.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "You don't usually have to write GPU kernels yourself; when you use a PyTorch operation, it is automatically translated to one or more kernels that do the job on GPU.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "With those two ideas in your back pocket, let's start asking questions.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Here is the entire script that we use for the post: 01_matmul_add.py. We recommend opening this script in a separate tab and walk through the code step by step. We use the NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to setup a GPU on the Hugging Face infrastructure and experiment with the scripts using the Dev Mode with Spaces. One could also run the scripts with the Hugging Face Jobs pipeline. (Note: The traces in this blog were generated using PyTorch 2.13. If you are using a different version, some trace details like CompiledFxGraph might differ or be absent.)",
+      "spans": [
+        {
+          "start": 52,
+          "end": 68,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py"
+        },
+        {
+          "start": 172,
+          "end": 193,
+          "kind": "code"
+        },
+        {
+          "start": 328,
+          "end": 348,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/spaces-dev-mode"
+        },
+        {
+          "start": 390,
+          "end": 416,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/huggingface_hub/en/guides/jobs"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "The matrix multiplication and addition operation",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "As correctly quipped by Dr. Sara Hooker, just as we are primarily made up of water, Deep Neural Networks are primarily made up of matrix multiplies. As fundamental as they are, it would be a shame to start our profiling journey with anything else.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 39,
+          "kind": "a",
+          "href": "https://youtu.be/7knwihgj0fU?si=uvzGH-J9bsCHP4Nn&t=2199"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "The matrix addition along with the matrix multiplication mimics how weights and biases interact in a neuron. This addition (pun intended) will help us understand how it paves the way for compilation later in the post.",
+      "spans": [
+        {
+          "start": 199,
+          "end": 216,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler#lets-see-some-torch-compile-at-work"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "To profile, we will be using the torch.profiler module. The steps involved are:",
+      "spans": [
+        {
+          "start": 33,
+          "end": 47,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Have the code to profile ready (here def fn, which wraps the matrix multiplication and matrix addition)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L26-L27"
+        },
+        {
+          "start": 37,
+          "end": 43,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Annotate the algorithm. While this is completely optional, we recommend doing this. The record_function annotates our function as matmul_add, which will be easy to navigate in the traces (as we note later)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L32"
+        },
+        {
+          "start": 88,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 140,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Wrap the code with the torch.profiler.profile context manager",
+      "spans": [
+        {
+          "start": 23,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 46,
+          "end": 61,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L53-L62"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Export the profile",
+      "spans": [
+        {
+          "start": 11,
+          "end": 18,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L70"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The profiler exports two distinct artifacts:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "The profiler table: Provides the statistical summary of the algorithm. It answers \"What is taking the most time\". This becomes really helpful to figure out hotspots. A hotspot would be events that take the most amount of time, can be a bottleneck of the pipeline, or an event that is triggered a lot of times.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "The profiler trace: Provides the temporal execution view. Answers \"When and Why an operation happened\", depicting the activities taking place on the CPU and the GPU. This is helpful when we want to investigate the kernel(s) that were launched, any delays in launching them, any overlap between CPU and GPU activities, etc.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Let's see the two in action with our first execution. (Here is the entire 01_matmul_add.py script)",
+      "spans": [
+        {
+          "start": 74,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 97,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "It is recommended to run this script on a machine with a GPU.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "If you run the above script (on a GPU machine) you will find a folder traces/01_matmul_add with the two artifacts:",
+      "spans": [
+        {
+          "start": 70,
+          "end": 90,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "Figure 1: Profiler table for matmul add on 64 sized matrices",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "The .txt file holds the profiler table. Upon opening the file, as shown in Figure 1, one would be greeted with a big table with the first column consisting of the events that were triggered inside the scope of profile.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "The other columns are related to the time the event takes on the CPU or GPU or any other device(s) specified in activities within torch.profiler.profile. Look at which events take the most amount of time, and try to intuitively understand if that event should in fact take that time. It is also important to look at the column \"# of Calls\" which dictates how many times the event was triggered.",
+      "spans": [
+        {
+          "start": 112,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 152,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "While we are at it, let's also talk about \"Self CPU/CUDA\" vs \"CPU/CUDA total\". The \"Self\" columns measure time spent only inside the event itself, excluding its children. The \"total\" columns include the event and all of its children together. So if you look at the \"CPU total\" of matmul_add, it consists of the time it took on self plus the children events it triggered. This is an important nuance to note.",
+      "spans": [
+        {
+          "start": 280,
+          "end": 290,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "If you look at the last two lines out of the table you would notice that the profiler tells us that",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "The CPU time is in ms while the GPU time is in us. To put things in perspective, the time spent on GPUs (the kernel ampere_bf16_s16816gemm...) is less than 1% of the time spent on the CPU (the matmul_add operation). The GPU stays idle most of the time, which is an immediate red flag. The reason this happens is that the GPU can compute a small matmul very quickly, so our code spends most of the time preparing the kernels, launching them on the GPU, sending the data to multiply and gathering the results. This concept is known as an overhead-bound algorithm.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 47,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 141,
+          "kind": "code"
+        },
+        {
+          "start": 193,
+          "end": 203,
+          "kind": "code"
+        },
+        {
+          "start": 536,
+          "end": 550,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "The easiest way to move out of this regime is to use bigger matrix multiplications.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "Figure 2: Profiler table for matmul add on 4096 sized matrices",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "The last two lines in Figure 2 are:",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Both times are in ms, which means we have materialized more GPU time just by increasing the size of the matrix multiplications. If you look at Figure 2 you would also notice that the most CUDA time is now taken by the GPU kernel (ampere_bf16_s16816gemm_..) and not by the CPU operation that launched it (matmul_add). This means that we were indeed able to move from overhead bound to compute bound.",
+      "spans": [
+        {
+          "start": 230,
+          "end": 255,
+          "kind": "code"
+        },
+        {
+          "start": 304,
+          "end": 314,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "We now move into visualising the dispatch chain, which lives inside the .json artifacts. You can upload them to Perfetto UI and see the traces, or you can use uvx trace-util -f traces -b <hf_uname>/traces to generate the Perfetto links directly.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 123,
+          "kind": "a",
+          "href": "https://ui.perfetto.dev"
+        },
+        {
+          "start": 159,
+          "end": 204,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "64x64 traces",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "Figure 3: Profiler trace for matmul and add on 64 sized matrices",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "In Figure 3, we see the profiler trace for the matrix multiplication and addition. Here the bar width indicates the duration of an event, the vertical nesting is the call hierarchy, the CPU lane denotes the events that happen on the CPU, while the GPU lane shows the actual kernel executions. One might also notice the empty spaces which are the waiting or idle time.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "The script was run with default configurations which are:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "size 64: The inputs, weights and biases are sized (64, 64)",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "dtype bf16: The data type is bfloat16",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "no compile: We have not compiled the torch operations",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "no warmup: We have not warmed up the GPU before profiling",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "With Perfetto we suggest using the keyboard for quicker access to the trace. One could use \"W A S D\" for navigating the trace.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "Figure 4: The CPU and GPU lanes of a PyTorch profiler trace",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "There are two lanes in Figure 4, one for the CPU activity and one for the GPU activity. In the CPU lane one would notice three profile steps (starting from ProfilerStep#2). This comes from the schedule.",
+      "spans": [
+        {
+          "start": 156,
+          "end": 170,
+          "kind": "code"
+        },
+        {
+          "start": 193,
+          "end": 201,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "The wait skips noisy initializations (ProfilerStep#0), warmup runs through the profiler without recording (ProfilerStep#1), and active is what shows up in trace. One can find the schedule being used in the script here.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 8,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 52,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 61,
+          "kind": "code"
+        },
+        {
+          "start": 107,
+          "end": 121,
+          "kind": "code"
+        },
+        {
+          "start": 128,
+          "end": 134,
+          "kind": "code"
+        },
+        {
+          "start": 206,
+          "end": 217,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L58"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Let's put on our detective hats and investigate the trace and ask some questions.",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Why does the ProfilerStep#2 take so long?",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "Figure 5: ProfileStep#2 is visibly wider than the steps that follow it",
+      "spans": [
+        {
+          "start": 10,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "In Figure 5, we notice that ProfileStep#2 takes more time compared to the other steps, and upon looking closely you would see a similar pattern with the matmul_add annotation as well. The smoking gun is inside the annotation, not the annotation itself:",
+      "spans": [
+        {
+          "start": 28,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 163,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "Step",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "matmul_add start",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "aten::matmul start",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "gap",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "#2",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "138.736",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "366.493",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "227.757 µs",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "#3",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "517.926",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "523.447",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "5.521 µs",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "#4",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "610.039",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "614.527",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "4.488 µs",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "Figure 6: The ~228 µs dead window between record_function(\"matmul_add\") and aten::matmul",
+      "spans": [
+        {
+          "start": 42,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 76,
+          "end": 88,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "That ~228 µs shown in Figure 6 is the \"dead window\" between entering record_function(\"matmul_add\") and PyTorch actually dispatching aten::matmul. This can happen for multiple reasons, including workspace allocations, cuBLAS (NVIDIA’s proprietary, GPU-accelerated library for performing fundamental linear algebra operations) heuristics, or lazy module loading. We can either look away or run some more warmup steps before we profile (which is the standard)",
+      "spans": [
+        {
+          "start": 69,
+          "end": 98,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 217,
+          "end": 223,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/cublas"
+        },
+        {
+          "start": 392,
+          "end": 414,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/01_matmul_add.py#L35-L39"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "In terms of profiling, warmup is when you run the events a couple of times before actually profiling it. The pre-work done by the GPU (including the above pointers) are one time efforts which we do not want to profile. In our example, we have two warmup stages, one where we actually loop over the function before entering the profiler, and two inside the profiler which is achieved by the warmup argument. In this section, we have enabled the actual iterations along with the schedule.",
+      "spans": [
+        {
+          "start": 390,
+          "end": 396,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Perfetto Trace for 64x64 with Warmup",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "a",
+          "href": "https://ui.perfetto.dev/#!/?url=https://huggingface.co/buckets/ariG23498/traces/resolve/01_matmul_add/64_bf16_warm_eager.json"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "Figure 7: After warming up, every profile step takes a similar amount of time",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "In Figure 7 we see that each profile step takes a similar time, but this does not mean we were able to optimize the one time overheads. We warmed up the runs so that the overheads were not profiled. We think that closing this section abruptly without a hint to solving this would do injustice to the reader, so here is a link to read about further optimizing launch overheads.",
+      "spans": [
+        {
+          "start": 321,
+          "end": 325,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/accelerating-generative-ai-2/"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Why is there an offset of ~2.5 ms between the CPU and GPU lanes?",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "Figure 8: The ~2.5 ms offset between the CPU and GPU lanes",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "In Figure 8, we see that the CPU and GPU lanes have an offset of around 2.5 ms: this is the delay after the CPU submits the CUDA kernels and the time they actually start executing. One might think the warmup stage combined with the schedule's wait and warmup should keep a GPU busy and would diminish the offset.",
+      "spans": [
+        {
+          "start": 243,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 252,
+          "end": 258,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "To uncover what is really happening, let's change our schedule a little:",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "Figure 9: With wait=0 and warmup=0, the trace reveals an Activity Buffer Request",
+      "spans": [
+        {
+          "start": 15,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 80,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Figure 9 shows us that there is an Activity Buffer Request in the GPU lane before any operation. Let's zoom in a little more.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "Figure 10: A gap appears between the matmul and add kernels on profile step 1",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "Upon zooming into the GPU trace, we notice that the matmul and add kernels for ProfileStep#0 (the CPU trace of which is not visible in the Figure) happen one after the other, while the kernels for ProfileStep#1 have a window in between. The best explanation for this is that there was an overflow of buffers, and another buffer request (a request to allocate some memory on the GPU VRAM) was issued during the kernel execution.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 197,
+          "end": 210,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "The best way to rule out other possibilities is to profile for more iterations and see whether a similar window appears in other parts of the trace. To do that we run with active=20.",
+      "spans": [
+        {
+          "start": 172,
+          "end": 181,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "Figure 11: With 20 active steps the gap only shows up once, confirming it is a buffer request",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "As shown in Figure 11, we see a similar trend in ProfileStep#1. This is aligned with our previous findings, and we can safely conclude that it was indeed another buffer request.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 62,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0104",
+      "source": "The chain of events",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t13",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "Figure 12: The chain of dispatch",
+      "spans": [],
+      "table": {
+        "id": "t13",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "In Figure 12, we see the nested CPU calls. This is an important visualization, where one gets to understand what a chain of dispatch really looks like.",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "We begin with ProfileStep#<id> which encapsulates the profiling step. Due to us annotating the step, we see the matmul_add row. The matmul_add consists of two aten calls, one for matrix multiplication and one for matrix addition.",
+      "spans": [
+        {
+          "start": 14,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 159,
+          "end": 163,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "The aten::matmul is the ATen-level dispatch that those user-facing PyTorch matmul calls land on. aten::mm is the 2D matrix-matrix multiply backend.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 16,
+          "kind": "code"
+        },
+        {
+          "start": 24,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/pytorch/pytorch/tree/main/aten/src/ATen"
+        },
+        {
+          "start": 97,
+          "end": 105,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "It is very interesting to note how PyTorch calls aten::bmm (batched matrix multiplication) if we add the batch axis to our matrices. Let's take a detour and see the aten::bmm in action.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 165,
+          "end": 174,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0111",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t14",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "Figure 13: Batched Matrix Multiplication",
+      "spans": [],
+      "table": {
+        "id": "t14",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "In Figure 13, upon adding the batch axis to the inputs, aten::matmul now encapsulates a bunch of other prerequisite CUDA runtime calls along with aten::bmm (instead of aten::mm). This also hints at the heuristics that cuBLAS needs to do in order to dispatch the right (most suitable) kernel for the program.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 68,
+          "kind": "code"
+        },
+        {
+          "start": 146,
+          "end": 155,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 176,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "In the rest of the post, we will be working with simple 2D matrices, unless otherwise mentioned.",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "Why does matmul have an extra CUDA runtime call?",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t15",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "Figure 14: A CUDA occupancy query fires before the matmul kernel launch",
+      "spans": [],
+      "table": {
+        "id": "t15",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "We notice that for aten::mm there are two CUDA Runtime calls, namely cudaOccupancyMaxActiveBlocksPerMultiprocessor (boxed in Figure 14) and cudaLaunchKernel, while for aten::add there is only the cudaLaunchKernel.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 69,
+          "end": 114,
+          "kind": "code"
+        },
+        {
+          "start": 140,
+          "end": 156,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 177,
+          "kind": "code"
+        },
+        {
+          "start": 196,
+          "end": 212,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0119",
+      "source": "cudaOccupancyMaxActiveBlocksPerMultiprocessor is a planning call and is purely CPU side. It asks: \"given a kernel function, a chosen block size, and a chosen dynamic shared memory size, how many blocks of this kernel can simultaneously reside on one SM (Streaming Multiprocessor)?\"",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0120",
+      "source": "This begs the question, why do we need planning for matmul and not for add?",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "To understand this, we have to look at the kernel's resource footprint. If you click on the GPU kernels, you will be able to inspect the resource footprint for the respective kernel.",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "Figure 15: Matmul footprint",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "Figure 16: Add footprint",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "In Figure 15, we note that for matrix multiplication the registers per thread and shared memory are dynamic (based on the size of the matrix). cuBLAS ships hundreds of kernel variants, and each has a heuristic-driven launch path that needs runtime information about hardware capacity. The occupancy query is part of that heuristic. Conceptually, we can think of GPU-accelerated matmuls as working on independent tiles: how many tiles we use and how big each tile needs to be depends on the matrices and the hardware. Modern algorithms are way more complicated than that, but this is still a good reference framework.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 82,
+          "end": 95,
+          "kind": "code"
+        },
+        {
+          "start": 389,
+          "end": 417,
+          "kind": "a",
+          "href": "https://alvinwan.com/how-to-tile-matrix-multiplication/"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "From Figure 16 we see that the footprint of addition says 32 registers and zero shared memory. That fits trivially. There's nothing to query, because no hardware resource is going to limit occupancy. The kernel is, by design, resource-light.",
+      "spans": []
+    },
+    {
+      "id": "b0128",
+      "source": "You can use this as a quick diagnostic when reading any trace. Scan the CPU lane for cudaOccupancyMaxActiveBlocksPerMultiprocessor. Each occurrence flags a \"heavyweight, adaptively launched\" kernel, usually a GEMM (GEneral Matrix Multiplication), conv, or similar. The kernels without a preceding occupancy query are the elementwise/reduction crowd that PyTorch launches mechanically.",
+      "spans": [
+        {
+          "start": 85,
+          "end": 130,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0129",
+      "source": "Why is cudaDeviceSynchronize so big (~1.78 ms)?",
+      "spans": []
+    },
+    {
+      "id": "b0130",
+      "source": "cudaDeviceSynchronize blocks the CPU until all GPU work on this device finishes. The profiler emits this sync at the end of the active window to flush events. Without it, kernel timings would be missing.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0131",
+      "source": "A 1.78 ms sync covering 26 µs of real GPU work tells you this run was 98% idle. That's the textbook overhead-bound symptom.",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "4096x4096 traces",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "We already know from the profiler table analysis (above) that providing bigger matrices to our algorithm moves it out from the overhead-bound region to being compute-bound.",
+      "spans": []
+    },
+    {
+      "id": "b0134",
+      "source": "Let's run the command and dive deeper into the traces.",
+      "spans": []
+    },
+    {
+      "id": "b0135",
+      "source": "Why does the same kernel take more time compared to others?",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Figure 17: One matmul kernel runs longer than the others despite identical inputs",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "In Figure 17, we notice that the matmul kernel for ProfileStep#3 takes longer on the GPU than the other steps. This is particularly interesting to note, because the other kernels launched were the exact same, which means there were no cuBLAS heuristics involved. There are no scheduling gaps, the CPU launches are normal, and it is not a profiler artifact.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0139",
+      "source": "This trace in Figure 17 makes a useful point that's easy to miss in idealized examples: kernel runtimes are not constants, even on the same hardware environment running identical code on identical data.",
+      "spans": []
+    },
+    {
+      "id": "b0140",
+      "source": "Let's make this more concrete by modifying the script a little. We run the iteration 20 times, capturing each of the steps.",
+      "spans": []
+    },
+    {
+      "id": "b0141",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t18",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "Figure 18: Across 20 iterations the same matmul kernel runs at different speeds",
+      "spans": [],
+      "table": {
+        "id": "t18",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "Figure 18 reveals a similar finding. While each kernel was the exact same, they time differently. The different compute times can be blamed on a bunch of reasons:",
+      "spans": []
+    },
+    {
+      "id": "b0144",
+      "source": "GPU clocks on idle and boost",
+      "spans": []
+    },
+    {
+      "id": "b0145",
+      "source": "GPU heating",
+      "spans": []
+    },
+    {
+      "id": "b0146",
+      "source": "GPU power management",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "Driver side housekeeping",
+      "spans": []
+    },
+    {
+      "id": "b0148",
+      "source": "A reader who only saw the average would conclude that a matmul took ~1 ms (mean of 5 = 1084 µs); a reader who looked at the trace would see that the matmul takes ~580 µs except when the GPU throws a fit. Those are very different mental models, and only one of them is correct.",
+      "spans": []
+    },
+    {
+      "id": "b0149",
+      "source": "Let's see some torch.compile at work",
+      "spans": []
+    },
+    {
+      "id": "b0150",
+      "source": "Working with torch.compile has always amazed us. One writes normal eager PyTorch code, but PyTorch tries to capture tensor-heavy regions, turn them into graphs, optimize them, and run generated code. The default backend is usually TorchInductor, and the broad pipeline is:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 231,
+          "end": 244,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0151",
+      "source": "TorchDynamo captures Python execution into an FX graph",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0152",
+      "source": "AOTAutograd prepares forward/backward graphs when gradients are involved",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0153",
+      "source": "Inductor lowers the graph into optimized CPU or GPU code.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0154",
+      "source": "In this section, we talk about compilation and look at the profiler traces.",
+      "spans": []
+    },
+    {
+      "id": "b0155",
+      "source": "The args.compile flag triggers the following code:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 16,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0156",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t19",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "Figure 19: The compiled regions show up as TorchDynamo and Inductor frames in the trace",
+      "spans": [],
+      "table": {
+        "id": "t19",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "In Figure 19, we see the new CPU rows named Torch-Compiled Region: 0/0 which points us to the compiled functions being used.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 70,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0159",
+      "source": "Did we fuse the matmul and add kernels into one?",
+      "spans": []
+    },
+    {
+      "id": "b0160",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t20",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "Figure 20: Compiled run dispatches a single aten::addmm",
+      "spans": [
+        {
+          "start": 44,
+          "end": 55,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t20",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "Looking at Figure 20 we ask the question, did we actually fuse the multiplication and addition operations together into one?",
+      "spans": []
+    },
+    {
+      "id": "b0163",
+      "source": "This is operator fusion at the graph level. Inductor took our torch.add(torch.matmul(x, w), b) and rewrote it into a single aten::addmm(b, x, w) call. The important thing to note here is that it did not produce a new fused CUDA kernel. The actual GPU work is still ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_nn, the same cuBLAS kernel eager mode used. So the \"fusion\" here is at the dispatcher level, not at the kernel level.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 94,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 199,
+          "end": 202,
+          "kind": "strong"
+        },
+        {
+          "start": 213,
+          "end": 216,
+          "kind": "strong"
+        },
+        {
+          "start": 265,
+          "end": 324,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0164",
+      "source": "PyTorch provides the torch.addmm function that does what we did in two steps, that is multiply and add. We encourage the reader to look at the traces of this function and comment your observations in the comments below!",
+      "spans": [
+        {
+          "start": 21,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 32,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/2.12/generated/torch.addmm.html"
+        }
+      ]
+    },
+    {
+      "id": "b0165",
+      "source": "torch.compile's runtime architecture",
+      "spans": []
+    },
+    {
+      "id": "b0166",
+      "source": "While we know in theory what happens when we compile our functions it is equally important to see it in action. Let's look at the CPU-side hierarchy which reflects torch.compile's runtime architecture.",
+      "spans": [
+        {
+          "start": 164,
+          "end": 177,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0167",
+      "source": "TorchDynamo Cache Lookup is where Dynamo checks that the current call still matches what was compiled with the same input shapes, dtypes, devices, and tensor metadata. If anything mismatched, Dynamo would recompile. This cost is paid every call, even after compilation.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0168",
+      "source": "Torch-Compiled Region is the wrapper that \"enters\" the compiled version. AOTDispatcher Runtime Wrapper Prologue is AOT Autograd's runtime wrapper. Even though we don't need gradients here, AOTDispatcher is always in the stack handling tensor metadata, view tracking, and would set up the backward pass if requires_grad were true.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        },
+        {
+          "start": 73,
+          "end": 111,
+          "kind": "strong"
+        },
+        {
+          "start": 305,
+          "end": 318,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0169",
+      "source": "## Call CompiledFxGraph is where the actual generated code runs. The string after \"CompiledFxGraph\" is the content hash of the FX graph. It's the same across all three active steps, confirming cache hits.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0170",
+      "source": "You can find the generated code on disk under /tmp/torchinductor_<user>/fxgraph keyed by this hash, useful when you want to read the Triton/C++ that Inductor actually produced.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 79,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0171",
+      "source": "Do the CUDA launches go down by half?",
+      "spans": []
+    },
+    {
+      "id": "b0172",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t21",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "Figure 21: Each compiled step still launches two GPU kernels, a Device-to-Device memcpy and the GEMM",
+      "spans": [],
+      "table": {
+        "id": "t21",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "Looking at the traces in Figure 21, we were really happy to notice only one cudaLaunchKernel per step. This observation was directly contradicting what we were seeing in the GPU trace. There were still two kernels being launched per step, namely the Memcpy DtoD (Device -> Device) and the GEMM. Going back to the CPU trace, we noticed that we had completely missed the cudaMemcpyAsync dispatch.",
+      "spans": [
+        {
+          "start": 76,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 250,
+          "end": 280,
+          "kind": "code"
+        },
+        {
+          "start": 369,
+          "end": 384,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0175",
+      "source": "addmm computes out = α·A·B + β·C, and cuBLAS's GEMM-with-bias-add epilogue writes into a destination buffer that needs to already contain the bias. An epilogues can be thought of all the operations that happen after a GEMM. In the world of deep-learning we constantly come up with GEMM-Epilogues like activations, bias addition, normalization and many more. This is why there are cuBLAS GEMM-with- kernel variants.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        },
+        {
+          "start": 15,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 210,
+          "end": 215,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0176",
+      "source": "If you use different modes for torch.compile you would notice different kernel variants being launched. You can try it for yourself and add a comment below about your observations!",
+      "spans": [
+        {
+          "start": 21,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 31,
+          "end": 44,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0177",
+      "source": "So Inductor-generated code does:",
+      "spans": []
+    },
+    {
+      "id": "b0178",
+      "source": "out = copy(C) ← that's the DtoD memcpy (32 MB, takes ~33 µs)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0179",
+      "source": "out = α·(A·B) + β·out ← GEMM with α=β=1, fusing the bias add into the writeback",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 39,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0180",
+      "source": "The result is mathematically still the same. The bias add isn't free, as we pay a memcpy upfront plus a slightly more expensive GEMM epilogue.",
+      "spans": []
+    },
+    {
+      "id": "b0181",
+      "source": "The fusion one might have hoped for, where x·w + b (here out = α·A·B + β·C) collapses into a single kernel with no extra memory traffic, isn't what happened. Inductor preserved the two memory-touching operations, it just relabeled the bias copy as a memcpy and the addition as a GEMM epilogue.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0182",
+      "source": "A truly fused implementation would skip the memcpy. That's what FlashAttention-style hand-written kernels do, and what Inductor can do via Triton codegen, but for a 4096×4096 bf16 matmul, Inductor evidently decided \"use cuBLAS, do the bias via epilogue setup\" was the best path.",
+      "spans": [
+        {
+          "start": 165,
+          "end": 186,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0183",
+      "source": "CPU overhead went up, not down",
+      "spans": []
+    },
+    {
+      "id": "b0184",
+      "source": "This is the easiest thing to miss when comparing an eager and a compiled run:",
+      "spans": []
+    },
+    {
+      "id": "b0185",
+      "source": "step",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "eager dur (ms)",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "compile dur (ms)",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "#2",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "0.1",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "0.2",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "#3",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "0.07",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "0.1",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "#4",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "0.07",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "0.1",
+      "spans": [],
+      "table": {
+        "id": "t22",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "torch.compile is roughly 2× more expensive on the CPU per step. That's because every call walks the full Dynamo > AOTAutograd > Inductor stack, on top of the same aten::addmm dispatch we have anyway. The compile pipeline is built for ML models with dozens of ops where the per-call overhead amortizes (for a single op it's a tax).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 163,
+          "end": 174,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0198",
+      "source": "torch.compile has a mode argument. It is for the reader to take home as an assignment to read the documentation and come up with a mode that could take the CPU overhead down. 🤗",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 131,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0199",
+      "source": "Trace reading cheatsheet",
+      "spans": []
+    },
+    {
+      "id": "b0200",
+      "source": "A quick reference for the patterns we walked through. The idea is: if you see this in a trace, this is what it usually means.",
+      "spans": []
+    },
+    {
+      "id": "b0201",
+      "source": "Profiler table",
+      "spans": []
+    },
+    {
+      "id": "b0202",
+      "source": "What you see",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "What it usually means",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "Self CPU time total ≫ Self CUDA time total (CPU in ms, GPU in µs)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 22,
+          "end": 42,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t23",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "Overhead-bound. The CPU spends more time dispatching than the GPU spends computing. Make the work bigger (larger matrices, batched ops) or fuse calls.",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "Self CPU time total ≈ Self CUDA time total, both in ms",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 22,
+          "end": 42,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t23",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "Compute-bound. The GPU is the bottleneck, which is usually what you want.",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "One event dominates CUDA total",
+      "spans": [
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t23",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "That's your hotspot. Start the optimization there.",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "One event has a huge # of Calls",
+      "spans": [
+        {
+          "start": 21,
+          "end": 31,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t23",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0211",
+      "source": "A potential bottleneck even if each call is cheap. Check whether it can be fused or batched.",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "CPU total ≫ Self CPU for a row",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 12,
+          "end": 20,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t23",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "Most of the cost lives in children. Drill into the nested events, not the parent.",
+      "spans": [],
+      "table": {
+        "id": "t23",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "CPU lane",
+      "spans": []
+    },
+    {
+      "id": "b0215",
+      "source": "What you see",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "What it usually means",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "First ProfileStep much wider than the rest",
+      "spans": [
+        {
+          "start": 6,
+          "end": 17,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0218",
+      "source": "Cold-start overhead: workspace allocation, cuBLAS heuristics, lazy module loading. Add warmup iterations and/or the schedule's warmup argument.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 133,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0219",
+      "source": "Big gap between record_function(\"...\") start and the first aten::* inside it",
+      "spans": [
+        {
+          "start": 16,
+          "end": 38,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 66,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0220",
+      "source": "Same cold-start tax, just zoomed in. The annotation entered, but the dispatch hadn't happened yet.",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0221",
+      "source": "cudaOccupancyMaxActiveBlocksPerMultiprocessor before a cudaLaunchKernel",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 71,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "A heavyweight, adaptively-launched kernel (GEMM, conv, etc.). cuBLAS is asking the driver how many blocks fit on an SM so it can pick a kernel variant.",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "cudaLaunchKernel with no preceding occupancy query",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "An elementwise or reduction kernel with a fixed, resource-light footprint. Nothing to plan.",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "A long cudaDeviceSynchronize at the end of the active window",
+      "spans": [
+        {
+          "start": 7,
+          "end": 28,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "The profiler flushing events. Its duration is mostly the GPU finishing pending work, not a real CPU cost. A sync covering tiny GPU work is a classic overhead-bound symptom.",
+      "spans": [],
+      "table": {
+        "id": "t24",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "A cudaMemcpyAsync you didn't write",
+      "spans": [
+        {
+          "start": 2,
+          "end": 17,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "Often a hidden Device-to-Device copy. Common when addmm seeds its destination buffer with the bias before the GEMM epilogue.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 55,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t24",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "GPU lane",
+      "spans": []
+    },
+    {
+      "id": "b0230",
+      "source": "What you see",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "What it usually means",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "Activity Buffer Request on the GPU lane",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t25",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "The profiler is allocating/refilling its own event buffer. The first one usually accounts for the initial CPU↔GPU lane offset.",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0234",
+      "source": "A gap between two kernels in a single step",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0235",
+      "source": "Likely another buffer request mid-execution. Confirm by running more iterations: if it appears only once, it's the profiler, not your code.",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0236",
+      "source": "The same kernel timing differently across steps",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0237",
+      "source": "GPU clocks, thermals, power management, driver housekeeping. Read the trace, not just the mean.",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0238",
+      "source": "A kernel named like ampere_bf16_s16816gemm_...",
+      "spans": [
+        {
+          "start": 20,
+          "end": 46,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t25",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0239",
+      "source": "The actual cuBLAS GPU work for a matmul. The kernel name is typically the same in eager and compiled mode for the same shapes/dtypes.",
+      "spans": [],
+      "table": {
+        "id": "t25",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0240",
+      "source": "Memcpy DtoD immediately before a GEMM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t25",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "The bias copy for an addmm epilogue. The \"fusion\" is at the dispatcher level, not in the kernel.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 26,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t25",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0242",
+      "source": "Dispatch chain",
+      "spans": []
+    },
+    {
+      "id": "b0243",
+      "source": "What you see",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0244",
+      "source": "What it usually means",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0245",
+      "source": "ProfileStep#N → <record_function name> → aten::* → aten::mm / aten::bmm / aten::add",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 16,
+          "end": 38,
+          "kind": "code"
+        },
+        {
+          "start": 41,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 62,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 74,
+          "end": 83,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t26",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0246",
+      "source": "The canonical nested call hierarchy. Self time excludes children; Total time includes them.",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0247",
+      "source": "aten::matmul resolving to aten::mm",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 34,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t26",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0248",
+      "source": "2D × 2D matrix multiply.",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0249",
+      "source": "aten::matmul resolving to aten::bmm (with extra CUDA runtime calls)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 35,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t26",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0250",
+      "source": "Batched matmul on 3D+ tensors. cuBLAS does more heuristic work to pick the variant.",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0251",
+      "source": "aten::addmm(b, x, w) instead of a separate aten::add + aten::mm pair",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 52,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 63,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t26",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0252",
+      "source": "Operator fusion at the dispatcher level. The GPU kernel is still the same GEMM, with the bias add folded into the epilogue.",
+      "spans": [],
+      "table": {
+        "id": "t26",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0253",
+      "source": "torch.compile",
+      "spans": []
+    },
+    {
+      "id": "b0254",
+      "source": "What you see",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0255",
+      "source": "What it usually means",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0256",
+      "source": "A Torch-Compiled Region: K/M row in the CPU lane",
+      "spans": [
+        {
+          "start": 2,
+          "end": 28,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0257",
+      "source": "You're inside a compiled function.",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0258",
+      "source": "TorchDynamo Cache Lookup on every step",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0259",
+      "source": "Dynamo is verifying shapes/dtypes/devices match the cached compile. Paid on every call, even after compilation.",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0260",
+      "source": "AOTDispatcher Runtime Wrapper Prologue even with no grads",
+      "spans": [
+        {
+          "start": 0,
+          "end": 38,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0261",
+      "source": "AOTAutograd's runtime wrapper is always in the stack, handling tensor metadata and view tracking.",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0262",
+      "source": "## Call CompiledFxGraph <hash> with the same hash across steps",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0263",
+      "source": "Cache hits on the generated code. The generated source lives under /tmp/torchinductor_<user>/fxgraph/<hash>.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 107,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0264",
+      "source": "Per-step CPU time higher under torch.compile than eager for a tiny op",
+      "spans": [
+        {
+          "start": 31,
+          "end": 44,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t27",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0265",
+      "source": "Expected. The Dynamo → AOTAutograd → Inductor stack is a tax that only amortizes over many ops.",
+      "spans": [],
+      "table": {
+        "id": "t27",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0266",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0267",
+      "source": "We started with a tiny matmul + add and used it as an excuse to learn how to read a PyTorch profiler. Along the way we picked up a few mental models that travel well to bigger workloads. This was the first stop in the Profiling PyTorch series. In the posts that follow, we will gradually leave this two-op toy behind and walk up the ladder of complexity, looking at larger building blocks and, eventually, real models.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 35,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 235,
+          "kind": "strong"
+        },
+        {
+          "start": 244,
+          "end": 256,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-mlp-fusion"
+        }
+      ]
+    },
+    {
+      "id": "b0268",
+      "source": "Thanks to Noe Flandre, Suvaditya Mukherjee, and Vidit Ostwal for their reviews on the early draft of the post!",
+      "spans": [
+        {
+          "start": 10,
+          "end": 21,
+          "kind": "a",
+          "href": "https://huggingface.co/NoeFlandre"
+        },
+        {
+          "start": 23,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/suvadityamuk"
+        },
+        {
+          "start": 48,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/ViditOstwal"
+        }
+      ]
+    },
+    {
+      "id": "b0269",
+      "source": "The blog post was polished using an LLM. This in no way means that we have let an agent run in the background and let it generate the blog. Some of us in the team are non-english speakers and think LLMs (which are mostly trained in the English Language) can rectify silly grammar mistakes or rephrase sentences that sound less intimidating and cleaner. Hope this helps with the idea of \"why should I read, if this was LLM generated\". 🤗",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "f98f5050ea343b615c0b5cbde6f32000396fd0eff48cb2e13ae659501e613816",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "def fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)"
+    },
+    {
+      "id": "c0002",
+      "source": "def step():\n  with torch.profiler.record_function(\"matmul_add\"):\n    return fn(x, w, b)"
+    },
+    {
+      "id": "c0003",
+      "source": "  with torch.profiler.profile(\n    activities=[\n        torch.profiler.ProfilerActivity.CPU,  # the cpu activities\n        torch.profiler.ProfilerActivity.CUDA, # the gpu activities\n    ],\n  ) as prof:\n    # it is recommended to run events multiple times to warm up the GPUs\n    for _ in range(5):\n      step()\n      prof.step()"
+    },
+    {
+      "id": "c0004",
+      "source": "# the profiler table\nprof.key_averages().table(sort_by=\"cuda_time_total\", row_limit=15)\n\n# the profiler trace\nprof.export_chrome_trace(trace_path)"
+    },
+    {
+      "id": "c0005",
+      "source": "uv run 01_matmul_add.py --size 64"
+    },
+    {
+      "id": "c0006",
+      "source": "64_bf16_cold_eager.json\n64_bf16_cold_eager.txt"
+    },
+    {
+      "id": "c0007",
+      "source": "Self CPU time total: 2.314ms\nSelf CUDA time total: 23.104us"
+    },
+    {
+      "id": "c0008",
+      "source": "uv run 01_matmul_add.py --size 4096 "
+    },
+    {
+      "id": "c0009",
+      "source": "Self CPU time total: 4.908ms\nSelf CUDA time total: 4.495ms"
+    },
+    {
+      "id": "c0010",
+      "source": "schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)"
+    },
+    {
+      "id": "c0011",
+      "source": "uv run 01_matmul_add.py --warmup"
+    },
+    {
+      "id": "c0012",
+      "source": "- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=3, repeat=1)"
+    },
+    {
+      "id": "c0013",
+      "source": "- x = torch.randn(args.size, args.size, device=device, dtype=dtype)\n- w = torch.randn( args.size, args.size, device=device, dtype=dtype)\n- b = torch.randn(args.size, args.size, device=device, dtype=dtype)\n\n+ # adding a batch size of 8\n+ x = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ w = torch.randn(8, args.size, args.size, device=device, dtype=dtype)\n+ b = torch.randn(8, args.size, args.size, device=device, dtype=dtype)"
+    },
+    {
+      "id": "c0014",
+      "source": "uv run 01_matmul_add.py --size 4096 --warmup"
+    },
+    {
+      "id": "c0015",
+      "source": "- schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1)\n+ schedule = torch.profiler.schedule(wait=0, warmup=0, active=20, repeat=1)\n\n- for _ in range(5):\n+ for _ in range(20):"
+    },
+    {
+      "id": "c0016",
+      "source": "uv run 01_matmul_add.py --size 4096 --warmup --compile"
+    },
+    {
+      "id": "c0017",
+      "source": "def fn(x, w, b):\n  return torch.add(torch.matmul(x, w), b)\n\nfn = torch.compile(fn) if args.compile else fn"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "f98f5050ea343b615c0b5cbde6f32000396fd0eff48cb2e13ae659501e613816",
+  "mediaLayout": [
+    {
+      "mediaId": "image_4446f047e4de57f3",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_2c4bc92a11bbd46c",
+      "type": "image",
+      "afterBlockId": "b0033",
+      "order": 1
+    },
+    {
+      "mediaId": "image_390e78150feb537d",
+      "type": "image",
+      "afterBlockId": "b0041",
+      "order": 2
+    },
+    {
+      "mediaId": "image_791e3bb398f132f8",
+      "type": "image",
+      "afterBlockId": "b0047",
+      "order": 3
+    },
+    {
+      "mediaId": "image_d891e011fa7a56ca",
+      "type": "image",
+      "afterBlockId": "b0056",
+      "order": 4
+    },
+    {
+      "mediaId": "image_065ea9f77454c86c",
+      "type": "image",
+      "afterBlockId": "b0062",
+      "order": 5
+    },
+    {
+      "mediaId": "image_3bd05ae0affb4083",
+      "type": "image",
+      "afterBlockId": "b0081",
+      "order": 6
+    },
+    {
+      "mediaId": "image_12d3b2f1eb566839",
+      "type": "image",
+      "afterBlockId": "b0086",
+      "order": 7
+    },
+    {
+      "mediaId": "image_b295e922526cc3da",
+      "type": "image",
+      "afterBlockId": "b0090",
+      "order": 8
+    },
+    {
+      "mediaId": "image_22e1e35f48568736",
+      "type": "image",
+      "afterBlockId": "b0094",
+      "order": 9
+    },
+    {
+      "mediaId": "image_2245eda98df0d21d",
+      "type": "image",
+      "afterBlockId": "b0097",
+      "order": 10
+    },
+    {
+      "mediaId": "image_298f91d0536300de",
+      "type": "image",
+      "afterBlockId": "b0101",
+      "order": 11
+    },
+    {
+      "mediaId": "image_4755670078af1f06",
+      "type": "image",
+      "afterBlockId": "b0105",
+      "order": 12
+    },
+    {
+      "mediaId": "image_56998be5f39a1f9d",
+      "type": "image",
+      "afterBlockId": "b0111",
+      "order": 13
+    },
+    {
+      "mediaId": "image_e35477dcf8953def",
+      "type": "image",
+      "afterBlockId": "b0116",
+      "order": 14
+    },
+    {
+      "mediaId": "image_be1fa17eba2be120",
+      "type": "image",
+      "afterBlockId": "b0122",
+      "order": 15
+    },
+    {
+      "mediaId": "image_5033c2520280a819",
+      "type": "image",
+      "afterBlockId": "b0123",
+      "order": 16
+    },
+    {
+      "mediaId": "image_1e377b43496a440e",
+      "type": "image",
+      "afterBlockId": "b0136",
+      "order": 17
+    },
+    {
+      "mediaId": "image_69bf8debe6008889",
+      "type": "image",
+      "afterBlockId": "b0141",
+      "order": 18
+    },
+    {
+      "mediaId": "image_0996eff9b001327c",
+      "type": "image",
+      "afterBlockId": "b0156",
+      "order": 19
+    },
+    {
+      "mediaId": "image_d54693b5b4a98084",
+      "type": "image",
+      "afterBlockId": "b0160",
+      "order": 20
+    },
+    {
+      "mediaId": "image_46667ae4e0a08bed",
+      "type": "image",
+      "afterBlockId": "b0172",
+      "order": 21
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 22,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 22,
+    "savedImages": 22,
+    "sourceImageOccurrences": 22,
+    "placedImageOccurrences": 22,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:12.281969Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:12.281986Z"
 }

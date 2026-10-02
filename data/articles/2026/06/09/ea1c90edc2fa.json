@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-01T16:44:55.990457Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Migrating Your GitHub CI to Hugging Face Jobs\n\nIf you have a GitHub repository and you have GitHub Actions enabled, you probably use GitHub-hosted runners for CI. That is the default for many projects because it is simple: add a workflow, write runs-on: ubuntu-latest , and GitHub gives you a machine.\n\nThat default is convenient, but it also has limits. GitHub Actions can be slow or down for maintenance, the hosted machines are generic, and GPU access is not something most open-source projects can just turn on. For Trackio , those limits started to matter. We wanted both reliable CPU CI for basic unit tests and frontend checks, but also GPU CI for tests that need to run on actual CUDA hardware.\n\nSo built an alternative: keep GitHub Actions in charge of CI, but run the jobs on Hugging Face Jobs .\n\nThe result: Trackio's CI now runs on Hugging Face Jobs and streams back real-time logs, cutting our CI time for CPU jobs by about 30% and enabling a whole new test suite that runs on GPU machines !\n\nIn this article, we explain step-by-step how to recreate the same setup for your GitHub repo. If you are using an agent, you can point it to this article, since we provide CLI instructions alongside browser-based instructions for us humans.\n\nLet's start with a quick intro to Hugging Face Jobs!\n\n## What is Hugging Face Jobs?\n\nHugging Face Jobs lets you run commands or scripts on Hugging Face's serverless infrastructure with almost any hardware flavor. A Job is essentially:\n\n- a Docker image, from Docker Hub or a Hugging Face Space\n\n- a hardware flavor, such as CPU or t4-small or h200 GPU\n\n- optional environment variables and secrets\n\nFor example, you can run:\n\n```\nhf jobs run python:3.12 python -c \"print('Hello world')\"\n```\n\n```\nhf jobs uv run --flavor a10g-small \"https://raw.githubusercontent.com/huggingface/trl/main/trl/scripts/sft.py\"\n```\n\nThat makes Jobs a natural fit for CI. CI jobs are already command-driven, already run in clean environments, and often benefit from choosing exactly the right hardware. For ML libraries, the GPU case is especially compelling: you can run a test suite on real GPU hardware without maintaining your own always-on runner.\n\nThe key step is connecting GitHub Actions to HF Jobs, which we describe below.\n\nFor this setup, we created huggingface/jobs-actions , a small bridge that turns a GitHub Actions job into an ephemeral self-hosted runner running inside an HF Job.\n\nThe complete flow looks like this:\n\n- A pull request triggers a GitHub Actions workflow.\n\n- GitHub queues any job whose runs-on label is not available, for example hf-jobs-cpu-upgrade or hf-jobs-t4-small , and sends a signed workflow_job.queued webhook to the dispatcher through the GitHub App.\n\n- The dispatcher Space verifies the webhook, checks for an hf-jobs-* label, mints a short-lived GitHub runner registration token, and starts an HF Job on the matching hardware.\n\n- The HF Job boots an ephemeral GitHub Actions runner and registers it with the repo using that one-shot token.\n\n- GitHub assigns the pending workflow job to that runner; the runner executes the CI job, reports status back to GitHub, and exits.\n\nFrom GitHub's point of view, this is just a self-hosted runner. From Hugging Face's point of view, it is just a Job that launches a container to run the workflow steps from the repo’s GitHub Actions.\n\n## Step 1: Duplicate the dispatcher Space\n\nThe first thing you need is the dispatcher. This is a small Docker Space that receives GitHub workflow_job webhook events and launches HF Jobs in response.\n\nCreate this first because the GitHub App needs a webhook URL, and that URL comes from the Space. This Space should be under your own namespace or under a Hugging Face org that you have write access to.\n\nGo to huggingface/jobs-actions-dispatcher and click Duplicate this Space .\n\n```\nOwner: your HF user or org\nName: jobs-actions-dispatcher\nHardware: cpu-upgrade\n```\n\nUse cpu-upgrade for real CI so the dispatcher stays available for GitHub webhooks. cpu-basic is fine for testing and will probably work, but it can sleep after inactivity; if GitHub's webhook arrives while it is waking up, the workflow may stay queued forever.\n\nAfter it builds, open the duplicated Space. You will see a section that says \"Required Space secrets,\" which you can ignore for now. The landing page should display the GitHub App webhook URL you need in the next step. It will look like this:\n\n```\nhttps://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space/webhook\n```\n\nIf you'd prefer to set up the dispatcher Space with an agent or use a CLI workflow:\n\n```\nexport HF_NAMESPACE=your-hf-user-or-org\nexport SPACE_ID=\"$HF_NAMESPACE/jobs-actions-dispatcher\"\n\nhf repo duplicate huggingface/jobs-actions-dispatcher \"$SPACE_ID\" \\\n  --type space \\\n  --flavor cpu-upgrade \\\n  --exist-ok\n```\n\n```\nexport DISPATCHER_URL=\"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\"\n```\n\n## Step 2: Create and install the GitHub App\n\nNext, create and install the GitHub App from the dispatcher Space itself. This App needs permission to listen for queued workflow jobs and create ephemeral self-hosted runner registration tokens.\n\nOpen your duplicated dispatcher Space:\n\n```\nhttps://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space\n```\n\nIn the setup form, enter the GitHub repo whose CI should run on HF Jobs:\n\n```\nYOUR-GITHUB-ORG/YOUR-REPO\n```\n\nThen click the button to create the GitHub App. GitHub will ask you to choose a name for the App; the name can be anything, as long as it is available in your GitHub account or org. After you submit, the final screen tells you exactly how to upload the App credentials to the dispatcher Space with the hf CLI.\n\nImportant note : you will need to provide an Hugging Face token that has permissions to launch Jobs, corresponding to your personal account or an org under which Jobs should be charged. This token should be saved as the HF_TOKEN secret in your dispatcher Space.\n\nFinally, you will install the App on the same GitHub repo you entered in the Space. In the Trackio setup, we installed it on gradio-app/trackio .\n\n### Agent-assisted setup\n\nThe GitHub App manifest flow is still browser-based, but an agent can follow the same Space-driven path:\n\n```\nexport HF_NAMESPACE=your-hf-user-or-org\nexport GITHUB_REPO=YOUR-GITHUB-ORG/YOUR-REPO\nopen \"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\"\n```\n\nPaste GITHUB_REPO into the Space, click the GitHub App creation button, choose any available App name, and follow the generated GitHub instructions.\n\nAfter the App exists, install it on your repo from the App settings page. For a GitHub org, the installation settings are under:\n\n```\nhttps://github.com/organizations/YOUR-GITHUB-ORG/settings/installations\n```\n\n## Step 3: Final dispatcher settings\n\nAt this point, the dispatcher Space should be configured. The GitHub App setup flow generated the commands that upload the App credentials, webhook secret, and Hugging Face token to the Space.\n\nBy default, HF Jobs are launched under the same namespace as the dispatcher Space. Optionally, set HF_NAMESPACE as a Space variable if you want to bill jobs to a different Hugging Face user or org:\n\n```\nexport SPACE_ID=YOUR-HF-NAMESPACE/jobs-actions-dispatcher\nhf spaces variables add \"$SPACE_ID\" -e HF_NAMESPACE=your-billing-namespace\nhf spaces restart \"$SPACE_ID\"\n```\n\nThe token you set in Step 2 should correspond to this namespace.\n\n## Step 4: Change runs-on\n\nThe actual workflow change is small. Instead of:\n\n```\nruns-on: ubuntu-latest\n```\n\nuse one of the labels handled by the dispatcher:\n\n```\nruns-on: hf-jobs-cpu-upgrade\n```\n\nFor GPU tests, use a GPU label:\n\n```\nruns-on: hf-jobs-t4-small\n```\n\nFor any GitHub Action you'd like to run on HF Jobs, this 1-line change is all you need!\n\nTo add a minimal smoke-test workflow from the CLI:\n\n```\nmkdir -p .github/workflows\ncat > .github/workflows/hf-jobs-test.yml <<'EOF'\nname: HF Jobs Test\n\non:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  test:\n    runs-on: hf-jobs-cpu-upgrade\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"Hello from Hugging Face Jobs\"\nEOF\n\ngit add .github/workflows/hf-jobs-test.yml\ngit commit -m \"Run CI on Hugging Face Jobs\"\ngit push\n```\n\n```\ngh run list --repo YOUR-GITHUB-ORG/YOUR-REPO --limit 5\nhf jobs ps --namespace \"$HF_NAMESPACE\"\nhf spaces logs \"$SPACE_ID\"\n```\n\nYou should be able to see logs just like a regular GitHub Action—for example, in this Trackio PR #565 .\n\nNote on choosing the right Docker image\n\nOur first CPU setup used ubuntu:22.04 and installed missing system packages during every run. That worked, but it was slower than it needed to be. GitHub's ubuntu-latest image includes a lot of developer tooling by default; a bare Ubuntu image does not.\n\nFor Trackio, the UI tests need Playwright browsers, Node, ffmpeg, sqlite, git, and normal Linux build dependencies. Hugging Face Jobs supports using any Docker image , so we switched to the Microsoft Playwright image, which worked well:\n\n```\nmcr.microsoft.com/playwright:v1.60.0-jammy\n```\n\n```\nnvidia/cuda:12.4.0-runtime-ubuntu22.04\n```\n\nHere are the numbers from the Trackio CI:\n\nRunner setup Runtime Compared to GitHub average\n\nGitHub ubuntu-latest baseline\n\nHF Jobs CPU, Playwright image\n\nHF Jobs GPU, t4-small label\n\nno GitHub-hosted GPU baseline\n\nThe biggest win was GPU CI. The Trackio GPU check ran on HF Jobs and passed in 45s , costing less than a cent at the t4-small rate for that duration.\n\nThe CPU result was also encouraging. With the right image, the Linux test job was faster than the GitHub-hosted baseline. That suggests HF Jobs can be a practical CI backend, especially for ML projects that need custom images or accelerators.\n\nLogs were another pleasant surprise. GitHub Actions logs are useful, but the web UI can be heavy for large logs. HF Jobs logs are easy to fetch from the CLI:\n\n```\nhf jobs logs <job_id> > logs.txt\n```\n\nThat makes them easy to inspect with local tools or coding agents. In our bridge, we also mirrored the GitHub Actions job log into the HF Job log, so either system had enough information to debug a run.\n\nFinally, although we didn't need them for Trackio's CI, HF Jobs also supports mounting volumes , which can be very helpful if you need to load datasets or models from Hugging Face quickly as part of your CI.\n\nHopefully, this gives you all you need to try HF Jobs for running your GitHub Actions!\n\n## Spaces mentioned in this article 1\n\nMore Articles from our Blog\n\n## Learn the Hugging Face Kernel Hub in 5 Minutes\n\ninference javascript webgpu\n\n## Introducing @huggingface/kernels: 200+ WebGPU Kernels for Local AI\n\nGitHub CI is limitless and free. In Huggingface now I can't even run more 3 CPU spaces.\n\nHi @ k-l-lambda what error do you see when try to run more than 3 CPU Spaces? Can you share a bit more about your CI setup?\n\nPlease feel free to drop a comment if you need any help migrating your CI!\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "If you have a GitHub repository and you have GitHub Actions enabled, you probably use GitHub-hosted runners for CI. That is the default for many projects because it is simple: add a workflow, write runs-on: ubuntu-latest, and GitHub gives you a machine.\n\nThat default is convenient, but it also has limits. GitHub Actions can be slow or down for maintenance, the hosted machines are generic, and GPU access is not something most open-source projects can just turn on. For Trackio, those limits started to matter. We wanted both reliable CPU CI for basic unit tests and frontend checks, but also GPU CI for tests that need to run on actual CUDA hardware.\n\nSo built an alternative: keep GitHub Actions in charge of CI, but run the jobs on Hugging Face Jobs.\n\nThe result: Trackio's CI now runs on Hugging Face Jobs and streams back real-time logs, cutting our CI time for CPU jobs by about 30% and enabling a whole new test suite that runs on GPU machines!\n\nIn this article, we explain step-by-step how to recreate the same setup for your GitHub repo. If you are using an agent, you can point it to this article, since we provide CLI instructions alongside browser-based instructions for us humans.\n\nLet's start with a quick intro to Hugging Face Jobs!\n\n## What is Hugging Face Jobs?\n\nHugging Face Jobs lets you run commands or scripts on Hugging Face's serverless infrastructure with almost any hardware flavor. A Job is essentially:\n\n- a command to run\n\n- a Docker image, from Docker Hub or a Hugging Face Space\n\n- a hardware flavor, such as CPU or t4-small or h200 GPU\n\n- optional environment variables and secrets\n\nFor example, you can run:\n\n```\nhf jobs run python:3.12 python -c \"print('Hello world')\"\n```\n\nor\n\n```\nhf jobs uv run --flavor a10g-small \"https://raw.githubusercontent.com/huggingface/trl/main/trl/scripts/sft.py\" \n```\n\nThat makes Jobs a natural fit for CI. CI jobs are already command-driven, already run in clean environments, and often benefit from choosing exactly the right hardware. For ML libraries, the GPU case is especially compelling: you can run a test suite on real GPU hardware without maintaining your own always-on runner.\n\nThe key step is connecting GitHub Actions to HF Jobs, which we describe below.\n\n## The architecture\n\nFor this setup, we created huggingface/jobs-actions, a small bridge that turns a GitHub Actions job into an ephemeral self-hosted runner running inside an HF Job.\n\nThe complete flow looks like this:\n\n- A pull request triggers a GitHub Actions workflow.\n\n- GitHub queues any job whose runs-on label is not available, for example hf-jobs-cpu-upgrade or hf-jobs-t4-small, and sends a signed workflow_job.queued webhook to the dispatcher through the GitHub App.\n\n- The dispatcher Space verifies the webhook, checks for an hf-jobs-* label, mints a short-lived GitHub runner registration token, and starts an HF Job on the matching hardware.\n\n- The HF Job boots an ephemeral GitHub Actions runner and registers it with the repo using that one-shot token.\n\n- GitHub assigns the pending workflow job to that runner; the runner executes the CI job, reports status back to GitHub, and exits.\n\nFrom GitHub's point of view, this is just a self-hosted runner. From Hugging Face's point of view, it is just a Job that launches a container to run the workflow steps from the repo’s GitHub Actions.\n\n## Step 1: Duplicate the dispatcher Space\n\nThe first thing you need is the dispatcher. This is a small Docker Space that receives GitHub workflow_job webhook events and launches HF Jobs in response.\n\nCreate this first because the GitHub App needs a webhook URL, and that URL comes from the Space. This Space should be under your own namespace or under a Hugging Face org that you have write access to.\n\n#### Web setup\n\nGo to huggingface/jobs-actions-dispatcher and click Duplicate this Space.\n\nUse:\n\n```\nOwner: your HF user or org\nName: jobs-actions-dispatcher\nHardware: cpu-upgrade\n```\n\nUse cpu-upgrade for real CI so the dispatcher stays available for GitHub webhooks. cpu-basic is fine for testing and will probably work, but it can sleep after inactivity; if GitHub's webhook arrives while it is waking up, the workflow may stay queued forever.\n\nAfter it builds, open the duplicated Space. You will see a section that says \"Required Space secrets,\" which you can ignore for now. The landing page should display the GitHub App webhook URL you need in the next step. It will look like this:\n\n```\nhttps://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space/webhook\n```\n\n#### CLI setup\n\nIf you'd prefer to set up the dispatcher Space with an agent or use a CLI workflow:\n\n```\nexport HF_NAMESPACE=your-hf-user-or-org\nexport SPACE_ID=\"$HF_NAMESPACE/jobs-actions-dispatcher\"\n\nhf repo duplicate huggingface/jobs-actions-dispatcher \"$SPACE_ID\" \\\n  --type space \\\n  --flavor cpu-upgrade \\\n  --exist-ok\n```\n\nThen set:\n\n```\nexport DISPATCHER_URL=\"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\"\n```\n\n## Step 2: Create and install the GitHub App\n\nNext, create and install the GitHub App from the dispatcher Space itself. This App needs permission to listen for queued workflow jobs and create ephemeral self-hosted runner registration tokens.\n\n### Web setup\n\nOpen your duplicated dispatcher Space:\n\n```\nhttps://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space\n```\n\nIn the setup form, enter the GitHub repo whose CI should run on HF Jobs:\n\n```\nYOUR-GITHUB-ORG/YOUR-REPO\n```\n\nThen click the button to create the GitHub App. GitHub will ask you to choose a name for the App; the name can be anything, as long as it is available in your GitHub account or org. After you submit, the final screen tells you exactly how to upload the App credentials to the dispatcher Space with the hf CLI.\n\nImportant note: you will need to provide an Hugging Face token that has permissions to launch Jobs, corresponding to your personal account or an org under which Jobs should be charged. This token should be saved as the HF_TOKEN secret in your dispatcher Space.\n\nFinally, you will install the App on the same GitHub repo you entered in the Space. In the Trackio setup, we installed it on gradio-app/trackio.\n\n### Agent-assisted setup\n\nThe GitHub App manifest flow is still browser-based, but an agent can follow the same Space-driven path:\n\n```\nexport HF_NAMESPACE=your-hf-user-or-org\nexport GITHUB_REPO=YOUR-GITHUB-ORG/YOUR-REPO\nopen \"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\"\n```\n\nPaste $GITHUB_REPO into the Space, click the GitHub App creation button, choose any available App name, and follow the generated GitHub instructions.\n\nAfter the App exists, install it on your repo from the App settings page. For a GitHub org, the installation settings are under:\n\n```\nhttps://github.com/organizations/YOUR-GITHUB-ORG/settings/installations\n```\n\n## Step 3: Final dispatcher settings\n\nAt this point, the dispatcher Space should be configured. The GitHub App setup flow generated the commands that upload the App credentials, webhook secret, and Hugging Face token to the Space.\n\nBy default, HF Jobs are launched under the same namespace as the dispatcher Space. Optionally, set HF_NAMESPACE as a Space variable if you want to bill jobs to a different Hugging Face user or org:\n\n```\nexport SPACE_ID=YOUR-HF-NAMESPACE/jobs-actions-dispatcher\nhf spaces variables add \"$SPACE_ID\" -e HF_NAMESPACE=your-billing-namespace\nhf spaces restart \"$SPACE_ID\"\n```\n\nThe token you set in Step 2 should correspond to this namespace.\n\n## Step 4: Change runs-on\n\nThe actual workflow change is small. Instead of:\n\n```\nruns-on: ubuntu-latest\n```\n\nuse one of the labels handled by the dispatcher:\n\n```\nruns-on: hf-jobs-cpu-upgrade\n```\n\nFor GPU tests, use a GPU label:\n\n```\nruns-on: hf-jobs-t4-small\n```\n\nFor any GitHub Action you'd like to run on HF Jobs, this 1-line change is all you need!\n\n## Step 5: Test it out\n\nTo add a minimal smoke-test workflow from the CLI:\n\n```\nmkdir -p .github/workflows\ncat > .github/workflows/hf-jobs-test.yml <<'EOF'\nname: HF Jobs Test\n\non:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  test:\n    runs-on: hf-jobs-cpu-upgrade\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"Hello from Hugging Face Jobs\"\nEOF\n\ngit add .github/workflows/hf-jobs-test.yml\ngit commit -m \"Run CI on Hugging Face Jobs\"\ngit push\n```\n\nTo verify from the CLI:\n\n```\ngh run list --repo YOUR-GITHUB-ORG/YOUR-REPO --limit 5\nhf jobs ps --namespace \"$HF_NAMESPACE\"\nhf spaces logs \"$SPACE_ID\"\n```\n\nYou should be able to see logs just like a regular GitHub Action—for example, in this Trackio PR #565.\n\nAnd that's it!\n\nNote on choosing the right Docker image\n\nOur first CPU setup used ubuntu:22.04 and installed missing system packages during every run. That worked, but it was slower than it needed to be. GitHub's ubuntu-latest image includes a lot of developer tooling by default; a bare Ubuntu image does not.\n\nFor Trackio, the UI tests need Playwright browsers, Node, ffmpeg, sqlite, git, and normal Linux build dependencies. Hugging Face Jobs supports using any Docker image, so we switched to the Microsoft Playwright image, which worked well:\n\n```\nmcr.microsoft.com/playwright:v1.60.0-jammy\n```\n\nFor GPU jobs, we used:\n\n```\nnvidia/cuda:12.4.0-runtime-ubuntu22.04\n```\n\n## Results\n\nHere are the numbers from the Trackio CI:\n\nRunner setup\n\nRuntime\n\nCompared to GitHub average\n\nGitHub ubuntu-latest baseline\n\n1m40s\n\nbaseline\n\nHF Jobs CPU, Playwright image\n\n1m10s\n\n\\-30s, about 30% faster\n\nHF Jobs GPU, t4-small label\n\n45s\n\nno GitHub-hosted GPU baseline\n\nThe biggest win was GPU CI. The Trackio GPU check ran on HF Jobs and passed in 45s, costing less than a cent at the t4-small rate for that duration.\n\nThe CPU result was also encouraging. With the right image, the Linux test job was faster than the GitHub-hosted baseline. That suggests HF Jobs can be a practical CI backend, especially for ML projects that need custom images or accelerators.\n\nLogs were another pleasant surprise. GitHub Actions logs are useful, but the web UI can be heavy for large logs. HF Jobs logs are easy to fetch from the CLI:\n\n```\nhf jobs logs <job_id> > logs.txt\n```\n\nThat makes them easy to inspect with local tools or coding agents. In our bridge, we also mirrored the GitHub Actions job log into the HF Job log, so either system had enough information to debug a run.\n\nFinally, although we didn't need them for Trackio's CI, HF Jobs also supports mounting volumes, which can be very helpful if you need to load datasets or models from Hugging Face quickly as part of your CI.\n\nHopefully, this gives you all you need to try HF Jobs for running your GitHub Actions!",
   "summaryZh": "本文介绍了开源项目Trackio如何将GitHub CI的运行环境迁移至Hugging Face Jobs。该方案利用Hugging Face的Serverless基础设施，不仅将CPU任务的CI时间缩短了约30%，还让项目能够直接在GPU硬件上运行测试套件，为开发者提供了实用的DevOps配置指南。",
   "summaryGeneratedAt": "2026-08-30T10:45:02.191168Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +54,915 @@
     "summaryZh": "本文介绍了开源项目Trackio如何将GitHub CI的运行环境迁移至Hugging Face Jobs。该方案利用Hugging Face的Serverless基础设施，不仅将CPU任务的CI时间缩短了约30%，还让项目能够直接在GPU硬件上运行测试套件，为开发者提供了实用的DevOps配置指南。",
     "glossary": [],
     "duplicateKey": "migrating-github-ci-huggingface-jobs"
-  }
+  },
+  "images": [
+    {
+      "src": "https://github.com/user-attachments/assets/c8b450c3-b801-43dc-97ff-954d9bbaf975",
+      "originalUrl": "https://github.com/user-attachments/assets/c8b450c3-b801-43dc-97ff-954d9bbaf975",
+      "alt": "image",
+      "id": "image_87f61ae592306717"
+    },
+    {
+      "src": "https://github.com/user-attachments/assets/0fc8ac73-f93a-419b-bd80-70da2756f50c",
+      "originalUrl": "https://github.com/user-attachments/assets/0fc8ac73-f93a-419b-bd80-70da2756f50c",
+      "alt": "image",
+      "id": "image_4e8ed77ce516d92a"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "If you have a GitHub repository and you have GitHub Actions enabled, you probably use GitHub-hosted runners for CI. That is the default for many projects because it is simple: add a workflow, write runs-on: ubuntu-latest, and GitHub gives you a machine.",
+      "spans": [
+        {
+          "start": 198,
+          "end": 220,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "That default is convenient, but it also has limits. GitHub Actions can be slow or down for maintenance, the hosted machines are generic, and GPU access is not something most open-source projects can just turn on. For Trackio, those limits started to matter. We wanted both reliable CPU CI for basic unit tests and frontend checks, but also GPU CI for tests that need to run on actual CUDA hardware.",
+      "spans": [
+        {
+          "start": 217,
+          "end": 224,
+          "kind": "a",
+          "href": "https://github.com/gradio-app/trackio"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "So built an alternative: keep GitHub Actions in charge of CI, but run the jobs on Hugging Face Jobs.",
+      "spans": [
+        {
+          "start": 82,
+          "end": 99,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/jobs-overview"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "The result: Trackio's CI now runs on Hugging Face Jobs and streams back real-time logs, cutting our CI time for CPU jobs by about 30% and enabling a whole new test suite that runs on GPU machines!",
+      "spans": [
+        {
+          "start": 88,
+          "end": 195,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "In this article, we explain step-by-step how to recreate the same setup for your GitHub repo. If you are using an agent, you can point it to this article, since we provide CLI instructions alongside browser-based instructions for us humans.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Let's start with a quick intro to Hugging Face Jobs!",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "What is Hugging Face Jobs?",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Hugging Face Jobs lets you run commands or scripts on Hugging Face's serverless infrastructure with almost any hardware flavor. A Job is essentially:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/jobs-overview"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "a command to run",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "a Docker image, from Docker Hub or a Hugging Face Space",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "a hardware flavor, such as CPU or t4-small or h200 GPU",
+      "spans": [
+        {
+          "start": 34,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 46,
+          "end": 50,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "optional environment variables and secrets",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "For example, you can run:",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "or",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "That makes Jobs a natural fit for CI. CI jobs are already command-driven, already run in clean environments, and often benefit from choosing exactly the right hardware. For ML libraries, the GPU case is especially compelling: you can run a test suite on real GPU hardware without maintaining your own always-on runner.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "The key step is connecting GitHub Actions to HF Jobs, which we describe below.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "The architecture",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "For this setup, we created huggingface/jobs-actions, a small bridge that turns a GitHub Actions job into an ephemeral self-hosted runner running inside an HF Job.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 27,
+          "end": 51,
+          "kind": "a",
+          "href": "https://github.com/huggingface/jobs-actions"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "The complete flow looks like this:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "A pull request triggers a GitHub Actions workflow.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "GitHub queues any job whose runs-on label is not available, for example hf-jobs-cpu-upgrade or hf-jobs-t4-small, and sends a signed workflow_job.queued webhook to the dispatcher through the GitHub App.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 35,
+          "kind": "code"
+        },
+        {
+          "start": 72,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 111,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 151,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "The dispatcher Space verifies the webhook, checks for an hf-jobs-* label, mints a short-lived GitHub runner registration token, and starts an HF Job on the matching hardware.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 66,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "The HF Job boots an ephemeral GitHub Actions runner and registers it with the repo using that one-shot token.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "GitHub assigns the pending workflow job to that runner; the runner executes the CI job, reports status back to GitHub, and exits.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "From GitHub's point of view, this is just a self-hosted runner. From Hugging Face's point of view, it is just a Job that launches a container to run the workflow steps from the repo’s GitHub Actions.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Step 1: Duplicate the dispatcher Space",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "The first thing you need is the dispatcher. This is a small Docker Space that receives GitHub workflow_job webhook events and launches HF Jobs in response.",
+      "spans": [
+        {
+          "start": 94,
+          "end": 106,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Create this first because the GitHub App needs a webhook URL, and that URL comes from the Space. This Space should be under your own namespace or under a Hugging Face org that you have write access to.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Web setup",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Go to huggingface/jobs-actions-dispatcher and click Duplicate this Space.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 6,
+          "end": 41,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/huggingface/jobs-actions-dispatcher"
+        },
+        {
+          "start": 52,
+          "end": 72,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Use:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Use cpu-upgrade for real CI so the dispatcher stays available for GitHub webhooks. cpu-basic is fine for testing and will probably work, but it can sleep after inactivity; if GitHub's webhook arrives while it is waking up, the workflow may stay queued forever.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 15,
+          "kind": "code"
+        },
+        {
+          "start": 83,
+          "end": 92,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "After it builds, open the duplicated Space. You will see a section that says \"Required Space secrets,\" which you can ignore for now. The landing page should display the GitHub App webhook URL you need in the next step. It will look like this:",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "CLI setup",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "If you'd prefer to set up the dispatcher Space with an agent or use a CLI workflow:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Then set:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Step 2: Create and install the GitHub App",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Next, create and install the GitHub App from the dispatcher Space itself. This App needs permission to listen for queued workflow jobs and create ephemeral self-hosted runner registration tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Web setup",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Open your duplicated dispatcher Space:",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "In the setup form, enter the GitHub repo whose CI should run on HF Jobs:",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Then click the button to create the GitHub App. GitHub will ask you to choose a name for the App; the name can be anything, as long as it is available in your GitHub account or org. After you submit, the final screen tells you exactly how to upload the App credentials to the dispatcher Space with the hf CLI.",
+      "spans": [
+        {
+          "start": 302,
+          "end": 304,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Important note: you will need to provide an Hugging Face token that has permissions to launch Jobs, corresponding to your personal account or an org under which Jobs should be charged. This token should be saved as the HF_TOKEN secret in your dispatcher Space.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 44,
+          "end": 62,
+          "kind": "a",
+          "href": "https://huggingface.co/settings/tokens"
+        },
+        {
+          "start": 219,
+          "end": 227,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Finally, you will install the App on the same GitHub repo you entered in the Space. In the Trackio setup, we installed it on gradio-app/trackio.",
+      "spans": [
+        {
+          "start": 125,
+          "end": 143,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Agent-assisted setup",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "The GitHub App manifest flow is still browser-based, but an agent can follow the same Space-driven path:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Paste $GITHUB_REPO into the Space, click the GitHub App creation button, choose any available App name, and follow the generated GitHub instructions.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 18,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "After the App exists, install it on your repo from the App settings page. For a GitHub org, the installation settings are under:",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Step 3: Final dispatcher settings",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "At this point, the dispatcher Space should be configured. The GitHub App setup flow generated the commands that upload the App credentials, webhook secret, and Hugging Face token to the Space.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "By default, HF Jobs are launched under the same namespace as the dispatcher Space. Optionally, set HF_NAMESPACE as a Space variable if you want to bill jobs to a different Hugging Face user or org:",
+      "spans": [
+        {
+          "start": 99,
+          "end": 111,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "The token you set in Step 2 should correspond to this namespace.",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Step 4: Change runs-on",
+      "spans": [
+        {
+          "start": 15,
+          "end": 22,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The actual workflow change is small. Instead of:",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "use one of the labels handled by the dispatcher:",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "For GPU tests, use a GPU label:",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "For any GitHub Action you'd like to run on HF Jobs, this 1-line change is all you need!",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Step 5: Test it out",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "To add a minimal smoke-test workflow from the CLI:",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "To verify from the CLI:",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "You should be able to see logs just like a regular GitHub Action—for example, in this Trackio PR #565.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 101,
+          "kind": "a",
+          "href": "https://github.com/gradio-app/trackio/pull/565"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "And that's it!",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Note on choosing the right Docker image",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Our first CPU setup used ubuntu:22.04 and installed missing system packages during every run. That worked, but it was slower than it needed to be. GitHub's ubuntu-latest image includes a lot of developer tooling by default; a bare Ubuntu image does not.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 37,
+          "kind": "code"
+        },
+        {
+          "start": 156,
+          "end": 169,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "For Trackio, the UI tests need Playwright browsers, Node, ffmpeg, sqlite, git, and normal Linux build dependencies. Hugging Face Jobs supports using any Docker image, so we switched to the Microsoft Playwright image, which worked well:",
+      "spans": [
+        {
+          "start": 153,
+          "end": 165,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/jobs-popular-images"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "For GPU jobs, we used:",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Results",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Here are the numbers from the Trackio CI:",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "Runner setup",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Runtime",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "Compared to GitHub average",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "GitHub ubuntu-latest baseline",
+      "spans": [
+        {
+          "start": 7,
+          "end": 20,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "1m40s",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "baseline",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "HF Jobs CPU, Playwright image",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "1m10s",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "-30s, about 30% faster",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "code"
+        },
+        {
+          "start": 12,
+          "end": 15,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "HF Jobs GPU, t4-small label",
+      "spans": [
+        {
+          "start": 13,
+          "end": 21,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "45s",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "no GitHub-hosted GPU baseline",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "The biggest win was GPU CI. The Trackio GPU check ran on HF Jobs and passed in 45s, costing less than a cent at the t4-small rate for that duration.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 82,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 124,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "The CPU result was also encouraging. With the right image, the Linux test job was faster than the GitHub-hosted baseline. That suggests HF Jobs can be a practical CI backend, especially for ML projects that need custom images or accelerators.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "Logs were another pleasant surprise. GitHub Actions logs are useful, but the web UI can be heavy for large logs. HF Jobs logs are easy to fetch from the CLI:",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "That makes them easy to inspect with local tools or coding agents. In our bridge, we also mirrored the GitHub Actions job log into the HF Job log, so either system had enough information to debug a run.",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Finally, although we didn't need them for Trackio's CI, HF Jobs also supports mounting volumes, which can be very helpful if you need to load datasets or models from Hugging Face quickly as part of your CI.",
+      "spans": [
+        {
+          "start": 69,
+          "end": 94,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/huggingface_hub/en/guides/jobs#mount-a-volume"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "Hopefully, this gives you all you need to try HF Jobs for running your GitHub Actions!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "9748b5b4932698f166a607068507637f05f72033204a966c85bf5c29f2154b17",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "hf jobs run python:3.12 python -c \"print('Hello world')\""
+    },
+    {
+      "id": "c0002",
+      "source": "hf jobs uv run --flavor a10g-small \"https://raw.githubusercontent.com/huggingface/trl/main/trl/scripts/sft.py\" "
+    },
+    {
+      "id": "c0003",
+      "source": "Owner: your HF user or org\nName: jobs-actions-dispatcher\nHardware: cpu-upgrade"
+    },
+    {
+      "id": "c0004",
+      "source": "https://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space/webhook"
+    },
+    {
+      "id": "c0005",
+      "source": "export HF_NAMESPACE=your-hf-user-or-org\nexport SPACE_ID=\"$HF_NAMESPACE/jobs-actions-dispatcher\"\n\nhf repo duplicate huggingface/jobs-actions-dispatcher \"$SPACE_ID\" \\\n  --type space \\\n  --flavor cpu-upgrade \\\n  --exist-ok"
+    },
+    {
+      "id": "c0006",
+      "source": "export DISPATCHER_URL=\"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\""
+    },
+    {
+      "id": "c0007",
+      "source": "https://YOUR-HF-NAMESPACE-jobs-actions-dispatcher.hf.space"
+    },
+    {
+      "id": "c0008",
+      "source": "YOUR-GITHUB-ORG/YOUR-REPO"
+    },
+    {
+      "id": "c0009",
+      "source": "export HF_NAMESPACE=your-hf-user-or-org\nexport GITHUB_REPO=YOUR-GITHUB-ORG/YOUR-REPO\nopen \"https://${HF_NAMESPACE}-jobs-actions-dispatcher.hf.space\""
+    },
+    {
+      "id": "c0010",
+      "source": "https://github.com/organizations/YOUR-GITHUB-ORG/settings/installations"
+    },
+    {
+      "id": "c0011",
+      "source": "export SPACE_ID=YOUR-HF-NAMESPACE/jobs-actions-dispatcher\nhf spaces variables add \"$SPACE_ID\" -e HF_NAMESPACE=your-billing-namespace\nhf spaces restart \"$SPACE_ID\""
+    },
+    {
+      "id": "c0012",
+      "source": "runs-on: ubuntu-latest"
+    },
+    {
+      "id": "c0013",
+      "source": "runs-on: hf-jobs-cpu-upgrade"
+    },
+    {
+      "id": "c0014",
+      "source": "runs-on: hf-jobs-t4-small"
+    },
+    {
+      "id": "c0015",
+      "source": "mkdir -p .github/workflows\ncat > .github/workflows/hf-jobs-test.yml <<'EOF'\nname: HF Jobs Test\n\non:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n  test:\n    runs-on: hf-jobs-cpu-upgrade\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"Hello from Hugging Face Jobs\"\nEOF\n\ngit add .github/workflows/hf-jobs-test.yml\ngit commit -m \"Run CI on Hugging Face Jobs\"\ngit push"
+    },
+    {
+      "id": "c0016",
+      "source": "gh run list --repo YOUR-GITHUB-ORG/YOUR-REPO --limit 5\nhf jobs ps --namespace \"$HF_NAMESPACE\"\nhf spaces logs \"$SPACE_ID\""
+    },
+    {
+      "id": "c0017",
+      "source": "mcr.microsoft.com/playwright:v1.60.0-jammy"
+    },
+    {
+      "id": "c0018",
+      "source": "nvidia/cuda:12.4.0-runtime-ubuntu22.04"
+    },
+    {
+      "id": "c0019",
+      "source": "hf jobs logs <job_id> > logs.txt"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "9748b5b4932698f166a607068507637f05f72033204a966c85bf5c29f2154b17",
+  "mediaLayout": [
+    {
+      "mediaId": "image_87f61ae592306717",
+      "type": "image",
+      "afterBlockId": "b0030",
+      "order": 0
+    },
+    {
+      "mediaId": "image_4e8ed77ce516d92a",
+      "type": "image",
+      "afterBlockId": "b0050",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:11.528495Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:11.528512Z"
 }

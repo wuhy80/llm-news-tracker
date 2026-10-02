@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-02T04:43:40.520450Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Ulysses Sequence Parallelism: Training with Million-Token Contexts\n\nTraining large language models on long sequences has become essential for building capable AI systems. As models are increasingly used for tasks like document analysis, code understanding, complex reasoning, and RAG workloads, the need to process sequences of hundreds of thousands—or even millions—of tokens has grown dramatically. To put this in perspective, an average book is roughly 250k tokens, so training on multi-document contexts or book-length inputs requires handling sequences well beyond what fits on a single GPU. However, training with such long contexts presents significant memory challenges: the attention computation scales quadratically with sequence length, quickly exceeding GPU memory for contexts beyond tens of thousands of tokens.\n\nUlysses Sequence Parallelism (part of the Arctic Long Sequence Training (ALST) protocol from Snowflake AI Research) provides an elegant solution by distributing the attention computation across multiple GPUs through attention head parallelism. In this post, we'll explore how Ulysses works and how it's been integrated across the Hugging Face ecosystem—from Accelerate to the Transformers Trainer and TRL's SFTTrainer.\n\n- The Challenge of Long Sequence Training\n\n- Integration with Accelerate\n\n- Integration with Transformers Trainer\n\n- Integration with TRL's SFTTrainer\n\n- Comparing Ulysses and Ring Attention\n\nThe attention mechanism in transformers scales quadratically with sequence length. For a sequence of length n n n , standard attention requires O ( n 2 ) O(n2) O ( n 2 ) FLOPs and O ( n 2 ) O(n2) O ( n 2 ) memory to compute and store the attention score matrix. Optimized implementations like FlashAttention reduce the memory to O ( n ) O(n) O ( n ) by tiling the computation and never materializing the full attention matrix—but the O ( n 2 ) O(n2) O ( n 2 ) compute remains. For very long sequences (32k+ tokens), even with FlashAttention, training still pushes the limits of single-GPU memory.\n\nConsider these scenarios where long-context training is essential:\n\n- Document understanding : Processing entire books, legal documents, or research papers\n\n- Code analysis : Understanding large codebases with multiple interconnected files\n\n- Reasoning tasks : Models that \"think\" step-by-step may generate thousands of tokens during inference\n\n- Retrieval-augmented generation : Incorporating many retrieved passages into the context\n\nTraditional data parallelism doesn't help here—each GPU still needs to process the full sequence inside the attention block. We need a way to split the sequence itself across multiple devices.\n\nUlysses Sequence Parallelism (SP), introduced in the DeepSpeed Ulysses paper , takes a clever approach: in addition to splitting on the sequence dimension, it also partitions the attention heads across GPUs.\n\nUlysses splits input sequences along the sequence dimension and uses all-to-all communication to exchange key-value pairs, enabling each GPU to compute a subset of attention heads. ( Source: Snowflake Engineering Blog )\n\nSequence Sharding : The input sequence is split along the sequence dimension across P P P GPUs. Each GPU i i i holds tokens [ i ⋅ n / P , ( i + 1 ) ⋅ n / P ) [i · n/P, (i+1) · n/P) [ i ⋅ n / P , ( i + 1 ) ⋅ n / P ) .\n\nQKV Projection : Each GPU computes the query, key, and value projections for its local sequence chunk.\n\nAll-to-All Communication : An all-to-all collective operation redistributes the data so that each GPU holds all sequence positions after the projections, but only for a subset of attention heads.\n\nLocal Attention : Each GPU computes attention for its assigned heads using standard attention mechanisms (FlashAttention or SDPA).\n\nAll-to-All Communication : Another all-to-all operation reverses the redistribution, returning to sequence-sharded format.\n\nOutput Projection : Each GPU computes the output projection for its local sequence chunk.\n\nThe key insight is that attention heads are independent—each head can be computed separately. By trading sequence locality for head locality, Ulysses enables efficient parallelization with relatively low communication overhead.\n\n### Communication Complexity\n\nUlysses requires two all-to-all operations per attention layer, with total communication volume of O ( n ⋅ d / P ) O(n · d / P) O ( n ⋅ d / P ) per GPU, where:\n\n- n n n is the sequence length\n\n- d d d is the hidden dimension\n\n- P P P is the parallelism degree\n\nRing Attention communicates O ( n ⋅ d ) O(n · d) O ( n ⋅ d ) per GPU — a factor of P P P more — via P − 1 P-1 P − 1 sequential point-to-point transfers around the ring. Ulysses also benefits from lower latency because all-to-all can exploit full bisectional bandwidth in a single collective step, whereas Ring Attention serializes over P − 1 P-1 P − 1 hops.\n\nAccelerate provides the foundation for Ulysses sequence parallelism through its ParallelismConfig class and DeepSpeed integration.\n\n```\nfrom accelerate import Accelerator\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=4,  # Split across 4 GPUs\n    dp_shard_size=1,  # Must satisfy: dp_replicate × dp_shard × sp_size = num_processes\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length=None,  # None for variable-length sequences\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",  # or \"sdpa\"\n    ),\n)\n\naccelerator = Accelerator(parallelism_config=parallelism_config)\n```\n\nNumber of GPUs for sequence parallelism\n\nMust be \"deepspeed\" for Ulysses\n\nsp_seq_length_is_variable\n\nSet to True for varying sequence lengths across batches\n\n\"flash_attention_2\" , \"flash_attention_3\" , or \"sdpa\"\n\n### Using the Accelerator\n\nWhen you call accelerator.prepare() , Ulysses is automatically set up:\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"meta-llama/Llama-3.1-8B\")\noptimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)\n\n# This registers the model with Ulysses and wraps the dataloader\nmodel, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)\n```\n\n- Registers the model with DeepSpeed's UlyssesSPAttentionHF\n\n- Wraps the dataloader with UlyssesSPDataLoaderAdapter to handle sequence sharding\n\n- Automatically injects shift_labels for correct loss computation\n\nWith Ulysses, each GPU computes loss on different parts of the sequence. The losses must be aggregated properly, weighted by the number of valid tokens per rank. If you're using the Transformers Trainer or TRL's SFTTrainer , this is handled automatically—the code below is only needed when writing a custom Accelerate training loop:\n\n```\nsp_size = parallelism_config.sp_size\nif sp_size > 1:\n    from deepspeed.utils import groups\n\n    sp_group = groups._get_sequence_parallel_group()\n\n    # Gather losses and token counts from all SP ranks\n    losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)\n    good_tokens = (batch[\"shift_labels\"] != -100).view(-1).sum()\n    good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)\n\n    # Weighted aggregation\n    total_loss = sum(\n        losses_per_rank[i] * good_tokens_per_rank[i]\n        for i in range(sp_size)\n        if good_tokens_per_rank[i] > 0\n    )\n    loss = total_loss / max(sum(good_tokens_per_rank), 1)\n\naccelerator.backward(loss)\n```\n\nThe weighted loss aggregation ensures correct gradients when tokens are unevenly distributed across ranks (e.g., when some ranks contain only padding or masked out prompt tokens).\n\nBoth Ulysses and Ring Attention use position_ids instead of attention_mask for causal masking during training. A 4D attention mask at these sequence lengths would be just as prohibitive as the attention scores themselves—at 128k tokens, that's another ~1TB tensor. Position IDs achieve the same causal behavior with O ( n ) O(n) O ( n ) memory instead of O ( n 2 ) O(n2) O ( n 2 ) . During evaluation/inference, DeepSpeed's SP attention layer can bypass the SP operations entirely (via disable_in_eval ) and fall back to the model's default attention implementation.\n\nThe Transformers Trainer provides seamless Ulysses integration through TrainingArguments.parallelism_config . It handles all the SP-specific details automatically—dataloader wrapping, sequence sharding, and loss aggregation—so you don't need to write any of the custom loss code shown above.\n\nJust pass the same parallelism_config from above into TrainingArguments :\n\n```\nfrom transformers import TrainingArguments\n\ntraining_args = TrainingArguments(\n    parallelism_config=parallelism_config,  # same ParallelismConfig as above\n    per_device_train_batch_size=1,\n)\n```\n\n### What the Trainer Handles Automatically\n\nDataloader Wrapping : After model preparation, the Trainer wraps the dataloader with UlyssesSPDataLoaderAdapter\n\nLoss Computation : The compute_loss method detects SP mode and routes to specialized _deepspeed_sp_compute_loss which handles:\n\n- Gathering losses across SP ranks\n\n- Computing valid token counts per rank\n\n- Weighted loss aggregation\n\nBatch Size Calculation : The effective data parallel world size accounts for SP:\n\n```\ndp_world_size = world_size // sp_size\n```\n\nDataloader Length Adjustment : Training step calculations are adjusted for SP's effect on iteration count\n\nUse an accelerate config file or command-line arguments:\n\n```\naccelerate launch \\\n    --config_file deepspeed_ulysses.yaml \\\n    train.py \\\n    --per_device_train_batch_size 1\n```\n\n## Integration with TRL SFTTrainer\n\nTRL's SFTTrainer builds on the Transformers Trainer and adds specific optimizations for supervised fine-tuning with long sequences.\n\n```\nfrom trl import SFTConfig, SFTTrainer\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=2,\n    dp_shard_size=2,  # 2D parallelism: SP × DP = 4 GPUs\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)\n\ntraining_args = SFTConfig(\n    ...,\n    parallelism_config=parallelism_config,\n    max_length=32768,\n    pad_to_multiple_of=2,  # Must equal sp_size\n    per_device_train_batch_size=1,\n)\n\ntrainer = SFTTrainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n)\ntrainer.train()\n```\n\n### Key SFTConfig Parameters for Ulysses\n\nMust equal sp_size to ensure sequence divisibility\n\nGlobal sequence length (before splitting across GPUs)\n\nWorks well with SP — packing reduces padding waste, especially for variable-length sequences\n\n### Accelerate Config File\n\nCreate alst_ulysses_4gpu.yaml :\n\n```\ncompute_environment: LOCAL_MACHINE\ndistributed_type: DEEPSPEED\nmixed_precision: bf16\nnum_processes: 4\ndeepspeed_config:\n  zero_stage: 3\n  seq_parallel_communication_data_type: bf16\nparallelism_config:\n  parallelism_config_sp_size: 2\n  parallelism_config_sp_backend: deepspeed\n  parallelism_config_dp_shard_size: 2\n  parallelism_config_sp_seq_length_is_variable: true\n  parallelism_config_sp_attn_implementation: flash_attention_2\n```\n\n### Complete Training Command\n\n```\naccelerate launch --config_file alst_ulysses_4gpu.yaml \\\n    trl/scripts/sft.py \\\n    --model_name_or_path meta-llama/Llama-3.1-8B \\\n    --dataset_name trl-lib/Capybara \\\n    --max_length 32768 \\\n    --packing \\\n    --pad_to_multiple_of 2 \\\n    --per_device_train_batch_size 1\n```\n\n### Shift Labels Handling\n\nThe SFTTrainer automatically handles pre-shifted labels when Ulysses is enabled:\n\n```\n# When using SP, labels are pre-shifted by the dataloader adapter\n# The trainer detects this and uses shift_labels directly\nlabels = inputs[\"labels\"] if \"shift_labels\" not in inputs else None\n\n# Loss computation uses the pre-shifted labels\nif \"shift_labels\" in inputs:\n    shift_logits = outputs.logits.contiguous()\n    shift_labels = inputs[\"shift_labels\"]\nelse:\n    shift_logits = outputs.logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()\n```\n\nBoth Ulysses and Ring Attention enable long-context training, but they have different characteristics:\n\nAspect Ulysses (DeepSpeed) Ring Attention (FSDP2)\n\nAttention head partitioning\n\nFlashAttention 2/3, SDPA\n\nTwo all-to-all s per layer\n\nO(total_seq x hidden / sp_size)\n\n### When to Choose Ulysses vs Ring Attention\n\nSince switching between the two only requires changing the accelerate config, we recommend trying both and comparing performance and memory usage on your specific setup. The main constraint is that Ulysses requires num_heads >= sp_size , while Ring Attention has no such limitation.\n\n### 1. Sequence Length Divisibility\n\nAlways ensure your sequence length is divisible by sp_size :\n\n```\ntraining_args = SFTConfig(\n    pad_to_multiple_of=4,  # For sp_size=4\n    max_length=32768,  # Must be divisible by 4\n)\n```\n\n### 2. Use Flash Attention\n\nFlash Attention 2 provides cleaner output and better performance than SDPA:\n\n```\nparallelism_config = ParallelismConfig(\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)\n```\n\nUse Flash Attention 3 for Hopper and look out for Flash Attention 4 release for Blackwell (FA2 on Blackwell is quite slow).\n\n### 3. Combine with DeepSpeed ZeRO\n\nFor very large models, combine Ulysses with ZeRO Stage 3:\n\n```\ndeepspeed_config:\n  zero_stage: 3\n  offload_optimizer:\n    device: cpu\n```\n\nIf the model is huge, you can offload the params as well by adding to the above:\n\n```\n  offload_param:\n    device: cpu\n```\n\n### 5. Use memory fragmentation-friendly PyTorch allocator\n\nThis environment variable will allow for a longer sequence length:\n\n```\nexport PYTORCH_ALLOC_CONF=expandable_segments:True\n```\n\n### 6. 2D Parallelism Configuration\n\nBalance SP and DP for your GPU count:\n\nGPUs sp_size dp_shard_size Use Case\n\nBalanced throughput and sequence length\n\nHigher throughput with moderate sequence length\n\nLonger sequences with moderate throughput\n\nRemember: dp_replicate_size × dp_shard_size × sp_size = num_processes\n\nIf your desired model architecture is supported by Liger-Kernel , it is fully compatible with Ulysses SP and can be enabled with a single flag:\n\n```\ntraining_args = SFTConfig(\n    use_liger_kernel=True,\n)\n```\n\nThe main memory saving comes from FusedLinearCrossEntropy which avoids materializing the full logits tensor during loss calculation. The savings grow with longer sequences where the logits tensor is larger.\n\nAdditionally, you can enable TiledMLP to further extend sequence length — like FusedLinearCrossEntropy , it saves working memory by tiling large matrix operations.\n\n### 8. Token Distribution Across Ranks\n\nYou don't need to worry about manually balancing tokens across SP ranks—the loss aggregation code handles uneven distributions gracefully (including ranks with zero valid tokens). With random batching over a reasonably sized dataset, the distribution evens out statistically over training.\n\nTo quantify the benefits of Ulysses SP, we trained Qwen3-4B on the Gutenberg English streaming dataset using TRL's SFTTrainer. All experiments ran on H100 80GB GPUs with DeepSpeed ZeRO-3, CPU optimizer offloading, gradient checkpointing, and flash-attn2 as the attention backend.\n\nConfig GPUs SP DP Seq Length Grad Acc Global Batch\n\nThe benchmark runs in the table above use the same global batch size (8 micro-batches), cosine learning-rate schedule, and seed, so those benchmark loss curves are directly comparable.\n\n### Loss Curve Matching Diagnostics (4 GPU)\n\nTo verify SP-vs-DP loss equivalence, we ran controlled 4-GPU A/B experiments with identical seed, model, optimizer, learning-rate schedule, and data order.\n\n#### Methodology for Fair DP vs SP Comparison\n\n- DP=4, SP=1, GAS=1 (baseline)\n\n- DP=1, SP=4, GAS=4 (Ulysses SP)\n\nFor fair comparison, GAS must scale with SP :\n\n- Ulysses SP splits the sequence across SP ranks, so each SP rank sees roughly 1/SP of the sequence tokens per micro-step.\n\n- If GAS is unchanged, each optimizer step in SP aggregates fewer total tokens than the DP baseline.\n\n- Setting GAS=SP keeps effective tokens per optimizer step matched:\n\n- DP tokens/step: dp_world_size * micro_batch * seq_len * GAS = 4 * B * L * 1\n\n- SP tokens/step: dp_world_size * micro_batch * (L/SP) * GAS * SP_ranks = 1 * B * (L/4) * 4 * 4 = 4 * B * L\n\nOn Gutenberg text (20 steps), canonical loss matches within logging precision between DP=4,SP=1,GAS=1 and DP=1,SP=4,GAS=4 .\n\nMeasured over 20 steps on 4 GPUs in controlled equivalence harnesses:\n\nHarness Metric DP vs SP setting Mean abs diff Max abs diff\n\nDP=4, SP=1 vs DP=1, SP=4\n\nTakeaway: under matched token budget, SP and non-SP match on canonical token-normalized loss. The remaining difference is in trainer-reported logging ( loss ), not in the underlying cross-entropy objective.\n\nSP=4 reduces per-GPU memory by 3.3x at the same sequence length, enabling training at up to 96K tokens on 4× H100 80GB. At 128K, the model OOMs.\n\nConfig Seq Length Peak Memory Notes\n\nSimilar memory at same seq length\n\n4x longer than DP baseline\n\n8x longer than DP baseline\n\n12x longer than DP baseline\n\nAt 8K tokens, DP=4 and SP=4 use nearly the same memory per GPU (~22 GB with ZeRO-3). The advantage of SP is that it enables scaling to much longer sequences: at 96K tokens (12x longer), peak memory is 66 GB — still within the H100's 80 GB capacity. At 128K, the model OOMs, establishing the practical limit for this configuration. DP=4 without SP cannot scale beyond 8K for this model.\n\nLonger sequences with SP process dramatically more tokens per second. SP=4 at 64K achieves 3.7x the throughput of the baseline.\n\nConfig Seq Length Tokens/s vs Baseline\n\nAt the same sequence length (8K), SP=4 has comparable throughput to the single-GPU baseline — the all-to-all communication overhead is minimal on NVLink-connected GPUs. The real benefit comes from longer sequences: as sequence length grows, the quadratic attention computation dominates over communication and other overheads, making each training step increasingly compute-efficient. Each step also processes proportionally more tokens, so throughput scales with sequence length. At 64K, SP=4 processes 13,396 tokens/second — 3.7x the baseline.\n\nThese results use only 4 GPUs with SP=4. With 8 GPUs (SP=8), you can push to even longer sequences — up to 256K+ tokens — or use 2D parallelism (SP=4, DP=2) to combine long-context training with data-parallel throughput.\n\n- HF Accelerate: deepspeed>=0.18.1 accelerate>=1.12\n\n- HF Trainer: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0\n\n- HF TRL: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0 trl>=0.18.0\n\nUse flash_attention_2 for Ampere GPUs, or flash_attention_3 for Hopper GPUs. Wait for flash_attention_4 on Blackwell 🕰.\n\n- Accelerate: Context Parallelism Guide\n\n- TRL: Distributing Training\n\n- DeepSpeed Sequence Parallelism\n\n- Accelerate ALST Example\n\n- TRL Accelerate Configs\n\n- Arctic Long Sequence Training: Scalable And Efficient Training For Multi-Million Token Sequences\n\n- DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models\n\n- Accelerate ND-Parallel: A Guide to Efficient Multi-GPU Training\n\n- Understanding Ulysses and Ring Attention\n\n- Enabling Long-Context Training with Sequence Parallelism in Axolotl\n\n## Models mentioned in this article 1\n\n## Datasets mentioned in this article 1\n\n## Papers mentioned in this article 3\n\nMore Articles from our Blog\n\n## Beyond LoRA: Can you beat the most popular fine-tuning technique?\n\ntransformers pytorch optimization\n\n## Tricks from OpenAI gpt-oss YOU 🫵 can use with transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Training large language models on long sequences has become essential for building capable AI systems. As models are increasingly used for tasks like document analysis, code understanding, complex reasoning, and RAG workloads, the need to process sequences of hundreds of thousands—or even millions—of tokens has grown dramatically. To put this in perspective, an average book is roughly 250k tokens, so training on multi-document contexts or book-length inputs requires handling sequences well beyond what fits on a single GPU. However, training with such long contexts presents significant memory challenges: the attention computation scales quadratically with sequence length, quickly exceeding GPU memory for contexts beyond tens of thousands of tokens.\n\nUlysses Sequence Parallelism (part of the Arctic Long Sequence Training (ALST) protocol from Snowflake AI Research) provides an elegant solution by distributing the attention computation across multiple GPUs through attention head parallelism. In this post, we'll explore how Ulysses works and how it's been integrated across the Hugging Face ecosystem—from Accelerate to the Transformers Trainer and TRL's SFTTrainer.\n\n## Contents\n\n- The Challenge of Long Sequence Training\n\n- How Ulysses Works\n\n- Integration with Accelerate\n\n- Integration with Transformers Trainer\n\n- Integration with TRL's SFTTrainer\n\n- Comparing Ulysses and Ring Attention\n\n- Best Practices\n\n- Benchmarks\n\n- Resources\n\n## The Challenge of Long Sequence Training\n\nThe attention mechanism in transformers scales quadratically with sequence length. For a sequence of length n n n, standard attention requires O(n2) O(n^2) O(n2) FLOPs and O(n2) O(n^2) O(n2) memory to compute and store the attention score matrix. Optimized implementations like FlashAttention reduce the memory to O(n) O(n) O(n) by tiling the computation and never materializing the full attention matrix—but the O(n2) O(n^2) O(n2) compute remains. For very long sequences (32k+ tokens), even with FlashAttention, training still pushes the limits of single-GPU memory.\n\nConsider these scenarios where long-context training is essential:\n\n- Document understanding: Processing entire books, legal documents, or research papers\n\n- Code analysis: Understanding large codebases with multiple interconnected files\n\n- Reasoning tasks: Models that \"think\" step-by-step may generate thousands of tokens during inference\n\n- Retrieval-augmented generation: Incorporating many retrieved passages into the context\n\nTraditional data parallelism doesn't help here—each GPU still needs to process the full sequence inside the attention block. We need a way to split the sequence itself across multiple devices.\n\n## How Ulysses Works\n\nUlysses Sequence Parallelism (SP), introduced in the DeepSpeed Ulysses paper, takes a clever approach: in addition to splitting on the sequence dimension, it also partitions the attention heads across GPUs.\n\nUlysses splits input sequences along the sequence dimension and uses all-to-all communication to exchange key-value pairs, enabling each GPU to compute a subset of attention heads. (Source: Snowflake Engineering Blog)\n\nHere's how it works:\n\nSequence Sharding: The input sequence is split along the sequence dimension across P P P GPUs. Each GPU i i i holds tokens [i⋅n/P,(i+1)⋅n/P) [i \\cdot n/P, (i+1) \\cdot n/P) [i⋅n/P,(i+1)⋅n/P).\n\nQKV Projection: Each GPU computes the query, key, and value projections for its local sequence chunk.\n\nAll-to-All Communication: An all-to-all collective operation redistributes the data so that each GPU holds all sequence positions after the projections, but only for a subset of attention heads.\n\nLocal Attention: Each GPU computes attention for its assigned heads using standard attention mechanisms (FlashAttention or SDPA).\n\nAll-to-All Communication: Another all-to-all operation reverses the redistribution, returning to sequence-sharded format.\n\nOutput Projection: Each GPU computes the output projection for its local sequence chunk.\n\nThe key insight is that attention heads are independent—each head can be computed separately. By trading sequence locality for head locality, Ulysses enables efficient parallelization with relatively low communication overhead.\n\n### Communication Complexity\n\nUlysses requires two all-to-all operations per attention layer, with total communication volume of O(n⋅d/P) O(n \\cdot d / P) O(n⋅d/P) per GPU, where:\n\n- n n n is the sequence length\n\n- d d d is the hidden dimension\n\n- P P P is the parallelism degree\n\nRing Attention communicates O(n⋅d) O(n \\cdot d) O(n⋅d) per GPU — a factor of P P P more — via P−1 P-1 P−1 sequential point-to-point transfers around the ring. Ulysses also benefits from lower latency because all-to-all can exploit full bisectional bandwidth in a single collective step, whereas Ring Attention serializes over P−1 P-1 P−1 hops.\n\n## Integration with Accelerate\n\nAccelerate provides the foundation for Ulysses sequence parallelism through its ParallelismConfig class and DeepSpeed integration.\n\n### Configuration\n\n```\nfrom accelerate import Accelerator\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=4,  # Split across 4 GPUs\n    dp_shard_size=1,  # Must satisfy: dp_replicate × dp_shard × sp_size = num_processes\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length=None,  # None for variable-length sequences\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",  # or \"sdpa\"\n    ),\n)\n\naccelerator = Accelerator(parallelism_config=parallelism_config)\n```\n\n### Key Parameters\n\nParameter\n\nDescription\n\nsp_size\n\nNumber of GPUs for sequence parallelism\n\nsp_backend\n\nMust be \"deepspeed\" for Ulysses\n\nsp_seq_length_is_variable\n\nSet to True for varying sequence lengths across batches\n\nsp_attn_implementation\n\n\"flash_attention_2\", \"flash_attention_3\", or \"sdpa\"\n\n### Using the Accelerator\n\nWhen you call accelerator.prepare(), Ulysses is automatically set up:\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"meta-llama/Llama-3.1-8B\")\noptimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)\n\n# This registers the model with Ulysses and wraps the dataloader\nmodel, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)\n```\n\nThe prepare() call:\n\n- Registers the model with DeepSpeed's UlyssesSPAttentionHF\n\n- Wraps the dataloader with UlyssesSPDataLoaderAdapter to handle sequence sharding\n\n- Automatically injects shift_labels for correct loss computation\n\n### Loss Aggregation\n\nWith Ulysses, each GPU computes loss on different parts of the sequence. The losses must be aggregated properly, weighted by the number of valid tokens per rank. If you're using the Transformers Trainer or TRL's SFTTrainer, this is handled automatically—the code below is only needed when writing a custom Accelerate training loop:\n\n```\nsp_size = parallelism_config.sp_size\nif sp_size > 1:\n    from deepspeed.utils import groups\n\n    sp_group = groups._get_sequence_parallel_group()\n\n    # Gather losses and token counts from all SP ranks\n    losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)\n    good_tokens = (batch[\"shift_labels\"] != -100).view(-1).sum()\n    good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)\n\n    # Weighted aggregation\n    total_loss = sum(\n        losses_per_rank[i] * good_tokens_per_rank[i]\n        for i in range(sp_size)\n        if good_tokens_per_rank[i] > 0\n    )\n    loss = total_loss / max(sum(good_tokens_per_rank), 1)\n\naccelerator.backward(loss)\n```\n\nThe weighted loss aggregation ensures correct gradients when tokens are unevenly distributed across ranks (e.g., when some ranks contain only padding or masked out prompt tokens).\n\nBoth Ulysses and Ring Attention use position_ids instead of attention_mask for causal masking during training. A 4D attention mask at these sequence lengths would be just as prohibitive as the attention scores themselves—at 128k tokens, that's another ~1TB tensor. Position IDs achieve the same causal behavior with O(n) O(n) O(n) memory instead of O(n2) O(n^2) O(n2). During evaluation/inference, DeepSpeed's SP attention layer can bypass the SP operations entirely (via disable_in_eval) and fall back to the model's default attention implementation.\n\n## Integration with Transformers Trainer\n\nThe Transformers Trainer provides seamless Ulysses integration through TrainingArguments.parallelism_config. It handles all the SP-specific details automatically—dataloader wrapping, sequence sharding, and loss aggregation—so you don't need to write any of the custom loss code shown above.\n\n### Configuration\n\nJust pass the same parallelism_config from above into TrainingArguments:\n\n```\nfrom transformers import TrainingArguments\n\ntraining_args = TrainingArguments(\n    parallelism_config=parallelism_config,  # same ParallelismConfig as above\n    per_device_train_batch_size=1,\n)\n```\n\n### What the Trainer Handles Automatically\n\nDataloader Wrapping: After model preparation, the Trainer wraps the dataloader with UlyssesSPDataLoaderAdapter\n\nLoss Computation: The compute_loss method detects SP mode and routes to specialized _deepspeed_sp_compute_loss which handles:\n\n- Gathering losses across SP ranks\n\n- Computing valid token counts per rank\n\n- Weighted loss aggregation\n\nBatch Size Calculation: The effective data parallel world size accounts for SP:\n\n```\ndp_world_size = world_size // sp_size\n```\n\nDataloader Length Adjustment: Training step calculations are adjusted for SP's effect on iteration count\n\n### Launch Command\n\nUse an accelerate config file or command-line arguments:\n\n```\naccelerate launch \\\n    --config_file deepspeed_ulysses.yaml \\\n    train.py \\\n    --per_device_train_batch_size 1\n```\n\n## Integration with TRL SFTTrainer\n\nTRL's SFTTrainer builds on the Transformers Trainer and adds specific optimizations for supervised fine-tuning with long sequences.\n\n### Configuration\n\n```\nfrom trl import SFTConfig, SFTTrainer\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=2,\n    dp_shard_size=2,  # 2D parallelism: SP × DP = 4 GPUs\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)\n\ntraining_args = SFTConfig(\n    ...,\n    parallelism_config=parallelism_config,\n    max_length=32768,\n    pad_to_multiple_of=2,  # Must equal sp_size\n    per_device_train_batch_size=1,\n)\n\ntrainer = SFTTrainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n)\ntrainer.train()\n```\n\n### Key SFTConfig Parameters for Ulysses\n\nParameter\n\nDescription\n\npad_to_multiple_of\n\nMust equal sp_size to ensure sequence divisibility\n\nmax_length\n\nGlobal sequence length (before splitting across GPUs)\n\npacking\n\nWorks well with SP — packing reduces padding waste, especially for variable-length sequences\n\n### Accelerate Config File\n\nCreate alst_ulysses_4gpu.yaml:\n\n```\ncompute_environment: LOCAL_MACHINE\ndistributed_type: DEEPSPEED\nmixed_precision: bf16\nnum_processes: 4\ndeepspeed_config:\n  zero_stage: 3\n  seq_parallel_communication_data_type: bf16\nparallelism_config:\n  parallelism_config_sp_size: 2\n  parallelism_config_sp_backend: deepspeed\n  parallelism_config_dp_shard_size: 2\n  parallelism_config_sp_seq_length_is_variable: true\n  parallelism_config_sp_attn_implementation: flash_attention_2\n```\n\n### Complete Training Command\n\n```\naccelerate launch --config_file alst_ulysses_4gpu.yaml \\\n    trl/scripts/sft.py \\\n    --model_name_or_path meta-llama/Llama-3.1-8B \\\n    --dataset_name trl-lib/Capybara \\\n    --max_length 32768 \\\n    --packing \\\n    --pad_to_multiple_of 2 \\\n    --per_device_train_batch_size 1\n```\n\n### Shift Labels Handling\n\nThe SFTTrainer automatically handles pre-shifted labels when Ulysses is enabled:\n\n```\n# When using SP, labels are pre-shifted by the dataloader adapter\n# The trainer detects this and uses shift_labels directly\nlabels = inputs[\"labels\"] if \"shift_labels\" not in inputs else None\n\n# Loss computation uses the pre-shifted labels\nif \"shift_labels\" in inputs:\n    shift_logits = outputs.logits.contiguous()\n    shift_labels = inputs[\"shift_labels\"]\nelse:\n    shift_logits = outputs.logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()\n```\n\n## Comparing Ulysses and Ring Attention\n\nBoth Ulysses and Ring Attention enable long-context training, but they have different characteristics:\n\nAspect\n\nUlysses (DeepSpeed)\n\nRing Attention (FSDP2)\n\nParallelism Method\n\nAttention head partitioning\n\nRing-based KV exchange\n\nBackend\n\nDeepSpeed ZeRO\n\nPyTorch FSDP2\n\nAttention Support\n\nFlashAttention 2/3, SDPA\n\nSDPA only\n\nCommunication\n\nTwo all-to-alls per layer\n\nP2P ring communication\n\nComm volume per GPU\n\nO(total_seq x hidden / sp_size)\n\nO(total_seq x hidden)\n\nSequence Divisibility\n\nsp_size\n\ncp_size * 2\n\nNum Head Constraint\n\nnum_heads >= sp_size\n\nNone\n\n### When to Choose Ulysses vs Ring Attention\n\nSince switching between the two only requires changing the accelerate config, we recommend trying both and comparing performance and memory usage on your specific setup. The main constraint is that Ulysses requires num_heads >= sp_size, while Ring Attention has no such limitation.\n\n## Best Practices\n\n### 1. Sequence Length Divisibility\n\nAlways ensure your sequence length is divisible by sp_size:\n\n```\ntraining_args = SFTConfig(\n    pad_to_multiple_of=4,  # For sp_size=4\n    max_length=32768,  # Must be divisible by 4\n)\n```\n\n### 2. Use Flash Attention\n\nFlash Attention 2 provides cleaner output and better performance than SDPA:\n\n```\nparallelism_config = ParallelismConfig(\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)\n```\n\nUse Flash Attention 3 for Hopper and look out for Flash Attention 4 release for Blackwell (FA2 on Blackwell is quite slow).\n\n### 3. Combine with DeepSpeed ZeRO\n\nFor very large models, combine Ulysses with ZeRO Stage 3:\n\n```\ndeepspeed_config:\n  zero_stage: 3\n  offload_optimizer:\n    device: cpu\n```\n\nIf the model is huge, you can offload the params as well by adding to the above:\n\n```\n  offload_param:\n    device: cpu\n```\n\n### 5. Use memory fragmentation-friendly PyTorch allocator\n\nThis environment variable will allow for a longer sequence length:\n\n```\nexport PYTORCH_ALLOC_CONF=expandable_segments:True\n```\n\n### 6. 2D Parallelism Configuration\n\nBalance SP and DP for your GPU count:\n\nGPUs\n\nsp_size\n\ndp_shard_size\n\nUse Case\n\n4\n\n2\n\n2\n\nBalanced throughput and sequence length\n\n4\n\n4\n\n1\n\nMaximum sequence length\n\n8\n\n2\n\n4\n\nHigher throughput with moderate sequence length\n\n8\n\n4\n\n2\n\nLonger sequences with moderate throughput\n\nRemember: dp_replicate_size × dp_shard_size × sp_size = num_processes\n\n### 7. Liger-Kernel\n\nIf your desired model architecture is supported by Liger-Kernel, it is fully compatible with Ulysses SP and can be enabled with a single flag:\n\n```\ntraining_args = SFTConfig(\n    use_liger_kernel=True,\n)\n```\n\nThe main memory saving comes from FusedLinearCrossEntropy which avoids materializing the full logits tensor during loss calculation. The savings grow with longer sequences where the logits tensor is larger.\n\nAdditionally, you can enable TiledMLP to further extend sequence length — like FusedLinearCrossEntropy, it saves working memory by tiling large matrix operations.\n\n### 8. Token Distribution Across Ranks\n\nYou don't need to worry about manually balancing tokens across SP ranks—the loss aggregation code handles uneven distributions gracefully (including ranks with zero valid tokens). With random batching over a reasonably sized dataset, the distribution evens out statistically over training.\n\n## Benchmarks\n\nTo quantify the benefits of Ulysses SP, we trained Qwen3-4B on the Gutenberg English streaming dataset using TRL's SFTTrainer. All experiments ran on H100 80GB GPUs with DeepSpeed ZeRO-3, CPU optimizer offloading, gradient checkpointing, and flash-attn2 as the attention backend.\n\n### Setup\n\nConfig\n\nGPUs\n\nSP\n\nDP\n\nSeq Length\n\nGrad Acc\n\nGlobal Batch\n\nBaseline\n\n1\n\n1\n\n1\n\n8K\n\n8\n\n8\n\nSP=4\n\n4\n\n4\n\n1\n\n8K\n\n8\n\n8\n\nSP=4\n\n4\n\n4\n\n1\n\n32K\n\n8\n\n8\n\nSP=4\n\n4\n\n4\n\n1\n\n64K\n\n8\n\n8\n\nSP=4\n\n4\n\n4\n\n1\n\n96K\n\n8\n\n8\n\nThe benchmark runs in the table above use the same global batch size (8 micro-batches), cosine learning-rate schedule, and seed, so those benchmark loss curves are directly comparable.\n\n### Loss Curve Matching Diagnostics (4 GPU)\n\nTo verify SP-vs-DP loss equivalence, we ran controlled 4-GPU A/B experiments with identical seed, model, optimizer, learning-rate schedule, and data order.\n\n#### Methodology for Fair DP vs SP Comparison\n\nCompared setups:\n\n- DP=4, SP=1, GAS=1 (baseline)\n\n- DP=1, SP=4, GAS=4 (Ulysses SP)\n\nFor fair comparison, GAS must scale with SP:\n\n- Ulysses SP splits the sequence across SP ranks, so each SP rank sees roughly 1/SP of the sequence tokens per micro-step.\n\n- If GAS is unchanged, each optimizer step in SP aggregates fewer total tokens than the DP baseline.\n\nSetting GAS=SP keeps effective tokens per optimizer step matched:\n\n- DP tokens/step: dp_world_size * micro_batch * seq_len * GAS = 4 * B * L * 1\n\n- SP tokens/step: dp_world_size * micro_batch * (L/SP) * GAS * SP_ranks = 1 * B * (L/4) * 4 * 4 = 4 * B * L\n\nOn Gutenberg text (20 steps), canonical loss matches within logging precision between DP=4,SP=1,GAS=1 and DP=1,SP=4,GAS=4.\n\nMeasured over 20 steps on 4 GPUs in controlled equivalence harnesses:\n\nHarness\n\nMetric\n\nDP vs SP setting\n\nMean abs diff\n\nMax abs diff\n\nTrainer\n\nloss\n\nDP=4, SP=1 vs DP=1, SP=4\n\n0.0054\n\n0.0131\n\nSFTTrainer\n\nlogged loss\n\nDP=4, SP=1 vs DP=1, SP=4\n\n0.0811\n\n0.0812\n\nSFTTrainer\n\ncanonical NLL\n\nDP=4, SP=1 vs DP=1, SP=4\n\n0.000004\n\n0.000005\n\nTakeaway: under matched token budget, SP and non-SP match on canonical token-normalized loss. The remaining difference is in trainer-reported logging (loss), not in the underlying cross-entropy objective.\n\n### Memory Reduction\n\nSP=4 reduces per-GPU memory by 3.3x at the same sequence length, enabling training at up to 96K tokens on 4× H100 80GB. At 128K, the model OOMs.\n\nConfig\n\nSeq Length\n\nPeak Memory\n\nNotes\n\nDP=4 (4 GPU)\n\n8K\n\n22.4 GB\n\nBaseline — no SP\n\nSP=4 (4 GPU)\n\n8K\n\n22.8 GB\n\nSimilar memory at same seq length\n\nSP=4 (4 GPU)\n\n32K\n\n35.0 GB\n\n4x longer than DP baseline\n\nSP=4 (4 GPU)\n\n64K\n\n50.5 GB\n\n8x longer than DP baseline\n\nSP=4 (4 GPU)\n\n96K\n\n66.0 GB\n\n12x longer than DP baseline\n\nSP=4 (4 GPU)\n\n128K\n\nOOM\n\nExceeds 80 GB limit\n\nAt 8K tokens, DP=4 and SP=4 use nearly the same memory per GPU (~22 GB with ZeRO-3). The advantage of SP is that it enables scaling to much longer sequences: at 96K tokens (12x longer), peak memory is 66 GB — still within the H100's 80 GB capacity. At 128K, the model OOMs, establishing the practical limit for this configuration. DP=4 without SP cannot scale beyond 8K for this model.\n\n### Throughput\n\nLonger sequences with SP process dramatically more tokens per second. SP=4 at 64K achieves 3.7x the throughput of the baseline.\n\nConfig\n\nSeq Length\n\nTokens/s\n\nvs Baseline\n\nBaseline (1 GPU)\n\n8K\n\n3,633\n\n—\n\nSP=4 (4 GPU)\n\n8K\n\n3,933\n\n~1x\n\nSP=4 (4 GPU)\n\n32K\n\n7,733\n\n2.1x\n\nSP=4 (4 GPU)\n\n64K\n\n13,396\n\n3.7x\n\nAt the same sequence length (8K), SP=4 has comparable throughput to the single-GPU baseline — the all-to-all communication overhead is minimal on NVLink-connected GPUs. The real benefit comes from longer sequences: as sequence length grows, the quadratic attention computation dominates over communication and other overheads, making each training step increasingly compute-efficient. Each step also processes proportionally more tokens, so throughput scales with sequence length. At 64K, SP=4 processes 13,396 tokens/second — 3.7x the baseline.\n\nThese results use only 4 GPUs with SP=4. With 8 GPUs (SP=8), you can push to even longer sequences — up to 256K+ tokens — or use 2D parallelism (SP=4, DP=2) to combine long-context training with data-parallel throughput.\n\n## Requirements\n\n- HF Accelerate: deepspeed>=0.18.1 accelerate>=1.12\n\n- HF Trainer: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0\n\n- HF TRL: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0 trl>=0.18.0\n\nUse flash_attention_2 for Ampere GPUs, or flash_attention_3 for Hopper GPUs. Wait for flash_attention_4 on Blackwell 🕰.\n\n## Resources\n\n### Documentation\n\n- Accelerate: Context Parallelism Guide\n\n- TRL: Distributing Training\n\n- DeepSpeed Sequence Parallelism\n\n### Examples\n\n- Accelerate ALST Example\n\n- TRL Accelerate Configs\n\n### Papers\n\n- Arctic Long Sequence Training: Scalable And Efficient Training For Multi-Million Token Sequences\n\n- DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models\n\n### Related Blog Posts\n\n- Accelerate ND-Parallel: A Guide to Efficient Multi-GPU Training\n\n- Understanding Ulysses and Ring Attention\n\n- Enabling Long-Context Training with Sequence Parallelism in Axolotl",
   "summaryZh": "本文介绍了Ulysses序列并行技术，该技术通过在多个GPU间分配注意力计算，有效解决了长上下文训练中注意力机制计算复杂度随序列长度二次增长的问题。通过集成至Hugging Face生态，该方案支持百万级Token上下文训练，显著降低了显存需求，为处理长文档分析和复杂推理任务提供了高效的工程实现路径。",
   "summaryGeneratedAt": "2026-08-30T11:59:40.680336Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -71,5 +71,3876 @@
       }
     ],
     "duplicateKey": "ulysses-sequence-parallelism"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/ulysses_overview.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/ulysses_overview.png",
+      "alt": "Ulysses Sequence Parallelism Overview",
+      "id": "image_d9ef2cd402d43f49"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/gutenberg_canonical_loss_dp4_vs_sp4.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/gutenberg_canonical_loss_dp4_vs_sp4.png",
+      "alt": "Canonical loss on Gutenberg for DP=4 vs SP=4",
+      "id": "image_546cff373ba49d92"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/memory_usage.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/memory_usage.png",
+      "alt": "Peak GPU Memory per Rank",
+      "id": "image_f2b5b5ff70e58844"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/throughput.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/ulysses/throughput.png",
+      "alt": "Training Throughput",
+      "id": "image_da9b013b01333d6f"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Training large language models on long sequences has become essential for building capable AI systems. As models are increasingly used for tasks like document analysis, code understanding, complex reasoning, and RAG workloads, the need to process sequences of hundreds of thousands—or even millions—of tokens has grown dramatically. To put this in perspective, an average book is roughly 250k tokens, so training on multi-document contexts or book-length inputs requires handling sequences well beyond what fits on a single GPU. However, training with such long contexts presents significant memory challenges: the attention computation scales quadratically with sequence length, quickly exceeding GPU memory for contexts beyond tens of thousands of tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Ulysses Sequence Parallelism (part of the Arctic Long Sequence Training (ALST) protocol from Snowflake AI Research) provides an elegant solution by distributing the attention computation across multiple GPUs through attention head parallelism. In this post, we'll explore how Ulysses works and how it's been integrated across the Hugging Face ecosystem—from Accelerate to the Transformers Trainer and TRL's SFTTrainer.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 87,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2506.13996"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Contents",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "The Challenge of Long Sequence Training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#the-challenge-of-long-sequence-training"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "How Ulysses Works",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#how-ulysses-works"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Integration with Accelerate",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#integration-with-accelerate"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Integration with Transformers Trainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#integration-with-transformers-trainer"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Integration with TRL's SFTTrainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#integration-with-trl-sfttrainer"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Comparing Ulysses and Ring Attention",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#comparing-ulysses-and-ring-attention"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Best Practices",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#best-practices"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Benchmarks",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#benchmarks"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ulysses-sp#resources"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "The Challenge of Long Sequence Training",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "The attention mechanism in transformers scales quadratically with sequence length. For a sequence of length n n n, standard attention requires O(n2) O(n^2) O(n2) FLOPs and O(n2) O(n^2) O(n2) memory to compute and store the attention score matrix. Optimized implementations like FlashAttention reduce the memory to O(n) O(n) O(n) by tiling the computation and never materializing the full attention matrix—but the O(n2) O(n^2) O(n2) compute remains. For very long sequences (32k+ tokens), even with FlashAttention, training still pushes the limits of single-GPU memory.",
+      "spans": [
+        {
+          "start": 278,
+          "end": 292,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2205.14135"
+        },
+        {
+          "start": 304,
+          "end": 310,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Consider these scenarios where long-context training is essential:",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Document understanding: Processing entire books, legal documents, or research papers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Code analysis: Understanding large codebases with multiple interconnected files",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Reasoning tasks: Models that \"think\" step-by-step may generate thousands of tokens during inference",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Retrieval-augmented generation: Incorporating many retrieved passages into the context",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Traditional data parallelism doesn't help here—each GPU still needs to process the full sequence inside the attention block. We need a way to split the sequence itself across multiple devices.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "How Ulysses Works",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Ulysses Sequence Parallelism (SP), introduced in the DeepSpeed Ulysses paper, takes a clever approach: in addition to splitting on the sequence dimension, it also partitions the attention heads across GPUs.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 76,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2309.14509"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Ulysses splits input sequences along the sequence dimension and uses all-to-all communication to exchange key-value pairs, enabling each GPU to compute a subset of attention heads. (Source: Snowflake Engineering Blog)",
+      "spans": [
+        {
+          "start": 190,
+          "end": 216,
+          "kind": "a",
+          "href": "https://www.snowflake.com/en/engineering-blog/ulysses-low-latency-llm-inference/"
+        },
+        {
+          "start": 182,
+          "end": 216,
+          "kind": "em"
+        },
+        {
+          "start": 182,
+          "end": 216,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Here's how it works:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Sequence Sharding: The input sequence is split along the sequence dimension across P P P GPUs. Each GPU i i i holds tokens [i⋅n/P,(i+1)⋅n/P) [i \\cdot n/P, (i+1) \\cdot n/P) [i⋅n/P,(i+1)⋅n/P).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "QKV Projection: Each GPU computes the query, key, and value projections for its local sequence chunk.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "All-to-All Communication: An all-to-all collective operation redistributes the data so that each GPU holds all sequence positions after the projections, but only for a subset of attention heads.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        },
+        {
+          "start": 107,
+          "end": 110,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Local Attention: Each GPU computes attention for its assigned heads using standard attention mechanisms (FlashAttention or SDPA).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "All-to-All Communication: Another all-to-all operation reverses the redistribution, returning to sequence-sharded format.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Output Projection: Each GPU computes the output projection for its local sequence chunk.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "The key insight is that attention heads are independent—each head can be computed separately. By trading sequence locality for head locality, Ulysses enables efficient parallelization with relatively low communication overhead.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Communication Complexity",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Ulysses requires two all-to-all operations per attention layer, with total communication volume of O(n⋅d/P) O(n \\cdot d / P) O(n⋅d/P) per GPU, where:",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "n n n is the sequence length",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "d d d is the hidden dimension",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "P P P is the parallelism degree",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Ring Attention communicates O(n⋅d) O(n \\cdot d) O(n⋅d) per GPU — a factor of P P P more — via P−1 P-1 P−1 sequential point-to-point transfers around the ring. Ulysses also benefits from lower latency because all-to-all can exploit full bisectional bandwidth in a single collective step, whereas Ring Attention serializes over P−1 P-1 P−1 hops.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Integration with Accelerate",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Accelerate provides the foundation for Ulysses sequence parallelism through its ParallelismConfig class and DeepSpeed integration.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 80,
+          "end": 97,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/concept_guides/sequence_parallelism#alstulysses-sp-backend-configuration"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Configuration",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Key Parameters",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Parameter",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "Description",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "sp_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "Number of GPUs for sequence parallelism",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "sp_backend",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "Must be \"deepspeed\" for Ulysses",
+      "spans": [
+        {
+          "start": 8,
+          "end": 19,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "sp_seq_length_is_variable",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "Set to True for varying sequence lengths across batches",
+      "spans": [
+        {
+          "start": 7,
+          "end": 11,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "sp_attn_implementation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "\"flash_attention_2\", \"flash_attention_3\", or \"sdpa\"",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 51,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Using the Accelerator",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "When you call accelerator.prepare(), Ulysses is automatically set up:",
+      "spans": [
+        {
+          "start": 14,
+          "end": 35,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The prepare() call:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Registers the model with DeepSpeed's UlyssesSPAttentionHF",
+      "spans": [
+        {
+          "start": 37,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Wraps the dataloader with UlyssesSPDataLoaderAdapter to handle sequence sharding",
+      "spans": [
+        {
+          "start": 26,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Automatically injects shift_labels for correct loss computation",
+      "spans": [
+        {
+          "start": 22,
+          "end": 34,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Loss Aggregation",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "With Ulysses, each GPU computes loss on different parts of the sequence. The losses must be aggregated properly, weighted by the number of valid tokens per rank. If you're using the Transformers Trainer or TRL's SFTTrainer, this is handled automatically—the code below is only needed when writing a custom Accelerate training loop:",
+      "spans": [
+        {
+          "start": 195,
+          "end": 202,
+          "kind": "code"
+        },
+        {
+          "start": 212,
+          "end": 222,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "The weighted loss aggregation ensures correct gradients when tokens are unevenly distributed across ranks (e.g., when some ranks contain only padding or masked out prompt tokens).",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Both Ulysses and Ring Attention use position_ids instead of attention_mask for causal masking during training. A 4D attention mask at these sequence lengths would be just as prohibitive as the attention scores themselves—at 128k tokens, that's another ~1TB tensor. Position IDs achieve the same causal behavior with O(n) O(n) O(n) memory instead of O(n2) O(n^2) O(n2). During evaluation/inference, DeepSpeed's SP attention layer can bypass the SP operations entirely (via disable_in_eval) and fall back to the model's default attention implementation.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 60,
+          "end": 74,
+          "kind": "code"
+        },
+        {
+          "start": 472,
+          "end": 487,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Integration with Transformers Trainer",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "The Transformers Trainer provides seamless Ulysses integration through TrainingArguments.parallelism_config. It handles all the SP-specific details automatically—dataloader wrapping, sequence sharding, and loss aggregation—so you don't need to write any of the custom loss code shown above.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 17,
+          "end": 24,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/trainer"
+        },
+        {
+          "start": 71,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 71,
+          "end": 107,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/trainer#transformers.TrainingArguments.parallelism_config"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Configuration",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Just pass the same parallelism_config from above into TrainingArguments:",
+      "spans": [
+        {
+          "start": 19,
+          "end": 37,
+          "kind": "code"
+        },
+        {
+          "start": 54,
+          "end": 71,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "What the Trainer Handles Automatically",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Dataloader Wrapping: After model preparation, the Trainer wraps the dataloader with UlyssesSPDataLoaderAdapter",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 84,
+          "end": 110,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Loss Computation: The compute_loss method detects SP mode and routes to specialized _deepspeed_sp_compute_loss which handles:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "strong"
+        },
+        {
+          "start": 22,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 84,
+          "end": 110,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Gathering losses across SP ranks",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Computing valid token counts per rank",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Weighted loss aggregation",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Batch Size Calculation: The effective data parallel world size accounts for SP:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Dataloader Length Adjustment: Training step calculations are adjusted for SP's effect on iteration count",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Launch Command",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Use an accelerate config file or command-line arguments:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Integration with TRL SFTTrainer",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "TRL's SFTTrainer builds on the Transformers Trainer and adds specific optimizations for supervised fine-tuning with long sequences.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 16,
+          "kind": "code"
+        },
+        {
+          "start": 6,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/trl/sft_trainer"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "Configuration",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "Key SFTConfig Parameters for Ulysses",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "Parameter",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "Description",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "pad_to_multiple_of",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "Must equal sp_size to ensure sequence divisibility",
+      "spans": [
+        {
+          "start": 11,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "max_length",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "Global sequence length (before splitting across GPUs)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "packing",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "Works well with SP — packing reduces padding waste, especially for variable-length sequences",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "Accelerate Config File",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Create alst_ulysses_4gpu.yaml:",
+      "spans": [
+        {
+          "start": 7,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Complete Training Command",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Shift Labels Handling",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "The SFTTrainer automatically handles pre-shifted labels when Ulysses is enabled:",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "Comparing Ulysses and Ring Attention",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "Both Ulysses and Ring Attention enable long-context training, but they have different characteristics:",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "Aspect",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Ulysses (DeepSpeed)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "Ring Attention (FSDP2)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "Parallelism Method",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "Attention head partitioning",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "Ring-based KV exchange",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "Backend",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "DeepSpeed ZeRO",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "PyTorch FSDP2",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "Attention Support",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "FlashAttention 2/3, SDPA",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "SDPA only",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "Communication",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "Two all-to-alls per layer",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "P2P ring communication",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "Comm volume per GPU",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "O(total_seq x hidden / sp_size)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "O(total_seq x hidden)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "Sequence Divisibility",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "sp_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "cp_size * 2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "Num Head Constraint",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "num_heads >= sp_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "When to Choose Ulysses vs Ring Attention",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Since switching between the two only requires changing the accelerate config, we recommend trying both and comparing performance and memory usage on your specific setup. The main constraint is that Ulysses requires num_heads >= sp_size, while Ring Attention has no such limitation.",
+      "spans": [
+        {
+          "start": 215,
+          "end": 235,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0121",
+      "source": "Best Practices",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "1. Sequence Length Divisibility",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "Always ensure your sequence length is divisible by sp_size:",
+      "spans": [
+        {
+          "start": 51,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "2. Use Flash Attention",
+      "spans": []
+    },
+    {
+      "id": "b0125",
+      "source": "Flash Attention 2 provides cleaner output and better performance than SDPA:",
+      "spans": []
+    },
+    {
+      "id": "b0126",
+      "source": "Use Flash Attention 3 for Hopper and look out for Flash Attention 4 release for Blackwell (FA2 on Blackwell is quite slow).",
+      "spans": []
+    },
+    {
+      "id": "b0127",
+      "source": "3. Combine with DeepSpeed ZeRO",
+      "spans": []
+    },
+    {
+      "id": "b0128",
+      "source": "For very large models, combine Ulysses with ZeRO Stage 3:",
+      "spans": []
+    },
+    {
+      "id": "b0129",
+      "source": "If the model is huge, you can offload the params as well by adding to the above:",
+      "spans": []
+    },
+    {
+      "id": "b0130",
+      "source": "5. Use memory fragmentation-friendly PyTorch allocator",
+      "spans": []
+    },
+    {
+      "id": "b0131",
+      "source": "This environment variable will allow for a longer sequence length:",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "6. 2D Parallelism Configuration",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "Balance SP and DP for your GPU count:",
+      "spans": []
+    },
+    {
+      "id": "b0134",
+      "source": "GPUs",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "sp_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "dp_shard_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Use Case",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "2",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "2",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "Balanced throughput and sequence length",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "Maximum sequence length",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "2",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "Higher throughput with moderate sequence length",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "2",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "Longer sequences with moderate throughput",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "Remember: dp_replicate_size × dp_shard_size × sp_size = num_processes",
+      "spans": [
+        {
+          "start": 10,
+          "end": 69,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0155",
+      "source": "7. Liger-Kernel",
+      "spans": []
+    },
+    {
+      "id": "b0156",
+      "source": "If your desired model architecture is supported by Liger-Kernel, it is fully compatible with Ulysses SP and can be enabled with a single flag:",
+      "spans": [
+        {
+          "start": 51,
+          "end": 63,
+          "kind": "a",
+          "href": "https://github.com/linkedin/Liger-Kernel"
+        }
+      ]
+    },
+    {
+      "id": "b0157",
+      "source": "The main memory saving comes from FusedLinearCrossEntropy which avoids materializing the full logits tensor during loss calculation. The savings grow with longer sequences where the logits tensor is larger.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0158",
+      "source": "Additionally, you can enable TiledMLP to further extend sequence length — like FusedLinearCrossEntropy, it saves working memory by tiling large matrix operations.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 37,
+          "kind": "code"
+        },
+        {
+          "start": 29,
+          "end": 37,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai/tutorials/ulysses-alst-sequence-parallelism/#tiled-mlp-computation"
+        },
+        {
+          "start": 79,
+          "end": 102,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0159",
+      "source": "8. Token Distribution Across Ranks",
+      "spans": []
+    },
+    {
+      "id": "b0160",
+      "source": "You don't need to worry about manually balancing tokens across SP ranks—the loss aggregation code handles uneven distributions gracefully (including ranks with zero valid tokens). With random batching over a reasonably sized dataset, the distribution evens out statistically over training.",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "Benchmarks",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "To quantify the benefits of Ulysses SP, we trained Qwen3-4B on the Gutenberg English streaming dataset using TRL's SFTTrainer. All experiments ran on H100 80GB GPUs with DeepSpeed ZeRO-3, CPU optimizer offloading, gradient checkpointing, and flash-attn2 as the attention backend.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/Qwen/Qwen3-4B"
+        },
+        {
+          "start": 67,
+          "end": 84,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/sedthh/gutenberg_english"
+        }
+      ]
+    },
+    {
+      "id": "b0163",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0164",
+      "source": "Config",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "GPUs",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "SP",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "DP",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "Seq Length",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "Grad Acc",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "Global Batch",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "Baseline",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "SP=4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "SP=4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "32K",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "SP=4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "64K",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0198",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0199",
+      "source": "SP=4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0200",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0201",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0202",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "96K",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "The benchmark runs in the table above use the same global batch size (8 micro-batches), cosine learning-rate schedule, and seed, so those benchmark loss curves are directly comparable.",
+      "spans": []
+    },
+    {
+      "id": "b0207",
+      "source": "Loss Curve Matching Diagnostics (4 GPU)",
+      "spans": []
+    },
+    {
+      "id": "b0208",
+      "source": "To verify SP-vs-DP loss equivalence, we ran controlled 4-GPU A/B experiments with identical seed, model, optimizer, learning-rate schedule, and data order.",
+      "spans": []
+    },
+    {
+      "id": "b0209",
+      "source": "Methodology for Fair DP vs SP Comparison",
+      "spans": []
+    },
+    {
+      "id": "b0210",
+      "source": "Compared setups:",
+      "spans": []
+    },
+    {
+      "id": "b0211",
+      "source": "DP=4, SP=1, GAS=1 (baseline)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0212",
+      "source": "DP=1, SP=4, GAS=4 (Ulysses SP)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0213",
+      "source": "For fair comparison, GAS must scale with SP:",
+      "spans": [
+        {
+          "start": 21,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 41,
+          "end": 43,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0214",
+      "source": "Ulysses SP splits the sequence across SP ranks, so each SP rank sees roughly 1/SP of the sequence tokens per micro-step.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 77,
+          "end": 81,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0215",
+      "source": "If GAS is unchanged, each optimizer step in SP aggregates fewer total tokens than the DP baseline.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 6,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0216",
+      "source": "Setting GAS=SP keeps effective tokens per optimizer step matched:",
+      "spans": [
+        {
+          "start": 8,
+          "end": 14,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0217",
+      "source": "DP tokens/step: dp_world_size * micro_batch * seq_len * GAS = 4 * B * L * 1",
+      "spans": [
+        {
+          "start": 16,
+          "end": 75,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0218",
+      "source": "SP tokens/step: dp_world_size * micro_batch * (L/SP) * GAS * SP_ranks = 1 * B * (L/4) * 4 * 4 = 4 * B * L",
+      "spans": [
+        {
+          "start": 16,
+          "end": 105,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0219",
+      "source": "On Gutenberg text (20 steps), canonical loss matches within logging precision between DP=4,SP=1,GAS=1 and DP=1,SP=4,GAS=4.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 101,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 121,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0220",
+      "source": "Measured over 20 steps on 4 GPUs in controlled equivalence harnesses:",
+      "spans": []
+    },
+    {
+      "id": "b0221",
+      "source": "Harness",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "Metric",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "DP vs SP setting",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "Mean abs diff",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "Max abs diff",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "Trainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "loss",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "DP=4, SP=1 vs DP=1, SP=4",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "0.0054",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0230",
+      "source": "0.0131",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "SFTTrainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "logged loss",
+      "spans": [
+        {
+          "start": 7,
+          "end": 11,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "DP=4, SP=1 vs DP=1, SP=4",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0234",
+      "source": "0.0811",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0235",
+      "source": "0.0812",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0236",
+      "source": "SFTTrainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0237",
+      "source": "canonical NLL",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0238",
+      "source": "DP=4, SP=1 vs DP=1, SP=4",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0239",
+      "source": "0.000004",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0240",
+      "source": "0.000005",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "Takeaway: under matched token budget, SP and non-SP match on canonical token-normalized loss. The remaining difference is in trainer-reported logging (loss), not in the underlying cross-entropy objective.",
+      "spans": [
+        {
+          "start": 151,
+          "end": 155,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0242",
+      "source": "Memory Reduction",
+      "spans": []
+    },
+    {
+      "id": "b0243",
+      "source": "SP=4 reduces per-GPU memory by 3.3x at the same sequence length, enabling training at up to 96K tokens on 4× H100 80GB. At 128K, the model OOMs.",
+      "spans": []
+    },
+    {
+      "id": "b0244",
+      "source": "Config",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0245",
+      "source": "Seq Length",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0246",
+      "source": "Peak Memory",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0247",
+      "source": "Notes",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0248",
+      "source": "DP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0249",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0250",
+      "source": "22.4 GB",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0251",
+      "source": "Baseline — no SP",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0252",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0253",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0254",
+      "source": "22.8 GB",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0255",
+      "source": "Similar memory at same seq length",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0256",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0257",
+      "source": "32K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0258",
+      "source": "35.0 GB",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0259",
+      "source": "4x longer than DP baseline",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0260",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0261",
+      "source": "64K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0262",
+      "source": "50.5 GB",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0263",
+      "source": "8x longer than DP baseline",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0264",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0265",
+      "source": "96K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0266",
+      "source": "66.0 GB",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0267",
+      "source": "12x longer than DP baseline",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0268",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0269",
+      "source": "128K",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0270",
+      "source": "OOM",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0271",
+      "source": "Exceeds 80 GB limit",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0272",
+      "source": "At 8K tokens, DP=4 and SP=4 use nearly the same memory per GPU (~22 GB with ZeRO-3). The advantage of SP is that it enables scaling to much longer sequences: at 96K tokens (12x longer), peak memory is 66 GB — still within the H100's 80 GB capacity. At 128K, the model OOMs, establishing the practical limit for this configuration. DP=4 without SP cannot scale beyond 8K for this model.",
+      "spans": []
+    },
+    {
+      "id": "b0273",
+      "source": "Throughput",
+      "spans": []
+    },
+    {
+      "id": "b0274",
+      "source": "Longer sequences with SP process dramatically more tokens per second. SP=4 at 64K achieves 3.7x the throughput of the baseline.",
+      "spans": []
+    },
+    {
+      "id": "b0275",
+      "source": "Config",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0276",
+      "source": "Seq Length",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0277",
+      "source": "Tokens/s",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0278",
+      "source": "vs Baseline",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0279",
+      "source": "Baseline (1 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0280",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0281",
+      "source": "3,633",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0282",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0283",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0284",
+      "source": "8K",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0285",
+      "source": "3,933",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0286",
+      "source": "~1x",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0287",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0288",
+      "source": "32K",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0289",
+      "source": "7,733",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0290",
+      "source": "2.1x",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0291",
+      "source": "SP=4 (4 GPU)",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0292",
+      "source": "64K",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0293",
+      "source": "13,396",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0294",
+      "source": "3.7x",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0295",
+      "source": "At the same sequence length (8K), SP=4 has comparable throughput to the single-GPU baseline — the all-to-all communication overhead is minimal on NVLink-connected GPUs. The real benefit comes from longer sequences: as sequence length grows, the quadratic attention computation dominates over communication and other overheads, making each training step increasingly compute-efficient. Each step also processes proportionally more tokens, so throughput scales with sequence length. At 64K, SP=4 processes 13,396 tokens/second — 3.7x the baseline.",
+      "spans": []
+    },
+    {
+      "id": "b0296",
+      "source": "These results use only 4 GPUs with SP=4. With 8 GPUs (SP=8), you can push to even longer sequences — up to 256K+ tokens — or use 2D parallelism (SP=4, DP=2) to combine long-context training with data-parallel throughput.",
+      "spans": []
+    },
+    {
+      "id": "b0297",
+      "source": "Requirements",
+      "spans": []
+    },
+    {
+      "id": "b0298",
+      "source": "HF Accelerate: deepspeed>=0.18.1 accelerate>=1.12",
+      "spans": [
+        {
+          "start": 15,
+          "end": 49,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0299",
+      "source": "HF Trainer: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0",
+      "spans": [
+        {
+          "start": 12,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0300",
+      "source": "HF TRL: deepspeed>=0.18.1 accelerate>=1.12 transformers>=5.0 trl>=0.18.0",
+      "spans": [
+        {
+          "start": 8,
+          "end": 72,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0301",
+      "source": "Use flash_attention_2 for Ampere GPUs, or flash_attention_3 for Hopper GPUs. Wait for flash_attention_4 on Blackwell 🕰.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 42,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 103,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0302",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0303",
+      "source": "Documentation",
+      "spans": []
+    },
+    {
+      "id": "b0304",
+      "source": "Accelerate: Context Parallelism Guide",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/concept_guides/context_parallelism"
+        }
+      ]
+    },
+    {
+      "id": "b0305",
+      "source": "TRL: Distributing Training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/trl/distributing_training"
+        }
+      ]
+    },
+    {
+      "id": "b0306",
+      "source": "DeepSpeed Sequence Parallelism",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai/tutorials/ulysses-alst-sequence-parallelism"
+        }
+      ]
+    },
+    {
+      "id": "b0307",
+      "source": "Examples",
+      "spans": []
+    },
+    {
+      "id": "b0308",
+      "source": "Accelerate ALST Example",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate/tree/main/examples/alst_ulysses_sequence_parallelism"
+        }
+      ]
+    },
+    {
+      "id": "b0309",
+      "source": "TRL Accelerate Configs",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "a",
+          "href": "https://github.com/huggingface/trl/tree/main/examples/accelerate_configs"
+        }
+      ]
+    },
+    {
+      "id": "b0310",
+      "source": "Papers",
+      "spans": []
+    },
+    {
+      "id": "b0311",
+      "source": "Arctic Long Sequence Training: Scalable And Efficient Training For Multi-Million Token Sequences",
+      "spans": [
+        {
+          "start": 0,
+          "end": 96,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2506.13996"
+        }
+      ]
+    },
+    {
+      "id": "b0312",
+      "source": "DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models",
+      "spans": [
+        {
+          "start": 0,
+          "end": 105,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2309.14509"
+        }
+      ]
+    },
+    {
+      "id": "b0313",
+      "source": "Related Blog Posts",
+      "spans": []
+    },
+    {
+      "id": "b0314",
+      "source": "Accelerate ND-Parallel: A Guide to Efficient Multi-GPU Training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 63,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/accelerate-nd-parallel"
+        }
+      ]
+    },
+    {
+      "id": "b0315",
+      "source": "Understanding Ulysses and Ring Attention",
+      "spans": [
+        {
+          "start": 0,
+          "end": 40,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/exploding-gradients/ulysses-ring-attention"
+        }
+      ]
+    },
+    {
+      "id": "b0316",
+      "source": "Enabling Long-Context Training with Sequence Parallelism in Axolotl",
+      "spans": [
+        {
+          "start": 0,
+          "end": 67,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/axolotl-ai-co/long-context-with-sequence-parallelism-in-axolotl"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "0a0d21a0a2d0c377ba38c7f8b5717bc178775e1ad8fff6355974dcc538203889",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from accelerate import Accelerator\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=4,  # Split across 4 GPUs\n    dp_shard_size=1,  # Must satisfy: dp_replicate × dp_shard × sp_size = num_processes\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length=None,  # None for variable-length sequences\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",  # or \"sdpa\"\n    ),\n)\n\naccelerator = Accelerator(parallelism_config=parallelism_config)"
+    },
+    {
+      "id": "c0002",
+      "source": "from transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"meta-llama/Llama-3.1-8B\")\noptimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)\n\n# This registers the model with Ulysses and wraps the dataloader\nmodel, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)"
+    },
+    {
+      "id": "c0003",
+      "source": "sp_size = parallelism_config.sp_size\nif sp_size > 1:\n    from deepspeed.utils import groups\n\n    sp_group = groups._get_sequence_parallel_group()\n\n    # Gather losses and token counts from all SP ranks\n    losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)\n    good_tokens = (batch[\"shift_labels\"] != -100).view(-1).sum()\n    good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)\n\n    # Weighted aggregation\n    total_loss = sum(\n        losses_per_rank[i] * good_tokens_per_rank[i]\n        for i in range(sp_size)\n        if good_tokens_per_rank[i] > 0\n    )\n    loss = total_loss / max(sum(good_tokens_per_rank), 1)\n\naccelerator.backward(loss)"
+    },
+    {
+      "id": "c0004",
+      "source": "from transformers import TrainingArguments\n\ntraining_args = TrainingArguments(\n    parallelism_config=parallelism_config,  # same ParallelismConfig as above\n    per_device_train_batch_size=1,\n)"
+    },
+    {
+      "id": "c0005",
+      "source": "dp_world_size = world_size // sp_size"
+    },
+    {
+      "id": "c0006",
+      "source": "accelerate launch \\\n    --config_file deepspeed_ulysses.yaml \\\n    train.py \\\n    --per_device_train_batch_size 1"
+    },
+    {
+      "id": "c0007",
+      "source": "from trl import SFTConfig, SFTTrainer\nfrom accelerate.utils import ParallelismConfig, DeepSpeedSequenceParallelConfig\n\nparallelism_config = ParallelismConfig(\n    sp_backend=\"deepspeed\",\n    sp_size=2,\n    dp_shard_size=2,  # 2D parallelism: SP × DP = 4 GPUs\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_seq_length_is_variable=True,\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)\n\ntraining_args = SFTConfig(\n    ...,\n    parallelism_config=parallelism_config,\n    max_length=32768,\n    pad_to_multiple_of=2,  # Must equal sp_size\n    per_device_train_batch_size=1,\n)\n\ntrainer = SFTTrainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n)\ntrainer.train()"
+    },
+    {
+      "id": "c0008",
+      "source": "compute_environment: LOCAL_MACHINE\ndistributed_type: DEEPSPEED\nmixed_precision: bf16\nnum_processes: 4\ndeepspeed_config:\n  zero_stage: 3\n  seq_parallel_communication_data_type: bf16\nparallelism_config:\n  parallelism_config_sp_size: 2\n  parallelism_config_sp_backend: deepspeed\n  parallelism_config_dp_shard_size: 2\n  parallelism_config_sp_seq_length_is_variable: true\n  parallelism_config_sp_attn_implementation: flash_attention_2"
+    },
+    {
+      "id": "c0009",
+      "source": "accelerate launch --config_file alst_ulysses_4gpu.yaml \\\n    trl/scripts/sft.py \\\n    --model_name_or_path meta-llama/Llama-3.1-8B \\\n    --dataset_name trl-lib/Capybara \\\n    --max_length 32768 \\\n    --packing \\\n    --pad_to_multiple_of 2 \\\n    --per_device_train_batch_size 1"
+    },
+    {
+      "id": "c0010",
+      "source": "# When using SP, labels are pre-shifted by the dataloader adapter\n# The trainer detects this and uses shift_labels directly\nlabels = inputs[\"labels\"] if \"shift_labels\" not in inputs else None\n\n# Loss computation uses the pre-shifted labels\nif \"shift_labels\" in inputs:\n    shift_logits = outputs.logits.contiguous()\n    shift_labels = inputs[\"shift_labels\"]\nelse:\n    shift_logits = outputs.logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()"
+    },
+    {
+      "id": "c0011",
+      "source": "training_args = SFTConfig(\n    pad_to_multiple_of=4,  # For sp_size=4\n    max_length=32768,  # Must be divisible by 4\n)"
+    },
+    {
+      "id": "c0012",
+      "source": "parallelism_config = ParallelismConfig(\n    sp_handler=DeepSpeedSequenceParallelConfig(\n        sp_attn_implementation=\"flash_attention_2\",\n    ),\n)"
+    },
+    {
+      "id": "c0013",
+      "source": "deepspeed_config:\n  zero_stage: 3\n  offload_optimizer:\n    device: cpu"
+    },
+    {
+      "id": "c0014",
+      "source": "  offload_param:\n    device: cpu"
+    },
+    {
+      "id": "c0015",
+      "source": "export PYTORCH_ALLOC_CONF=expandable_segments:True"
+    },
+    {
+      "id": "c0016",
+      "source": "training_args = SFTConfig(\n    use_liger_kernel=True,\n)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "0a0d21a0a2d0c377ba38c7f8b5717bc178775e1ad8fff6355974dcc538203889",
+  "mediaLayout": [
+    {
+      "mediaId": "image_d9ef2cd402d43f49",
+      "type": "image",
+      "afterBlockId": "b0022",
+      "order": 0
+    },
+    {
+      "mediaId": "image_546cff373ba49d92",
+      "type": "image",
+      "afterBlockId": "b0218",
+      "order": 1
+    },
+    {
+      "mediaId": "image_f2b5b5ff70e58844",
+      "type": "image",
+      "afterBlockId": "b0242",
+      "order": 2
+    },
+    {
+      "mediaId": "image_da9b013b01333d6f",
+      "type": "image",
+      "afterBlockId": "b0273",
+      "order": 3
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 4,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 4,
+    "savedImages": 4,
+    "sourceImageOccurrences": 4,
+    "placedImageOccurrences": 4,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:16.057384Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:16.057401Z"
 }

@@ -90,6 +90,7 @@ def article_blocks(body: str) -> list[dict[str, str]]:
     in_code = False
 
     def append(kind: str, value: str) -> None:
+        value = re.sub(r'^\\(?=[#*+>\-]|\d+[.)]\s)', '', value)
         source = normalize_source(value)
         if not source:
             return

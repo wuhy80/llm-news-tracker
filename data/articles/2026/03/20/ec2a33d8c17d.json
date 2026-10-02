@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:09.485867Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Build a Domain-Specific Embedding Model in Under a Day\n\nPublished March 20, 2026\n\nIf you are building a RAG (Retrieval-Augmented Generation) system, you have likely hit this wall: Everything works… until it doesn’t. General-purpose embedding models are trained to understand the internet; not your contracts, manufacturing logs, proprietary chemical formulations or internal taxonomy. They capture broad semantic similarity, but they do not understand the fine-grained distinctions that matter in your domain. Fine-tuning an embedding model can improve the performance of your retrieval pipeline when off-the-shelf models fail to effectively capture domain-specific nuances. Despite how critical embeddings are to RAG performance, the process remains surprisingly fragmented, the skills required are specialized, and the time investment is daunting.\n\nWith a single GPU and less than a day of training time, you can transform a general-purpose embedding model into one that truly understands your domain, no manual labeling required. To help you hit the ground running, we are also releasing a ready-to-use synthetic training dataset generated from NVIDIA's public documentation using this exact pipeline. Using this data and the recipe, we saw over 10% improvement in both Recall@10 and NDCG@10. Atlassian applied this recipe to fine-tune on their JIRA dataset , increasing Recall@60 from 0.751 to 0.951, a 26% improvement - on a single GPU.\n\n🔗Quick Links to Dataset and Code:\n\nSynthetic dataset on NVIDIA’s public documents\n\n🧑‍💻Open Source Projects Recipe Integrates:\n\nNeMo Data Designer for synthetic data generation\n\nNeMo Automodel for embedding model training\n\nBEIR for Information retrieval evaluation\n\nNeMo Export-Deploy for ONNX/TensorRT conversion\n\nNVIDIA NIM for production inference serving\n\nA directory of domain documents (text files - .txt, .md, or similar)\n\nA valid NVIDIA API key (free at build.nvidia.com )\n\nNVIDIA Ampere GPU or newer with at least 80GB memory (with Compute Capability >= 8.0)\n\nThis tutorial has been tested on 1xA100 (80GB), and 1xH100 (80GB)\n\nBy the end of this post, you’ll know how to:\n\n📄 Generate training data from domain documents without labeled data\n\n🎯 Use hard negative mining for effective contrastive training\n\n🔗 Improve embedding quality with multi-hop queries\n\n⚙️ Fine-tune a bi-encoder embedding model\n\n📊 Evaluate whether fine-tuning improves retrieval\n\n🚀 Deploy the fine-tuned model in your pipeline\n\nIn this tutorial, we will finetune the base model Llama-Nemotron-Embed-1B-v2 - a 1-billion-parameter embedding model that balances quality and inference cost. To get started, follow this setup guide .\n\n📚 Step 1: Generate Training Data from Documents\n\nFine-tuning an embedding model requires thousands of (query, relevant document) pairs. Most use cases don’t have this data readily available. Creating it manually is expensive, slow, and often biased by the annotator’s personal interpretation of what’s “relevant.”\n\nInstead of labeling data by hand, you can use an LLM (nvidia/nemotron-3-nano-30b-a3b) to read your documents and automatically generate high-quality synthetic question–answer pairs.\n\n```\nnemotron embed sdg -c default corpus_dir=./data/my_domain_docs\n```\n\nBehind the scenes, this runs a four-stage synthetic data generation (SDG) pipeline powered by NeMo Data Designer :\n\nWhat does the output look like?\n\nThe thermal design power (TDP) of the H100 GPU is 700W in SXM form factor. The cooling solution must maintain junction temperature below 83°C under sustained workloads. Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.\n\n```\n{\n  \"question\": \"What cooling approach is recommended when deploying more than 4 H100 GPUs per server node?\",\n  \"answer\": \"Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.\",\n  \"query_type\": \"contextual\",\n  \"reasoning_type\": \"factual\",\n  \"question_complexity\": 3,\n  \"segment_ids\": [1],\n  \"quality_score\": 8.5\n}\n```\n\n```\n{\n  \"question\": \"How does the 700W TDP of the H100 SXM constrain the choice between air and liquid cooling in multi-GPU configurations?\",\n  \"answer\": \"The 700W TDP generates substantial heat that must be dissipated to keep junction temperatures below 83°C. In dense configurations exceeding 4 GPUs per node, air cooling in standard 2U chassis cannot handle this thermal load, making liquid cooling necessary.\",\n  \"query_type\": \"multi_hop\",\n  \"reasoning_type\": \"causal\",\n  \"question_complexity\": 4,\n  \"segment_ids\": [1, 2],\n  \"hop_count\": 2,\n  \"quality_score\": 9.0\n}\n```\n\nNotice the difference: the first question is a simple factual lookup. The second requires multi-hop, causal reasoning. The pipeline generates both types, with configurable complexity levels (2–5) and hop counts (1–3). Each QA pair then undergoes quality evaluation, receiving sub-scores for relevance, accuracy, context support, and clarity, along with an overall score. Only pairs that meet the threshold are included in training.\n\n⛏️ Step 2: Mine Hard Negatives (and Why They Matter)\n\nIf you train an embedding model with only positive pairs (query + correct document), it learns to distinguish obviously different documents but fails on the hard cases — passages that look relevant but are not the right answer. In a real retrieval system, these near-misses are exactly the documents that cause bad answers. Hard negative mining finds these confusing passages so the model can learn to tell them apart.\n\n```\nnemotron embed prep -c default\n```\n\nThe above command runs three sub-steps automatically:\n\n2a. Train / Validation / Test Split\n\nThe generated QA pairs are split into training (80%) and test (20%) sets. The test set is formatted as a BEIR -compatible benchmark for standardized evaluation in Step 5.\n\n2b. Hard Negative Mining\n\nUsing the base embedding model, the pipeline:\n\nEmbeds every query and every passage in the corpus.\n\nComputes similarity between each query and all passages.\n\nMasks out each query's labeled positive documents.\n\nApplies a margin filter: any non-positive document scoring above 95% of the minimum positive score is eliminated. This exclusion zone guards against false negatives — unlabeled passages that are so close to the positive they may actually be relevant.\n\nFrom the surviving candidates, selects the top-k highest-scoring documents as hard negatives (5 per query by default).\n\nThe result: hard negatives are the most similar non-positive passages that still fall safely below the positive-score ceiling. They are passages the current model considers highly relevant but that are not the labeled answer.\n\nWhy this works : Training on easy negatives (completely unrelated passages) teaches the model nothing new. Training on hard negatives forces it to learn the subtle distinctions that matter in your domain. For example, in a medical corpus, a question about \"metformin dosage for Type 2 diabetes\" might have hard negatives about \"metformin side effects\" or \"insulin dosage for Type 1 diabetes\" — close but critically different. The 95% margin ceiling prevents the miner from selecting passages that are too close to the positive, which could actually be correct answers that simply weren't labeled during SDG.\n\nMulti-hop questions reference multiple positive documents. For example, a question like \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\" has two positive passages.\n\nUnrolling creates one training example per (query, positive document) pair, so the contrastive loss sees each positive independently. A question with 2 positive documents becomes 2 training examples, each with the same hard negatives but a different positive.\n\nThe final output is a training-ready JSON file:\n\n```\n{\n  \"question_id\": \"q42_0\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 3.2\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}, \n{\n  \"question_id\": \"q42_1\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 5.1\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}\n```\n\n🔍 Step 3: Understand Multi-Hop Questions and Why They Improve Retrieval\n\nStandard embedding fine-tuning generates one question per passage and trains the model to match them. This works for simple factual lookups, but real users ask complex questions that span multiple documents or sections. If the model has only seen single-hop training data, it will struggle to retrieve all the relevant passages for these complex queries.\n\nThe SDG pipeline generates questions at 1 to 3 hops by default:\n\n1-hop: \"What is the TDP of the H100 SXM?\" — answered by a single passage.\n\n2-hop: \"How does the H100's TDP relate to cooling requirements in dense deployments?\" — requires connecting information from two passages.\n\n3-hop: \"Given the TDP, cooling constraints, and rack density limits, what is the maximum number of H100 GPUs deployable in a standard data center row?\" — synthesizes three passages.\n\nEach hop is tracked with its own context summary and segment IDs, so the training data preserves the full reasoning chain. After unrolling (Step 2c), each (question, relevant passage) pair becomes an independent training signal, teaching the model that all of these passages are relevant to the multi-hop query.\n\nThe fine-tuned model learns to retrieve contextually related documents, not just lexically similar ones.\n\n🧠 Step 4: Fine-Tune the Embedding Model\n\n```\nnemotron embed finetune -c default\n```\n\nHow contrastive learning works\n\nThe training uses a biencoder architecture with contrastive loss .\n\nThe temperature of 0.02 is deliberately aggressive, it produces a very sharp probability distribution. This works well because the hard negatives from Step 2 are high-quality: they are genuinely confusing passages that the model needs strong gradients to learn to distinguish.\n\nDefault is tuned for the small example dataset; for real-world data, 1–2 epochs is usually sufficient to avoid overfitting.\n\nTuning: try double and half of the default value\n\nLearning rate warmup steps\n\nSet to 5-10% of total steps of finetune to have better early training stability\n\n1 positive + 4 hard negatives\n\nIf ckpt_every_steps is omitted from the config, checkpoint frequency is set automatically:\n\nMap-style datasets (known length): defaults to once per epoch.\n\nIterable datasets (unknown length): defaults to twice during training.\n\nThis means you can start with a small corpus (50–100 documents) for a quick proof-of-concept and scale up later without manually tuning checkpoint settings.\n\n📈 Step 5: Measure the Improvement\n\nDid fine-tuning actually help? Let’s find out by running a standardized evaluation comparing the base model against the fine-tuned checkpoint on the held-out test set:\n\n```\nnemotron embed eval -c default\n```\n\nThe evaluation uses the BEIR framework and computes four standard information retrieval metrics at k = 1, 5, 10, and 100:\n\nnDCG@k: Ranking quality — are the best documents ranked highest?\n\nRecall@k: Coverage — what fraction of relevant documents appear in the top k?\n\nPrecision@k: Accuracy — what fraction of the top k results are actually relevant?\n\nMAP@k: Average precision across all queries\n\nA successful fine-tune typically results in a 10% improvement in nDCG@10 and Recall@10 within <1 day.\n\nResults using Retrieval Synthetic NVDocs:\n\n```\n📊 Comparison (Base -> Fine-tuned)\n============================================================\n  NDCG:\n    NDCG@1: 0.55178 → 0.60796 (+0.05618, +10.2%)\n    NDCG@5: 0.51894 → 0.57689 (+0.05795, +11.2%)\n    NDCG@10: 0.55506 → 0.61559 (+0.06053, +10.9%)\n    NDCG@100: 0.60617 → 0.66567 (+0.05950, +9.8%)\n  Recall:\n    Recall@1: 0.28478 → 0.31547 (+0.03069, +10.8%)\n    Recall@5: 0.54486 → 0.60288 (+0.05802, +10.6%)\n    Recall@10: 0.62979 → 0.69296 (+0.06317, +10.0%)\n    Recall@100: 0.81421 → 0.87020 (+0.05599, +6.9%)\n```\n\nWhat if the numbers don't improve?\n\nThe pipeline makes it easy to iterate:\n\nLow quality scores in SDG? Check your document quality — clean, well-formatted text produces better synthetic data. Try a larger and more powerful LLM.\n\nNot enough training data? Add more documents to your corpus and re-run Stage 0.\n\nOverfitting? The default 3 epochs is calibrated for the small example dataset; for most real-world data, 1–2 epochs is enough . Also consider increasing the quality threshold to keep only the best training examples.\n\nWrong learning rate? Try double or half of the default learning rate.\n\n🏆 Real-World Results: Atlassian\n\nThis recipe has been validated on real enterprise data by Atlassian. They applied this pipeline to fine-tune Llama-Nemotron-Embed-1B-v2 on a public Jira dataset using a single NVIDIA A100 80GB GPU, following the same stages described above\n\nRecall@60 jumped from 0.751 to 0.951 — a 26.7% gain.\n\nThe fine-tuned model retrieves the correct document within the top 60 results for 95.1% of queries, up from 75.1% with the base model. For a retrieval system underpinning Jira search, this directly translates into more relevant results for millions of users. Find more details in their blog post Advancing semantic search for millions of Rovo users .\n\n🚀 Step 6: Export and Deploy\n\nA PyTorch checkpoint is great for evaluation but too slow for production. The final two stages convert the model and serve it behind an API.\n\nExport to ONNX / TensorRT\n\n```\nnemotron embed export -c default\n```\n\nThis exports the fine-tuned checkpoint to ONNX (opset 17). Optionally, it compiles a TensorRT engine for maximum inference throughput, with configurable optimization profiles for batch size (1–64) and sequence length (3–256):\n\n```\n# ONNX only (runs anywhere)\nnemotron embed export -c default export_to_trt=false\n\n# FP8 quantization for further speedup\nnemotron embed export -c default quant_cfg=fp8\n```\n\nThe exported model is deployed inside an NVIDIA NIM container — a production-ready inference microservice exposing an OpenAI-compatible /v1/embeddings endpoint:\n\n```\nnemotron embed deploy -c default\n```\n\nOnce running, any client can call it:\n\n```\ncurl -X POST http://localhost:8000/v1/embeddings \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"input\": [\"What cooling is needed for 8 H100 GPUs in a 2U chassis?\"],\n       \"model\": \"custom\",\n       \"input_type\": \"query\"}'\n```\n\nBecause NIM serves an OpenAI-compatible API, you can drop it into any existing RAG pipeline that uses the embeddings API format — no code changes needed.\n\nVerify deployment accuracy\n\nThe pipeline includes a NIM accuracy verification step that runs the same BEIR evaluation against the deployed endpoint:\n\n```\nnemotron embed eval -c default eval_nim=true eval_base=false\n```\n\nThis catches any accuracy loss from the ONNX/TensorRT conversion. Metrics that match within tolerance (0.03 for @1, 0.01 for @5+) are marked with a check; deviations beyond conversion noise are flagged.\n\nThe full embedding fine-tuning pipeline can be run in six commands, from raw documents to a deployed model.\n\n```\n# 1. Generate synthetic training data from your documents\nnemotron embed sdg -c default corpus_dir=./data/my_docs\n\n# 2. Prepare the training data (split data, mine hard negatives, unroll)\nnemotron embed prep -c default\n\n# 3. Fine-tune the embedding model\nnemotron embed finetune -c default\n\n# 4. Evaluate the base vs. fine-tuned model\nnemotron embed eval -c default\n\n# 5. Export the optimized model\nnemotron embed export -c default\n\n# 6. Deploy the model\nnemotron embed deploy -c default\n```\n\nExpected time and resources\n\nStage GPU Required? Estimated Time Notes\n\nVaries by corpus size and API rate limit\n\nHard negative mining on GPU\n\nVaries by dataset size and epochs\n\nTensorRT requires NGC container\n\nTotal: under a day, with most time being hands-off training. For a small corpus (~500 documents), the entire pipeline completes in about 2–3 hours.\n\nThe pipeline can run end-to-end, but each stage can also be executed independently depending on your starting point. For example, if you have raw documents, you can begin with synthetic data generation (SDG), while datasets that already include hard negatives can skip earlier steps and go directly to fine-tuning. Since every stage uses standard formats such as JSON, BEIR, and ONNX, it’s easy to integrate custom components or reuse intermediate outputs in other workflows. The recipe is also flexible in how it runs, supporting execution on a local machine, inside Docker containers, or on Slurm-based clusters.\n\nIf you have domain documents and some time in your hand, you can generate your first batch of synthetic training data today! The full pipeline - from documents to a deployed, domain-adapted embedding model - runs in under a day on a single GPU. You can start with our ready-made nvidia/Retrieval-Synthetic-NVDocs-v1 dataset to try the pipeline right away. Let us know what you build.\n\nStar the repos for Nemotron , NeMo Data Designer and NeMo Automodel if you find them useful.\n\nModels mentioned in this article 1\n\nDatasets mentioned in this article 1\n\nBuild Low-Latency Multilingual Voice Agents: Open Weights & Full Deployment Control with NVIDIA Magpie TTS\n\nNVIDIA Cosmos-H-Dreams: Bringing Real-Time Generative Simulation to Surgical Robotics\n\nThank you Nvidia for this. Could you please make it possible, even if not the default, to call a \"locally\" / internally deployed LLM (OpenAI compatible endpoint) for the SDG phase ? The whole point of self-hosting a fine-tuned embedding model, appart from accurracy, is that the company's data never leave the premises. Thanks\n\nThanks for the feedback. We will add the support in the next release of the recipe.\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "If you are building a RAG (Retrieval-Augmented Generation) system, you have likely hit this wall: Everything works… until it doesn’t. General-purpose embedding models are trained to understand the internet; not your contracts, manufacturing logs, proprietary chemical formulations or internal taxonomy. They capture broad semantic similarity, but they do not understand the fine-grained distinctions that matter in your domain. Fine-tuning an embedding model can improve the performance of your retrieval pipeline when off-the-shelf models fail to effectively capture domain-specific nuances. Despite how critical embeddings are to RAG performance, the process remains surprisingly fragmented, the skills required are specialized, and the time investment is daunting.\n\nWith a single GPU and less than a day of training time, you can transform a general-purpose embedding model into one that truly understands your domain, no manual labeling required. To help you hit the ground running, we are also releasing a ready-to-use synthetic training dataset generated from NVIDIA's public documentation using this exact pipeline. Using this data and the recipe, we saw over 10% improvement in both Recall@10 and NDCG@10. Atlassian applied this recipe to fine-tune on their JIRA dataset, increasing Recall@60 from 0.751 to 0.951, a 26% improvement - on a single GPU.\n\n### 🔗Quick Links to Dataset and Code:\n\n- Embedding Model\n\n- GitHub\n\n- Synthetic dataset on NVIDIA’s public documents\n\n### 🧑‍💻Open Source Projects Recipe Integrates:\n\n- NeMo Data Designer for synthetic data generation\n\n- NeMo Automodel for embedding model training\n\n- BEIR for Information retrieval evaluation\n\n- NeMo Export-Deploy for ONNX/TensorRT conversion\n\n- NVIDIA NIM for production inference serving\n\n### 📋Prerequisites:\n\n- A directory of domain documents (text files - .txt, .md, or similar)\n\n- A valid NVIDIA API key (free at build.nvidia.com)\n\nNVIDIA Ampere GPU or newer with at least 80GB memory (with Compute Capability >= 8.0)\n\n- This tutorial has been tested on 1xA100 (80GB), and 1xH100 (80GB)\n\nBy the end of this post, you’ll know how to: 📄 Generate training data from domain documents without labeled data 🎯 Use hard negative mining for effective contrastive training 🔗 Improve embedding quality with multi-hop queries ⚙️ Fine-tune a bi-encoder embedding model 📊 Evaluate whether fine-tuning improves retrieval 🚀 Deploy the fine-tuned model in your pipeline\n\n## ⚙️Setup\n\nIn this tutorial, we will finetune the base model Llama-Nemotron-Embed-1B-v2 - a 1-billion-parameter embedding model that balances quality and inference cost. To get started, follow this setup guide.\n\n## 📚 Step 1: Generate Training Data from Documents\n\nFine-tuning an embedding model requires thousands of (query, relevant document) pairs. Most use cases don’t have this data readily available. Creating it manually is expensive, slow, and often biased by the annotator’s personal interpretation of what’s “relevant.” Instead of labeling data by hand, you can use an LLM (nvidia/nemotron-3-nano-30b-a3b) to read your documents and automatically generate high-quality synthetic question–answer pairs.\n\n```\nnemotron embed sdg -c default corpus_dir=./data/my_domain_docs\n```\n\n### How does it work?\n\nBehind the scenes, this runs a four-stage synthetic data generation (SDG) pipeline powered by NeMo Data Designer:\n\n### What does the output look like?\n\nSource document chunk:\n\nThe thermal design power (TDP) of the H100 GPU is 700W in SXM form factor. The cooling solution must maintain junction temperature below 83°C under sustained workloads. Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.\n\nGenerated QA pairs:\n\n```\n{\n  \"question\": \"What cooling approach is recommended when deploying more than 4 H100 GPUs per server node?\",\n  \"answer\": \"Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.\",\n  \"query_type\": \"contextual\",\n  \"reasoning_type\": \"factual\",\n  \"question_complexity\": 3,\n  \"segment_ids\": [1],\n  \"quality_score\": 8.5\n}\n```\n\n```\n{\n  \"question\": \"How does the 700W TDP of the H100 SXM constrain the choice between air and liquid cooling in multi-GPU configurations?\",\n  \"answer\": \"The 700W TDP generates substantial heat that must be dissipated to keep junction temperatures below 83°C. In dense configurations exceeding 4 GPUs per node, air cooling in standard 2U chassis cannot handle this thermal load, making liquid cooling necessary.\",\n  \"query_type\": \"multi_hop\",\n  \"reasoning_type\": \"causal\",\n  \"question_complexity\": 4,\n  \"segment_ids\": [1, 2],\n  \"hop_count\": 2,\n  \"quality_score\": 9.0\n}\n```\n\nNotice the difference: the first question is a simple factual lookup. The second requires multi-hop, causal reasoning. The pipeline generates both types, with configurable complexity levels (2–5) and hop counts (1–3). Each QA pair then undergoes quality evaluation, receiving sub-scores for relevance, accuracy, context support, and clarity, along with an overall score. Only pairs that meet the threshold are included in training.\n\n## ⛏️ Step 2: Mine Hard Negatives (and Why They Matter)\n\nIf you train an embedding model with only positive pairs (query + correct document), it learns to distinguish obviously different documents but fails on the hard cases — passages that look relevant but are not the right answer. In a real retrieval system, these near-misses are exactly the documents that cause bad answers. Hard negative mining finds these confusing passages so the model can learn to tell them apart.\n\n```\nnemotron embed prep -c default\n```\n\nThe above command runs three sub-steps automatically:\n\n### 2a. Train / Validation / Test Split\n\nThe generated QA pairs are split into training (80%) and test (20%) sets. The test set is formatted as a BEIR-compatible benchmark for standardized evaluation in Step 5.\n\n### 2b. Hard Negative Mining\n\nUsing the base embedding model, the pipeline:\n\n- Embeds every query and every passage in the corpus.\n\n- Computes similarity between each query and all passages.\n\n- Masks out each query's labeled positive documents.\n\n- Applies a margin filter: any non-positive document scoring above 95% of the minimum positive score is eliminated. This exclusion zone guards against false negatives — unlabeled passages that are so close to the positive they may actually be relevant.\n\n- From the surviving candidates, selects the top-k highest-scoring documents as hard negatives (5 per query by default).\n\nThe result: hard negatives are the most similar non-positive passages that still fall safely below the positive-score ceiling. They are passages the current model considers highly relevant but that are not the labeled answer.\n\nWhy this works: Training on easy negatives (completely unrelated passages) teaches the model nothing new. Training on hard negatives forces it to learn the subtle distinctions that matter in your domain. For example, in a medical corpus, a question about \"metformin dosage for Type 2 diabetes\" might have hard negatives about \"metformin side effects\" or \"insulin dosage for Type 1 diabetes\" — close but critically different. The 95% margin ceiling prevents the miner from selecting passages that are too close to the positive, which could actually be correct answers that simply weren't labeled during SDG.\n\n### 2c. Multi-Hop Unrolling\n\nMulti-hop questions reference multiple positive documents. For example, a question like \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\" has two positive passages.\n\nUnrolling creates one training example per (query, positive document) pair, so the contrastive loss sees each positive independently. A question with 2 positive documents becomes 2 training examples, each with the same hard negatives but a different positive.\n\nThe final output is a training-ready JSON file:\n\n```\n{\n  \"question_id\": \"q42_0\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 3.2\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}, \n{\n  \"question_id\": \"q42_1\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 5.1\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}\n```\n\n## 🔍 Step 3: Understand Multi-Hop Questions and Why They Improve Retrieval\n\nStandard embedding fine-tuning generates one question per passage and trains the model to match them. This works for simple factual lookups, but real users ask complex questions that span multiple documents or sections. If the model has only seen single-hop training data, it will struggle to retrieve all the relevant passages for these complex queries.\n\nThe SDG pipeline generates questions at 1 to 3 hops by default:\n\n- 1-hop: \"What is the TDP of the H100 SXM?\" — answered by a single passage.\n\n- 2-hop: \"How does the H100's TDP relate to cooling requirements in dense deployments?\" — requires connecting information from two passages.\n\n- 3-hop: \"Given the TDP, cooling constraints, and rack density limits, what is the maximum number of H100 GPUs deployable in a standard data center row?\" — synthesizes three passages.\n\nEach hop is tracked with its own context summary and segment IDs, so the training data preserves the full reasoning chain. After unrolling (Step 2c), each (question, relevant passage) pair becomes an independent training signal, teaching the model that all of these passages are relevant to the multi-hop query.\n\nThe fine-tuned model learns to retrieve contextually related documents, not just lexically similar ones.\n\n## 🧠 Step 4: Fine-Tune the Embedding Model\n\n```\nnemotron embed finetune -c default\n```\n\n### How contrastive learning works\n\nThe training uses a biencoder architecture with contrastive loss.\n\nThe temperature of 0.02 is deliberately aggressive, it produces a very sharp probability distribution. This works well because the hard negatives from Step 2 are high-quality: they are genuinely confusing passages that the model needs strong gradients to learn to distinguish.\n\n### Key hyperparameters\n\nParameter\n\nDefault\n\nNotes\n\nEpochs\n\n3\n\nDefault is tuned for the small example dataset; for real-world data, 1–2 epochs is usually sufficient to avoid overfitting.\n\nLearning rate\n\n1e-5\n\nTuning: try double and half of the default value\n\nLearning rate warmup steps\n\n5\n\nSet to 5-10% of total steps of finetune to have better early training stability\n\nGlobal batch size\n\n128\n\n—\n\nPassages per query\n\n5\n\n1 positive + 4 hard negatives\n\n### Checkpoint frequency\n\nIf ckpt_every_steps is omitted from the config, checkpoint frequency is set automatically:\n\n- Map-style datasets (known length): defaults to once per epoch.\n\n- Iterable datasets (unknown length): defaults to twice during training.\n\nThis means you can start with a small corpus (50–100 documents) for a quick proof-of-concept and scale up later without manually tuning checkpoint settings.\n\n## 📈 Step 5: Measure the Improvement\n\nDid fine-tuning actually help? Let’s find out by running a standardized evaluation comparing the base model against the fine-tuned checkpoint on the held-out test set:\n\n```\nnemotron embed eval -c default\n```\n\nThe evaluation uses the BEIR framework and computes four standard information retrieval metrics at k = 1, 5, 10, and 100:\n\n- nDCG@k: Ranking quality — are the best documents ranked highest?\n\n- Recall@k: Coverage — what fraction of relevant documents appear in the top k?\n\n- Precision@k: Accuracy — what fraction of the top k results are actually relevant?\n\n- MAP@k: Average precision across all queries\n\nA successful fine-tune typically results in a 10% improvement in nDCG@10 and Recall@10 within <1 day.\n\nResults using Retrieval Synthetic NVDocs:\n\n```\n📊 Comparison (Base -> Fine-tuned)\n============================================================\n  NDCG:\n    NDCG@1: 0.55178 → 0.60796 (+0.05618, +10.2%)\n    NDCG@5: 0.51894 → 0.57689 (+0.05795, +11.2%)\n    NDCG@10: 0.55506 → 0.61559 (+0.06053, +10.9%)\n    NDCG@100: 0.60617 → 0.66567 (+0.05950, +9.8%)\n  Recall:\n    Recall@1: 0.28478 → 0.31547 (+0.03069, +10.8%)\n    Recall@5: 0.54486 → 0.60288 (+0.05802, +10.6%)\n    Recall@10: 0.62979 → 0.69296 (+0.06317, +10.0%)\n    Recall@100: 0.81421 → 0.87020 (+0.05599, +6.9%)\n```\n\n### What if the numbers don't improve?\n\nThe pipeline makes it easy to iterate:\n\n- Low quality scores in SDG? Check your document quality — clean, well-formatted text produces better synthetic data. Try a larger and more powerful LLM.\n\n- Not enough training data? Add more documents to your corpus and re-run Stage 0.\n\n- Overfitting? The default 3 epochs is calibrated for the small example dataset; for most real-world data, 1–2 epochs is enough. Also consider increasing the quality threshold to keep only the best training examples.\n\n- Wrong learning rate? Try double or half of the default learning rate.\n\n### 🏆 Real-World Results: Atlassian\n\nThis recipe has been validated on real enterprise data by Atlassian. They applied this pipeline to fine-tune Llama-Nemotron-Embed-1B-v2 on a public Jira dataset using a single NVIDIA A100 80GB GPU, following the same stages described above\n\nRecall@60 jumped from 0.751 to 0.951 — a 26.7% gain. The fine-tuned model retrieves the correct document within the top 60 results for 95.1% of queries, up from 75.1% with the base model. For a retrieval system underpinning Jira search, this directly translates into more relevant results for millions of users. Find more details in their blog post Advancing semantic search for millions of Rovo users.\n\n## 🚀 Step 6: Export and Deploy\n\nA PyTorch checkpoint is great for evaluation but too slow for production. The final two stages convert the model and serve it behind an API.\n\n### Export to ONNX / TensorRT\n\n```\nnemotron embed export -c default\n```\n\nThis exports the fine-tuned checkpoint to ONNX (opset 17). Optionally, it compiles a TensorRT engine for maximum inference throughput, with configurable optimization profiles for batch size (1–64) and sequence length (3–256):\n\n```\n# ONNX only (runs anywhere)\nnemotron embed export -c default export_to_trt=false\n\n# FP8 quantization for further speedup\nnemotron embed export -c default quant_cfg=fp8\n```\n\n### Deploy with NVIDIA NIM\n\nThe exported model is deployed inside an NVIDIA NIM container — a production-ready inference microservice exposing an OpenAI-compatible /v1/embeddings endpoint:\n\n```\nnemotron embed deploy -c default\n```\n\nOnce running, any client can call it:\n\n```\ncurl -X POST http://localhost:8000/v1/embeddings \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"input\": [\"What cooling is needed for 8 H100 GPUs in a 2U chassis?\"],\n       \"model\": \"custom\",\n       \"input_type\": \"query\"}'\n```\n\nBecause NIM serves an OpenAI-compatible API, you can drop it into any existing RAG pipeline that uses the embeddings API format — no code changes needed.\n\n### Verify deployment accuracy\n\nThe pipeline includes a NIM accuracy verification step that runs the same BEIR evaluation against the deployed endpoint:\n\n```\nnemotron embed eval -c default eval_nim=true eval_base=false\n```\n\nThis catches any accuracy loss from the ONNX/TensorRT conversion. Metrics that match within tolerance (0.03 for @1, 0.01 for @5+) are marked with a check; deviations beyond conversion noise are flagged.\n\n## Putting It All Together\n\nThe full embedding fine-tuning pipeline can be run in six commands, from raw documents to a deployed model.\n\n```\n# 1. Generate synthetic training data from your documents\nnemotron embed sdg -c default corpus_dir=./data/my_docs\n\n# 2. Prepare the training data (split data, mine hard negatives, unroll)\nnemotron embed prep -c default\n\n# 3. Fine-tune the embedding model\nnemotron embed finetune -c default\n\n# 4. Evaluate the base vs. fine-tuned model\nnemotron embed eval -c default\n\n# 5. Export the optimized model\nnemotron embed export -c default\n\n# 6. Deploy the model\nnemotron embed deploy -c default\n```\n\n### Expected time and resources\n\nStage\n\nGPU Required?\n\nEstimated Time\n\nNotes\n\nSDG\n\nNo (uses API)\n\n~1 hour\n\nVaries by corpus size and API rate limit\n\nData Prep\n\nYes (40 GB VRAM)\n\n~5 min\n\nHard negative mining on GPU\n\nFine-Tune\n\nYes (80 GB VRAM)\n\n~1 hours\n\nVaries by dataset size and epochs\n\nEval\n\nYes (40 GB VRAM)\n\n~5 min\n\n—\n\nExport\n\nYes (40 GB VRAM)\n\n~5 min\n\nTensorRT requires NGC container\n\nDeploy\n\nYes (40 GB VRAM)\n\n~5 min\n\nNIM container startup\n\nTotal: under a day, with most time being hands-off training. For a small corpus (~500 documents), the entire pipeline completes in about 2–3 hours.\n\nThe pipeline can run end-to-end, but each stage can also be executed independently depending on your starting point. For example, if you have raw documents, you can begin with synthetic data generation (SDG), while datasets that already include hard negatives can skip earlier steps and go directly to fine-tuning. Since every stage uses standard formats such as JSON, BEIR, and ONNX, it’s easy to integrate custom components or reuse intermediate outputs in other workflows. The recipe is also flexible in how it runs, supporting execution on a local machine, inside Docker containers, or on Slurm-based clusters.\n\n## Try It Yourself\n\nIf you have domain documents and some time in your hand, you can generate your first batch of synthetic training data today! The full pipeline - from documents to a deployed, domain-adapted embedding model - runs in under a day on a single GPU. You can start with our ready-made nvidia/Retrieval-Synthetic-NVDocs-v1 dataset to try the pipeline right away. Let us know what you build. Star the repos for Nemotron, NeMo Data Designer and NeMo Automodel if you find them useful.",
   "summaryZh": "Hugging Face分享了在单GPU环境下，利用NVIDIA NeMo工具链在一天内完成领域特定嵌入模型微调的实操方案。该方案通过合成数据生成技术，解决了通用模型在特定领域（如法律、制造、化学）语义理解不足的问题。实测显示，该方法能显著提升RAG系统的检索召回率（Recall）和NDCG指标，为企业级AI应用提供了低成本、高效率的优化路径。",
   "summaryGeneratedAt": "2026-08-30T11:14:35.654220Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -75,5 +75,1551 @@
       }
     ],
     "duplicateKey": "domain-specific-embedding-finetuning"
-  }
+  },
+  "images": [
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/84IMYChKX4twWnC4U6iCQ.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/84IMYChKX4twWnC4U6iCQ.png",
+      "alt": "sdg_pipeline",
+      "id": "image_e7e37cdfa51e4874"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/ntYmgzatUK_Sfn35GCdve.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/ntYmgzatUK_Sfn35GCdve.png",
+      "alt": "contrastive_learning",
+      "id": "image_55c07e7e0a73784f"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/hsFtTLz1WfSgaWBdHof82.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/662a9c2154a9f1037104a075/hsFtTLz1WfSgaWBdHof82.png",
+      "alt": "ATL result",
+      "id": "image_5c7eb27eb200fd51"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "If you are building a RAG (Retrieval-Augmented Generation) system, you have likely hit this wall: Everything works… until it doesn’t. General-purpose embedding models are trained to understand the internet; not your contracts, manufacturing logs, proprietary chemical formulations or internal taxonomy. They capture broad semantic similarity, but they do not understand the fine-grained distinctions that matter in your domain. Fine-tuning an embedding model can improve the performance of your retrieval pipeline when off-the-shelf models fail to effectively capture domain-specific nuances. Despite how critical embeddings are to RAG performance, the process remains surprisingly fragmented, the skills required are specialized, and the time investment is daunting.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "With a single GPU and less than a day of training time, you can transform a general-purpose embedding model into one that truly understands your domain, no manual labeling required. To help you hit the ground running, we are also releasing a ready-to-use synthetic training dataset generated from NVIDIA's public documentation using this exact pipeline. Using this data and the recipe, we saw over 10% improvement in both Recall@10 and NDCG@10. Atlassian applied this recipe to fine-tune on their JIRA dataset, increasing Recall@60 from 0.751 to 0.951, a 26% improvement - on a single GPU.",
+      "spans": [
+        {
+          "start": 255,
+          "end": 281,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/nvidia/Retrieval-Synthetic-NVDocs-v1"
+        },
+        {
+          "start": 445,
+          "end": 454,
+          "kind": "a",
+          "href": "https://www.atlassian.com/"
+        },
+        {
+          "start": 497,
+          "end": 509,
+          "kind": "a",
+          "href": "https://zenodo.org/records/15719919/files/2025-06-23%20ThePublicJiraDataset.zip?download=1"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "🔗Quick Links to Dataset and Code:",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Embedding Model",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "GitHub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-NeMo/Nemotron/tree/main/src/nemotron/recipes/embed"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Synthetic dataset on NVIDIA’s public documents",
+      "spans": [
+        {
+          "start": 0,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/nvidia/Retrieval-Synthetic-NVDocs-v1"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "🧑‍💻Open Source Projects Recipe Integrates:",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "NeMo Data Designer for synthetic data generation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-NeMo/DataDesigner"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "NeMo Automodel for embedding model training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Automodel"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "BEIR for Information retrieval evaluation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://github.com/beir-cellar/beir"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "NeMo Export-Deploy for ONNX/TensorRT conversion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Export-Deploy"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "NVIDIA NIM for production inference serving",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/nim"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "📋Prerequisites:",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "A directory of domain documents (text files - .txt, .md, or similar)",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "A valid NVIDIA API key (free at build.nvidia.com)",
+      "spans": [
+        {
+          "start": 32,
+          "end": 48,
+          "kind": "a",
+          "href": "https://build.nvidia.com"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "NVIDIA Ampere GPU or newer with at least 80GB memory (with Compute Capability >= 8.0)",
+      "spans": [
+        {
+          "start": 59,
+          "end": 77,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/cuda-gpus"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "This tutorial has been tested on 1xA100 (80GB), and 1xH100 (80GB)",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "By the end of this post, you’ll know how to: 📄 Generate training data from domain documents without labeled data 🎯 Use hard negative mining for effective contrastive training 🔗 Improve embedding quality with multi-hop queries ⚙️ Fine-tune a bi-encoder embedding model 📊 Evaluate whether fine-tuning improves retrieval 🚀 Deploy the fine-tuned model in your pipeline",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "⚙️Setup",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "In this tutorial, we will finetune the base model Llama-Nemotron-Embed-1B-v2 - a 1-billion-parameter embedding model that balances quality and inference cost. To get started, follow this setup guide.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 76,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2"
+        },
+        {
+          "start": 187,
+          "end": 198,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-NeMo/Nemotron/blob/main/docs/nemotron/embed/README.md"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "📚 Step 1: Generate Training Data from Documents",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Fine-tuning an embedding model requires thousands of (query, relevant document) pairs. Most use cases don’t have this data readily available. Creating it manually is expensive, slow, and often biased by the annotator’s personal interpretation of what’s “relevant.” Instead of labeling data by hand, you can use an LLM (nvidia/nemotron-3-nano-30b-a3b) to read your documents and automatically generate high-quality synthetic question–answer pairs.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "How does it work?",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Behind the scenes, this runs a four-stage synthetic data generation (SDG) pipeline powered by NeMo Data Designer:",
+      "spans": [
+        {
+          "start": 94,
+          "end": 112,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-NeMo/DataDesigner"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "What does the output look like?",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Source document chunk:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The thermal design power (TDP) of the H100 GPU is 700W in SXM form factor. The cooling solution must maintain junction temperature below 83°C under sustained workloads. Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Generated QA pairs:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Notice the difference: the first question is a simple factual lookup. The second requires multi-hop, causal reasoning. The pipeline generates both types, with configurable complexity levels (2–5) and hop counts (1–3). Each QA pair then undergoes quality evaluation, receiving sub-scores for relevance, accuracy, context support, and clarity, along with an overall score. Only pairs that meet the threshold are included in training.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "⛏️ Step 2: Mine Hard Negatives (and Why They Matter)",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "If you train an embedding model with only positive pairs (query + correct document), it learns to distinguish obviously different documents but fails on the hard cases — passages that look relevant but are not the right answer. In a real retrieval system, these near-misses are exactly the documents that cause bad answers. Hard negative mining finds these confusing passages so the model can learn to tell them apart.",
+      "spans": [
+        {
+          "start": 184,
+          "end": 188,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "The above command runs three sub-steps automatically:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "2a. Train / Validation / Test Split",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "The generated QA pairs are split into training (80%) and test (20%) sets. The test set is formatted as a BEIR-compatible benchmark for standardized evaluation in Step 5.",
+      "spans": [
+        {
+          "start": 105,
+          "end": 109,
+          "kind": "a",
+          "href": "https://github.com/beir-cellar/beir"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "2b. Hard Negative Mining",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Using the base embedding model, the pipeline:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Embeds every query and every passage in the corpus.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Computes similarity between each query and all passages.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Masks out each query's labeled positive documents.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Applies a margin filter: any non-positive document scoring above 95% of the minimum positive score is eliminated. This exclusion zone guards against false negatives — unlabeled passages that are so close to the positive they may actually be relevant.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 64,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "From the surviving candidates, selects the top-k highest-scoring documents as hard negatives (5 per query by default).",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "The result: hard negatives are the most similar non-positive passages that still fall safely below the positive-score ceiling. They are passages the current model considers highly relevant but that are not the labeled answer.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Why this works: Training on easy negatives (completely unrelated passages) teaches the model nothing new. Training on hard negatives forces it to learn the subtle distinctions that matter in your domain. For example, in a medical corpus, a question about \"metformin dosage for Type 2 diabetes\" might have hard negatives about \"metformin side effects\" or \"insulin dosage for Type 1 diabetes\" — close but critically different. The 95% margin ceiling prevents the miner from selecting passages that are too close to the positive, which could actually be correct answers that simply weren't labeled during SDG.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "2c. Multi-Hop Unrolling",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Multi-hop questions reference multiple positive documents. For example, a question like \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\" has two positive passages.",
+      "spans": [
+        {
+          "start": 88,
+          "end": 201,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Unrolling creates one training example per (query, positive document) pair, so the contrastive loss sees each positive independently. A question with 2 positive documents becomes 2 training examples, each with the same hard negatives but a different positive.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "The final output is a training-ready JSON file:",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "🔍 Step 3: Understand Multi-Hop Questions and Why They Improve Retrieval",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Standard embedding fine-tuning generates one question per passage and trains the model to match them. This works for simple factual lookups, but real users ask complex questions that span multiple documents or sections. If the model has only seen single-hop training data, it will struggle to retrieve all the relevant passages for these complex queries.",
+      "spans": [
+        {
+          "start": 302,
+          "end": 305,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "The SDG pipeline generates questions at 1 to 3 hops by default:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "1-hop: \"What is the TDP of the H100 SXM?\" — answered by a single passage.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "2-hop: \"How does the H100's TDP relate to cooling requirements in dense deployments?\" — requires connecting information from two passages.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "3-hop: \"Given the TDP, cooling constraints, and rack density limits, what is the maximum number of H100 GPUs deployable in a standard data center row?\" — synthesizes three passages.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Each hop is tracked with its own context summary and segment IDs, so the training data preserves the full reasoning chain. After unrolling (Step 2c), each (question, relevant passage) pair becomes an independent training signal, teaching the model that all of these passages are relevant to the multi-hop query.",
+      "spans": [
+        {
+          "start": 253,
+          "end": 256,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "The fine-tuned model learns to retrieve contextually related documents, not just lexically similar ones.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "🧠 Step 4: Fine-Tune the Embedding Model",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "How contrastive learning works",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "The training uses a biencoder architecture with contrastive loss.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 42,
+          "kind": "strong"
+        },
+        {
+          "start": 48,
+          "end": 64,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "The temperature of 0.02 is deliberately aggressive, it produces a very sharp probability distribution. This works well because the hard negatives from Step 2 are high-quality: they are genuinely confusing passages that the model needs strong gradients to learn to distinguish.",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Key hyperparameters",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Parameter",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "Default",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "Notes",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "Epochs",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "3",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "Default is tuned for the small example dataset; for real-world data, 1–2 epochs is usually sufficient to avoid overfitting.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 101,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "Learning rate",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "1e-5",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Tuning: try double and half of the default value",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Learning rate warmup steps",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "5",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "Set to 5-10% of total steps of finetune to have better early training stability",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "Global batch size",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "128",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "Passages per query",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "5",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "1 positive + 4 hard negatives",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "Checkpoint frequency",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "If ckpt_every_steps is omitted from the config, checkpoint frequency is set automatically:",
+      "spans": [
+        {
+          "start": 3,
+          "end": 19,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Map-style datasets (known length): defaults to once per epoch.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "Iterable datasets (unknown length): defaults to twice during training.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "This means you can start with a small corpus (50–100 documents) for a quick proof-of-concept and scale up later without manually tuning checkpoint settings.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "📈 Step 5: Measure the Improvement",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Did fine-tuning actually help? Let’s find out by running a standardized evaluation comparing the base model against the fine-tuned checkpoint on the held-out test set:",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "The evaluation uses the BEIR framework and computes four standard information retrieval metrics at k = 1, 5, 10, and 100:",
+      "spans": [
+        {
+          "start": 24,
+          "end": 38,
+          "kind": "a",
+          "href": "https://github.com/beir-cellar/beir"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "nDCG@k: Ranking quality — are the best documents ranked highest?",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Recall@k: Coverage — what fraction of relevant documents appear in the top k?",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Precision@k: Accuracy — what fraction of the top k results are actually relevant?",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "MAP@k: Average precision across all queries",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "A successful fine-tune typically results in a 10% improvement in nDCG@10 and Recall@10 within <1 day.",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "Results using Retrieval Synthetic NVDocs:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "What if the numbers don't improve?",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "The pipeline makes it easy to iterate:",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "Low quality scores in SDG? Check your document quality — clean, well-formatted text produces better synthetic data. Try a larger and more powerful LLM.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "Not enough training data? Add more documents to your corpus and re-run Stage 0.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "Overfitting? The default 3 epochs is calibrated for the small example dataset; for most real-world data, 1–2 epochs is enough. Also consider increasing the quality threshold to keep only the best training examples.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        },
+        {
+          "start": 105,
+          "end": 125,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Wrong learning rate? Try double or half of the default learning rate.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "🏆 Real-World Results: Atlassian",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "This recipe has been validated on real enterprise data by Atlassian. They applied this pipeline to fine-tune Llama-Nemotron-Embed-1B-v2 on a public Jira dataset using a single NVIDIA A100 80GB GPU, following the same stages described above",
+      "spans": [
+        {
+          "start": 141,
+          "end": 160,
+          "kind": "a",
+          "href": "https://zenodo.org/records/15719919/files/2025-06-23%20ThePublicJiraDataset.zip?download=1"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "Recall@60 jumped from 0.751 to 0.951 — a 26.7% gain. The fine-tuned model retrieves the correct document within the top 60 results for 95.1% of queries, up from 75.1% with the base model. For a retrieval system underpinning Jira search, this directly translates into more relevant results for millions of users. Find more details in their blog post Advancing semantic search for millions of Rovo users.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 52,
+          "kind": "strong"
+        },
+        {
+          "start": 349,
+          "end": 401,
+          "kind": "a",
+          "href": "https://www.atlassian.com/blog/atlassian-engineering/advancing-rovo-semantic-search"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "🚀 Step 6: Export and Deploy",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "A PyTorch checkpoint is great for evaluation but too slow for production. The final two stages convert the model and serve it behind an API.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "Export to ONNX / TensorRT",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "This exports the fine-tuned checkpoint to ONNX (opset 17). Optionally, it compiles a TensorRT engine for maximum inference throughput, with configurable optimization profiles for batch size (1–64) and sequence length (3–256):",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "Deploy with NVIDIA NIM",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "The exported model is deployed inside an NVIDIA NIM container — a production-ready inference microservice exposing an OpenAI-compatible /v1/embeddings endpoint:",
+      "spans": [
+        {
+          "start": 41,
+          "end": 51,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/nim"
+        }
+      ]
+    },
+    {
+      "id": "b0108",
+      "source": "Once running, any client can call it:",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "Because NIM serves an OpenAI-compatible API, you can drop it into any existing RAG pipeline that uses the embeddings API format — no code changes needed.",
+      "spans": []
+    },
+    {
+      "id": "b0110",
+      "source": "Verify deployment accuracy",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "The pipeline includes a NIM accuracy verification step that runs the same BEIR evaluation against the deployed endpoint:",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "This catches any accuracy loss from the ONNX/TensorRT conversion. Metrics that match within tolerance (0.03 for @1, 0.01 for @5+) are marked with a check; deviations beyond conversion noise are flagged.",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "Putting It All Together",
+      "spans": []
+    },
+    {
+      "id": "b0114",
+      "source": "The full embedding fine-tuning pipeline can be run in six commands, from raw documents to a deployed model.",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "Expected time and resources",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "Stage",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "GPU Required?",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "Estimated Time",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "Notes",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "SDG",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "No (uses API)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "~1 hour",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "Varies by corpus size and API rate limit",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "Data Prep",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "Yes (40 GB VRAM)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "~5 min",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "Hard negative mining on GPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "Fine-Tune",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "Yes (80 GB VRAM)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "~1 hours",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "Varies by dataset size and epochs",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "Eval",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "Yes (40 GB VRAM)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "~5 min",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "Export",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Yes (40 GB VRAM)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "~5 min",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "TensorRT requires NGC container",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "Deploy",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "Yes (40 GB VRAM)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "~5 min",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "NIM container startup",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "Total: under a day, with most time being hands-off training. For a small corpus (~500 documents), the entire pipeline completes in about 2–3 hours.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 60,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0145",
+      "source": "The pipeline can run end-to-end, but each stage can also be executed independently depending on your starting point. For example, if you have raw documents, you can begin with synthetic data generation (SDG), while datasets that already include hard negatives can skip earlier steps and go directly to fine-tuning. Since every stage uses standard formats such as JSON, BEIR, and ONNX, it’s easy to integrate custom components or reuse intermediate outputs in other workflows. The recipe is also flexible in how it runs, supporting execution on a local machine, inside Docker containers, or on Slurm-based clusters.",
+      "spans": []
+    },
+    {
+      "id": "b0146",
+      "source": "Try It Yourself",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "If you have domain documents and some time in your hand, you can generate your first batch of synthetic training data today! The full pipeline - from documents to a deployed, domain-adapted embedding model - runs in under a day on a single GPU. You can start with our ready-made nvidia/Retrieval-Synthetic-NVDocs-v1 dataset to try the pipeline right away. Let us know what you build. Star the repos for Nemotron, NeMo Data Designer and NeMo Automodel if you find them useful.",
+      "spans": [
+        {
+          "start": 279,
+          "end": 315,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/nvidia/Retrieval-Synthetic-NVDocs-v1"
+        },
+        {
+          "start": 384,
+          "end": 398,
+          "kind": "strong"
+        },
+        {
+          "start": 403,
+          "end": 411,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/Nemotron"
+        },
+        {
+          "start": 413,
+          "end": 431,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Data-Designer"
+        },
+        {
+          "start": 436,
+          "end": 450,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Automodel"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "17237a3dc78a092f0be0ecf4858e00701906a8d6acef34f6bdb2c32c4f29bee8",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "nemotron embed sdg -c default corpus_dir=./data/my_domain_docs"
+    },
+    {
+      "id": "c0002",
+      "source": "{\n  \"question\": \"What cooling approach is recommended when deploying more than 4 H100 GPUs per server node?\",\n  \"answer\": \"Liquid cooling is recommended for dense deployments exceeding 4 GPUs per node, as air cooling cannot dissipate sufficient heat in standard 2U chassis configurations.\",\n  \"query_type\": \"contextual\",\n  \"reasoning_type\": \"factual\",\n  \"question_complexity\": 3,\n  \"segment_ids\": [1],\n  \"quality_score\": 8.5\n}"
+    },
+    {
+      "id": "c0003",
+      "source": "{\n  \"question\": \"How does the 700W TDP of the H100 SXM constrain the choice between air and liquid cooling in multi-GPU configurations?\",\n  \"answer\": \"The 700W TDP generates substantial heat that must be dissipated to keep junction temperatures below 83°C. In dense configurations exceeding 4 GPUs per node, air cooling in standard 2U chassis cannot handle this thermal load, making liquid cooling necessary.\",\n  \"query_type\": \"multi_hop\",\n  \"reasoning_type\": \"causal\",\n  \"question_complexity\": 4,\n  \"segment_ids\": [1, 2],\n  \"hop_count\": 2,\n  \"quality_score\": 9.0\n}"
+    },
+    {
+      "id": "c0004",
+      "source": "nemotron embed prep -c default"
+    },
+    {
+      "id": "c0005",
+      "source": "{\n  \"question_id\": \"q42_0\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 3.2\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}, \n{\n  \"question_id\": \"q42_1\",\n  \"question\": \"How does the thermal management system in Section 3.2 relate to the power constraints described in Section 5.1?\",\n  \"pos_doc\": [{\"id\": \"Section 5.1\"}],\n  \"neg_doc\": [{\"id\": \"d_x7y8z9\"}, {\"id\": \"d_m4n5o6\"}, {\"id\": \"d_p1q2r3\"}, {\"id\": \"d_s4t5u6\"}, {\"id\": \"d_v7w8x9\"}]\n}"
+    },
+    {
+      "id": "c0006",
+      "source": "nemotron embed finetune -c default"
+    },
+    {
+      "id": "c0007",
+      "source": "nemotron embed eval -c default"
+    },
+    {
+      "id": "c0008",
+      "source": "📊 Comparison (Base -> Fine-tuned)\n============================================================\n  NDCG:\n    NDCG@1: 0.55178 → 0.60796 (+0.05618, +10.2%)\n    NDCG@5: 0.51894 → 0.57689 (+0.05795, +11.2%)\n    NDCG@10: 0.55506 → 0.61559 (+0.06053, +10.9%)\n    NDCG@100: 0.60617 → 0.66567 (+0.05950, +9.8%)\n  Recall:\n    Recall@1: 0.28478 → 0.31547 (+0.03069, +10.8%)\n    Recall@5: 0.54486 → 0.60288 (+0.05802, +10.6%)\n    Recall@10: 0.62979 → 0.69296 (+0.06317, +10.0%)\n    Recall@100: 0.81421 → 0.87020 (+0.05599, +6.9%)"
+    },
+    {
+      "id": "c0009",
+      "source": "nemotron embed export -c default"
+    },
+    {
+      "id": "c0010",
+      "source": "# ONNX only (runs anywhere)\nnemotron embed export -c default export_to_trt=false\n\n# FP8 quantization for further speedup\nnemotron embed export -c default quant_cfg=fp8"
+    },
+    {
+      "id": "c0011",
+      "source": "nemotron embed deploy -c default"
+    },
+    {
+      "id": "c0012",
+      "source": "curl -X POST http://localhost:8000/v1/embeddings \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"input\": [\"What cooling is needed for 8 H100 GPUs in a 2U chassis?\"],\n       \"model\": \"custom\",\n       \"input_type\": \"query\"}'"
+    },
+    {
+      "id": "c0013",
+      "source": "nemotron embed eval -c default eval_nim=true eval_base=false"
+    },
+    {
+      "id": "c0014",
+      "source": "# 1. Generate synthetic training data from your documents\nnemotron embed sdg -c default corpus_dir=./data/my_docs\n\n# 2. Prepare the training data (split data, mine hard negatives, unroll)\nnemotron embed prep -c default\n\n# 3. Fine-tune the embedding model\nnemotron embed finetune -c default\n\n# 4. Evaluate the base vs. fine-tuned model\nnemotron embed eval -c default\n\n# 5. Export the optimized model\nnemotron embed export -c default\n\n# 6. Deploy the model\nnemotron embed deploy -c default"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "17237a3dc78a092f0be0ecf4858e00701906a8d6acef34f6bdb2c32c4f29bee8",
+  "mediaLayout": [
+    {
+      "mediaId": "image_e7e37cdfa51e4874",
+      "type": "image",
+      "afterBlockId": "b0024",
+      "order": 0
+    },
+    {
+      "mediaId": "image_55c07e7e0a73784f",
+      "type": "image",
+      "afterBlockId": "b0058",
+      "order": 1
+    },
+    {
+      "mediaId": "image_5c7eb27eb200fd51",
+      "type": "image",
+      "afterBlockId": "b0101",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:15.615997Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:15.616095Z"
 }

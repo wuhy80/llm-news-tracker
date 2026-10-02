@@ -48,6 +48,10 @@ class Document(HTMLParser):
 def safe_url(value, base=''):
     url = urljoin(base, html.unescape(value or '').strip())
     p = urlparse(url)
+    if (p.hostname or '').endswith(('feishu.cn', 'larksuite.com')) and (p.hostname or '').startswith('internal-api-'):
+        return ''
+    if any(key.lower() in {'access_token', 'auth_token', 'authorization', 'password', 'secret', 'x-amz-credential', 'x-amz-signature', 'x-goog-signature'} for key in parse_qs(p.query)):
+        return ''
     return url if p.scheme in {'http', 'https'} and p.hostname and not p.username and not p.password else ''
 
 
@@ -92,6 +96,9 @@ def media_roots(value, base_url=''):
     parser = Document()
     parser.feed(value or '')
     nodes = list(walk(parser.root))
+    from huggingface_content import is_huggingface_blog, content_root
+    if is_huggingface_blog(base_url):
+        return [content_root(parser.root)], nodes
     explicit = [n for n in nodes if BODY_CLASSES.intersection((n.attrs.get('class') or '').split()) or n.attrs.get('itemprop') == 'articleBody']
     articles = [n for n in nodes if n.tag == 'article']
     mains = [n for n in nodes if n.tag == 'main' or n.attrs.get('role') == 'main']

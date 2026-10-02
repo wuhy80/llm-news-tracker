@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/build-rocm-kernels",
   "resolvedUrl": "https://huggingface.co/blog/build-rocm-kernels",
   "fetchedAt": "2026-08-26T02:08:23.166743Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "## Intoduction\n\nCustom kernels are the backbone of high-performance deep learning, enabling GPU operations tailored precisely to your workload; whether that’s image processing, tensor transformations, or other compute-heavy tasks. But compiling these kernels for the right architectures, wiring all the build flags, and integrating them cleanly into PyTorch extensions can quickly become a mess of CMake/Nix, compiler errors, and ABI issues, which is not fun. Hugging Face’s kernels library makes it easy to build (with kernel-builder) and share these kernels with the kernels-community, with support for multiple GPU and accelerator backends, including CUDA, ROCm, Metal, and XPU. This ensures your kernels are fast, portable, and seamlessly integrated with PyTorch.\n\nIn this guide, we focus exclusively on ROCm-compatible kernels and show how to build, test, and share them using kernels. You’ll learn how to create kernels that run efficiently on AMD GPUs, along with best practices for reproducibility, packaging, and deployment.\n\nThis ROCm-specific walkthrough is a streamlined version of the original kernel-builder guide. If you’re looking for the broader CUDA-focused version, you can find it here: A Guide to Building and Scaling Production-Ready CUDA Kernels.\n\n## Build Steps\n\nWe will use the GEMM kernel from RadeonFlow_Kernels as an example. If you want to go straight to the guide, click here.\n\n### About the kernel\n\nThis section was written by the RadeonFlow GEMM kernel authors to introduce the kernel. Authors: ColorsWind, Zesen Liu, and Andy\n\nThe RadeonFlow GEMM kernel is a high-performance, FP8 block-wise matrix multiplication implementation optimized for the AMD Instinct MI300X GPU. GEMM (General Matrix Multiplication) is the core building block behind most deep learning workloads: given two matrices A and B, you compute their product C = A × B. Here it’s implemented in FP8, a low-precision floating-point format that trades a bit of accuracy for much higher throughput and lower memory bandwidth. This kernel was developed for the AMD Developer Challenge 2025, it was awarded the 🏆 Grand Prize in June 2025, recognizing its excellence in performance and innovation on AMD hardware.\n\nThe kernel operates on quantized inputs using the e4m3fnuz floating-point format and applies per-block scaling to preserve accuracy during low-precision computation. The e4m3fnuz format is an FP8 variant with 4 exponent bits and 3 mantissa bits, designed to be efficient for neural network workloads. Because FP8 has a much smaller dynamic range than FP16/FP32, we apply per-block scaling factors (a_scale and b_scale) so that each block of values is rescaled into a numerically “comfortable” range before and after computation, which helps preserve accuracy despite the low precision. It takes the following arguments:\n\n```\n(a, b, a_scale, b_scale, c)\n```\n\nwhere a and b are the input matrices, a_scale and b_scale are the scaling factors for a and b respectively, and c is the output matrix:\n\n- a is K × M in e4m3fnuz\n\n- b is K × N in e4m3fnuz\n\n- a_scale is (K // 128) × M in fp32\n\n- b_scale is (K // 128) × (N // 128) in fp32\n\n- c is M × N in bf16\n\nThe kernel is precompiled for specific matrix shapes and assumes a transposed memory layout (as required by the competition). To support additional shapes or alternative memory layouts, you must modify the kernel launcher.\n\nSo now that we have a high-performance ROCm kernel, the natural question is: how do we integrate it into a real PyTorch workflow and share it with others? That’s exactly what we’ll cover next, using kernels to structure, build, and publish the ROCm kernel.\n\nThis is a fairly technical guide, but you can still follow it step by step without understanding every detail and everything will work fine. If you’re curious, you can always come back later to dig deeper into the concepts.\n\n### Step 1: Project Structure\n\nThe Hugging Face Kernel Builder expects your files to be organized like this:\n\n```\ngemm/\n├── build.toml\n├── gemm\n│   └── gemm_kernel.h\n├── flake.nix\n└── torch-ext\n    ├── torch_binding.cpp\n    ├── torch_binding.h\n    └── gemm\n        └── __init__.py\n```\n\n- build.toml: The project manifest; it’s the brain of the build process.\n\n- gemm/: Your raw CUDA source code where the GPU magic happens.\n\n- flake.nix: The key to a perfectly reproducible build environment.\n\n- torch-ext/gemm/: The Python wrapper for the raw PyTorch operators\n\nSometimes your project might depend on other files, like tests or helper scripts, and you can add them without any issues. In our case, our project will be structured like this:\n\n```\ngemm/\n├── build.toml\n├── gemm\n│   ├── gemm_kernel.h\n│   ├── gemm_kernel_legacy.h\n│   ├── transpose_kernel.h\n│   └── gemm_launcher.hip\n├── include\n│   ├── clangd_workaround.h\n│   ├── gpu_libs.h\n│   ├── gpu_types.h\n│   └── timer.h\n├── src/utils\n│   ├── arithmetic.h\n│   └── timer.hip\n├── tests/checker\n│   ├── checker.cpp\n│   ├── metrics.h\n│   └── checker.h\n├── flake.nix\n└── torch-ext\n    ├── torch_binding.cpp\n    ├── torch_binding.h\n    └── gemm\n        └── __init__.py\n```\n\nIf you look at the original files of the gemm kernel in the RadeonFlow Kernels, they are HIP source files with .cpp extensions. As a first step, you need to change these extensions to either .h or .hip depending on their content and usage:\n\n- Use .h for header files containing kernel declarations, inline functions, or template code that will be included in other files\n\n- Use .hip for implementation files containing HIP/GPU code that needs to be compiled separately (e.g., kernel launchers, device functions with complex implementations)\n\nIn our example, gemm_kernel.h, gemm_kernel_legacy.h, and transpose_kernel.h are header files, while gemm_launcher.hip is a HIP implementation file. This naming convention helps the kernel-builder (kernels/builder) correctly identify and compile each file type.\n\n### Step 2: Configuration Files Setup\n\n#### The build.toml Manifest\n\nThis file orchestrates the entire build. It tells the kernel-builder what to compile and how everything connects.\n\n```\n[general]\nname = \"gemm\"\nuniversal = false\n\n[torch]\nsrc = [\n  \"torch-ext/torch_binding.cpp\",\n  \"torch-ext/torch_binding.h\",\n]\n\n[kernel.gemm]\nbackend = \"rocm\"\nrocm-archs = [\n    \"gfx942\",\n]\n\ndepends = [\"torch\"]\n\nsrc = [\n  \"include/clangd_workaround.h\",\n  \"include/gpu_libs.h\",\n  \"include/gpu_types.h\",\n  \"include/timer.h\",\n  \"gemm/gemm_kernel.h\",\n  \"gemm/gemm_kernel_legacy.h\",\n  \"gemm/gemm_launcher.hip\",\n  \"gemm/transpose_kernel.h\",\n  \"src/utils/arithmetic.h\",\n  \"src/utils/timer.hip\",\n  \"tests/checker/metrics.h\",\n]\n\ninclude = [\"include\"]\n```\n\ngeneral\n\nThis section contains general project configuration settings.\n\n- name (required): The name of your project. This should match your kernel name and will be used for the Python package.\n\n- universal (optional): the kernel is a universal kernel when set to true. A universal kernel is a pure Python package (no compiled files). Universal kernels do not use the other sections described below. A good example of a universal kernel is a Triton kernel. Default: false\n\ntorch\n\nThis section describes the Torch extension configuration. It defines the Python bindings that will expose your kernel to PyTorch.\n\n- src (required): A list of source files and headers for the PyTorch extension. In our case, this includes the C++ binding files that create the Python interface.\n\nkernel.gemm\n\nSpecification of a kernel named \"gemm\". You can define multiple kernel sections in the same build.toml file if you have multiple kernels.\n\n- backend (required): The compute backend for the kernel. We use \"rocm\" for AMD GPU support.\n\n- rocm-archs (required for ROCm): A list of ROCm architectures that the kernel should be compiled for. \"gfx942\" targets the MI300 series GPUs.\n\n- depends (required): A list of dependencies. We depend on \"torch\" to use PyTorch's tensor operations.\n\n- include (optional): Include directories relative to the project root. This helps the compiler find header files.\n\n#### The flake.nix Reproducibility File\n\nTo ensure anyone can build your kernel on any machine, we use a flake.nix file. It locks the exact version of the kernel-builder and its dependencies. (You can just copy and paste this example and change the description)\n\n```\n{\n  description = \"Flake for GEMM kernel\";\n\n  inputs = {\n    kernel-builder.url = \"github:huggingface/kernels\";\n  };\n\n  outputs =\n    {\n      self,\n      kernel-builder,\n    }:\n\n    kernel-builder.lib.genFlakeOutputs {\n      inherit self;\n      path = ./.;\n    };\n}\n```\n\n#### Writing the Kernel\n\nNow for the GPU code. Inside gemm/gemm_launcher.hip, we define how the GEMM kernel is launched. Depending on the configuration, we either call the new optimized gemm/gemm_kernel or fall back to the legacy implementation (gemm/gemm_kernel_legacy).\n\n```\n// ... previous includes and definitions\nextern \"C\" void run(\n    void *a, void *b, void *as, void *bs, void *c,\n    int m, int n, int k,\n    PerfMetrics *metrics, hipStream_t job_stream0\n) {\n    const __FP8_TYPE *a_ptr = static_cast<const __FP8_TYPE *>(a);\n    const __FP8_TYPE *b_ptr = static_cast<const __FP8_TYPE *>(b);\n    __BF16_TYPE *c_ptr = static_cast<__BF16_TYPE *>(c);\n    const float *as_ptr = static_cast<const float *>(as);\n    const float *bs_ptr = static_cast<const float *>(bs);\n\n    KernelTimerScoped timer(timers, 2LL * m * n * k,\n        metrics ? &metrics->entries[0].time : nullptr,\n        metrics ? &metrics->entries[0].gflops : nullptr, job_stream0);\n\n    // Dispatch GEMM to the fastest available implementation\n    switch (pack_shape(m, n, k)) {\n        DISPATCH_GEMM(1024, 1536, 7168, 256, 128, 128, 4, 2, 512, 4, 16);\n        DISPATCH_GEMM(6144, 7168, 2304, 256, 128, 128, 4, 2, 512, 1, 16);\n        default: {\n            printf(\"Error: Unsupported shape M=%d, K=%d, N=%d\\n\", m, k, n);\n            abort();\n        }\n    }\n}\n// ...\n```\n\n#### Registering a Native PyTorch Operator\n\nThis step is key. We’re not just making the function available in Python; we’re turning it into a native PyTorch operator. That means it becomes a first-class part of PyTorch itself, accessible through torch.ops.\n\nThe file torch-ext/torch_binding.cpp handles this registration.\n\n```\n#include <torch/all.h>\n#include <torch/library.h>\n#include <hip/hip_runtime.h>\n\n#include \"registration.h\"\n#include \"torch_binding.h\"\n\n// Forward declaration of the C function from gemm_launcher.hip\nextern \"C\" {\n    struct PerfMetrics;\n    void run(void *a, void *b, void *as, void *bs, void *c, int m, int n, int k, PerfMetrics *metrics, hipStream_t job_stream0);\n}\n\nvoid gemm(torch::Tensor &out, torch::Tensor const &a, torch::Tensor const &b, \n          torch::Tensor const &as, torch::Tensor const &bs) {\n    \n    // Validate tensor properties\n    TORCH_CHECK(a.device().is_cuda(), \"Input tensor a must be on GPU device\");\n    TORCH_CHECK(b.device().is_cuda(), \"Input tensor b must be on GPU device\");\n    TORCH_CHECK(as.device().is_cuda(), \"Scale tensor as must be on GPU device\");\n    TORCH_CHECK(bs.device().is_cuda(), \"Scale tensor bs must be on GPU device\");\n    TORCH_CHECK(out.device().is_cuda(), \"Output tensor out must be on GPU device\");\n    \n    TORCH_CHECK(a.is_contiguous(), \"Input tensor a must be contiguous\");\n    TORCH_CHECK(b.is_contiguous(), \"Input tensor b must be contiguous\");\n    TORCH_CHECK(as.is_contiguous(), \"Scale tensor as must be contiguous\");\n    TORCH_CHECK(bs.is_contiguous(), \"Scale tensor bs must be contiguous\");\n    TORCH_CHECK(out.is_contiguous(), \"Output tensor out must be contiguous\");\n    \n    // Get matrix dimensions from tensor shapes\n    // Assuming a is [M, K], b is [K, N], out is [M, N]\n    int M = a.size(0);\n    int K = a.size(1);\n    int N = b.size(1);\n    \n    TORCH_CHECK(b.size(0) == K, \"Matrix dimensions mismatch: a.size(1) != b.size(0)\");\n    TORCH_CHECK(out.size(0) == M, \"Output tensor dimension mismatch: out.size(0) != M\");\n    TORCH_CHECK(out.size(1) == N, \"Output tensor dimension mismatch: out.size(1) != N\");\n    \n    // Use default HIP stream (stream 0)\n    const hipStream_t stream = 0;\n    \n    // Call the C function\n    run(a.data_ptr(), b.data_ptr(), as.data_ptr(), bs.data_ptr(), out.data_ptr(),\n        M, N, K, nullptr, stream);\n}\n\nTORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {\n  ops.def(\"gemm(Tensor! out, Tensor a, Tensor b, Tensor a_scale, Tensor b_scale) -> ()\");\n  ops.impl(\"gemm\", torch::kCUDA, &gemm);\n}\n\nREGISTER_EXTENSION(TORCH_EXTENSION_NAME)\n```\n\nThe torch_binding.h file contains function declarations. For instance, the gemm kernel has the following declaration in torch_binding.h:\n\n```\n#pragma once\n\n#include <torch/torch.h>\n\nvoid gemm(torch::Tensor &out, torch::Tensor const &a, torch::Tensor const &b, \n          torch::Tensor const &as, torch::Tensor const &bs);\n```\n\n#### Setting up the __init__.py wrapper\n\nIn torch-ext/gemm/ we need an __init__.py file to make this directory a Python package and to expose our custom operator in a user-friendly way.\n\n```\nfrom typing import Optional\nimport torch\nfrom ._ops import ops\n\ndef gemm(a: torch.Tensor, b: torch.Tensor, as_: torch.Tensor, bs: torch.Tensor, \n         out: Optional[torch.Tensor] = None) -> torch.Tensor:\n         \n    if out is None:\n        # Create output tensor with appropriate shape and dtype\n        M, K = a.shape\n        K_b, N = b.shape\n        assert K == K_b, f\"Matrix dimension mismatch: A has {K} cols, B has {K_b} rows\"\n        \n        # Output should be BF16 type on the same device as inputs\n        out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)\n    \n    ops.gemm(out, a, b, as_, bs)\n    return out\n```\n\n### Step 3: Building the Kernel\n\nThe kernel builder uses Nix for building kernels. You can build or run the kernels directly if you have Nix installed on your system. We recommend installing Nix in the following way:\n\n- Linux: use the official Nix installer.\n\n- macOS: use the Determinate Nix installer. In addition, Xcode 16.x is currently required to build kernels.\n\n#### Getting Started with Nix\n\nFirst of all, run this:\n\n```\nnix flake update\n```\n\nThis generates a flake.lock file that pins the kernel builder and all its transitive dependencies. Commit both flake.nix and flake.lock to your repository to ensure that kernel builds are reproducible.\n\nSince the kernel builder depends on many packages (e.g., every supported PyTorch version), it is recommended to enable the Hugging Face cache to avoid expensive rebuilds:\n\n```\n# Install cachix and configure the cache\ncachix use huggingface\n```\n\nOr run it once without installing cachix permanently:\n\n```\n# Use cachix without installing it\nnix run nixpkgs#cachix -- use huggingface\n```\n\n#### Building Kernels with Nix\n\nA kernel that has a flake.nix file can be built with the build-and-copy command:\n\n```\ncd Build_RadeonFlow_Kernels/gemm\nnix build . -L\n```\n\nThe compiled kernel will then be in the local build/ directory.\n\n#### Development Shell for Local Development\n\nThe kernel-builder provides shells for developing kernels. In such a shell, all required dependencies are available, as well as build2cmake for generating project files:\n\n```\n$ nix develop\n$ build2cmake generate-torch build.toml\n$ cmake -B build-ext\n$ cmake --build build-ext\n```\n\nIf you want to test the kernel as a Python package, you can do so. nix develop will automatically create a virtual environment in .venv and activate it:\n\n```\n$ nix develop\n$ build2cmake generate-torch build.toml\n$ pip install --no-build-isolation -e .\n```\n\nDevelopment shells are available for every build configuration. For instance, you can get a Torch 2.7 development shell with ROCm 6.3 using:\n\n```\n$ rm -rf .venv  # Remove existing venv if any\n$ nix develop .#devShells.torch27-cxx11-rocm63-x86_64-linux\n```\n\n### Step 4: Uploading the kernel to the Hub\n\nNow that we built our kernel, we can test it and upload it to the Hub.\n\n#### Building the Kernel for All PyTorch and ROCm Versions\n\nOne small thing we'll want to do before we share is clean up all of the development artifacts that were generated during the build process to avoid uploading unnecessary files.\n\n```\nbuild2cmake clean build.toml \n```\n\nTo build the kernel for all supported versions of PyTorch and ROCm, the kernel-builder tool automates the process:\n\n```\n# Outside of the dev shell, run the following command\n# if you are inside of the sandbox you can leave with `exit`\nnix build . -L\n```\n\nNote: This process may take a while, as it will build the kernel for all supported versions of PyTorch and ROCm. The output will be in the result directory.\n\nThe last step is to move the results into the expected build directory (this is where the kernels library will look for them).\n\n```\nmkdir -p build\nrsync -av --delete --chmod=Du+w,Fu+w result/ build/\n```\n\n#### Pushing to the Hugging Face Hub\n\nPushing the build artifacts to the Hub will make it straightforward for other developers to use your kernel. We can use the kernels upload command for this:\n\n```\nkernels upload <path_to_kernel> --repo_id hub-username/img2gray\n```\n\nYou can also follow a standard git-based process for the upload. First, create a new repo: hf repo create gemm Make sure you are logged in to the Hugging Face Hub using huggingface-cli login. Now, in your project directory, connect your project to the new repository and push your code: # Initialize git and connect to the Hugging Face Hub git init git remote add origin https://huggingface.co/<your-username>/gemm # Pull the changes (just the default .gitattributes file) git pull origin main git xet install git checkout -b main # Update to use Xet for the binary files git xet track \"*.so\" # Add and commit your changes (being careful to only include the necessary files # since our build2cmake command generated a lot of dev-specific files) git add \\ build/ gemm/ include/ src/utils tests/checker \\ torch-ext/torch_binding.cpp torch-ext/torch_binding.h torch-ext/gemm \\ flake.nix flake.lock build.toml git commit -m \"feat: Created a compliant gemm kernel\" git push -u origin main\n\nFantastic! Your kernel is now on the Hugging Face Hub, ready for others to use and fully compliant with the kernels library.\n\n### Step 5: Let's use it :)\n\nWith the kernels library, you don't \"install\" the kernel in the traditional sense. You load it directly from its Hub repository, which automatically registers the new operator.\n\n```\nimport torch\nfrom kernels import get_kernel\n\n# Load the kernel from the Hub\ngemm = get_kernel(\"kernels-community/gemm\")\n\n# Matrix dimensions (must be supported - see gemm_launcher.cpp)\nM, N, K = 1024, 1536, 7168\nQUANT_SIZE = 128\n\n# Setup device\ndevice = torch.device(\"cuda\")\n\n# Create inputs - kernel expects A:(K,M), B:(K,N)\nA_fp32 = torch.randn(M, K, device=device)\nB_fp32 = torch.randn(K, N, device=device)\n\n# Convert to FP8\nA_fp8 = A_fp32.to(torch.float8_e4m3fnuz)\nB_fp8 = B_fp32.to(torch.float8_e4m3fnuz)\n\n# Create scale factors (uniform scaling)\nA_scale = torch.ones(K // QUANT_SIZE, M, device=device, dtype=torch.float32)\nB_scale = torch.ones(K // QUANT_SIZE, N // QUANT_SIZE, device=device, dtype=torch.float32)\n\nC = torch.zeros(M, N, device=device, dtype=torch.bfloat16)\n\n# Use the kernel\nresult = gemm.gemm(A_fp8, B_fp8, A_scale, B_scale, C)\n```\n\nThat's it! Your ROCm kernel is now ready to use from the Hugging Face Hub.\n\n## Conclusion\n\nBuilding and sharing ROCm kernels with the Hugging Face is now easier than ever. With a clean, reproducible workflow powered by Nix and seamless integration into PyTorch, developers can focus on optimizing performance rather than setup. Once built, your custom kernel can be shared on the Hugging Face Hub; making it instantly accessible to the community and usable across projects with just a few lines of code. 🚀\n\n## Related Libraries & Hub\n\n- kernels – Library to build, manage and load kernels from the Hub. It contains the kernel-builder tooling.\n\n- Kernels Community Hub – Share and discover kernels from the community.",
   "summaryZh": "关于在Hugging Face上构建和共享ROCm内核的简短动态，缺乏详细信息。",
   "summaryGeneratedAt": "2026-09-01T06:45:27.436276Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -51,5 +50,1118 @@
     "summaryZh": "关于在Hugging Face上构建和共享ROCm内核的简短动态，缺乏详细信息。",
     "glossary": [],
     "duplicateKey": "huggingface-rocm-kernels"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/build-rocm-kernels/thumbnail.png",
+      "originalUrl": "https://huggingface.co/blog/assets/build-rocm-kernels/thumbnail.png",
+      "alt": "Easily Build and Share ROCm Kernels with Hugging Face",
+      "id": "image_4424108b595217d0"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Intoduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Custom kernels are the backbone of high-performance deep learning, enabling GPU operations tailored precisely to your workload; whether that’s image processing, tensor transformations, or other compute-heavy tasks. But compiling these kernels for the right architectures, wiring all the build flags, and integrating them cleanly into PyTorch extensions can quickly become a mess of CMake/Nix, compiler errors, and ABI issues, which is not fun. Hugging Face’s kernels library makes it easy to build (with kernel-builder) and share these kernels with the kernels-community, with support for multiple GPU and accelerator backends, including CUDA, ROCm, Metal, and XPU. This ensures your kernels are fast, portable, and seamlessly integrated with PyTorch.",
+      "spans": [
+        {
+          "start": 459,
+          "end": 466,
+          "kind": "strong"
+        },
+        {
+          "start": 459,
+          "end": 466,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels"
+        },
+        {
+          "start": 504,
+          "end": 518,
+          "kind": "strong"
+        },
+        {
+          "start": 504,
+          "end": 518,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels/tree/main/kernel-builder"
+        },
+        {
+          "start": 553,
+          "end": 570,
+          "kind": "strong"
+        },
+        {
+          "start": 553,
+          "end": 570,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels-community"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "In this guide, we focus exclusively on ROCm-compatible kernels and show how to build, test, and share them using kernels. You’ll learn how to create kernels that run efficiently on AMD GPUs, along with best practices for reproducibility, packaging, and deployment.",
+      "spans": [
+        {
+          "start": 113,
+          "end": 120,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels/tree/main"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This ROCm-specific walkthrough is a streamlined version of the original kernel-builder guide. If you’re looking for the broader CUDA-focused version, you can find it here: A Guide to Building and Scaling Production-Ready CUDA Kernels.",
+      "spans": [
+        {
+          "start": 172,
+          "end": 233,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/kernel-builder"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Build Steps",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "We will use the GEMM kernel from RadeonFlow_Kernels as an example. If you want to go straight to the guide, click here.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 51,
+          "kind": "a",
+          "href": "https://github.com/RadeonFlow/RadeonFlow_Kernels"
+        },
+        {
+          "start": 108,
+          "end": 118,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/build-rocm-kernels#step-1-project-structure"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "About the kernel",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "This section was written by the RadeonFlow GEMM kernel authors to introduce the kernel. Authors: ColorsWind, Zesen Liu, and Andy",
+      "spans": [
+        {
+          "start": 32,
+          "end": 47,
+          "kind": "strong"
+        },
+        {
+          "start": 97,
+          "end": 107,
+          "kind": "a",
+          "href": "https://huggingface.co/ColorsWind"
+        },
+        {
+          "start": 109,
+          "end": 118,
+          "kind": "a",
+          "href": "https://huggingface.co/ftyghome"
+        },
+        {
+          "start": 124,
+          "end": 128,
+          "kind": "a",
+          "href": "https://huggingface.co/jpy794"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "The RadeonFlow GEMM kernel is a high-performance, FP8 block-wise matrix multiplication implementation optimized for the AMD Instinct MI300X GPU. GEMM (General Matrix Multiplication) is the core building block behind most deep learning workloads: given two matrices A and B, you compute their product C = A × B. Here it’s implemented in FP8, a low-precision floating-point format that trades a bit of accuracy for much higher throughput and lower memory bandwidth. This kernel was developed for the AMD Developer Challenge 2025, it was awarded the 🏆 Grand Prize in June 2025, recognizing its excellence in performance and innovation on AMD hardware.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 498,
+          "end": 526,
+          "kind": "a",
+          "href": "https://www.datamonsters.com/amd-developer-challenge-2025"
+        },
+        {
+          "start": 549,
+          "end": 560,
+          "kind": "strong"
+        },
+        {
+          "start": 564,
+          "end": 573,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "The kernel operates on quantized inputs using the e4m3fnuz floating-point format and applies per-block scaling to preserve accuracy during low-precision computation. The e4m3fnuz format is an FP8 variant with 4 exponent bits and 3 mantissa bits, designed to be efficient for neural network workloads. Because FP8 has a much smaller dynamic range than FP16/FP32, we apply per-block scaling factors (a_scale and b_scale) so that each block of values is rescaled into a numerically “comfortable” range before and after computation, which helps preserve accuracy despite the low precision. It takes the following arguments:",
+      "spans": [
+        {
+          "start": 50,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 178,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "where a and b are the input matrices, a_scale and b_scale are the scaling factors for a and b respectively, and c is the output matrix:",
+      "spans": [
+        {
+          "start": 6,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 12,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 50,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 87,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 113,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "a is K × M in e4m3fnuz",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "b is K × N in e4m3fnuz",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "a_scale is (K // 128) × M in fp32",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "b_scale is (K // 128) × (N // 128) in fp32",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "c is M × N in bf16",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "The kernel is precompiled for specific matrix shapes and assumes a transposed memory layout (as required by the competition). To support additional shapes or alternative memory layouts, you must modify the kernel launcher.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "So now that we have a high-performance ROCm kernel, the natural question is: how do we integrate it into a real PyTorch workflow and share it with others? That’s exactly what we’ll cover next, using kernels to structure, build, and publish the ROCm kernel.",
+      "spans": [
+        {
+          "start": 199,
+          "end": 206,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "This is a fairly technical guide, but you can still follow it step by step without understanding every detail and everything will work fine. If you’re curious, you can always come back later to dig deeper into the concepts.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Step 1: Project Structure",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "The Hugging Face Kernel Builder expects your files to be organized like this:",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "build.toml: The project manifest; it’s the brain of the build process.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "gemm/: Your raw CUDA source code where the GPU magic happens.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "flake.nix: The key to a perfectly reproducible build environment.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "torch-ext/gemm/: The Python wrapper for the raw PyTorch operators",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Sometimes your project might depend on other files, like tests or helper scripts, and you can add them without any issues. In our case, our project will be structured like this:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "If you look at the original files of the gemm kernel in the RadeonFlow Kernels, they are HIP source files with .cpp extensions. As a first step, you need to change these extensions to either .h or .hip depending on their content and usage:",
+      "spans": [
+        {
+          "start": 111,
+          "end": 115,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Use .h for header files containing kernel declarations, inline functions, or template code that will be included in other files",
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Use .hip for implementation files containing HIP/GPU code that needs to be compiled separately (e.g., kernel launchers, device functions with complex implementations)",
+      "spans": [
+        {
+          "start": 4,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "In our example, gemm_kernel.h, gemm_kernel_legacy.h, and transpose_kernel.h are header files, while gemm_launcher.hip is a HIP implementation file. This naming convention helps the kernel-builder (kernels/builder) correctly identify and compile each file type.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 31,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 75,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 117,
+          "kind": "code"
+        },
+        {
+          "start": 197,
+          "end": 212,
+          "kind": "code"
+        },
+        {
+          "start": 197,
+          "end": 212,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels/tree/main/kernel-builder"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Step 2: Configuration Files Setup",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "The build.toml Manifest",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "This file orchestrates the entire build. It tells the kernel-builder what to compile and how everything connects.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "general",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "This section contains general project configuration settings.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "name (required): The name of your project. This should match your kernel name and will be used for the Python package.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "universal (optional): the kernel is a universal kernel when set to true. A universal kernel is a pure Python package (no compiled files). Universal kernels do not use the other sections described below. A good example of a universal kernel is a Triton kernel. Default: false",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 67,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 269,
+          "end": 274,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "torch",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "This section describes the Torch extension configuration. It defines the Python bindings that will expose your kernel to PyTorch.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "src (required): A list of source files and headers for the PyTorch extension. In our case, this includes the C++ binding files that create the Python interface.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "kernel.gemm",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Specification of a kernel named \"gemm\". You can define multiple kernel sections in the same build.toml file if you have multiple kernels.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "backend (required): The compute backend for the kernel. We use \"rocm\" for AMD GPU support.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "rocm-archs (required for ROCm): A list of ROCm architectures that the kernel should be compiled for. \"gfx942\" targets the MI300 series GPUs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "depends (required): A list of dependencies. We depend on \"torch\" to use PyTorch's tensor operations.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "include (optional): Include directories relative to the project root. This helps the compiler find header files.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "The flake.nix Reproducibility File",
+      "spans": [
+        {
+          "start": 4,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "To ensure anyone can build your kernel on any machine, we use a flake.nix file. It locks the exact version of the kernel-builder and its dependencies. (You can just copy and paste this example and change the description)",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Writing the Kernel",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Now for the GPU code. Inside gemm/gemm_launcher.hip, we define how the GEMM kernel is launched. Depending on the configuration, we either call the new optimized gemm/gemm_kernel or fall back to the legacy implementation (gemm/gemm_kernel_legacy).",
+      "spans": [
+        {
+          "start": 29,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 177,
+          "kind": "code"
+        },
+        {
+          "start": 221,
+          "end": 244,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Registering a Native PyTorch Operator",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "This step is key. We’re not just making the function available in Python; we’re turning it into a native PyTorch operator. That means it becomes a first-class part of PyTorch itself, accessible through torch.ops.",
+      "spans": [
+        {
+          "start": 202,
+          "end": 211,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "The file torch-ext/torch_binding.cpp handles this registration.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 36,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The torch_binding.h file contains function declarations. For instance, the gemm kernel has the following declaration in torch_binding.h:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 120,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Setting up the __init__.py wrapper",
+      "spans": [
+        {
+          "start": 15,
+          "end": 26,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "In torch-ext/gemm/ we need an __init__.py file to make this directory a Python package and to expose our custom operator in a user-friendly way.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 18,
+          "kind": "code"
+        },
+        {
+          "start": 30,
+          "end": 41,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Step 3: Building the Kernel",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "The kernel builder uses Nix for building kernels. You can build or run the kernels directly if you have Nix installed on your system. We recommend installing Nix in the following way:",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Linux: use the official Nix installer.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 15,
+          "end": 37,
+          "kind": "a",
+          "href": "https://nixos.org/download/"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "macOS: use the Determinate Nix installer. In addition, Xcode 16.x is currently required to build kernels.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 15,
+          "end": 40,
+          "kind": "a",
+          "href": "https://docs.determinate.systems/determinate-nix/"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Getting Started with Nix",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "First of all, run this:",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "This generates a flake.lock file that pins the kernel builder and all its transitive dependencies. Commit both flake.nix and flake.lock to your repository to ensure that kernel builds are reproducible.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Since the kernel builder depends on many packages (e.g., every supported PyTorch version), it is recommended to enable the Hugging Face cache to avoid expensive rebuilds:",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Or run it once without installing cachix permanently:",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "Building Kernels with Nix",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "A kernel that has a flake.nix file can be built with the build-and-copy command:",
+      "spans": [
+        {
+          "start": 20,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "The compiled kernel will then be in the local build/ directory.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Development Shell for Local Development",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "The kernel-builder provides shells for developing kernels. In such a shell, all required dependencies are available, as well as build2cmake for generating project files:",
+      "spans": [
+        {
+          "start": 128,
+          "end": 139,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "If you want to test the kernel as a Python package, you can do so. nix develop will automatically create a virtual environment in .venv and activate it:",
+      "spans": [
+        {
+          "start": 67,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Development shells are available for every build configuration. For instance, you can get a Torch 2.7 development shell with ROCm 6.3 using:",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "Step 4: Uploading the kernel to the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "Now that we built our kernel, we can test it and upload it to the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Building the Kernel for All PyTorch and ROCm Versions",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "One small thing we'll want to do before we share is clean up all of the development artifacts that were generated during the build process to avoid uploading unnecessary files.",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "To build the kernel for all supported versions of PyTorch and ROCm, the kernel-builder tool automates the process:",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Note: This process may take a while, as it will build the kernel for all supported versions of PyTorch and ROCm. The output will be in the result directory.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 139,
+          "end": 145,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "The last step is to move the results into the expected build directory (this is where the kernels library will look for them).",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "Pushing to the Hugging Face Hub",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "Pushing the build artifacts to the Hub will make it straightforward for other developers to use your kernel. We can use the kernels upload command for this:",
+      "spans": [
+        {
+          "start": 124,
+          "end": 138,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "You can also follow a standard git-based process for the upload. First, create a new repo: hf repo create gemm Make sure you are logged in to the Hugging Face Hub using huggingface-cli login. Now, in your project directory, connect your project to the new repository and push your code: # Initialize git and connect to the Hugging Face Hub git init git remote add origin https://huggingface.co/<your-username>/gemm # Pull the changes (just the default .gitattributes file) git pull origin main git xet install git checkout -b main # Update to use Xet for the binary files git xet track \"*.so\" # Add and commit your changes (being careful to only include the necessary files # since our build2cmake command generated a lot of dev-specific files) git add \\ build/ gemm/ include/ src/utils tests/checker \\ torch-ext/torch_binding.cpp torch-ext/torch_binding.h torch-ext/gemm \\ flake.nix flake.lock build.toml git commit -m \"feat: Created a compliant gemm kernel\" git push -u origin main",
+      "spans": [
+        {
+          "start": 91,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 287,
+          "end": 983,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "Fantastic! Your kernel is now on the Hugging Face Hub, ready for others to use and fully compliant with the kernels library.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Step 5: Let's use it :)",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "With the kernels library, you don't \"install\" the kernel in the traditional sense. You load it directly from its Hub repository, which automatically registers the new operator.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "That's it! Your ROCm kernel is now ready to use from the Hugging Face Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Building and sharing ROCm kernels with the Hugging Face is now easier than ever. With a clean, reproducible workflow powered by Nix and seamless integration into PyTorch, developers can focus on optimizing performance rather than setup. Once built, your custom kernel can be shared on the Hugging Face Hub; making it instantly accessible to the community and usable across projects with just a few lines of code. 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Related Libraries & Hub",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "kernels – Library to build, manage and load kernels from the Hub. It contains the kernel-builder tooling.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels"
+        },
+        {
+          "start": 82,
+          "end": 96,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels/tree/main/kernel-builder"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "Kernels Community Hub – Share and discover kernels from the community.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels-community"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "8593d51934b7c7f170ed857cde135583caf23a629064874c1e2eb3bb85cab063",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "(a, b, a_scale, b_scale, c)"
+    },
+    {
+      "id": "c0002",
+      "source": "gemm/\n├── build.toml\n├── gemm\n│   └── gemm_kernel.h\n├── flake.nix\n└── torch-ext\n    ├── torch_binding.cpp\n    ├── torch_binding.h\n    └── gemm\n        └── __init__.py"
+    },
+    {
+      "id": "c0003",
+      "source": "gemm/\n├── build.toml\n├── gemm\n│   ├── gemm_kernel.h\n│   ├── gemm_kernel_legacy.h\n│   ├── transpose_kernel.h\n│   └── gemm_launcher.hip\n├── include\n│   ├── clangd_workaround.h\n│   ├── gpu_libs.h\n│   ├── gpu_types.h\n│   └── timer.h\n├── src/utils\n│   ├── arithmetic.h\n│   └── timer.hip\n├── tests/checker\n│   ├── checker.cpp\n│   ├── metrics.h\n│   └── checker.h\n├── flake.nix\n└── torch-ext\n    ├── torch_binding.cpp\n    ├── torch_binding.h\n    └── gemm\n        └── __init__.py"
+    },
+    {
+      "id": "c0004",
+      "source": "[general]\nname = \"gemm\"\nuniversal = false\n\n[torch]\nsrc = [\n  \"torch-ext/torch_binding.cpp\",\n  \"torch-ext/torch_binding.h\",\n]\n\n[kernel.gemm]\nbackend = \"rocm\"\nrocm-archs = [\n    \"gfx942\",\n]\n\ndepends = [\"torch\"]\n\nsrc = [\n  \"include/clangd_workaround.h\",\n  \"include/gpu_libs.h\",\n  \"include/gpu_types.h\",\n  \"include/timer.h\",\n  \"gemm/gemm_kernel.h\",\n  \"gemm/gemm_kernel_legacy.h\",\n  \"gemm/gemm_launcher.hip\",\n  \"gemm/transpose_kernel.h\",\n  \"src/utils/arithmetic.h\",\n  \"src/utils/timer.hip\",\n  \"tests/checker/metrics.h\",\n]\n\ninclude = [\"include\"]"
+    },
+    {
+      "id": "c0005",
+      "source": "{\n  description = \"Flake for GEMM kernel\";\n\n  inputs = {\n    kernel-builder.url = \"github:huggingface/kernels\";\n  };\n\n  outputs =\n    {\n      self,\n      kernel-builder,\n    }:\n\n    kernel-builder.lib.genFlakeOutputs {\n      inherit self;\n      path = ./.;\n    };\n}"
+    },
+    {
+      "id": "c0006",
+      "source": "// ... previous includes and definitions\nextern \"C\" void run(\n    void *a, void *b, void *as, void *bs, void *c,\n    int m, int n, int k,\n    PerfMetrics *metrics, hipStream_t job_stream0\n) {\n    const __FP8_TYPE *a_ptr = static_cast<const __FP8_TYPE *>(a);\n    const __FP8_TYPE *b_ptr = static_cast<const __FP8_TYPE *>(b);\n    __BF16_TYPE *c_ptr = static_cast<__BF16_TYPE *>(c);\n    const float *as_ptr = static_cast<const float *>(as);\n    const float *bs_ptr = static_cast<const float *>(bs);\n\n    KernelTimerScoped timer(timers, 2LL * m * n * k,\n        metrics ? &metrics->entries[0].time : nullptr,\n        metrics ? &metrics->entries[0].gflops : nullptr, job_stream0);\n\n    // Dispatch GEMM to the fastest available implementation\n    switch (pack_shape(m, n, k)) {\n        DISPATCH_GEMM(1024, 1536, 7168, 256, 128, 128, 4, 2, 512, 4, 16);\n        DISPATCH_GEMM(6144, 7168, 2304, 256, 128, 128, 4, 2, 512, 1, 16);\n        default: {\n            printf(\"Error: Unsupported shape M=%d, K=%d, N=%d\\n\", m, k, n);\n            abort();\n        }\n    }\n}\n// ..."
+    },
+    {
+      "id": "c0007",
+      "source": "#include <torch/all.h>\n#include <torch/library.h>\n#include <hip/hip_runtime.h>\n\n#include \"registration.h\"\n#include \"torch_binding.h\"\n\n// Forward declaration of the C function from gemm_launcher.hip\nextern \"C\" {\n    struct PerfMetrics;\n    void run(void *a, void *b, void *as, void *bs, void *c, int m, int n, int k, PerfMetrics *metrics, hipStream_t job_stream0);\n}\n\nvoid gemm(torch::Tensor &out, torch::Tensor const &a, torch::Tensor const &b, \n          torch::Tensor const &as, torch::Tensor const &bs) {\n    \n    // Validate tensor properties\n    TORCH_CHECK(a.device().is_cuda(), \"Input tensor a must be on GPU device\");\n    TORCH_CHECK(b.device().is_cuda(), \"Input tensor b must be on GPU device\");\n    TORCH_CHECK(as.device().is_cuda(), \"Scale tensor as must be on GPU device\");\n    TORCH_CHECK(bs.device().is_cuda(), \"Scale tensor bs must be on GPU device\");\n    TORCH_CHECK(out.device().is_cuda(), \"Output tensor out must be on GPU device\");\n    \n    TORCH_CHECK(a.is_contiguous(), \"Input tensor a must be contiguous\");\n    TORCH_CHECK(b.is_contiguous(), \"Input tensor b must be contiguous\");\n    TORCH_CHECK(as.is_contiguous(), \"Scale tensor as must be contiguous\");\n    TORCH_CHECK(bs.is_contiguous(), \"Scale tensor bs must be contiguous\");\n    TORCH_CHECK(out.is_contiguous(), \"Output tensor out must be contiguous\");\n    \n    // Get matrix dimensions from tensor shapes\n    // Assuming a is [M, K], b is [K, N], out is [M, N]\n    int M = a.size(0);\n    int K = a.size(1);\n    int N = b.size(1);\n    \n    TORCH_CHECK(b.size(0) == K, \"Matrix dimensions mismatch: a.size(1) != b.size(0)\");\n    TORCH_CHECK(out.size(0) == M, \"Output tensor dimension mismatch: out.size(0) != M\");\n    TORCH_CHECK(out.size(1) == N, \"Output tensor dimension mismatch: out.size(1) != N\");\n    \n    // Use default HIP stream (stream 0)\n    const hipStream_t stream = 0;\n    \n    // Call the C function\n    run(a.data_ptr(), b.data_ptr(), as.data_ptr(), bs.data_ptr(), out.data_ptr(),\n        M, N, K, nullptr, stream);\n}\n\nTORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {\n  ops.def(\"gemm(Tensor! out, Tensor a, Tensor b, Tensor a_scale, Tensor b_scale) -> ()\");\n  ops.impl(\"gemm\", torch::kCUDA, &gemm);\n}\n\nREGISTER_EXTENSION(TORCH_EXTENSION_NAME)"
+    },
+    {
+      "id": "c0008",
+      "source": "#pragma once\n\n#include <torch/torch.h>\n\nvoid gemm(torch::Tensor &out, torch::Tensor const &a, torch::Tensor const &b, \n          torch::Tensor const &as, torch::Tensor const &bs);"
+    },
+    {
+      "id": "c0009",
+      "source": "from typing import Optional\nimport torch\nfrom ._ops import ops\n\ndef gemm(a: torch.Tensor, b: torch.Tensor, as_: torch.Tensor, bs: torch.Tensor, \n         out: Optional[torch.Tensor] = None) -> torch.Tensor:\n         \n    if out is None:\n        # Create output tensor with appropriate shape and dtype\n        M, K = a.shape\n        K_b, N = b.shape\n        assert K == K_b, f\"Matrix dimension mismatch: A has {K} cols, B has {K_b} rows\"\n        \n        # Output should be BF16 type on the same device as inputs\n        out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)\n    \n    ops.gemm(out, a, b, as_, bs)\n    return out"
+    },
+    {
+      "id": "c0010",
+      "source": "nix flake update"
+    },
+    {
+      "id": "c0011",
+      "source": "# Install cachix and configure the cache\ncachix use huggingface"
+    },
+    {
+      "id": "c0012",
+      "source": "# Use cachix without installing it\nnix run nixpkgs#cachix -- use huggingface"
+    },
+    {
+      "id": "c0013",
+      "source": "cd Build_RadeonFlow_Kernels/gemm\nnix build . -L"
+    },
+    {
+      "id": "c0014",
+      "source": "$ nix develop\n$ build2cmake generate-torch build.toml\n$ cmake -B build-ext\n$ cmake --build build-ext"
+    },
+    {
+      "id": "c0015",
+      "source": "$ nix develop\n$ build2cmake generate-torch build.toml\n$ pip install --no-build-isolation -e ."
+    },
+    {
+      "id": "c0016",
+      "source": "$ rm -rf .venv  # Remove existing venv if any\n$ nix develop .#devShells.torch27-cxx11-rocm63-x86_64-linux"
+    },
+    {
+      "id": "c0017",
+      "source": "build2cmake clean build.toml "
+    },
+    {
+      "id": "c0018",
+      "source": "# Outside of the dev shell, run the following command\n# if you are inside of the sandbox you can leave with `exit`\nnix build . -L"
+    },
+    {
+      "id": "c0019",
+      "source": "mkdir -p build\nrsync -av --delete --chmod=Du+w,Fu+w result/ build/"
+    },
+    {
+      "id": "c0020",
+      "source": "kernels upload <path_to_kernel> --repo_id hub-username/img2gray"
+    },
+    {
+      "id": "c0021",
+      "source": "import torch\nfrom kernels import get_kernel\n\n# Load the kernel from the Hub\ngemm = get_kernel(\"kernels-community/gemm\")\n\n# Matrix dimensions (must be supported - see gemm_launcher.cpp)\nM, N, K = 1024, 1536, 7168\nQUANT_SIZE = 128\n\n# Setup device\ndevice = torch.device(\"cuda\")\n\n# Create inputs - kernel expects A:(K,M), B:(K,N)\nA_fp32 = torch.randn(M, K, device=device)\nB_fp32 = torch.randn(K, N, device=device)\n\n# Convert to FP8\nA_fp8 = A_fp32.to(torch.float8_e4m3fnuz)\nB_fp8 = B_fp32.to(torch.float8_e4m3fnuz)\n\n# Create scale factors (uniform scaling)\nA_scale = torch.ones(K // QUANT_SIZE, M, device=device, dtype=torch.float32)\nB_scale = torch.ones(K // QUANT_SIZE, N // QUANT_SIZE, device=device, dtype=torch.float32)\n\nC = torch.zeros(M, N, device=device, dtype=torch.bfloat16)\n\n# Use the kernel\nresult = gemm.gemm(A_fp8, B_fp8, A_scale, B_scale, C)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "8593d51934b7c7f170ed857cde135583caf23a629064874c1e2eb3bb85cab063",
+  "mediaLayout": [
+    {
+      "mediaId": "image_4424108b595217d0",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:19.753019Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:19.753033Z"
 }

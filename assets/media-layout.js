@@ -20,7 +20,15 @@
       element.alt = String(media.alt || '文章配图');
       element.loading = 'lazy';
       element.decoding = 'async';
-      element.addEventListener('error', () => figure.remove(), {once: true});
+      const link = document.createElement('a');
+      link.href = httpUrl(media.originalUrl)?.href || src;
+      link.target = '_blank'; link.rel = 'noopener noreferrer'; link.title = '打开原图';
+      element.addEventListener('error', () => {
+        element.remove();
+        const notice = document.createElement('span'); notice.className = 'reader-image-error';
+        notice.textContent = '图片暂时无法加载，点击查看原图 ↗'; link.append(notice);
+      }, {once: true});
+      link.append(element); figure.append(link);
     } else {
       const url = httpUrl(media.src);
       if (!url) return null;
@@ -45,7 +53,7 @@
       element.src = url.href;
       figure.classList.add('reader-video');
     }
-    figure.append(element);
+    if (type !== 'image') figure.append(element);
     if (type === 'video' || media.alt) {
       const caption = document.createElement('figcaption');
       if (type === 'image') caption.textContent = String(media.alt);
@@ -70,7 +78,8 @@
         if (media && typeof media === 'object') resources.set(media.id || `legacy-${type}-${index}`, {type, media});
       });
     }
-    if (!resources.size) return;
+    const unsupported = item?.contentIntegrity?.unsupportedEmbeds || [];
+    if (!resources.size && !unsupported.length) return;
     let verified = false;
     if (item?.mediaLayoutVersion === 1 && /^[a-f0-9]{64}$/.test(item.mediaLayoutBodyHash || '') && globalThis.crypto?.subtle) {
       try {
@@ -95,7 +104,7 @@
       const cursor = cursors.get(anchor);
       if (cursor) cursor.after(figure);
       else if (anchor === null) container.prepend(figure);
-      else if (anchors.get(anchor).tagName === 'LI') anchors.get(anchor).append(figure);
+      else if (['LI', 'TD', 'TH'].includes(anchors.get(anchor).tagName)) anchors.get(anchor).append(figure);
       else anchors.get(anchor).after(figure);
       cursors.set(anchor, figure);
       placed.add(entry.mediaId);
@@ -113,6 +122,17 @@
       if (figure) attachments.append(figure);
     }
     if (attachments.children.length > 1) container.append(attachments);
+    if (unsupported.length) {
+      const details=document.createElement('details'); const label=document.createElement('summary');
+      label.textContent='需在原站查看的嵌入内容'; details.append(label);
+      for (const entry of unsupported) {
+        if (!httpUrl(entry.url)) continue;
+        const p=document.createElement('p'); const link=document.createElement('a');
+        link.href=entry.url; link.textContent='查看原文嵌入内容 ↗'; link.target='_blank'; link.rel='noopener noreferrer';
+        p.append(link); details.append(p);
+      }
+      container.append(details);
+    }
   }
   window.LLMMediaLayout = {render};
 })();

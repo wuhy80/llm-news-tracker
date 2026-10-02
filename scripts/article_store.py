@@ -792,7 +792,17 @@ def write_snapshot(
             payload[field] = existing[field]
     from media_layout import build_layout, body_digest
     source = media_source or take_media_source(payload["resolvedUrl"])
-    if source:
+    from huggingface_content import is_huggingface_blog, extract as extract_hf, remap_translation
+    hf = is_huggingface_blog(payload['resolvedUrl'])
+    if hf and source and source[1] == 'html':
+        payload.update(extract_hf(source[0], payload['resolvedUrl']))
+        payload['mediaFormatVersion'] = MEDIA_FORMAT_VERSION
+        payload['mediaLayoutCheckedAt'] = utc_now()
+    elif hf and existing.get('hfContentVersion'):
+        for key, value in existing.items():
+            if key in {'body', 'images', 'videos', 'hfContentVersion', 'inlineContent', 'inlineContentBodyHash', 'codeContent', 'contentIntegrity', 'contentKind'} or key.startswith('mediaLayout'):
+                payload[key] = value
+    elif source:
         try:
             payload.update(build_layout(payload["body"], payload.get("images", []), payload.get("videos", []), source[0], source[1], payload["resolvedUrl"]))
             payload["mediaLayoutCheckedAt"] = utc_now()
@@ -803,12 +813,22 @@ def write_snapshot(
           and payload.get("videos", []) == existing.get("videos", [])):
         payload.update({key: value for key, value in existing.items() if key.startswith("mediaLayout")})
     payload = redact_snapshot(payload)
+    translation_update = None
+    if hf and existing.get('body') != payload['body']:
+        from translate_articles import translation_path
+        translation_file = translation_path(item)
+        if translation_file.exists():
+            record = json.loads(translation_file.read_text(encoding='utf-8'))
+            translation_update = (translation_file, remap_translation(record, existing.get('body', ''), payload['body']))
     if error:
         payload["note"] = redact_secrets(error[:180])
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+    if translation_update:
+        from news_store import atomic_write_json
+        atomic_write_json(*translation_update)
     return path
 
 
@@ -1032,6 +1052,8 @@ def fetch_community_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     with urllib.request.build_opener(PublicRedirectHandler()).open(request, timeout=15) as response:
         payload = response.read(MAX_DOWNLOAD_BYTES + 1)
         if len(payload) > MAX_DOWNLOAD_BYTES:
+            if urllib.parse.urlparse(resolved_url).hostname in {'huggingface.co', 'www.huggingface.co'}:
+                raise ValueError('Hugging Face HTML exceeds archive bound; refusing truncated source')
             payload = payload[:MAX_DOWNLOAD_BYTES]
         charset = response.headers.get_content_charset() or "utf-8"
     document = json.loads(payload.decode(charset, errors="replace"))
@@ -1075,11 +1097,20 @@ def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
         validate_public_url(resolved_url)
         payload = response.read(MAX_DOWNLOAD_BYTES + 1)
         if len(payload) > MAX_DOWNLOAD_BYTES:
+            if urllib.parse.urlparse(resolved_url).hostname in {'huggingface.co', 'www.huggingface.co'}:
+                raise ValueError('Hugging Face HTML exceeds archive bound; refusing truncated source')
             payload = payload[:MAX_DOWNLOAD_BYTES]
         charset = response.headers.get_content_charset() or "utf-8"
     document = payload.decode(charset, errors="replace")
-    body = text_from_html(document, prefer_main=True)
-    images, videos = extract_media_refs(document, resolved_url)
+    from huggingface_content import is_huggingface_blog, extract as extract_hf
+    if is_huggingface_blog(resolved_url):
+        content = extract_hf(document, resolved_url)
+        body = content['body']
+        images = [{'url': i['originalUrl'], 'alt': i['alt']} for i in content['images']]
+        videos = content['videos']
+    else:
+        body = text_from_html(document, prefer_main=True)
+        images, videos = extract_media_refs(document, resolved_url)
     if len(body) < MIN_BODY_CHARS and not videos:
         raise ValueError("readable body not found")
     if has_corrupted_text(body):
@@ -1163,4 +1194,3 @@ def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = 
     summary = (item.get("summary") or "").strip()
     write_snapshot(item, summary, "summary", resolved_url=target_url, error=" | ".join(errors))
     return item["id"], "summary"
-

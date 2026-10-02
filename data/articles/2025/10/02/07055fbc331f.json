@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/dots-ocr-ne",
   "resolvedUrl": "https://huggingface.co/blog/dots-ocr-ne",
   "fetchedAt": "2026-08-26T02:08:24.742073Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Every year our hardware is a little more powerful, our models a little smarter for each parameter. In 2025, it is more feasible than ever to run truly competitive models on-device. dots.ocr, a 3B parameter OCR model from RedNote, surpasses Gemini 2.5 Pro in OmniDocBench, making OCR a truly no compromises on-device use case. Running models on-device is certainly appealing to developers: no smuggling API keys, zero cost, and no network required. However, if we want these models to run on-device, we need to be mindful of the limited compute and power budgets.\n\nEnter the Neural Engine, Apple's custom AI accelerator that has shipped with every Apple device since 2017. This accelerator is designed for high performance whilst sipping battery power. Some of our testing has found the Neural Engine to be 12x more power efficient than CPU, and 4x more power efficient than GPU.\n\nWhilst this all sounds very appealing, unfortunately the Neural Engine is only accessible through Core ML, Apple's closed source ML framework. Furthermore, even just converting a model from PyTorch to Core ML can present some challenges, and without a preconverted model or some knowledge of the sharp edges it can be arduous for developers. Luckily, Apple also offers MLX, a more modern and flexible ML framework that targets the GPU (not the Neural Engine), and can be used in conjunction with Core ML.\n\nIn this three part series, we will provide a reasoning trace of how we converted dots.ocr to run on-device, using a combination of CoreML and MLX. This process should be applicable to many other models, and we hope that this will help highlight the ideas and tools needed for developers looking to run their own models on-device.\n\nTo follow along, clone the repo. You'll need uv and hf installed to run the setup command:\n\n```\n./boostrap.sh\n```\n\nIf you just want to skip ahead and use the converted model, you can download it here.\n\n## Conversion\n\nConverting from PyTorch to CoreML is a two step process:\n\n- Capturing your PyTorch execution graph (via torch.jit.trace or, the more modern approach of torch.export).\n\n- Compiling this converted graph to an .mlpackage using coremltools.\n\nWhilst we do have a few knobs we can tweak for step 2, most of our control is in step 1, the graph we feed to coremltools.\n\nFollowing the programmers litany of make it work, make it right, make it fast, we will first focus on getting the conversion working on GPU, in FLOAT32, and with static shapes. Once we have this working, we can dial down the precision and try and move to the Neural Engine.\n\n## Dots.OCR\n\nDots.OCR consists of two key components: A 1.2B parameter vision encoder trained from scratch, based on the NaViT architecture, and a Qwen2.5-1.5B backbone. We will be using CoreML to run the vision encoder, and MLX to run the LM backbone.\n\n## Step 0: Understand and simplify the model\n\nIn order to convert a model, it's best to understand the structure and function before getting started. Looking at the original vision modelling file here, we can see that the vision encoder is similar to the QwenVL family. Like many vision encoders, the vision encoder for dots works on a patch basis, in this case 14x14 patches. The dots vision encoder is capable of processing videos and batches of images. This gives us an opportunity to simplify by only processing a single image at a time. This approach is frequent in on-device apps, where we convert a model that provides the essential functions and iterate if we want to process multiple images.\n\nWhen kicking off the conversion process, it's best to start with a minimal viable model. This means removing any bells and whistles that are not strictly necessary for the model to function. In our case, dots has many different attention implementations available for both the vision encoder and the LM backbone. CoreML has lots of infrastructure oriented around the scaled_dot_product_attention operator, which they introduced in iOS 18. We can simplify the model by removing all of the other attention implementations and just focusing on simple sdpa (not the memory efficient variant) for now, commit here.\n\nOnce we've done this, we see a scary warning message when we load the model:\n\n```\nSliding Window Attention is enabled but not implemented for `sdpa`; unexpected results may be encountered.\n```\n\nThe model doesn't require Sliding Window Attention to function, so we can happily move on.\n\n## Step 1: A simple harness\n\nUsing torch.jit.trace is still the most mature method for converting models to CoreML. We usually encapsulate this in a simple harness that allows you to modify the compute units used and the precision selected.\n\nYou can check out the initial harness here. If we run the following on the original code implementation:\n\n```\nuv run convert.py --precision FLOAT32 --compute_units CPU_AND_GPU\n```\n\nWe should bump into the first (of many) issues.\n\n## Step 2: Bug hunting\n\nIt is rare that a model will convert first time. Often, you will need to progressively make changes further and further down the execution graph until you reach the final node.\n\nOur first issue is the following error:\n\n```\nERROR - converting 'outer' op (located at: 'vision_tower/rotary_pos_emb/192'):\nIn op \"matmul\", when x and y are both non-const, their dtype need to match, but got x as int32 and y as fp32\n```\n\nLuckily this error gives us quite a bit of information. We can look at the VisionRotaryEmbedding layer and see the following code:\n\n```\ndef forward(self, seqlen: int) -> torch.Tensor:\n    seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)\n    freqs = torch.outer(seq, self.inv_freq)\n    return freqs\n```\n\nAlthough torch.arange has a dtype argument, coremltools ignores this for arange and always outputs int32. We can simply add a cast after the arange to fix this issue, commit here.\n\nAfter fixing this, running the conversion again leads us to our next issue at repeat_interleave:\n\n```\nERROR - converting 'repeat_interleave' op (located at: 'vision_tower/204'):\nCannot add const [None]\n```\n\nWhilst this error is less informative, we only have a single call to repeat_interleave in our vision encoder:\n\n```\ncu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(\n    dim=0,\n    dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,\n)\n```\n\ncu_seqlens is used for masking variable length sequences in flash_attention_2. It's derived from the grid_thw tensor, which represents time, height and width. Since we are only processing a single image, we can simply remove this call, commit here.\n\nOnto the next! This time, we get a more cryptic error:\n\n```\nERROR - converting '_internal_op_tensor_inplace_fill_' op (located at: 'vision_tower/0/attn/301_internal_tensor_assign_1'):\n_internal_op_tensor_inplace_fill does not support dynamic index\n```\n\nThis is again due to the masking logic to handle variable length sequences. Since we are only processing a single image (not a video or batch of images), we don't really need attention masking at all! Therefore, we can just use a mask of all True. To prepare ourselves for the Neural Engine conversion, we also switch from using a boolean mask to a float mask of all zeros, as the Neural Engine does not support bool tensors commit here\n\nWith all of this done, the model should now successfully convert to CoreML! However, when we run the model, we get the following error:\n\n```\nerror: 'mps.reshape' op the result shape is not compatible with the input shape\n```\n\nThis reshape could be in multiple places! Luckily, we can use a previous warning message to help us track down the issue:\n\n```\nTracerWarning: Iterating over a tensor might cause the trace to be incorrect. Passing a tensor of different shape won't change the number of iterations executed (and might lead to errors or silently give incorrect results).\n  for t, h, w in grid_thw:\n```\n\nMost ML compilers do not like dynamic control flow. Luckily for us, as we are only processing a single image, we can simply remove the loop and process the single h, w pair, commit here.\n\nAnd there we have it! If we run the conversion again, we should see that the model successfully converts and matches the original PyTorch precision:\n\n```\nMax difference: 0.006000518798828125, Mean difference: 1.100682402466191e-05\n```\n\n## Step 3: Benchmarking\n\nNow that we've got the model working, let's evaluate the size and performance. The good news is the model is working, the bad news is that it's over 5GB! This is completely untenable for on device deployment! To benchmark the computation time, we can use the built in XCode tooling by calling:\n\n```\nopen DotsOCR_FLOAT32.mlpackage\n```\n\nwhich will launch the XCode inspector for the model. After clicking + Performance Report and launching a report on all compute devices, you should see something like the following:\n\nOver a second for a single forward pass of the vision encoder! We have lots of more work.\n\nIn the second part of this series, we will work on the integration between CoreML and MLX, to run the full model on-device. In the third part, we will dive deep into the optimizations required to get this model running on the Neural Engine, including quantization and dynamic shapes.",
   "summaryZh": "关于利用Core ML和dots.ocr实现SOTA级别OCR的最新动态，由于原始内容缺失，暂无详细信息。",
   "summaryGeneratedAt": "2026-09-01T07:08:04.741582Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,718 @@
     "summaryZh": "关于利用Core ML和dots.ocr实现SOTA级别OCR的最新动态，由于原始内容缺失，暂无详细信息。",
     "glossary": [],
     "duplicateKey": "sota-ocr-core-ml-dots-ocr"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/joules_cu.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/joules_cu.png",
+      "alt": "Compute unit energy",
+      "id": "image_d883d7b01fe9f6e8"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/NE_Header.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/NE_Header.png",
+      "alt": "NE Header",
+      "id": "image_00ae5b74d96b85f3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/perf_report_gpu.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dots-ocr-ne/perf_report_gpu.png",
+      "alt": "GPU Perf report",
+      "id": "image_a432149d54583af6"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Every year our hardware is a little more powerful, our models a little smarter for each parameter. In 2025, it is more feasible than ever to run truly competitive models on-device. dots.ocr, a 3B parameter OCR model from RedNote, surpasses Gemini 2.5 Pro in OmniDocBench, making OCR a truly no compromises on-device use case. Running models on-device is certainly appealing to developers: no smuggling API keys, zero cost, and no network required. However, if we want these models to run on-device, we need to be mindful of the limited compute and power budgets.",
+      "spans": [
+        {
+          "start": 181,
+          "end": 189,
+          "kind": "a",
+          "href": "https://huggingface.co/rednote-hilab/dots.ocr"
+        },
+        {
+          "start": 258,
+          "end": 270,
+          "kind": "a",
+          "href": "https://github.com/opendatalab/OmniDocBench"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Enter the Neural Engine, Apple's custom AI accelerator that has shipped with every Apple device since 2017. This accelerator is designed for high performance whilst sipping battery power. Some of our testing has found the Neural Engine to be 12x more power efficient than CPU, and 4x more power efficient than GPU.",
+      "spans": [
+        {
+          "start": 242,
+          "end": 275,
+          "kind": "strong"
+        },
+        {
+          "start": 281,
+          "end": 313,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Whilst this all sounds very appealing, unfortunately the Neural Engine is only accessible through Core ML, Apple's closed source ML framework. Furthermore, even just converting a model from PyTorch to Core ML can present some challenges, and without a preconverted model or some knowledge of the sharp edges it can be arduous for developers. Luckily, Apple also offers MLX, a more modern and flexible ML framework that targets the GPU (not the Neural Engine), and can be used in conjunction with Core ML.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 105,
+          "kind": "a",
+          "href": "https://developer.apple.com/documentation/coreml"
+        },
+        {
+          "start": 115,
+          "end": 128,
+          "kind": "em"
+        },
+        {
+          "start": 369,
+          "end": 372,
+          "kind": "a",
+          "href": "https://mlx-framework.org"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "In this three part series, we will provide a reasoning trace of how we converted dots.ocr to run on-device, using a combination of CoreML and MLX. This process should be applicable to many other models, and we hope that this will help highlight the ideas and tools needed for developers looking to run their own models on-device.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 60,
+          "kind": "em"
+        },
+        {
+          "start": 81,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 131,
+          "end": 137,
+          "kind": "code"
+        },
+        {
+          "start": 142,
+          "end": 145,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "To follow along, clone the repo. You'll need uv and hf installed to run the setup command:",
+      "spans": [
+        {
+          "start": 23,
+          "end": 31,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne"
+        },
+        {
+          "start": 45,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 54,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "If you just want to skip ahead and use the converted model, you can download it here.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 84,
+          "kind": "a",
+          "href": "https://huggingface.co/FL33TW00D-HF/dots.ocr.ne"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Conversion",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Converting from PyTorch to CoreML is a two step process:",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Capturing your PyTorch execution graph (via torch.jit.trace or, the more modern approach of torch.export).",
+      "spans": [
+        {
+          "start": 44,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 44,
+          "end": 59,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/stable/generated/torch.jit.trace.html"
+        },
+        {
+          "start": 92,
+          "end": 104,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 104,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/stable/export.html"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Compiling this converted graph to an .mlpackage using coremltools.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 54,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 54,
+          "end": 65,
+          "kind": "a",
+          "href": "https://github.com/apple/coremltools"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Whilst we do have a few knobs we can tweak for step 2, most of our control is in step 1, the graph we feed to coremltools.",
+      "spans": [
+        {
+          "start": 110,
+          "end": 121,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Following the programmers litany of make it work, make it right, make it fast, we will first focus on getting the conversion working on GPU, in FLOAT32, and with static shapes. Once we have this working, we can dial down the precision and try and move to the Neural Engine.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 36,
+          "end": 77,
+          "kind": "a",
+          "href": "https://wiki.c2.com/?MakeItWorkMakeItRightMakeItFast"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Dots.OCR",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Dots.OCR consists of two key components: A 1.2B parameter vision encoder trained from scratch, based on the NaViT architecture, and a Qwen2.5-1.5B backbone. We will be using CoreML to run the vision encoder, and MLX to run the LM backbone.",
+      "spans": [
+        {
+          "start": 108,
+          "end": 126,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2307.06304"
+        },
+        {
+          "start": 174,
+          "end": 180,
+          "kind": "code"
+        },
+        {
+          "start": 212,
+          "end": 215,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Step 0: Understand and simplify the model",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "In order to convert a model, it's best to understand the structure and function before getting started. Looking at the original vision modelling file here, we can see that the vision encoder is similar to the QwenVL family. Like many vision encoders, the vision encoder for dots works on a patch basis, in this case 14x14 patches. The dots vision encoder is capable of processing videos and batches of images. This gives us an opportunity to simplify by only processing a single image at a time. This approach is frequent in on-device apps, where we convert a model that provides the essential functions and iterate if we want to process multiple images.",
+      "spans": [
+        {
+          "start": 150,
+          "end": 154,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/blob/12c57588a97584b1c95e811475791e298e04162d/modeling_dots_vision.py"
+        },
+        {
+          "start": 274,
+          "end": 278,
+          "kind": "code"
+        },
+        {
+          "start": 316,
+          "end": 321,
+          "kind": "code"
+        },
+        {
+          "start": 335,
+          "end": 339,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "When kicking off the conversion process, it's best to start with a minimal viable model. This means removing any bells and whistles that are not strictly necessary for the model to function. In our case, dots has many different attention implementations available for both the vision encoder and the LM backbone. CoreML has lots of infrastructure oriented around the scaled_dot_product_attention operator, which they introduced in iOS 18. We can simplify the model by removing all of the other attention implementations and just focusing on simple sdpa (not the memory efficient variant) for now, commit here.",
+      "spans": [
+        {
+          "start": 367,
+          "end": 395,
+          "kind": "code"
+        },
+        {
+          "start": 367,
+          "end": 404,
+          "kind": "a",
+          "href": "https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS18.transformers.scaled_dot_product_attention"
+        },
+        {
+          "start": 548,
+          "end": 552,
+          "kind": "code"
+        },
+        {
+          "start": 554,
+          "end": 586,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/d51b0478aacf569146cfd6f6a7542850fe61b11c"
+        },
+        {
+          "start": 597,
+          "end": 608,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/2cde03299efb7b64c567a3c197ef4a0259768849"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Once we've done this, we see a scary warning message when we load the model:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "The model doesn't require Sliding Window Attention to function, so we can happily move on.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Step 1: A simple harness",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Using torch.jit.trace is still the most mature method for converting models to CoreML. We usually encapsulate this in a simple harness that allows you to modify the compute units used and the precision selected.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 21,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "You can check out the initial harness here. If we run the following on the original code implementation:",
+      "spans": [
+        {
+          "start": 38,
+          "end": 42,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/blob/master/convert.py"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "We should bump into the first (of many) issues.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Step 2: Bug hunting",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "It is rare that a model will convert first time. Often, you will need to progressively make changes further and further down the execution graph until you reach the final node.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Our first issue is the following error:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Luckily this error gives us quite a bit of information. We can look at the VisionRotaryEmbedding layer and see the following code:",
+      "spans": [
+        {
+          "start": 75,
+          "end": 96,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Although torch.arange has a dtype argument, coremltools ignores this for arange and always outputs int32. We can simply add a cast after the arange to fix this issue, commit here.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 28,
+          "end": 33,
+          "kind": "code"
+        },
+        {
+          "start": 44,
+          "end": 55,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 99,
+          "end": 104,
+          "kind": "code"
+        },
+        {
+          "start": 141,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 167,
+          "end": 178,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/fb968c54d35f7331d8b36b53d69e9767daba4ad3"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "After fixing this, running the conversion again leads us to our next issue at repeat_interleave:",
+      "spans": [
+        {
+          "start": 78,
+          "end": 95,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Whilst this error is less informative, we only have a single call to repeat_interleave in our vision encoder:",
+      "spans": [
+        {
+          "start": 69,
+          "end": 86,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "cu_seqlens is used for masking variable length sequences in flash_attention_2. It's derived from the grid_thw tensor, which represents time, height and width. Since we are only processing a single image, we can simply remove this call, commit here.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/Dao-AILab/flash-attention/issues/850"
+        },
+        {
+          "start": 60,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 101,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 135,
+          "end": 139,
+          "kind": "code"
+        },
+        {
+          "start": 141,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 152,
+          "end": 157,
+          "kind": "code"
+        },
+        {
+          "start": 236,
+          "end": 247,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/417512e522b595e5fbddb19c6c66f69db0ecca78"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Onto the next! This time, we get a more cryptic error:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "This is again due to the masking logic to handle variable length sequences. Since we are only processing a single image (not a video or batch of images), we don't really need attention masking at all! Therefore, we can just use a mask of all True. To prepare ourselves for the Neural Engine conversion, we also switch from using a boolean mask to a float mask of all zeros, as the Neural Engine does not support bool tensors commit here",
+      "spans": [
+        {
+          "start": 242,
+          "end": 246,
+          "kind": "code"
+        },
+        {
+          "start": 412,
+          "end": 416,
+          "kind": "code"
+        },
+        {
+          "start": 425,
+          "end": 436,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/9a1cd2a4d9d4d0c0c96aef5265f6bd306f1d603e"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "With all of this done, the model should now successfully convert to CoreML! However, when we run the model, we get the following error:",
+      "spans": [
+        {
+          "start": 93,
+          "end": 96,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "This reshape could be in multiple places! Luckily, we can use a previous warning message to help us track down the issue:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Most ML compilers do not like dynamic control flow. Luckily for us, as we are only processing a single image, we can simply remove the loop and process the single h, w pair, commit here.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 24,
+          "kind": "strong"
+        },
+        {
+          "start": 18,
+          "end": 50,
+          "kind": "a",
+          "href": "https://x.com/tenderizzation/status/1930437803097371080"
+        },
+        {
+          "start": 163,
+          "end": 167,
+          "kind": "code"
+        },
+        {
+          "start": 174,
+          "end": 185,
+          "kind": "a",
+          "href": "https://github.com/FL33TW00D/dots.ocr.ne/commit/c1049e0d53b20c30a612428a84a2b6203b3273f7"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "And there we have it! If we run the conversion again, we should see that the model successfully converts and matches the original PyTorch precision:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Step 3: Benchmarking",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Now that we've got the model working, let's evaluate the size and performance. The good news is the model is working, the bad news is that it's over 5GB! This is completely untenable for on device deployment! To benchmark the computation time, we can use the built in XCode tooling by calling:",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "which will launch the XCode inspector for the model. After clicking + Performance Report and launching a report on all compute devices, you should see something like the following:",
+      "spans": [
+        {
+          "start": 68,
+          "end": 88,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Over a second for a single forward pass of the vision encoder! We have lots of more work.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "In the second part of this series, we will work on the integration between CoreML and MLX, to run the full model on-device. In the third part, we will dive deep into the optimizations required to get this model running on the Neural Engine, including quantization and dynamic shapes.",
+      "spans": [
+        {
+          "start": 75,
+          "end": 81,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 89,
+          "kind": "code"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "c2859f53f9c744fe586d781d000afae50227aee71d9aadf22e2ed78d9621b425",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "./boostrap.sh"
+    },
+    {
+      "id": "c0002",
+      "source": "Sliding Window Attention is enabled but not implemented for `sdpa`; unexpected results may be encountered."
+    },
+    {
+      "id": "c0003",
+      "source": "uv run convert.py --precision FLOAT32 --compute_units CPU_AND_GPU"
+    },
+    {
+      "id": "c0004",
+      "source": "ERROR - converting 'outer' op (located at: 'vision_tower/rotary_pos_emb/192'):\nIn op \"matmul\", when x and y are both non-const, their dtype need to match, but got x as int32 and y as fp32"
+    },
+    {
+      "id": "c0005",
+      "source": "def forward(self, seqlen: int) -> torch.Tensor:\n    seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)\n    freqs = torch.outer(seq, self.inv_freq)\n    return freqs"
+    },
+    {
+      "id": "c0006",
+      "source": "ERROR - converting 'repeat_interleave' op (located at: 'vision_tower/204'):\nCannot add const [None]"
+    },
+    {
+      "id": "c0007",
+      "source": "cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(\n    dim=0,\n    dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,\n)"
+    },
+    {
+      "id": "c0008",
+      "source": "ERROR - converting '_internal_op_tensor_inplace_fill_' op (located at: 'vision_tower/0/attn/301_internal_tensor_assign_1'):\n_internal_op_tensor_inplace_fill does not support dynamic index"
+    },
+    {
+      "id": "c0009",
+      "source": "error: 'mps.reshape' op the result shape is not compatible with the input shape"
+    },
+    {
+      "id": "c0010",
+      "source": "TracerWarning: Iterating over a tensor might cause the trace to be incorrect. Passing a tensor of different shape won't change the number of iterations executed (and might lead to errors or silently give incorrect results).\n  for t, h, w in grid_thw:"
+    },
+    {
+      "id": "c0011",
+      "source": "Max difference: 0.006000518798828125, Mean difference: 1.100682402466191e-05"
+    },
+    {
+      "id": "c0012",
+      "source": "open DotsOCR_FLOAT32.mlpackage"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "c2859f53f9c744fe586d781d000afae50227aee71d9aadf22e2ed78d9621b425",
+  "mediaLayout": [
+    {
+      "mediaId": "image_d883d7b01fe9f6e8",
+      "type": "image",
+      "afterBlockId": "b0002",
+      "order": 0
+    },
+    {
+      "mediaId": "image_00ae5b74d96b85f3",
+      "type": "image",
+      "afterBlockId": "b0003",
+      "order": 1
+    },
+    {
+      "mediaId": "image_a432149d54583af6",
+      "type": "image",
+      "afterBlockId": "b0040",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:20.952887Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:20.952902Z"
 }
