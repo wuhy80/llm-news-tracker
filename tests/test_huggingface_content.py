@@ -14,6 +14,12 @@ def page(body):
     avatars=''.join(f'<img src="/avatars/{i}.svg" class="rounded-full">' for i in range(15))
     return f'<html><main><div class="blog-content"><h1>Title outside body</h1>{avatars}<div class="relative overflow-clip">{body}</div></div><article>Recommended stuff<img src="/wrong.jpg"></article><form>Upload images</form></main></html>'
 class HFTests(unittest.TestCase):
+    def test_private_download_links_are_not_published(self):
+        private = 'https://internal-api-drive-stream.feishu.cn/download?code=EXAMPLE'
+        r = extract(page(f'<p><a href="{private}">Download</a></p><img src="{private}">'), URL)
+        self.assertNotIn(private, json.dumps(r))
+        self.assertEqual(r['images'], [])
+        self.assertEqual(r['contentIntegrity']['status'], 'partial')
     def test_scope_all_images_and_positions(self):
         r=extract(page('<p>Opening.</p>'+''.join(f'<p><img src="/{i}.png"></p><p>Step {i}.</p>' for i in range(18))),URL)
         self.assertEqual(len(r['images']),18);self.assertNotIn('Recommended',r['body']);self.assertNotIn('Upload',r['body'])

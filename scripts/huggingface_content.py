@@ -109,6 +109,8 @@ def extract(document, url):
         if n.tag == 'img':
             src = image_url(n, url)
             if not src:
+                if n.attrs.get('src') and not safe_url(n.attrs['src'], url):
+                    unsupported.append({'type': 'image', 'url': url, 'reason': 'unsafe_or_private_image'})
                 # No silent successful accounting for an unsupported inline data image.
                 if (n.attrs.get('src') or '').startswith(('data:', 'blob:')):
                     unsupported.append({'type': 'image', 'url': url, 'reason': 'inline_image'})
