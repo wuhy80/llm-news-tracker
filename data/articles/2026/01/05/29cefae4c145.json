@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:11.326851Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "NVIDIA brings agents to life with DGX Spark and Reachy Mini\n\nPublished January 5, 2026\n\nToday at CES 2026, NVIDIA unveiled a world of new open models to enable the future of agents, online and in the real world. From the recently released NVIDIA Nemotron reasoning LLMs to the new NVIDIA Isaac GR00T N1.6 open reasoning VLA and NVIDIA Cosmos world foundation models , all the building blocks are here today for AI Builders to build their own agents.\n\nBut what if you could bring your own agent to life, right at your desk? An AI buddy that can be useful to you and process your data privately?\n\nIn the CES keynote today, Jensen Huang showed us how we can do exactly that, using the processing power of NVIDIA DGX Spark with Reachy Mini to create your own little office R2D2 you can talk to and collaborate with.\n\nThis blog post provides a step-by-step guide to replicate this amazing experience at home using a DGX Spark and Reachy Mini .\n\nIf you want to start cooking right away, here’s the source code of the demo .\n\nWe’ll be using the following:\n\nA reasoning model: demo uses NVIDIA Nemotron 3 Nano\n\nA vision model: demo uses NVIDIA Nemotron Nano 2 VL\n\nA text-to-speech model: demo uses ElevenLabs\n\nReachy Mini (or Reachy Mini Simulation )\n\nPython v3.10+ environment, with uv\n\nFeel free to adapt the recipe and make it your own - you have many ways to integrate the models into your application:\n\nLocal deployment – Run on your own hardware ( DGX Spark or a GPU with sufficient VRAM). Our implementation requires ~65GB disk space for the reasoning model, and ~28GB for the vision model.\n\nCloud deployment– Deploy the models on cloud GPUs e.g. through NVIDIA Brev or Hugging Face Inference Endpoints .\n\nServerless model endpoints – Send requests to NVIDIA or Hugging Face Inference Providers .\n\nGiving agentic powers to Reachy\n\nTurning an AI agent from a simple chat interface into something you can interact with naturally makes conversations feel more real. When an AI agent can see through a camera, speak out loud, and perform actions, the experience becomes more engaging. That’s what Reachy Mini makes possible.\n\nReachy Mini is designed to be customizable. With access to sensors, actuators, and APIs, you can easily wire it into your existing agent stack, by simulation or real hardware controlled directly from Python.\n\nThis post focuses on composing existing building blocks rather than reinventing them. We combine open models for reasoning and vision, an agent framework for orchestration, and tool handlers for actions. Each component is loosely coupled, making it easy to swap models, change routing logic, or add new behaviors.\n\nUnlike closed personal assistants, this setup stays fully open. You control the models, the prompts, the tools, and the robot’s actions. Reachy Mini simply becomes the physical endpoint of your agent where perception, reasoning, and action come together.\n\nIn this example, we use the NVIDIA NeMo Agent Toolkit , a flexible, lightweight, framework-agnostic open source library, to connect all the components of the agent together. It works seamlessly with other agentic frameworks, like LangChain, LangGraph, CrewAI, handling how models interact, routing inputs and outputs between them, and making it easy to experiment with different configurations or add new capabilities without rewriting core logic. The toolkit also provides built-in profiling and optimization features, letting you track token usage efficiency and latency across tools and agents, identify bottlenecks, and automatically tune hyperparameters to maximize accuracy while reducing cost and latency.\n\nStep 0: Set up and get access to models and services\n\nFirst, clone the repository that contains all the code you’ll need to follow along:\n\n```\ngit clone git@github.com/brevdev/reachy-personal-assistant\ncd reachy-personal-assistant\n```\n\nTo access your intelligence layer, powered by the NVIDIA Nemotron models, you can either deploy them using NVIDIA NIM or vLLM , or connect to them through remote endpoints available at build.nvidia.com .\n\nThe following instructions assume you are accessing the Nemotron models via endpoints. Create a .env file in the main directory with your API keys. For local deployments, you do not need to specify API keys and can skip this step.\n\n```\nNVIDIA_API_KEY=your_nvidia_api_key_here\nELEVENLABS_API_KEY=your_elevenlabs_api_key_here\n```\n\nStep 1: Build a chat interface\n\nStart by getting a basic LLM chat workflow running through NeMo Agent Toolkit’s API server. NeMo Agent Toolkit supports running workflows via `nat serve` and providing a config file. The config file passed here contains all the necessary setup information for the agent, which includes the models used for chat, image understanding, as well as the router model used by the agent. The NeMo Agent Toolkit UI can connect over HTTP/WebSocket so you can chat with your workflow like a standard chat product. In this implementation, the NeMo Agent Toolkit server is launched on port 8001 (so your bot can call it, and the UI can too):\n\n```\ncd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001\n```\n\nNext, verify that you can send a plain text prompt through a separate terminal to ensure everything is setup correctly:\n\n```\ncurl -s http://localhost:8001/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\": \"test\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]}'\n```\n\nReviewing the agent configuration, you’ll notice it defines far more capabilities than a simple chat completion. The next steps will walk through those details.\n\nStep 2: Add NeMo Agent Toolkit’s built-in ReAct agent for tool calling\n\nTool calling is an essential part of AI agents. NeMo Agent Toolkit includes a built-in ReAct agent that can reason between tool calls and use multiple tools before answering. We route “action requests” to a ReAct agent that’s allowed to call tools (for example, tools that trigger robot behaviors or fetch current robot state).\n\nSome practical notes to keep in mind:\n\nKeep tool schemas tight (clear name/description/args), because that’s what the agent uses to decide what to call.\n\nPut a hard cap on steps (max_tool_calls) so the agent can’t spiral.\n\nIf using a physical robot, consider a “confirm before actuation” pattern for physical actions to ensure movement safety.\n\nTake a look at this portion of the config it defines the tools (like Wikipedia search) and specifies the ReAct agent pattern used to manage them.\n\n```\nfunctions:\n   wikipedia_search:\n      _type: wiki_search\n      max_results: 2\n      \n   ..\n   react_agent:\n      _type: react_agent\n      llm_name: agent_llm\n      verbose: true\n      parse_agent_response_max_retries: 3\n      tool_names: [wikipedia_search]\n\n​​workflow:\n   _type: ces_tutorial_router_agent\n   agent: react_agent\n```\n\nStep 3: Add a router to direct queries to different models\n\nThe key idea: don’t use one model for everything. Instead, route based on intent:\n\nText queries can use a fast text model\n\nVisual queries must be run through a VLM\n\nAction/tool requests are routed to the ReAct agent + tools\n\nYou can implement routing a few ways (heuristics, a lightweight classifier, or a dedicated routing service). If you want the “production” version of this idea, the NVIDIA LLM Router developer example is the full reference implementation and includes evaluation and monitoring patterns.\n\nA basic routing policy might work like this:\n\nIf the user is asking a question about their environment, then send the request to a VLM along with an image captured from the camera (or Reachy).\n\nIf the user asks a question requiring real time information, send the input to a ReACT agent to perform a web search via a tool call.\n\nIf the user is asking simple questions, send the request to a small and fast model optimized for chit chat.\n\nThese sections of the config define the routing topology and specify the router model.\n\n```\nfunctions:\n   ..\n   \n   router:\n      _type: router\n      route_config:\n        - name: other\n          description: Any question that requires careful thought, outside information, image understanding, or tool calling to take actions.\n        - name: chit_chat\n          description: Any simple chit chat, small talk, or casual conversation.\n        - name: image_understanding\n          description: A question that requires the assistant to see the user eg a question about their appearance, environment, scene or surroundings. Examples what am I holding, what am I wearing, what do I look like, what is in my surroundings, what does it say on the whiteboard. Questions about attire eg what color is my shirt/hat/jacket/etc\n      llm_name: routing_llm\n\n\nllms:\n   ..\n   routing_llm: \n      _type: nim\n      model_name: microsoft/phi-3-mini-128k-instruct\n      temperature: 0.0\n```\n\nNOTE : If you want to reduce latency/cost or run offline, you can self-host one of the routed models (typically the “fast text” model) and keep the VLM remote. One common approach is serving via NVIDIA NIM or vLLM and pointing NeMo Agent Toolkit to an OpenAI-compatible endpoint.\n\nStep 4: Add a Pipecat bot for real-time voice + vision\n\nNow we go real time. Pipecat is a framework designed for low-latency voice/multimodal agents: it orchestrates audio/video streams, AI services, and transports so you can build natural conversations. In this repo, the bot service is responsible for:\n\nCapturing vision (robot camera)\n\nSpeech recognition + text-to-speech\n\nCoordinating robot movement and expressive behaviors\n\nYou will find all the pipecat bot code in the `reachy-personal-assistant/bot` folder .\n\nStep 5: Hook everything up to Reachy (hardware or simulation)\n\nReachy Mini exposes a daemon that the rest of your system connects to. The repo runs the daemon in simulation by default (--sim). If you have access to a real Reachy you can remove this flag and the same code will control your robot.\n\nYou will need three terminals to run the entire system:\n\nTerminal 1: Reachy daemon\n\n```\ncd bot\n# macOS:\nuv run mjpython -m reachy_mini.daemon.app.main --sim --no-localhost-only\n\n# Linux:\nuv run -m reachy_mini.daemon.app.main --sim --no-localhost-only\n```\n\nIf you are using the physical hardware, remember to omit the --sim flag from the command.\n\n```\ncd bot\nuv venv\nuv sync\nuv run --env-file ../.env python main.py\n```\n\nTerminal 3: NeMo Agent Toolkit service\n\nIf the NeMo Agent Toolkit service is not already running from Step 1, start it now in Terminal 3.\n\n```\ncd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001\n```\n\nOnce all the terminals are set up, there are two main windows to keep track of:\n\nReachy Sim – This window appears automatically when you start the simulator daemon in Terminal 1. This is applicable if you’re running Reachy mini simulation in place of the physical device.\n\nPipecat Playground – This is the client-side UI where you can connect to the agent, enable microphone and camera inputs, and view live transcripts. In Terminal 2, open the URL exposed by the bot service: http://localhost:7860/ . Click “CONNECT” in your browser. It may take a few seconds to initialize, and you’ll be prompted to grant microphone (and optionally camera) access.\n\nOnce both windows are up and running:\n\nThe Client and Agent STATUS indicators should show READY\n\nThe bot will greet you with a welcome message “Hello, how may I assist you today?”\n\nAt this point, you can start interacting with your agent!\n\nTry these example prompts\n\nHere are a few simple prompts to help you test your personal assistant. You can start with these and then experiment by adding your own to see how the agent responds!\n\nText-only prompts (routes to the fast text model)\n\n“Explain what you can do in one sentence.”\n\n“Summarize the last thing I said.”\n\nVision prompts (routes to the VLM)\n\n“What am I holding up to the camera?”\n\n“Read the text on this page and summarize it.”\n\nInstead of a \"black-box\" assistant, this builds a foundation for a private, hackable system where you can control both the intelligence and the hardware. You can inspect, extend, and run it locally, with full visibility into data flow, tool permissions, and how the robot perceives and acts.\n\nDepending on your goals, here are a few directions to explore next:\n\nOptimize for performance: Use the LLM Router developer example to balance cost, latency, and quality by intelligently directing queries between different models.\n\nCheck out the tutorial for building a voice-powered RAG agent with guardrails using Nemotron open models.\n\nMaster the hardware: Explore the Reachy Mini SDK and simulation docs to design and test advanced robotic behaviors before deploying to your physical system.\n\nExplore and contribute to the apps built by the community for Reachy.\n\nWant to try it right away? Deploy the full environment here . One click and you're running.\n\nModels mentioned in this article 3\n\nSpaces mentioned in this article 1\n\nCollections mentioned in this article 2\n\nMore Articles from our Blog\n\nAdding MCP Tools to Reachy Mini\n\npartnerships hardware nvidia\n\nServerless Inference with Hugging Face and NVIDIA NIM\n\nThe config seems to point to type \"nim\" (Nvidia's microservices). I'm guessing that you'd recommend an openai compatible inference server such as vllm for local hosting on the DGX Spark? It'd be nice if you appended instructions for running the same models with Triton Server via TensorRT-LLM backend.\n\nThis comment has been hidden\n\nAI is developing rapidly, it's crazy!\n\nCan you give more detailed steps for local hosting on the DGX Spark and the corresponding config file ?\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Today at CES 2026, NVIDIA unveiled a world of new open models to enable the future of agents, online and in the real world. From the recently released NVIDIA Nemotron reasoning LLMs to the new NVIDIA Isaac GR00T N1.6 open reasoning VLA and NVIDIA Cosmos world foundation models, all the building blocks are here today for AI Builders to build their own agents.\n\nBut what if you could bring your own agent to life, right at your desk? An AI buddy that can be useful to you and process your data privately?\n\nIn the CES keynote today, Jensen Huang showed us how we can do exactly that, using the processing power of NVIDIA DGX Spark with Reachy Mini to create your own little office R2D2 you can talk to and collaborate with.\n\nThis blog post provides a step-by-step guide to replicate this amazing experience at home using a DGX Spark and Reachy Mini.\n\nLet’s dive in!\n\n## Ingredients\n\nIf you want to start cooking right away, here’s the source code of the demo.\n\nWe’ll be using the following:\n\n- A reasoning model: demo uses NVIDIA Nemotron 3 Nano\n\n- A vision model: demo uses NVIDIA Nemotron Nano 2 VL\n\n- A text-to-speech model: demo uses ElevenLabs\n\n- Reachy Mini (or Reachy Mini Simulation)\n\n- Python v3.10+ environment, with uv\n\nFeel free to adapt the recipe and make it your own - you have many ways to integrate the models into your application:\n\n- Local deployment – Run on your own hardware (DGX Spark or a GPU with sufficient VRAM). Our implementation requires ~65GB disk space for the reasoning model, and ~28GB for the vision model.\n\n- Cloud deployment– Deploy the models on cloud GPUs e.g. through NVIDIA Brev or Hugging Face Inference Endpoints.\n\n- Serverless model endpoints – Send requests to NVIDIA or Hugging Face Inference Providers.\n\n## Giving agentic powers to Reachy\n\nTurning an AI agent from a simple chat interface into something you can interact with naturally makes conversations feel more real. When an AI agent can see through a camera, speak out loud, and perform actions, the experience becomes more engaging. That’s what Reachy Mini makes possible.\n\nReachy Mini is designed to be customizable. With access to sensors, actuators, and APIs, you can easily wire it into your existing agent stack, by simulation or real hardware controlled directly from Python.\n\nThis post focuses on composing existing building blocks rather than reinventing them. We combine open models for reasoning and vision, an agent framework for orchestration, and tool handlers for actions. Each component is loosely coupled, making it easy to swap models, change routing logic, or add new behaviors.\n\nUnlike closed personal assistants, this setup stays fully open. You control the models, the prompts, the tools, and the robot’s actions. Reachy Mini simply becomes the physical endpoint of your agent where perception, reasoning, and action come together.\n\n## Building the agent\n\nIn this example, we use the NVIDIA NeMo Agent Toolkit, a flexible, lightweight, framework-agnostic open source library, to connect all the components of the agent together. It works seamlessly with other agentic frameworks, like LangChain, LangGraph, CrewAI, handling how models interact, routing inputs and outputs between them, and making it easy to experiment with different configurations or add new capabilities without rewriting core logic. The toolkit also provides built-in profiling and optimization features, letting you track token usage efficiency and latency across tools and agents, identify bottlenecks, and automatically tune hyperparameters to maximize accuracy while reducing cost and latency.\n\n## Step 0: Set up and get access to models and services\n\nFirst, clone the repository that contains all the code you’ll need to follow along:\n\n```\ngit clone git@github.com/brevdev/reachy-personal-assistant\ncd reachy-personal-assistant\n```\n\nTo access your intelligence layer, powered by the NVIDIA Nemotron models, you can either deploy them using NVIDIA NIM or vLLM, or connect to them through remote endpoints available at build.nvidia.com.\n\nThe following instructions assume you are accessing the Nemotron models via endpoints. Create a .env file in the main directory with your API keys. For local deployments, you do not need to specify API keys and can skip this step.\n\n```\nNVIDIA_API_KEY=your_nvidia_api_key_here\nELEVENLABS_API_KEY=your_elevenlabs_api_key_here\n```\n\n## Step 1: Build a chat interface\n\nStart by getting a basic LLM chat workflow running through NeMo Agent Toolkit’s API server. NeMo Agent Toolkit supports running workflows via `nat serve` and providing a config file. The config file passed here contains all the necessary setup information for the agent, which includes the models used for chat, image understanding, as well as the router model used by the agent. The NeMo Agent Toolkit UI can connect over HTTP/WebSocket so you can chat with your workflow like a standard chat product. In this implementation, the NeMo Agent Toolkit server is launched on port 8001 (so your bot can call it, and the UI can too):\n\n```\ncd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001\n```\n\nNext, verify that you can send a plain text prompt through a separate terminal to ensure everything is setup correctly:\n\n```\ncurl -s http://localhost:8001/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\": \"test\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]}'\n```\n\nReviewing the agent configuration, you’ll notice it defines far more capabilities than a simple chat completion. The next steps will walk through those details.\n\n## Step 2: Add NeMo Agent Toolkit’s built-in ReAct agent for tool calling\n\nTool calling is an essential part of AI agents. NeMo Agent Toolkit includes a built-in ReAct agent that can reason between tool calls and use multiple tools before answering. We route “action requests” to a ReAct agent that’s allowed to call tools (for example, tools that trigger robot behaviors or fetch current robot state).\n\nSome practical notes to keep in mind:\n\n- Keep tool schemas tight (clear name/description/args), because that’s what the agent uses to decide what to call.\n\n- Put a hard cap on steps (max_tool_calls) so the agent can’t spiral.\n\n- If using a physical robot, consider a “confirm before actuation” pattern for physical actions to ensure movement safety.\n\nTake a look at this portion of the config it defines the tools (like Wikipedia search) and specifies the ReAct agent pattern used to manage them.\n\n```\nfunctions:\n   wikipedia_search:\n      _type: wiki_search\n      max_results: 2\n      \n   ..\n   react_agent:\n      _type: react_agent\n      llm_name: agent_llm\n      verbose: true\n      parse_agent_response_max_retries: 3\n      tool_names: [wikipedia_search]\n\n​​workflow:\n   _type: ces_tutorial_router_agent\n   agent: react_agent\n```\n\n## Step 3: Add a router to direct queries to different models\n\nThe key idea: don’t use one model for everything. Instead, route based on intent:\n\n- Text queries can use a fast text model\n\n- Visual queries must be run through a VLM\n\n- Action/tool requests are routed to the ReAct agent + tools\n\nYou can implement routing a few ways (heuristics, a lightweight classifier, or a dedicated routing service). If you want the “production” version of this idea, the NVIDIA LLM Router developer example is the full reference implementation and includes evaluation and monitoring patterns.\n\nA basic routing policy might work like this:\n\n- If the user is asking a question about their environment, then send the request to a VLM along with an image captured from the camera (or Reachy).\n\n- If the user asks a question requiring real time information, send the input to a ReACT agent to perform a web search via a tool call.\n\n- If the user is asking simple questions, send the request to a small and fast model optimized for chit chat.\n\nThese sections of the config define the routing topology and specify the router model.\n\n```\nfunctions:\n   ..\n   \n   router:\n      _type: router\n      route_config:\n        - name: other\n          description: Any question that requires careful thought, outside information, image understanding, or tool calling to take actions.\n        - name: chit_chat\n          description: Any simple chit chat, small talk, or casual conversation.\n        - name: image_understanding\n          description: A question that requires the assistant to see the user eg a question about their appearance, environment, scene or surroundings. Examples what am I holding, what am I wearing, what do I look like, what is in my surroundings, what does it say on the whiteboard. Questions about attire eg what color is my shirt/hat/jacket/etc\n      llm_name: routing_llm\n\n\nllms:\n   ..\n   routing_llm: \n      _type: nim\n      model_name: microsoft/phi-3-mini-128k-instruct\n      temperature: 0.0\n```\n\nNOTE: If you want to reduce latency/cost or run offline, you can self-host one of the routed models (typically the “fast text” model) and keep the VLM remote. One common approach is serving via NVIDIA NIM or vLLM and pointing NeMo Agent Toolkit to an OpenAI-compatible endpoint.\n\n## Step 4: Add a Pipecat bot for real-time voice + vision\n\nNow we go real time. Pipecat is a framework designed for low-latency voice/multimodal agents: it orchestrates audio/video streams, AI services, and transports so you can build natural conversations. In this repo, the bot service is responsible for:\n\n- Capturing vision (robot camera)\n\n- Speech recognition + text-to-speech\n\n- Coordinating robot movement and expressive behaviors\n\nYou will find all the pipecat bot code in the `reachy-personal-assistant/bot` folder.\n\n## Step 5: Hook everything up to Reachy (hardware or simulation)\n\nReachy Mini exposes a daemon that the rest of your system connects to. The repo runs the daemon in simulation by default (--sim). If you have access to a real Reachy you can remove this flag and the same code will control your robot.\n\n### Run the full system\n\nYou will need three terminals to run the entire system:\n\n#### Terminal 1: Reachy daemon\n\n```\ncd bot\n# macOS:\nuv run mjpython -m reachy_mini.daemon.app.main --sim --no-localhost-only\n\n# Linux:\nuv run -m reachy_mini.daemon.app.main --sim --no-localhost-only\n```\n\nIf you are using the physical hardware, remember to omit the --sim flag from the command.\n\n#### Terminal 2: Bot service\n\n```\ncd bot\nuv venv\nuv sync\nuv run --env-file ../.env python main.py\n```\n\n#### Terminal 3: NeMo Agent Toolkit service\n\nIf the NeMo Agent Toolkit service is not already running from Step 1, start it now in Terminal 3.\n\n```\ncd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001\n```\n\nOnce all the terminals are set up, there are two main windows to keep track of:\n\nReachy Sim – This window appears automatically when you start the simulator daemon in Terminal 1. This is applicable if you’re running Reachy mini simulation in place of the physical device.\n\nPipecat Playground – This is the client-side UI where you can connect to the agent, enable microphone and camera inputs, and view live transcripts. In Terminal 2, open the URL exposed by the bot service: http://localhost:7860/. Click “CONNECT” in your browser. It may take a few seconds to initialize, and you’ll be prompted to grant microphone (and optionally camera) access.\n\nOnce both windows are up and running:\n\n- The Client and Agent STATUS indicators should show READY\n\n- The bot will greet you with a welcome message “Hello, how may I assist you today?”\n\nAt this point, you can start interacting with your agent!\n\n## Try these example prompts\n\nHere are a few simple prompts to help you test your personal assistant. You can start with these and then experiment by adding your own to see how the agent responds!\n\nText-only prompts (routes to the fast text model)\n\n- “Explain what you can do in one sentence.”\n\n- “Summarize the last thing I said.”\n\nVision prompts (routes to the VLM)\n\n- “What am I holding up to the camera?”\n\n- “Read the text on this page and summarize it.”\n\n## Where to go next\n\nInstead of a \"black-box\" assistant, this builds a foundation for a private, hackable system where you can control both the intelligence and the hardware. You can inspect, extend, and run it locally, with full visibility into data flow, tool permissions, and how the robot perceives and acts.\n\nDepending on your goals, here are a few directions to explore next:\n\n- Optimize for performance: Use the LLM Router developer example to balance cost, latency, and quality by intelligently directing queries between different models.\n\n- Check out the tutorial for building a voice-powered RAG agent with guardrails using Nemotron open models.\n\n- Master the hardware: Explore the Reachy Mini SDK and simulation docs to design and test advanced robotic behaviors before deploying to your physical system.\n\n- Explore and contribute to the apps built by the community for Reachy.\n\nWant to try it right away? Deploy the full environment here. One click and you're running.",
   "summaryZh": "NVIDIA展示了如何利用DGX Spark和Reachy Mini机器人构建桌面级智能体。通过集成Nemotron推理模型与视觉模型，开发者可以实现具备语音交互与物理操作能力的个人AI助手。文章提供了详细的部署指南与开源代码，为边缘侧智能体开发提供了完整的参考方案。",
   "summaryGeneratedAt": "2026-08-30T16:54:35.870022Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -53,5 +53,792 @@
     "summaryZh": "NVIDIA展示了如何利用DGX Spark和Reachy Mini机器人构建桌面级智能体。通过集成Nemotron推理模型与视觉模型，开发者可以实现具备语音交互与物理操作能力的个人AI助手。文章提供了详细的部署指南与开源代码，为边缘侧智能体开发提供了完整的参考方案。",
     "glossary": [],
     "duplicateKey": "nvidia-agent-demo-dgx"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/new_thumbnail.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/new_thumbnail.png",
+      "alt": "NVIDIA creates real world agents with DGX Spark and Reachy Mini at the CES 2026 Keynote",
+      "id": "image_4c22d1ef8d44f405"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/reachy-mini-dgx-spark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/reachy-mini-dgx-spark.png",
+      "alt": "Reachy Mini and DGX Spark on a desk",
+      "id": "image_b80b4770a33e7b2e"
+    }
+  ],
+  "videos": [
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/nvidia%20ces%20keynote%20-%20reachy%20demo.mp4?download=true",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/nvidia-reachy-mini/nvidia%20ces%20keynote%20-%20reachy%20demo.mp4?download=true",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/nvidia-reachy-mini",
+      "id": "video_9f502ca95c709c81"
+    }
+  ],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Today at CES 2026, NVIDIA unveiled a world of new open models to enable the future of agents, online and in the real world. From the recently released NVIDIA Nemotron reasoning LLMs to the new NVIDIA Isaac GR00T N1.6 open reasoning VLA and NVIDIA Cosmos world foundation models, all the building blocks are here today for AI Builders to build their own agents.",
+      "spans": [
+        {
+          "start": 151,
+          "end": 166,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/nvidia/nvidia-nemotron-v3"
+        },
+        {
+          "start": 193,
+          "end": 216,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/GR00T-N1.6-3B"
+        },
+        {
+          "start": 240,
+          "end": 277,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/nvidia/cosmos-reason2"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "But what if you could bring your own agent to life, right at your desk? An AI buddy that can be useful to you and process your data privately?",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In the CES keynote today, Jensen Huang showed us how we can do exactly that, using the processing power of NVIDIA DGX Spark with Reachy Mini to create your own little office R2D2 you can talk to and collaborate with.",
+      "spans": [
+        {
+          "start": 114,
+          "end": 123,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/products/workstations/dgx-spark/"
+        },
+        {
+          "start": 129,
+          "end": 140,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/pollen-robotics/Reachy_Mini"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This blog post provides a step-by-step guide to replicate this amazing experience at home using a DGX Spark and Reachy Mini.",
+      "spans": [
+        {
+          "start": 112,
+          "end": 123,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/pollen-robotics/Reachy_Mini"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Let’s dive in!",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Ingredients",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "If you want to start cooking right away, here’s the source code of the demo.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 75,
+          "kind": "a",
+          "href": "https://github.com/brevdev/reachy-personal-assistant"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "We’ll be using the following:",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "A reasoning model: demo uses NVIDIA Nemotron 3 Nano",
+      "spans": [
+        {
+          "start": 29,
+          "end": 51,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "A vision model: demo uses NVIDIA Nemotron Nano 2 VL",
+      "spans": [
+        {
+          "start": 26,
+          "end": 51,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "A text-to-speech model: demo uses ElevenLabs",
+      "spans": [
+        {
+          "start": 34,
+          "end": 44,
+          "kind": "a",
+          "href": "https://elevenlabs.io"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Reachy Mini (or Reachy Mini Simulation)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://www.pollen-robotics.com/reachy-mini/"
+        },
+        {
+          "start": 16,
+          "end": 38,
+          "kind": "a",
+          "href": "https://github.com/pollen-robotics/reachy_mini/blob/main/docs/source/platforms/simulation/get_started.md"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Python v3.10+ environment, with uv",
+      "spans": [
+        {
+          "start": 32,
+          "end": 34,
+          "kind": "a",
+          "href": "https://docs.astral.sh/uv/"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Feel free to adapt the recipe and make it your own - you have many ways to integrate the models into your application:",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Local deployment – Run on your own hardware (DGX Spark or a GPU with sufficient VRAM). Our implementation requires ~65GB disk space for the reasoning model, and ~28GB for the vision model.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 54,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/products/workstations/dgx-spark/"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Cloud deployment– Deploy the models on cloud GPUs e.g. through NVIDIA Brev or Hugging Face Inference Endpoints.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 74,
+          "kind": "a",
+          "href": "http://build.nvidia.com/gpu"
+        },
+        {
+          "start": 78,
+          "end": 110,
+          "kind": "a",
+          "href": "https://endpoints.huggingface.co/"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Serverless model endpoints – Send requests to NVIDIA or Hugging Face Inference Providers.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 52,
+          "kind": "a",
+          "href": "https://build.nvidia.com/nvidia/nemotron-3-nano-30b-a3b/deploy"
+        },
+        {
+          "start": 56,
+          "end": 88,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/inference-providers/en/index"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Giving agentic powers to Reachy",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Turning an AI agent from a simple chat interface into something you can interact with naturally makes conversations feel more real. When an AI agent can see through a camera, speak out loud, and perform actions, the experience becomes more engaging. That’s what Reachy Mini makes possible.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Reachy Mini is designed to be customizable. With access to sensors, actuators, and APIs, you can easily wire it into your existing agent stack, by simulation or real hardware controlled directly from Python.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "This post focuses on composing existing building blocks rather than reinventing them. We combine open models for reasoning and vision, an agent framework for orchestration, and tool handlers for actions. Each component is loosely coupled, making it easy to swap models, change routing logic, or add new behaviors.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Unlike closed personal assistants, this setup stays fully open. You control the models, the prompts, the tools, and the robot’s actions. Reachy Mini simply becomes the physical endpoint of your agent where perception, reasoning, and action come together.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Building the agent",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "In this example, we use the NVIDIA NeMo Agent Toolkit, a flexible, lightweight, framework-agnostic open source library, to connect all the components of the agent together. It works seamlessly with other agentic frameworks, like LangChain, LangGraph, CrewAI, handling how models interact, routing inputs and outputs between them, and making it easy to experiment with different configurations or add new capabilities without rewriting core logic. The toolkit also provides built-in profiling and optimization features, letting you track token usage efficiency and latency across tools and agents, identify bottlenecks, and automatically tune hyperparameters to maximize accuracy while reducing cost and latency.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 53,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Agent-Toolkit"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Step 0: Set up and get access to models and services",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "First, clone the repository that contains all the code you’ll need to follow along:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "To access your intelligence layer, powered by the NVIDIA Nemotron models, you can either deploy them using NVIDIA NIM or vLLM, or connect to them through remote endpoints available at build.nvidia.com.",
+      "spans": [
+        {
+          "start": 107,
+          "end": 117,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/nim/large-language-models/latest/getting-started.html"
+        },
+        {
+          "start": 121,
+          "end": 125,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16#use-it-with-vllm"
+        },
+        {
+          "start": 184,
+          "end": 200,
+          "kind": "a",
+          "href": "http://build.nvidia.com"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "The following instructions assume you are accessing the Nemotron models via endpoints. Create a .env file in the main directory with your API keys. For local deployments, you do not need to specify API keys and can skip this step.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Step 1: Build a chat interface",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Start by getting a basic LLM chat workflow running through NeMo Agent Toolkit’s API server. NeMo Agent Toolkit supports running workflows via `nat serve` and providing a config file. The config file passed here contains all the necessary setup information for the agent, which includes the models used for chat, image understanding, as well as the router model used by the agent. The NeMo Agent Toolkit UI can connect over HTTP/WebSocket so you can chat with your workflow like a standard chat product. In this implementation, the NeMo Agent Toolkit server is launched on port 8001 (so your bot can call it, and the UI can too):",
+      "spans": [
+        {
+          "start": 187,
+          "end": 198,
+          "kind": "a",
+          "href": "https://github.com/brevdev/reachy-personal-assistant/blob/main/nat/src/ces_tutorial/config.yml"
+        },
+        {
+          "start": 384,
+          "end": 405,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/NeMo-Agent-Toolkit-UI"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Next, verify that you can send a plain text prompt through a separate terminal to ensure everything is setup correctly:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Reviewing the agent configuration, you’ll notice it defines far more capabilities than a simple chat completion. The next steps will walk through those details.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Step 2: Add NeMo Agent Toolkit’s built-in ReAct agent for tool calling",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Tool calling is an essential part of AI agents. NeMo Agent Toolkit includes a built-in ReAct agent that can reason between tool calls and use multiple tools before answering. We route “action requests” to a ReAct agent that’s allowed to call tools (for example, tools that trigger robot behaviors or fetch current robot state).",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Some practical notes to keep in mind:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Keep tool schemas tight (clear name/description/args), because that’s what the agent uses to decide what to call.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Put a hard cap on steps (max_tool_calls) so the agent can’t spiral.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "If using a physical robot, consider a “confirm before actuation” pattern for physical actions to ensure movement safety.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Take a look at this portion of the config it defines the tools (like Wikipedia search) and specifies the ReAct agent pattern used to manage them.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Step 3: Add a router to direct queries to different models",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "The key idea: don’t use one model for everything. Instead, route based on intent:",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Text queries can use a fast text model",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Visual queries must be run through a VLM",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Action/tool requests are routed to the ReAct agent + tools",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "You can implement routing a few ways (heuristics, a lightweight classifier, or a dedicated routing service). If you want the “production” version of this idea, the NVIDIA LLM Router developer example is the full reference implementation and includes evaluation and monitoring patterns.",
+      "spans": [
+        {
+          "start": 171,
+          "end": 199,
+          "kind": "a",
+          "href": "https://build.nvidia.com/nvidia/llm-router"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "A basic routing policy might work like this:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "If the user is asking a question about their environment, then send the request to a VLM along with an image captured from the camera (or Reachy).",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "If the user asks a question requiring real time information, send the input to a ReACT agent to perform a web search via a tool call.",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "If the user is asking simple questions, send the request to a small and fast model optimized for chit chat.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "These sections of the config define the routing topology and specify the router model.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "NOTE: If you want to reduce latency/cost or run offline, you can self-host one of the routed models (typically the “fast text” model) and keep the VLM remote. One common approach is serving via NVIDIA NIM or vLLM and pointing NeMo Agent Toolkit to an OpenAI-compatible endpoint.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Step 4: Add a Pipecat bot for real-time voice + vision",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Now we go real time. Pipecat is a framework designed for low-latency voice/multimodal agents: it orchestrates audio/video streams, AI services, and transports so you can build natural conversations. In this repo, the bot service is responsible for:",
+      "spans": [
+        {
+          "start": 21,
+          "end": 28,
+          "kind": "a",
+          "href": "https://www.pipecat.ai/"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Capturing vision (robot camera)",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Speech recognition + text-to-speech",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Coordinating robot movement and expressive behaviors",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "You will find all the pipecat bot code in the `reachy-personal-assistant/bot` folder.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 84,
+          "kind": "a",
+          "href": "https://github.com/brevdev/reachy-personal-assistant/tree/main/bot"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Step 5: Hook everything up to Reachy (hardware or simulation)",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Reachy Mini exposes a daemon that the rest of your system connects to. The repo runs the daemon in simulation by default (--sim). If you have access to a real Reachy you can remove this flag and the same code will control your robot.",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Run the full system",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "You will need three terminals to run the entire system:",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "Terminal 1: Reachy daemon",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "If you are using the physical hardware, remember to omit the --sim flag from the command.",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "Terminal 2: Bot service",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Terminal 3: NeMo Agent Toolkit service",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "If the NeMo Agent Toolkit service is not already running from Step 1, start it now in Terminal 3.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Once all the terminals are set up, there are two main windows to keep track of:",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Reachy Sim – This window appears automatically when you start the simulator daemon in Terminal 1. This is applicable if you’re running Reachy mini simulation in place of the physical device.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Pipecat Playground – This is the client-side UI where you can connect to the agent, enable microphone and camera inputs, and view live transcripts. In Terminal 2, open the URL exposed by the bot service: http://localhost:7860/. Click “CONNECT” in your browser. It may take a few seconds to initialize, and you’ll be prompted to grant microphone (and optionally camera) access.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        },
+        {
+          "start": 204,
+          "end": 226,
+          "kind": "a",
+          "href": "http://localhost:7860/client/"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "Once both windows are up and running:",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "The Client and Agent STATUS indicators should show READY",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "The bot will greet you with a welcome message “Hello, how may I assist you today?”",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "At this point, you can start interacting with your agent!",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "Try these example prompts",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Here are a few simple prompts to help you test your personal assistant. You can start with these and then experiment by adding your own to see how the agent responds!",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Text-only prompts (routes to the fast text model)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0077",
+      "source": "“Explain what you can do in one sentence.”",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "“Summarize the last thing I said.”",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "Vision prompts (routes to the VLM)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "“What am I holding up to the camera?”",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "“Read the text on this page and summarize it.”",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "Where to go next",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "Instead of a \"black-box\" assistant, this builds a foundation for a private, hackable system where you can control both the intelligence and the hardware. You can inspect, extend, and run it locally, with full visibility into data flow, tool permissions, and how the robot perceives and acts.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Depending on your goals, here are a few directions to explore next:",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Optimize for performance: Use the LLM Router developer example to balance cost, latency, and quality by intelligently directing queries between different models.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 62,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-AI-Blueprints/llm-router/tree/experimental"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "Check out the tutorial for building a voice-powered RAG agent with guardrails using Nemotron open models.",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Master the hardware: Explore the Reachy Mini SDK and simulation docs to design and test advanced robotic behaviors before deploying to your physical system.",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Explore and contribute to the apps built by the community for Reachy.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/pollen-robotics/Reachy_Mini#apps"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Want to try it right away? Deploy the full environment here. One click and you're running.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 59,
+          "kind": "a",
+          "href": "https://brev.nvidia.com/launchable/deploy?launchableID=env-37ZZY950tDIuCQSSHXIKSGpRbFJ"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "3511e0a9c6aa753cded056f381a6e5d1863686df475e7a7cc17a890b6266ef02",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "git clone git@github.com/brevdev/reachy-personal-assistant\ncd reachy-personal-assistant"
+    },
+    {
+      "id": "c0002",
+      "source": "NVIDIA_API_KEY=your_nvidia_api_key_here\nELEVENLABS_API_KEY=your_elevenlabs_api_key_here"
+    },
+    {
+      "id": "c0003",
+      "source": "cd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001"
+    },
+    {
+      "id": "c0004",
+      "source": "curl -s http://localhost:8001/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\": \"test\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]}'"
+    },
+    {
+      "id": "c0005",
+      "source": "functions:\n   wikipedia_search:\n      _type: wiki_search\n      max_results: 2\n      \n   ..\n   react_agent:\n      _type: react_agent\n      llm_name: agent_llm\n      verbose: true\n      parse_agent_response_max_retries: 3\n      tool_names: [wikipedia_search]\n\n​​workflow:\n   _type: ces_tutorial_router_agent\n   agent: react_agent"
+    },
+    {
+      "id": "c0006",
+      "source": "functions:\n   ..\n   \n   router:\n      _type: router\n      route_config:\n        - name: other\n          description: Any question that requires careful thought, outside information, image understanding, or tool calling to take actions.\n        - name: chit_chat\n          description: Any simple chit chat, small talk, or casual conversation.\n        - name: image_understanding\n          description: A question that requires the assistant to see the user eg a question about their appearance, environment, scene or surroundings. Examples what am I holding, what am I wearing, what do I look like, what is in my surroundings, what does it say on the whiteboard. Questions about attire eg what color is my shirt/hat/jacket/etc\n      llm_name: routing_llm\n\n\nllms:\n   ..\n   routing_llm: \n      _type: nim\n      model_name: microsoft/phi-3-mini-128k-instruct\n      temperature: 0.0"
+    },
+    {
+      "id": "c0007",
+      "source": "cd bot\n# macOS:\nuv run mjpython -m reachy_mini.daemon.app.main --sim --no-localhost-only\n\n# Linux:\nuv run -m reachy_mini.daemon.app.main --sim --no-localhost-only"
+    },
+    {
+      "id": "c0008",
+      "source": "cd bot\nuv venv\nuv sync\nuv run --env-file ../.env python main.py"
+    },
+    {
+      "id": "c0009",
+      "source": "cd nat\nuv venv\nuv sync\nuv run --env-file ../.env nat serve --config_file src/ces_tutorial/config.yml --port 8001"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "3511e0a9c6aa753cded056f381a6e5d1863686df475e7a7cc17a890b6266ef02",
+  "mediaLayout": [
+    {
+      "mediaId": "image_4c22d1ef8d44f405",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "video_9f502ca95c709c81",
+      "type": "video",
+      "afterBlockId": "b0003",
+      "order": 1
+    },
+    {
+      "mediaId": "image_b80b4770a33e7b2e",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 1,
+    "savedVideos": 1,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:18.381990Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:18.382007Z"
 }

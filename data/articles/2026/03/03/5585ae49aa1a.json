@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-02T04:43:40.720522Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# PRX Part 3 — Training a Text-to-Image Model in 24h!\n\nIn the last two posts ( Part 1 and Part 2 ), we explored a wide range of architectural and training tricks for diffusion models. We tried to evaluate each idea in isolation, measuring throughput, convergence speed, and final image quality, and tried to understand what actually moves the needle.\n\nIn this post, we want to answer a much more practical question:\n\nWhat happens when we combine all the tricks that worked?\n\nInstead of optimizing one dimension at a time, we’ll stack the most promising ingredients together and see how far we can push performance under a strict compute budget.\n\nTo make things concrete, we’re doing a 24-hour speedrun :\n\n- ~ 1500 total compute budget (2/hour/GPU)\n\nThis is very far from the early diffusion days, where training competitive models could cost millions of dollars. The goal here is to demonstrate how much the field has evolved and how far careful engineering can take you in just a single day of training.\n\nThis speedrun is not just a fun experiment. It will likely serve as the foundation for our large-scale training recipe going forward.\n\nAlongside the results, we’re also open-sourcing our code ( Github link ), which contains:\n\n- The training code used for this speedrun\n\n- The experimental framework from the previous blog post\n\nSo you can reproduce, modify, and extend everything yourself.\n\nNow let’s walk through what went into this 24h run.\n\n### X-prediction and Training in the Pixel Space\n\nWe use the x-prediction formulation from Back to Basics: Let Denoising Generative Models Denoise [ Li and He, 2025 ]. As seen in Part 2 , this enables training directly in pixel space and eliminates the need for a VAE altogether . We use a patch size of 32 and use a 256-dimensional bottleneck in the initial token projection layer. This design keeps the sequence length under control, making pixel-space training computationally manageable even at higher resolutions.\n\nAt 512px, the sequence length is:\n\n( 512 / 32 ) 2 = 256 (512 / 32)2 = 256 ( 512/32 ) 2 = 256\n\nAt 1024px, the sequence length becomes:\n\n( 1024 / 32 ) 2 = 1024 (1024 / 32)2 = 1024 ( 1024/32 ) 2 = 1024\n\nInstead of following the usual 256px → 512px → 1024px schedule, we start directly at 512px and then fine-tune at 1024px.\n\nWith controlled token counts and modern hardware, pixel-space training is no longer prohibitive. It is simply a cleaner and more direct formulation.\n\nOne very nice side effect of predicting x 0 x_0 x 0 ​ directly in pixel space is that we can reuse a whole toolbox from classical computer vision.\n\nWhen your model outputs latents, perceptual supervision becomes awkward. You either have to decode back to pixels or define losses in a learned latent space that may or may not align with human perception. Once you predict pixels directly, everything becomes straightforward again. You can plug in perceptual losses exactly as they were originally designed.\n\nWe take inspiration from the paper PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss [ Ma et al. ], where the authors introduce additional perceptual objectives on top of the diffusion loss. They show that adding perceptual signals can noticeably improve convergence speed and final visual quality.\n\nFor this 24h run, we add two auxiliary losses:\n\n- LPIPS ([ Zhang et al. ])\n\n- A DINO-based perceptual loss (we use DINOv2 [ Oquab et al. ])\n\nThe idea is simple: In addition to the standard flow matching objective, we encourage the predicted clean image to match the target image in a perceptual feature space. LPIPS captures low-level perceptual similarity, while DINO features provide a stronger semantic signal.\n\nWe keep the same overall idea as the paper, but we tweaked a few details. In our experiments, we empirically found that it worked better to:\n\n- apply the perceptual losses on pooled full images instead of patch-wise features\n\n- apply them at all noise levels\n\nThese are small implementation details, but in our setting they consistently gave better results.\n\nWe used a weight of 0.1 for the LPIPS loss and 0.01 for the DINO perceptual loss, matching the values recommended in the original paper.\n\nThese losses are lightweight compared to the main transformer forward pass, and in our setup they add only a small overhead while providing a consistent quality boost.\n\n### Token Routing with TREAD\n\nTo make each step cheaper, we use token routing with TREAD [ Krause et al., 2025 ]), which randomly selects a fraction of tokens and lets them bypass a contiguous chunk of transformer blocks, then re-injects them later so nothing is dropped.\n\nWe picked TREAD over SPRINT ( Park et al., 2025 ) mostly for simplicity, and because the extra complexity of SPRINT did not feel worth the fairly small additional compute savings in our setting (sequence length 64 vs. 128 with TREAD at 512px).\n\nFollowing the TREAD recipe, we route 50% of the tokens from the 2nd block to the penultimate block of the transformer.\n\nRouted models can look worse under vanilla CFG, especially when undertrained, so we implemented a simple self-guidance scheme inspired by Guiding Token-Sparse Diffusion Models ( Krause et al., 2025 ), which guides using a dense vs. routed conditional prediction instead of relying on an unconditional branch.\n\n### Representation Alignment with REPA and DINOv3\n\nWe used REPA [ Yu et al., 2024 ] for representation alignment.\n\nFor the teacher, we went with DINOv3 [ Siméoni et al. 2025 ] since it gave the best quality improvements in our previous experiments.\n\nConcretely, we apply the alignment loss once,at the 8th transformer block with a loss weight of 0.5 .\n\nSince we combine REPA with TREAD routing, we only compute the alignment loss on the non-routed tokens , meaning the tokens that actually go through the blocks where we apply the loss. This keeps the REPA signal consistent and avoids comparing features for tokens that skipped the computation path.\n\nWe used the Muon optimizer, using the FSDP implementation from muon_fsdp_2 , since it showed a clear improvement over Adam in our previous runs.\n\nMuon is only applied to 2D parameters (basically matrices). Everything else (biases, norms, embeddings, etc.) is optimized with Adam, which is why the config has two parameter groups.\n\nGroup What it applies to Key params we used\n\nlr=1e-4 , momentum=0.95 , nesterov=true , ns_steps=5\n\nlr=1e-4 , betas=(0.9, 0.95) , eps=1e-8\n\nWe trained on three publicly available synthetic datasets:\n\n- Flux generated (1.7M), lehduong/flux_generated\n\n- FLUX-Reason-6M (6M), LucasFang/FLUX-Reason-6M\n\n- midjourney-v6-llava (1M), brivangl/midjourney-v6-llava which we re-captioned with Gemini 1.5 to make prompts more consistent and cut down caption noise.\n\nThe schedule is basically: go fast at 512, then sharpen at 1024:\n\n- 512px for 100k steps with batch size 1024\n\n- 1024px for 20k steps with batch size 512 without REPA .\n\nWe also keep an EMA of the weights for sampling and eval:\n\n- update_interval = 10ba\n\n## Results and Closing Thoughts\n\nBelow are the evaluation curves we tracked throughout the run and a few sample grids from the final checkpoint:\n\nFor a one day training run, this is already a pretty solid place to be. The model is not flawless yet (you can still spot some texture glitches, occasional weird anatomy, and it can get a bit shaky on very hard prompts), but it is clearly usable. Prompt following is strong, the overall aesthetic is consistent, and the 1024 stage mostly does what we want: sharpen details without breaking composition.\n\nThe key takeaway is that we're very close. The remaining issues look more like undertraining artifacts and limited data diversity than signs of a structural flaw in the recipe. The failure modes are consistent with what you’d expect from a model that simply hasn’t seen enough varied data yet. With more compute and broader coverage, this exact setup should continue improving in a fairly predictable way.\n\nZooming out, this speed run also highlights how far diffusion training has come. By combining pixel-space training, efficient routing, representation alignment, and lightweight perceptual guidance, you can now get a meaningful model in about a day on a budget that would have sounded unrealistic not that long ago.\n\nThis 24h run is just a starting point, not the finish line. Next, we will keep pushing the same recipe with a bit more scale and iterate on the dataset mix and captioning.\n\nAll the code and configs behind this speedrun, as well as the full experimental framework used throughout Part 1 and Part 2 , are available in the PRX repository: https://github.com/Photoroom/PRX .\n\nWhile we don’t redistribute the exact training datasets used in this run, the pipeline is fully configurable and designed to be easily adapted to your own data. You can plug in different datasets, tweak individual components (TREAD, REPA, perceptual losses, Muon, etc.), and run controlled experiments with minimal friction. Our goal is to make this a practical playground for fast diffusion research, and we hope the community will use it to explore, benchmark, and iterate on these techniques in their own setups.\n\nIf you made it this far, thank you for reading. We would also love to have you join our Discord community, where we share PRX progress and results, and discuss anything diffusion and text-to-image related.\n\nGoodbye for now, and stay tuned for the next round of experiments! 🚀\n\nThis speedrun was inspired by several recent efforts exploring fast and low-cost training of diffusion models. If you're interested in speedrunning text-to-image models, we encourage you to check out the following works:\n\n- Haridas, A., Shen, T., Yu, J. Nitro-T: Training a Text-to-Image Diffusion Model from Scratch in 1 Day. https://rocm.blogs.amd.com/artificial-intelligence/nitro-t-diffusion/README.html\n\n- Bhanded, S. Speedrunning ImageNet Diffusion. https://arxiv.org/abs/2512.12386\n\n- Sehwag, V., Kong, X., Li, J., Spranger, M., Lyu, L. Stretching Each Dollar: Diffusion Training from Scratch on a Micro-Budget. https://arxiv.org/abs/2407.15811\n\n- Yeh, S.-Y. Home-made Diffusion Model from Scratch to Hatch. https://arxiv.org/abs/2509.06068\n\n## Datasets mentioned in this article 3\n\n## PRX Part 4: Our Data Strategy\n\n## Training Design for Text-to-Image Models: Lessons from Ablations\n\n24 hours is very impressive, but looking at 32 H200 makes it make a bit more sense xD. Super cool that you used Muon! And, are you planning on releasing the re-captioned brivangl/midjourney-v6-llava?\n\nYeah, definitely not possible on consumer hardware… yet :D That’s also why we added the 1500 tag.\n\nRegarding releasing the captions, we hadn’t really thought about that. If you think it would be valuable for the community, we can work on releasing them as well.\n\nHi, this article is very inspiring.\n\nI'd like to get your thoughts on the perceptual loss. During a research internship on (raw) image restoration - and trying to explore the perception/distortion tradeoff , I did a few attempts at VGG and Dino loss aswell. I always ended up with checkerboard patterns (no matter vgg or dino). If you look at the original paper from Johnson , it's full of these artifacts.\n\nDid you face any such issue or can share useful insights about that topic ?\n\nI don’t think we really observed such artifacts, or at least not due to LPIPS. We did see something similar without LPIPS when using JIT on undertrained models, but I don’t think we observe them anymore. It might simply be because the model had not converged yet.\n\nOne situation where we started to observe checkerboard patterns was during reward alignment with GRPO or SRPO on one of these models. In that case the artifacts were much more noticeable, but I don’t think they were related to LPIPS since we were not using it at the time.\n\nWhat type of model were you using?\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "## Introduction\n\nWelcome back 👋\n\nIn the last two posts (Part 1 and Part 2), we explored a wide range of architectural and training tricks for diffusion models. We tried to evaluate each idea in isolation, measuring throughput, convergence speed, and final image quality, and tried to understand what actually moves the needle.\n\nIn this post, we want to answer a much more practical question:\n\nWhat happens when we combine all the tricks that worked?\n\nInstead of optimizing one dimension at a time, we’ll stack the most promising ingredients together and see how far we can push performance under a strict compute budget.\n\nTo make things concrete, we’re doing a 24-hour speedrun:\n\n- 32 H200\n\n- ~$1500 total compute budget (2$/hour/GPU)\n\nThis is very far from the early diffusion days, where training competitive models could cost millions of dollars. The goal here is to demonstrate how much the field has evolved and how far careful engineering can take you in just a single day of training.\n\nThis speedrun is not just a fun experiment. It will likely serve as the foundation for our large-scale training recipe going forward.\n\nAlongside the results, we’re also open-sourcing our code (Github link), which contains:\n\n- The training code used for this speedrun\n\n- The experimental framework from the previous blog post\n\nSo you can reproduce, modify, and extend everything yourself.\n\n## The Training Recipe\n\nNow let’s walk through what went into this 24h run.\n\n### X-prediction and Training in the Pixel Space\n\nWe use the x-prediction formulation from Back to Basics: Let Denoising Generative Models Denoise [Li and He, 2025]. As seen in Part 2, this enables training directly in pixel space and eliminates the need for a VAE altogether. We use a patch size of 32 and use a 256-dimensional bottleneck in the initial token projection layer. This design keeps the sequence length under control, making pixel-space training computationally manageable even at higher resolutions.\n\nAt 512px, the sequence length is:\n\n(512/32)2=256 (512 / 32)^2 = 256 (512/32)2=256\n\nAt 1024px, the sequence length becomes:\n\n(1024/32)2=1024 (1024 / 32)^2 = 1024 (1024/32)2=1024\n\nInstead of following the usual 256px → 512px → 1024px schedule, we start directly at 512px and then fine-tune at 1024px.\n\nWith controlled token counts and modern hardware, pixel-space training is no longer prohibitive. It is simply a cleaner and more direct formulation.\n\n### Perceptual Losses\n\nOne very nice side effect of predicting x0x_0x0​ directly in pixel space is that we can reuse a whole toolbox from classical computer vision.\n\nWhen your model outputs latents, perceptual supervision becomes awkward. You either have to decode back to pixels or define losses in a learned latent space that may or may not align with human perception. Once you predict pixels directly, everything becomes straightforward again. You can plug in perceptual losses exactly as they were originally designed.\n\nWe take inspiration from the paper PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss [Ma et al.], where the authors introduce additional perceptual objectives on top of the diffusion loss. They show that adding perceptual signals can noticeably improve convergence speed and final visual quality.\n\nFor this 24h run, we add two auxiliary losses:\n\n- LPIPS ([Zhang et al.])\n\n- A DINO-based perceptual loss (we use DINOv2 [Oquab et al.])\n\nThe idea is simple: In addition to the standard flow matching objective, we encourage the predicted clean image to match the target image in a perceptual feature space. LPIPS captures low-level perceptual similarity, while DINO features provide a stronger semantic signal.\n\nWe keep the same overall idea as the paper, but we tweaked a few details. In our experiments, we empirically found that it worked better to:\n\n- apply the perceptual losses on pooled full images instead of patch-wise features\n\n- apply them at all noise levels\n\nThese are small implementation details, but in our setting they consistently gave better results.\n\nWe used a weight of 0.1 for the LPIPS loss and 0.01 for the DINO perceptual loss, matching the values recommended in the original paper.\n\nThese losses are lightweight compared to the main transformer forward pass, and in our setup they add only a small overhead while providing a consistent quality boost.\n\n### Token Routing with TREAD\n\nTo make each step cheaper, we use token routing with TREAD [Krause et al., 2025]), which randomly selects a fraction of tokens and lets them bypass a contiguous chunk of transformer blocks, then re-injects them later so nothing is dropped.\n\nWe picked TREAD over SPRINT (Park et al., 2025) mostly for simplicity, and because the extra complexity of SPRINT did not feel worth the fairly small additional compute savings in our setting (sequence length 64 vs. 128 with TREAD at 512px).\n\nFollowing the TREAD recipe, we route 50% of the tokens from the 2nd block to the penultimate block of the transformer.\n\nRouted models can look worse under vanilla CFG, especially when undertrained, so we implemented a simple self-guidance scheme inspired by Guiding Token-Sparse Diffusion Models (Krause et al., 2025), which guides using a dense vs. routed conditional prediction instead of relying on an unconditional branch.\n\n### Representation Alignment with REPA and DINOv3\n\nWe used REPA [Yu et al., 2024] for representation alignment.\n\nFor the teacher, we went with DINOv3 [Siméoni et al. 2025] since it gave the best quality improvements in our previous experiments.\n\nConcretely, we apply the alignment loss once,at the 8th transformer block with a loss weight of 0.5.\n\nSince we combine REPA with TREAD routing, we only compute the alignment loss on the non-routed tokens, meaning the tokens that actually go through the blocks where we apply the loss. This keeps the REPA signal consistent and avoids comparing features for tokens that skipped the computation path.\n\n### Optimizer: Muon\n\nWe used the Muon optimizer, using the FSDP implementation from muon_fsdp_2, since it showed a clear improvement over Adam in our previous runs.\n\nMuon is only applied to 2D parameters (basically matrices). Everything else (biases, norms, embeddings, etc.) is optimized with Adam, which is why the config has two parameter groups.\n\nGroup\n\nWhat it applies to\n\nKey params we used\n\nMuon\n\n2D parameters\n\nlr=1e-4, momentum=0.95, nesterov=true, ns_steps=5\n\nAdam\n\nall non-2D parameters\n\nlr=1e-4, betas=(0.9, 0.95), eps=1e-8\n\n## Training Settings\n\nWe trained on three publicly available synthetic datasets:\n\n- Flux generated (1.7M), lehduong/flux_generated\n\n- FLUX-Reason-6M (6M), LucasFang/FLUX-Reason-6M\n\n- midjourney-v6-llava (1M), brivangl/midjourney-v6-llava which we re-captioned with Gemini 1.5 to make prompts more consistent and cut down caption noise.\n\nThe schedule is basically: go fast at 512, then sharpen at 1024:\n\n- 512px for 100k steps with batch size 1024\n\n- 1024px for 20k steps with batch size 512 without REPA.\n\nWe also keep an EMA of the weights for sampling and eval:\n\n- smoothing = 0.999\n\n- update_interval = 10ba\n\n- ema_start = 0ba\n\n## Results and Closing Thoughts\n\nBelow are the evaluation curves we tracked throughout the run and a few sample grids from the final checkpoint:\n\nFor a one day training run, this is already a pretty solid place to be. The model is not flawless yet (you can still spot some texture glitches, occasional weird anatomy, and it can get a bit shaky on very hard prompts), but it is clearly usable. Prompt following is strong, the overall aesthetic is consistent, and the 1024 stage mostly does what we want: sharpen details without breaking composition.\n\nThe key takeaway is that we're very close. The remaining issues look more like undertraining artifacts and limited data diversity than signs of a structural flaw in the recipe. The failure modes are consistent with what you’d expect from a model that simply hasn’t seen enough varied data yet. With more compute and broader coverage, this exact setup should continue improving in a fairly predictable way.\n\nZooming out, this speed run also highlights how far diffusion training has come. By combining pixel-space training, efficient routing, representation alignment, and lightweight perceptual guidance, you can now get a meaningful model in about a day on a budget that would have sounded unrealistic not that long ago.\n\n## What’s next?\n\nThis 24h run is just a starting point, not the finish line. Next, we will keep pushing the same recipe with a bit more scale and iterate on the dataset mix and captioning.\n\nAll the code and configs behind this speedrun, as well as the full experimental framework used throughout Part 1 and Part 2, are available in the PRX repository: https://github.com/Photoroom/PRX.\n\nWhile we don’t redistribute the exact training datasets used in this run, the pipeline is fully configurable and designed to be easily adapted to your own data. You can plug in different datasets, tweak individual components (TREAD, REPA, perceptual losses, Muon, etc.), and run controlled experiments with minimal friction. Our goal is to make this a practical playground for fast diffusion research, and we hope the community will use it to explore, benchmark, and iterate on these techniques in their own setups.\n\nIf you made it this far, thank you for reading. We would also love to have you join our Discord community, where we share PRX progress and results, and discuss anything diffusion and text-to-image related.\n\nGoodbye for now, and stay tuned for the next round of experiments! 🚀\n\n## Acknowledgements.\n\nThis speedrun was inspired by several recent efforts exploring fast and low-cost training of diffusion models. If you're interested in speedrunning text-to-image models, we encourage you to check out the following works:\n\n- Haridas, A., Shen, T., Yu, J. Nitro-T: Training a Text-to-Image Diffusion Model from Scratch in 1 Day. https://rocm.blogs.amd.com/artificial-intelligence/nitro-t-diffusion/README.html\n\n- Bhanded, S. Speedrunning ImageNet Diffusion. https://arxiv.org/abs/2512.12386\n\n- Sehwag, V., Kong, X., Li, J., Spranger, M., Lyu, L. Stretching Each Dollar: Diffusion Training from Scratch on a Micro-Budget. https://arxiv.org/abs/2407.15811\n\n- Yeh, S.-Y. Home-made Diffusion Model from Scratch to Hatch. https://arxiv.org/abs/2509.06068",
   "summaryZh": "Hugging Face发布了关于在24小时内完成文本到图像模型训练的实验报告。该项目通过整合多种架构优化技巧，在仅1500美元的计算预算下实现了高效训练。实验重点探讨了x-prediction公式的应用，并成功去除了VAE组件，直接在像素空间进行训练。该成果不仅验证了当前扩散模型训练技术的成熟度，还开源了相关代码与框架，为低成本、高效率的模型训练提供了可复现的参考方案。",
   "summaryGeneratedAt": "2026-08-30T12:00:16.862962Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -74,5 +74,1378 @@
       }
     ],
     "duplicateKey": "diffusion-24h-training-speedrun"
-  }
+  },
+  "images": [
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/7MUExmr-ed7sgd0D9H6yh.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/7MUExmr-ed7sgd0D9H6yh.png",
+      "alt": "",
+      "id": "image_daa370305c1d0bc1"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/wFevAF_ajrLWJxo8qll76.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/wFevAF_ajrLWJxo8qll76.png",
+      "alt": "",
+      "id": "image_68a19f667e985096"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/2JDkjJN0_FlFab5z6rz0V.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/2JDkjJN0_FlFab5z6rz0V.png",
+      "alt": "",
+      "id": "image_8ccfc7371f3d4a76"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/LZjbLPmMKSTv95T2hHFqs.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/LZjbLPmMKSTv95T2hHFqs.png",
+      "alt": "",
+      "id": "image_3f82d0c4cb416be3"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/F3uWaHXreakVacTkf6UIN.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/F3uWaHXreakVacTkf6UIN.png",
+      "alt": "",
+      "id": "image_28adabcec76084f2"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/X_XyKCFN1uaFhbz6fDC5f.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/X_XyKCFN1uaFhbz6fDC5f.png",
+      "alt": "",
+      "id": "image_8a39543599aca100"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/vuxXqk1jaAHjDcsaYfzoW.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/vuxXqk1jaAHjDcsaYfzoW.png",
+      "alt": "",
+      "id": "image_370d93a91b47e7ce"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/8xP_XO-ovK2V7IPPUl4X9.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/8xP_XO-ovK2V7IPPUl4X9.png",
+      "alt": "",
+      "id": "image_f9b633cb15667cf5"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/GrVwtipSxQPc_7AdX_Cyf.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/GrVwtipSxQPc_7AdX_Cyf.png",
+      "alt": "",
+      "id": "image_8a806896032ba4ea"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/bo3AdZb6PFYste4gNI_hS.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/bo3AdZb6PFYste4gNI_hS.png",
+      "alt": "",
+      "id": "image_8684a39cd6929b81"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/xSKUZg-4oCkY2709PFHJF.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/xSKUZg-4oCkY2709PFHJF.png",
+      "alt": "",
+      "id": "image_a1b41a4b0224b33c"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/B3QtNXI5RtqqKorQiPx75.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/B3QtNXI5RtqqKorQiPx75.png",
+      "alt": "",
+      "id": "image_2ae697718713a073"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/luwmLyhZgs7h2v2Wx4YRZ.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/luwmLyhZgs7h2v2Wx4YRZ.png",
+      "alt": "",
+      "id": "image_31b57b14581a426a"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/Q2zqJoyRe0-OtJxddzu42.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/Q2zqJoyRe0-OtJxddzu42.png",
+      "alt": "",
+      "id": "image_1d796ae4f2e4f623"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/rAMAI5mNE8PPhG0Lg5ln2.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/rAMAI5mNE8PPhG0Lg5ln2.png",
+      "alt": "",
+      "id": "image_8886c75455f3b122"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/nkS6ejpXCCdqqxSnbHQBY.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/nkS6ejpXCCdqqxSnbHQBY.png",
+      "alt": "",
+      "id": "image_ac7448f41ab540e5"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/drJMVDA36Lu7hYWVsrHaR.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/drJMVDA36Lu7hYWVsrHaR.png",
+      "alt": "",
+      "id": "image_4770b9bfefd29b4b"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/Ze4BuybUnlDu6bcZoVt-Y.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/Ze4BuybUnlDu6bcZoVt-Y.png",
+      "alt": "",
+      "id": "image_153ed15923493db4"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/s2-rKg3fqtGefcBXmNFHJ.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/s2-rKg3fqtGefcBXmNFHJ.png",
+      "alt": "image",
+      "id": "image_6ffffb62222cb45e"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/c5iZ9AQQ_wB7UONOiZaWs.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/c5iZ9AQQ_wB7UONOiZaWs.png",
+      "alt": "",
+      "id": "image_41defc242f15fede"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/f_KZ7Xdmx1aqLv1aWtHld.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/f_KZ7Xdmx1aqLv1aWtHld.png",
+      "alt": "",
+      "id": "image_ae031a2c5c4e3364"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/TNvYw9hHJ_87TiDYVdLuF.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/TNvYw9hHJ_87TiDYVdLuF.png",
+      "alt": "",
+      "id": "image_96acbac32d329ebc"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/wsWk2O4X4SZdEzuqdkxOI.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/wsWk2O4X4SZdEzuqdkxOI.png",
+      "alt": "",
+      "id": "image_56bb0dc029205378"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/RcnVYOwKjSciNdC_Ok4zW.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/RcnVYOwKjSciNdC_Ok4zW.png",
+      "alt": "",
+      "id": "image_9475edfcbe1e2d84"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/D1OUz7HPERstZe6r-x2Ji.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/D1OUz7HPERstZe6r-x2Ji.png",
+      "alt": "",
+      "id": "image_ab11a26a8b2551aa"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/3SKgSXkcBGnJATwG_wOH_.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/3SKgSXkcBGnJATwG_wOH_.png",
+      "alt": "",
+      "id": "image_be0d71ada1798ad8"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/F1lIaKaZKnTGpyNO3rzAX.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/F1lIaKaZKnTGpyNO3rzAX.png",
+      "alt": "",
+      "id": "image_4dc624d489f0af15"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/44VXfW9Sw1iBpGFDL7r3x.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/44VXfW9Sw1iBpGFDL7r3x.png",
+      "alt": "",
+      "id": "image_01f86cb4658e2282"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/VNQHVh2m1k6IcuxnxkLn-.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/VNQHVh2m1k6IcuxnxkLn-.png",
+      "alt": "",
+      "id": "image_2da85d812b008e86"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/1KwDxBoDcCkFAj2gXMJzU.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/1KwDxBoDcCkFAj2gXMJzU.png",
+      "alt": "",
+      "id": "image_b1cea1ba7277f9f3"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/zRiDsNZFnV4zDQopDMNBv.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68e529af513e724edd8702f6/zRiDsNZFnV4zDQopDMNBv.png",
+      "alt": "",
+      "id": "image_66502b5f9c2092d0"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Welcome back 👋",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In the last two posts (Part 1 and Part 2), we explored a wide range of architectural and training tricks for diffusion models. We tried to evaluate each idea in isolation, measuring throughput, convergence speed, and final image quality, and tried to understand what actually moves the needle.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Photoroom/prx-part1-architectures"
+        },
+        {
+          "start": 34,
+          "end": 40,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Photoroom/prx-part2"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "In this post, we want to answer a much more practical question:",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "What happens when we combine all the tricks that worked?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 56,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Instead of optimizing one dimension at a time, we’ll stack the most promising ingredients together and see how far we can push performance under a strict compute budget.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "To make things concrete, we’re doing a 24-hour speedrun:",
+      "spans": [
+        {
+          "start": 39,
+          "end": 55,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "32 H200",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "~$1500 total compute budget (2$/hour/GPU)",
+      "spans": [
+        {
+          "start": 1,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "This is very far from the early diffusion days, where training competitive models could cost millions of dollars. The goal here is to demonstrate how much the field has evolved and how far careful engineering can take you in just a single day of training.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "This speedrun is not just a fun experiment. It will likely serve as the foundation for our large-scale training recipe going forward.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Alongside the results, we’re also open-sourcing our code (Github link), which contains:",
+      "spans": [
+        {
+          "start": 58,
+          "end": 69,
+          "kind": "a",
+          "href": "https://github.com/Photoroom/PRX"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "The training code used for this speedrun",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "The experimental framework from the previous blog post",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "So you can reproduce, modify, and extend everything yourself.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "The Training Recipe",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Now let’s walk through what went into this 24h run.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "X-prediction and Training in the Pixel Space",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "We use the x-prediction formulation from Back to Basics: Let Denoising Generative Models Denoise [Li and He, 2025]. As seen in Part 2, this enables training directly in pixel space and eliminates the need for a VAE altogether. We use a patch size of 32 and use a 256-dimensional bottleneck in the initial token projection layer. This design keeps the sequence length under control, making pixel-space training computationally manageable even at higher resolutions.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 96,
+          "kind": "em"
+        },
+        {
+          "start": 98,
+          "end": 113,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2511.13720"
+        },
+        {
+          "start": 127,
+          "end": 133,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Photoroom/prx-part2"
+        },
+        {
+          "start": 148,
+          "end": 225,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "At 512px, the sequence length is:",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "(512/32)2=256 (512 / 32)^2 = 256 (512/32)2=256",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "At 1024px, the sequence length becomes:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "(1024/32)2=1024 (1024 / 32)^2 = 1024 (1024/32)2=1024",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Instead of following the usual 256px → 512px → 1024px schedule, we start directly at 512px and then fine-tune at 1024px.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "With controlled token counts and modern hardware, pixel-space training is no longer prohibitive. It is simply a cleaner and more direct formulation.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Perceptual Losses",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "One very nice side effect of predicting x0x_0x0​ directly in pixel space is that we can reuse a whole toolbox from classical computer vision.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "When your model outputs latents, perceptual supervision becomes awkward. You either have to decode back to pixels or define losses in a learned latent space that may or may not align with human perception. Once you predict pixels directly, everything becomes straightforward again. You can plug in perceptual losses exactly as they were originally designed.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "We take inspiration from the paper PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss [Ma et al.], where the authors introduce additional perceptual objectives on top of the diffusion loss. They show that adding perceptual signals can noticeably improve convergence speed and final visual quality.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 104,
+          "kind": "em"
+        },
+        {
+          "start": 106,
+          "end": 115,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2602.02493"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "For this 24h run, we add two auxiliary losses:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "LPIPS ([Zhang et al.])",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 8,
+          "end": 20,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1801.03924"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "A DINO-based perceptual loss (we use DINOv2 [Oquab et al.])",
+      "spans": [
+        {
+          "start": 2,
+          "end": 28,
+          "kind": "strong"
+        },
+        {
+          "start": 45,
+          "end": 57,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2304.07193"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "The idea is simple: In addition to the standard flow matching objective, we encourage the predicted clean image to match the target image in a perceptual feature space. LPIPS captures low-level perceptual similarity, while DINO features provide a stronger semantic signal.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "We keep the same overall idea as the paper, but we tweaked a few details. In our experiments, we empirically found that it worked better to:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "apply the perceptual losses on pooled full images instead of patch-wise features",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "apply them at all noise levels",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "These are small implementation details, but in our setting they consistently gave better results.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "We used a weight of 0.1 for the LPIPS loss and 0.01 for the DINO perceptual loss, matching the values recommended in the original paper.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 23,
+          "kind": "strong"
+        },
+        {
+          "start": 47,
+          "end": 51,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "These losses are lightweight compared to the main transformer forward pass, and in our setup they add only a small overhead while providing a consistent quality boost.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Token Routing with TREAD",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "To make each step cheaper, we use token routing with TREAD [Krause et al., 2025]), which randomly selects a fraction of tokens and lets them bypass a contiguous chunk of transformer blocks, then re-injects them later so nothing is dropped.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 58,
+          "kind": "em"
+        },
+        {
+          "start": 60,
+          "end": 79,
+          "kind": "a",
+          "href": "https://openaccess.thecvf.com/content/ICCV2025/papers/Krause_TREAD_Token_Routing_for_Efficient_Architecture-agnostic_Diffusion_Training_ICCV_2025_paper.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "We picked TREAD over SPRINT (Park et al., 2025) mostly for simplicity, and because the extra complexity of SPRINT did not feel worth the fairly small additional compute savings in our setting (sequence length 64 vs. 128 with TREAD at 512px).",
+      "spans": [
+        {
+          "start": 29,
+          "end": 46,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2510.21986"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Following the TREAD recipe, we route 50% of the tokens from the 2nd block to the penultimate block of the transformer.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 54,
+          "kind": "strong"
+        },
+        {
+          "start": 64,
+          "end": 73,
+          "kind": "strong"
+        },
+        {
+          "start": 81,
+          "end": 98,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Routed models can look worse under vanilla CFG, especially when undertrained, so we implemented a simple self-guidance scheme inspired by Guiding Token-Sparse Diffusion Models (Krause et al., 2025), which guides using a dense vs. routed conditional prediction instead of relying on an unconditional branch.",
+      "spans": [
+        {
+          "start": 177,
+          "end": 196,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2601.01608"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Representation Alignment with REPA and DINOv3",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "We used REPA [Yu et al., 2024] for representation alignment.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 12,
+          "kind": "strong"
+        },
+        {
+          "start": 14,
+          "end": 29,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2410.06940"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "For the teacher, we went with DINOv3 [Siméoni et al. 2025] since it gave the best quality improvements in our previous experiments.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 36,
+          "kind": "strong"
+        },
+        {
+          "start": 38,
+          "end": 57,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2508.10104"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Concretely, we apply the alignment loss once,at the 8th transformer block with a loss weight of 0.5.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 73,
+          "kind": "strong"
+        },
+        {
+          "start": 96,
+          "end": 99,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Since we combine REPA with TREAD routing, we only compute the alignment loss on the non-routed tokens, meaning the tokens that actually go through the blocks where we apply the loss. This keeps the REPA signal consistent and avoids comparing features for tokens that skipped the computation path.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 21,
+          "kind": "strong"
+        },
+        {
+          "start": 27,
+          "end": 32,
+          "kind": "strong"
+        },
+        {
+          "start": 84,
+          "end": 101,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Optimizer: Muon",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "We used the Muon optimizer, using the FSDP implementation from muon_fsdp_2, since it showed a clear improvement over Adam in our previous runs.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 16,
+          "kind": "strong"
+        },
+        {
+          "start": 63,
+          "end": 74,
+          "kind": "a",
+          "href": "https://github.com/samsja/muon_fsdp_2"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Muon is only applied to 2D parameters (basically matrices). Everything else (biases, norms, embeddings, etc.) is optimized with Adam, which is why the config has two parameter groups.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 37,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Group",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "What it applies to",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "Key params we used",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Muon",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "2D parameters",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "lr=1e-4, momentum=0.95, nesterov=true, ns_steps=5",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 9,
+          "end": 22,
+          "kind": "code"
+        },
+        {
+          "start": 24,
+          "end": 37,
+          "kind": "code"
+        },
+        {
+          "start": 39,
+          "end": 49,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "Adam",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "all non-2D parameters",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "lr=1e-4, betas=(0.9, 0.95), eps=1e-8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 9,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 28,
+          "end": 36,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "Training Settings",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "We trained on three publicly available synthetic datasets:",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "Flux generated (1.7M), lehduong/flux_generated",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 23,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/lehduong/flux_generated"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "FLUX-Reason-6M (6M), LucasFang/FLUX-Reason-6M",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 21,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/LucasFang/FLUX-Reason-6M"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "midjourney-v6-llava (1M), brivangl/midjourney-v6-llava which we re-captioned with Gemini 1.5 to make prompts more consistent and cut down caption noise.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/brivangl/midjourney-v6-llava"
+        },
+        {
+          "start": 82,
+          "end": 92,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "The schedule is basically: go fast at 512, then sharpen at 1024:",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "512px for 100k steps with batch size 1024",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 10,
+          "end": 20,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "1024px for 20k steps with batch size 512 without REPA.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 11,
+          "end": 20,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 40,
+          "kind": "strong"
+        },
+        {
+          "start": 49,
+          "end": 53,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "We also keep an EMA of the weights for sampling and eval:",
+      "spans": [
+        {
+          "start": 16,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "smoothing = 0.999",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "update_interval = 10ba",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "ema_start = 0ba",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Results and Closing Thoughts",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Below are the evaluation curves we tracked throughout the run and a few sample grids from the final checkpoint:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "For a one day training run, this is already a pretty solid place to be. The model is not flawless yet (you can still spot some texture glitches, occasional weird anatomy, and it can get a bit shaky on very hard prompts), but it is clearly usable. Prompt following is strong, the overall aesthetic is consistent, and the 1024 stage mostly does what we want: sharpen details without breaking composition.",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "The key takeaway is that we're very close. The remaining issues look more like undertraining artifacts and limited data diversity than signs of a structural flaw in the recipe. The failure modes are consistent with what you’d expect from a model that simply hasn’t seen enough varied data yet. With more compute and broader coverage, this exact setup should continue improving in a fairly predictable way.",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Zooming out, this speed run also highlights how far diffusion training has come. By combining pixel-space training, efficient routing, representation alignment, and lightweight perceptual guidance, you can now get a meaningful model in about a day on a budget that would have sounded unrealistic not that long ago.",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "What’s next?",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "This 24h run is just a starting point, not the finish line. Next, we will keep pushing the same recipe with a bit more scale and iterate on the dataset mix and captioning.",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "All the code and configs behind this speedrun, as well as the full experimental framework used throughout Part 1 and Part 2, are available in the PRX repository: https://github.com/Photoroom/PRX.",
+      "spans": [
+        {
+          "start": 106,
+          "end": 112,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Photoroom/prx-part1-architectures"
+        },
+        {
+          "start": 117,
+          "end": 123,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Photoroom/prx-part2"
+        },
+        {
+          "start": 162,
+          "end": 194,
+          "kind": "a",
+          "href": "https://github.com/Photoroom/PRX"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "While we don’t redistribute the exact training datasets used in this run, the pipeline is fully configurable and designed to be easily adapted to your own data. You can plug in different datasets, tweak individual components (TREAD, REPA, perceptual losses, Muon, etc.), and run controlled experiments with minimal friction. Our goal is to make this a practical playground for fast diffusion research, and we hope the community will use it to explore, benchmark, and iterate on these techniques in their own setups.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "If you made it this far, thank you for reading. We would also love to have you join our Discord community, where we share PRX progress and results, and discuss anything diffusion and text-to-image related.",
+      "spans": [
+        {
+          "start": 88,
+          "end": 95,
+          "kind": "a",
+          "href": "https://discord.gg/ZRwdpBSyyC"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "Goodbye for now, and stay tuned for the next round of experiments! 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Acknowledgements.",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "This speedrun was inspired by several recent efforts exploring fast and low-cost training of diffusion models. If you're interested in speedrunning text-to-image models, we encourage you to check out the following works:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Haridas, A., Shen, T., Yu, J. Nitro-T: Training a Text-to-Image Diffusion Model from Scratch in 1 Day. https://rocm.blogs.amd.com/artificial-intelligence/nitro-t-diffusion/README.html",
+      "spans": [
+        {
+          "start": 30,
+          "end": 102,
+          "kind": "em"
+        },
+        {
+          "start": 103,
+          "end": 183,
+          "kind": "a",
+          "href": "https://rocm.blogs.amd.com/artificial-intelligence/nitro-t-diffusion/README.html"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Bhanded, S. Speedrunning ImageNet Diffusion. https://arxiv.org/abs/2512.12386",
+      "spans": [
+        {
+          "start": 12,
+          "end": 44,
+          "kind": "em"
+        },
+        {
+          "start": 45,
+          "end": 77,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2512.12386"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Sehwag, V., Kong, X., Li, J., Spranger, M., Lyu, L. Stretching Each Dollar: Diffusion Training from Scratch on a Micro-Budget. https://arxiv.org/abs/2407.15811",
+      "spans": [
+        {
+          "start": 52,
+          "end": 126,
+          "kind": "em"
+        },
+        {
+          "start": 127,
+          "end": 159,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2407.15811"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Yeh, S.-Y. Home-made Diffusion Model from Scratch to Hatch. https://arxiv.org/abs/2509.06068",
+      "spans": [
+        {
+          "start": 11,
+          "end": 59,
+          "kind": "em"
+        },
+        {
+          "start": 60,
+          "end": 92,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2509.06068"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "adbeec8d38965a1cf2efd3b23cebd032a7ff56de3ffa5b4ae0066ba00b1c08ce",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "adbeec8d38965a1cf2efd3b23cebd032a7ff56de3ffa5b4ae0066ba00b1c08ce",
+  "mediaLayout": [
+    {
+      "mediaId": "image_daa370305c1d0bc1",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_68a19f667e985096",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 1
+    },
+    {
+      "mediaId": "image_8ccfc7371f3d4a76",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 2
+    },
+    {
+      "mediaId": "image_3f82d0c4cb416be3",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 3
+    },
+    {
+      "mediaId": "image_28adabcec76084f2",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 4
+    },
+    {
+      "mediaId": "image_8a39543599aca100",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 5
+    },
+    {
+      "mediaId": "image_370d93a91b47e7ce",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 6
+    },
+    {
+      "mediaId": "image_f9b633cb15667cf5",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 7
+    },
+    {
+      "mediaId": "image_8a806896032ba4ea",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 8
+    },
+    {
+      "mediaId": "image_8684a39cd6929b81",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 9
+    },
+    {
+      "mediaId": "image_a1b41a4b0224b33c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 10
+    },
+    {
+      "mediaId": "image_2ae697718713a073",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 11
+    },
+    {
+      "mediaId": "image_31b57b14581a426a",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 12
+    },
+    {
+      "mediaId": "image_1d796ae4f2e4f623",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 13
+    },
+    {
+      "mediaId": "image_8886c75455f3b122",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 14
+    },
+    {
+      "mediaId": "image_ac7448f41ab540e5",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 15
+    },
+    {
+      "mediaId": "image_4770b9bfefd29b4b",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 16
+    },
+    {
+      "mediaId": "image_153ed15923493db4",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 17
+    },
+    {
+      "mediaId": "image_6ffffb62222cb45e",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 18
+    },
+    {
+      "mediaId": "image_41defc242f15fede",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 19
+    },
+    {
+      "mediaId": "image_ae031a2c5c4e3364",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 20
+    },
+    {
+      "mediaId": "image_96acbac32d329ebc",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 21
+    },
+    {
+      "mediaId": "image_56bb0dc029205378",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 22
+    },
+    {
+      "mediaId": "image_9475edfcbe1e2d84",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 23
+    },
+    {
+      "mediaId": "image_ab11a26a8b2551aa",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 24
+    },
+    {
+      "mediaId": "image_be0d71ada1798ad8",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 25
+    },
+    {
+      "mediaId": "image_4dc624d489f0af15",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 26
+    },
+    {
+      "mediaId": "image_01f86cb4658e2282",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 27
+    },
+    {
+      "mediaId": "image_2da85d812b008e86",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 28
+    },
+    {
+      "mediaId": "image_b1cea1ba7277f9f3",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 29
+    },
+    {
+      "mediaId": "image_66502b5f9c2092d0",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 30
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 31,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 31,
+    "savedImages": 31,
+    "sourceImageOccurrences": 31,
+    "placedImageOccurrences": 31,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:16.322893Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:16.322915Z"
 }

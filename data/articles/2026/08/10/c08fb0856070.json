@@ -18,83 +18,59 @@
   "fetchedAt": "2026-09-01T11:46:13.207583Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Making Knowledge Distillation Cheap Enough to Run at Scale\n\nPublished August 10, 2026\n\nKnowledge distillation , training a smaller student model to match the performance of a larger teacher, is a well-known technique in Machine Learning. With the recent wave of open-source Large Language Models, such as gpt-oss , Qwen , GLM , or Kimi , it has become a mainstream research topic again. Deploying these very large models is expensive: the recent Kimi-K3 model has 2.8 trillion parameters and needs roughly 3TB of VRAM just to load. Compressing them into smaller models and recovering the original capabilities through knowledge distillation has therefore become standard practice, with companies like Nvidia ( Nemotron 3 Puzzle 75B ) or Multiverse Computing ( Hypernova 60B ) recently releasing high-quality compressed models.\n\nThe distillation step is what decides most of the final quality, but it's also usually the most expensive part of the pipeline. Keeping both the teacher and student loaded, and producing a probability distribution over the entire vocabulary for every token, requires enormous amounts of VRAM, typically feasible only with hundreds of GPUs and careful tensor-parallelism strategies. Our latest paper, Efficient Knowledge Distillation for LLMs: Offline Top-K Logits and a Fused Chunked KL Loss , tackles this with two systems changes: caching the teacher's top-K logits once so the teacher never has to sit in memory alongside the student, and a new, memory-efficient KL-divergence loss that avoids ever materializing the full vocabulary-size × sequence-length matrix, cutting VRAM use far below what the default implementations in libraries like PyTorch or NVIDIA Megatron-Bridge achieve. Together, these two changes cut training cost enough to make long-context healing possible on a single GPU, and cheap enough to make large-scale experimentation practical.\n\n## Why distillation recovery is expensive\n\nThe standard setup, online distillation using the Kullback-Leibler divergence loss (KL loss), keeps both the teacher and the student loaded at the same time. At every training step, the teacher runs a full forward pass to produce its output distribution, and the student is trained to match it. This is the most expressive setup, since the full teacher distribution is available, but it is also the most memory- and compute-intensive: two full-vocabulary tensors have to be held per token position, and the teacher has to be recomputed on every single step even though its behavior does not change across a training run.\n\nAs a practical example, gpt-oss-120b has a vocabulary of 201,088 tokens. At a sequence length of 32K and batch size 4, the teacher-probability tensor alone has shape 4 × 201,088 × 32,768 ; in bfloat16, that's already about 50GB of VRAM for a single tensor. Add gradients, activations, model weights, and optimizer states, and a single training iteration of distillation can peak at roughly 250GB of VRAM, more than even an H200 or B200 GPU can provide. In this post, we show that reformulating the KL loss to process the data in chunks reduces this cost to almost nothing.\n\nDense KL spikes to roughly 250GB, above a single H200's 141GB capacity. The fused chunked loss never forms that spike and peaks at about 128GB. Source: paper Figure 1.\n\nOffline distillation. Instead of recomputing the teacher at every step, we compute its output once, cache the top-100 most likely tokens per position, and train the student against that cache. The teacher never has to sit in memory during training and does not need to be run again once the cache exists, so the same cache can be reused across many ablations.\n\nA fused, chunked KL loss. To see why the loss itself is expensive, picture what it actually builds: for every token position in a sequence and every word in the vocabulary, the loss needs a number describing how much the student's prediction disagrees with the teacher's. Laid out as a grid, that's one row per vocabulary entry and one column per sequence position, for a vocabulary of 100K+ words and a long sequence, that grid is enormous, and the default way of computing a KL loss builds the whole thing before it can produce a single number.\n\nWe compare three ways of computing this same loss, all mathematically equivalent:\n\n- Dense KL is the textbook approach. It rebuilds a full, dense teacher-probability grid from the cached top-100 logits and compares it against the student's own dense grid of log-probabilities. This is the version closest to how online distillation already works, so we use it as our correctness baseline, but it holds the full vocabulary × sequence grid in memory, twice over.\n\n- Forward-chunked KL keeps the teacher sparse (only its cached top-100 logits per position, never expanded into a dense grid) and computes the loss piece by piece, one slice of sequence positions at a time. This removes the dense teacher and the dense comparison, and turns out to be the fastest of the three methods in our benchmarks. It still has one blind spot, though: the student's own logits, the grid produced by the model's output layer, are still computed in full and kept around for the backward pass, so memory still grows steeply with sequence length.\n\n- Fused chunked KL , our main contribution, goes a step further and fuses the model's output projection directly into the loss computation. It never produces the student's full logits grid at all: it processes one chunk of the sequence at a time end to end, projecting hidden states to logits for that chunk, folding the result into the running loss, and discarding the chunk before moving to the next one. The backward pass recomputes each chunk on the fly instead of storing it. The cost is doing that projection twice, once forward, once in backward, but in exchange, peak memory grows only linearly with sequence length instead of spiking with the full vocabulary × sequence size.\n\nThe GIF below shows the difference between the dense and fused-chunked approaches: one builds the whole comparison grid and holds onto all of it, the other builds and discards one slice at a time, so memory never grows beyond a single chunk.\n\nWe have open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss\n\n## What this changes in practice\n\nThe table below puts all four setups head to head: online distillation, and the three offline loss implementations just described. Comparing them on a single H200 GPU with Llama 3.1 8B Instruct as teacher and a 3.2B Llama model as student at an 8K token context, all four reach near-identical training loss, even though the offline runs train against only the cached top-100 logits per token.\n\nMethod (8K context, single H200) Peak memory Iteration time Throughput\n\nOffline, forward-chunked KL\n\nOffline, fused chunked KL\n\nThe loss curves overlap almost exactly across all four methods, confirming offline distillation with top-100 cached logits is lossless relative to online distillation. Source: paper Figure 2. At this sequence length, the fused chunked loss is not yet the fastest option, its extra backward-pass projection costs a bit of speed, but its real advantage only shows up as context length grows, which the next section demonstrates.\n\n### Scaling to long context lengths\n\nTo see the scaling pattern more starkly, we ran an isolated benchmark on a toy output-projection network (no transformer body, just the loss kernel). At 32K tokens, peak memory falls from 85.2 GiB with the dense loss to 5.45 GiB with the fully chunked version, a 15.6× reduction, and the dense loss fails outright from 64K tokens onward. At 256K tokens, the fully chunked loss uses 11.6 GiB against 134.2 GiB for the next-best chunked variant, and is about 3.3× faster per iteration at that length.\n\nDistilling a GPT-OSS 20B model at a 32,768-token context, the memory freed by the fused loss let the setup shrink from four GPU nodes down to one. Step time fell from 57.0 to 12.23 seconds, about 5× faster, and throughput per GPU rose from 74.2 to 345.7 TFLOP/s.\n\n## The resulting student\n\nThe efficient offline setup is what made a large-scale distillation campaign affordable in the first place. The resulting compact student, distilled from Llama 3.1 8B Instruct down to about 3.2B parameters, retains most of the teacher's accuracy on BoolQ and HellaSwag, stays within about nine points of it on MMLU, at less than half the parameter count.\n\nThe student retains most of the teacher's short-context accuracy at less than half the size. Source: paper Figure 6.\n\nThis work is part of Multiverse Computing's ongoing research into making distillation and healing practical to run at scale , not just as a one-off recipe, but as something teams can iterate on cheaply. The paper also covers additional ablations, such as how the choice of loss function and sequence packing affect recovery quality.\n\nWant the full technical details, including the closed-form gradient behind the fused chunked loss and the complete training configuration? Read the full paper , or get in touch with our team to talk about applying this to your own distillation pipelines.\n\nWe have also open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss\n\n## Models mentioned in this article 6\n\n## Papers mentioned in this article 1\n\n## Collections mentioned in this article 1\n\n## Quantization-Aware Healing: a compressed, 4-bit model that outperforms its full-precision original\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Knowledge distillation, training a smaller student model to match the performance of a larger teacher, is a well-known technique in Machine Learning. With the recent wave of open-source Large Language Models, such as gpt-oss, Qwen, GLM, or Kimi, it has become a mainstream research topic again. Deploying these very large models is expensive: the recent Kimi-K3 model has 2.8 trillion parameters and needs roughly 3TB of VRAM just to load. Compressing them into smaller models and recovering the original capabilities through knowledge distillation has therefore become standard practice, with companies like Nvidia (Nemotron 3 Puzzle 75B) or Multiverse Computing (Hypernova 60B) recently releasing high-quality compressed models.\n\nThe distillation step is what decides most of the final quality, but it's also usually the most expensive part of the pipeline. Keeping both the teacher and student loaded, and producing a probability distribution over the entire vocabulary for every token, requires enormous amounts of VRAM, typically feasible only with hundreds of GPUs and careful tensor-parallelism strategies. Our latest paper, Efficient Knowledge Distillation for LLMs: Offline Top-K Logits and a Fused Chunked KL Loss, tackles this with two systems changes: caching the teacher's top-K logits once so the teacher never has to sit in memory alongside the student, and a new, memory-efficient KL-divergence loss that avoids ever materializing the full vocabulary-size × sequence-length matrix, cutting VRAM use far below what the default implementations in libraries like PyTorch or NVIDIA Megatron-Bridge achieve. Together, these two changes cut training cost enough to make long-context healing possible on a single GPU, and cheap enough to make large-scale experimentation practical.\n\n## Why distillation recovery is expensive\n\nThe standard setup, online distillation using the Kullback-Leibler divergence loss (KL loss), keeps both the teacher and the student loaded at the same time. At every training step, the teacher runs a full forward pass to produce its output distribution, and the student is trained to match it. This is the most expressive setup, since the full teacher distribution is available, but it is also the most memory- and compute-intensive: two full-vocabulary tensors have to be held per token position, and the teacher has to be recomputed on every single step even though its behavior does not change across a training run.\n\nAs a practical example, gpt-oss-120b has a vocabulary of 201,088 tokens. At a sequence length of 32K and batch size 4, the teacher-probability tensor alone has shape 4 × 201,088 × 32,768; in bfloat16, that's already about 50GB of VRAM for a single tensor. Add gradients, activations, model weights, and optimizer states, and a single training iteration of distillation can peak at roughly 250GB of VRAM, more than even an H200 or B200 GPU can provide. In this post, we show that reformulating the KL loss to process the data in chunks reduces this cost to almost nothing.\n\nDense KL spikes to roughly 250GB, above a single H200's 141GB capacity. The fused chunked loss never forms that spike and peaks at about 128GB. Source: paper Figure 1.\n\n## Two systems changes\n\nOffline distillation. Instead of recomputing the teacher at every step, we compute its output once, cache the top-100 most likely tokens per position, and train the student against that cache. The teacher never has to sit in memory during training and does not need to be run again once the cache exists, so the same cache can be reused across many ablations.\n\nA fused, chunked KL loss. To see why the loss itself is expensive, picture what it actually builds: for every token position in a sequence and every word in the vocabulary, the loss needs a number describing how much the student's prediction disagrees with the teacher's. Laid out as a grid, that's one row per vocabulary entry and one column per sequence position, for a vocabulary of 100K+ words and a long sequence, that grid is enormous, and the default way of computing a KL loss builds the whole thing before it can produce a single number.\n\nWe compare three ways of computing this same loss, all mathematically equivalent:\n\n- Dense KL is the textbook approach. It rebuilds a full, dense teacher-probability grid from the cached top-100 logits and compares it against the student's own dense grid of log-probabilities. This is the version closest to how online distillation already works, so we use it as our correctness baseline, but it holds the full vocabulary × sequence grid in memory, twice over.\n\n- Forward-chunked KL keeps the teacher sparse (only its cached top-100 logits per position, never expanded into a dense grid) and computes the loss piece by piece, one slice of sequence positions at a time. This removes the dense teacher and the dense comparison, and turns out to be the fastest of the three methods in our benchmarks. It still has one blind spot, though: the student's own logits, the grid produced by the model's output layer, are still computed in full and kept around for the backward pass, so memory still grows steeply with sequence length.\n\n- Fused chunked KL, our main contribution, goes a step further and fuses the model's output projection directly into the loss computation. It never produces the student's full logits grid at all: it processes one chunk of the sequence at a time end to end, projecting hidden states to logits for that chunk, folding the result into the running loss, and discarding the chunk before moving to the next one. The backward pass recomputes each chunk on the fly instead of storing it. The cost is doing that projection twice, once forward, once in backward, but in exchange, peak memory grows only linearly with sequence length instead of spiking with the full vocabulary × sequence size.\n\nThe GIF below shows the difference between the dense and fused-chunked approaches: one builds the whole comparison grid and holds onto all of it, the other builds and discards one slice at a time, so memory never grows beyond a single chunk.\n\nWe have open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss\n\n## What this changes in practice\n\nThe table below puts all four setups head to head: online distillation, and the three offline loss implementations just described. Comparing them on a single H200 GPU with Llama 3.1 8B Instruct as teacher and a 3.2B Llama model as student at an 8K token context, all four reach near-identical training loss, even though the offline runs train against only the cached top-100 logits per token.\n\nMethod (8K context, single H200)\n\nPeak memory\n\nIteration time\n\nThroughput\n\nOnline distillation\n\n102.8 GB\n\n25.9 s\n\n237 TFLOP/s\n\nOffline, dense KL\n\n78.3 GB\n\n18.5 s\n\n331 TFLOP/s\n\nOffline, forward-chunked KL\n\n61.8 GB\n\n18.4 s\n\n335 TFLOP/s\n\nOffline, fused chunked KL\n\n58.3 GB\n\n20.2 s\n\n304 TFLOP/s\n\nThe loss curves overlap almost exactly across all four methods, confirming offline distillation with top-100 cached logits is lossless relative to online distillation. Source: paper Figure 2. At this sequence length, the fused chunked loss is not yet the fastest option, its extra backward-pass projection costs a bit of speed, but its real advantage only shows up as context length grows, which the next section demonstrates.\n\n### Scaling to long context lengths\n\nTo see the scaling pattern more starkly, we ran an isolated benchmark on a toy output-projection network (no transformer body, just the loss kernel). At 32K tokens, peak memory falls from 85.2 GiB with the dense loss to 5.45 GiB with the fully chunked version, a 15.6× reduction, and the dense loss fails outright from 64K tokens onward. At 256K tokens, the fully chunked loss uses 11.6 GiB against 134.2 GiB for the next-best chunked variant, and is about 3.3× faster per iteration at that length.\n\nDistilling a GPT-OSS 20B model at a 32,768-token context, the memory freed by the fused loss let the setup shrink from four GPU nodes down to one. Step time fell from 57.0 to 12.23 seconds, about 5× faster, and throughput per GPU rose from 74.2 to 345.7 TFLOP/s.\n\n## The resulting student\n\nThe efficient offline setup is what made a large-scale distillation campaign affordable in the first place. The resulting compact student, distilled from Llama 3.1 8B Instruct down to about 3.2B parameters, retains most of the teacher's accuracy on BoolQ and HellaSwag, stays within about nine points of it on MMLU, at less than half the parameter count.\n\nThe student retains most of the teacher's short-context accuracy at less than half the size. Source: paper Figure 6.\n\nThis work is part of Multiverse Computing's ongoing research into making distillation and healing practical to run at scale, not just as a one-off recipe, but as something teams can iterate on cheaply. The paper also covers additional ablations, such as how the choice of loss function and sequence packing affect recovery quality.\n\nWant the full technical details, including the closed-form gradient behind the fused chunked loss and the complete training configuration? Read the full paper, or get in touch with our team to talk about applying this to your own distillation pipelines.\n\nWe have also open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss",
   "summaryZh": "本文介绍了降低大模型知识蒸馏成本的优化方案。针对大模型（如Kimi-K3）部署成本高昂的问题，作者提出了通过离线Top-K Logits缓存和融合分块KL散度损失函数的方法，显著降低了训练过程中的显存占用。这些技术改进使得在有限的硬件资源下进行高效模型压缩成为可能，为大规模模型落地提供了更具经济性的路径。",
   "summaryGeneratedAt": "2026-08-30T09:58:05.399678Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
   "images": [
     {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1632247447995-noauth.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1632247447995-noauth.jpeg",
-      "id": "image_cca8affb10c4c522"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/624c3e54a19f20b19776366d/k5W_QQ63EJHZhIHckzwsi.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/624c3e54a19f20b19776366d/k5W_QQ63EJHZhIHckzwsi.jpeg",
-      "id": "image_e80c11d177472113"
-    },
-    {
-      "src": "https://huggingface.co/avatars/470b69366ebfc37f1095680a2243b6e8.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/470b69366ebfc37f1095680a2243b6e8.svg",
-      "id": "image_4229e1af1357d149"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/67b5217cde48625c1b7a58fb/YZZ1kwdnUqiRJDLb2a6L5.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/67b5217cde48625c1b7a58fb/YZZ1kwdnUqiRJDLb2a6L5.png",
-      "id": "image_ae38db8cad6a0540"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1584020801691-noauth.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1584020801691-noauth.jpeg",
-      "id": "image_fa7ea916f7256dc4"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/682101cc3b3f5d2aff061e9f/pn8IldH-9jbhv-kMPGFk4.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/682101cc3b3f5d2aff061e9f/pn8IldH-9jbhv-kMPGFk4.jpeg",
-      "id": "image_41fc5eba68cfb08c"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/668e37fd9c9aa124a3c867e8/4ivwrPQnZGMDF6ovxnAdA.jpeg",
-      "alt": "Antonio Tiene's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/668e37fd9c9aa124a3c867e8/4ivwrPQnZGMDF6ovxnAdA.jpeg",
-      "id": "image_39bdeb0a88b2747d"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6835694d56d5a69517655698/C3QUBARPGF4kbzJzZaT29.png",
-      "alt": "Multiverse Computing's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6835694d56d5a69517655698/C3QUBARPGF4kbzJzZaT29.png",
-      "id": "image_6aa1eb343003e3ef"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/cY6CZURnE_o0ARHhqvp6n.jpeg",
-      "alt": "Ali Hashemi's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/cY6CZURnE_o0ARHhqvp6n.jpeg",
-      "id": "image_aadf22ac520d0a54"
-    },
-    {
       "src": "https://img.shields.io/badge/%F0%9F%8C%90%20Multiverse%20Computing-Website-0BAA8F?style=for-the-badge",
-      "alt": "🌐 Multiverse Computing",
       "originalUrl": "https://img.shields.io/badge/%F0%9F%8C%90%20Multiverse%20Computing-Website-0BAA8F?style=for-the-badge",
+      "alt": "🌐 Multiverse Computing",
       "id": "image_efd4a2fa0bc0b54b"
     },
     {
       "src": "https://img.shields.io/badge/GitHub-Full--Chunked--KL--Loss-181717?style=for-the-badge&logo=github&logoColor=white",
-      "alt": "GitHub Repository",
       "originalUrl": "https://img.shields.io/badge/GitHub-Full--Chunked--KL--Loss-181717?style=for-the-badge&logo=github&logoColor=white",
+      "alt": "GitHub Repository",
       "id": "image_ae173a2dceba449e"
     },
     {
       "src": "https://img.shields.io/badge/%F0%9F%93%84%20arXiv-Paper-B31B1B?style=for-the-badge",
-      "alt": "📄 arXiv Paper",
       "originalUrl": "https://img.shields.io/badge/%F0%9F%93%84%20arXiv-Paper-B31B1B?style=for-the-badge",
+      "alt": "📄 arXiv Paper",
       "id": "image_e6bdfa7dc6fc5651"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/jsYblMP3R5futGF9Y8Kl1.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/jsYblMP3R5futGF9Y8Kl1.png",
+      "alt": "Peak VRAM usage by loss",
+      "id": "image_0152025b176540f7"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/668e37fd9c9aa124a3c867e8/-whmAUit96bo1Yy0vLPis.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/668e37fd9c9aa124a3c867e8/-whmAUit96bo1Yy0vLPis.png",
+      "alt": "Peak GPU memory over one training iteration at 32K context, comparing dense KL against the fused chunked KL loss",
+      "id": "image_653a59845b5f8583"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/k4K6L0g7crbOk4ZqJuFuy.gif",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/k4K6L0g7crbOk4ZqJuFuy.gif",
+      "alt": "How the dense KL loss holds the full vocabulary-by-sequence grid in memory, while the fused chunked loss builds and discards one slice at a time",
+      "id": "image_d68199fb800586d0"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/668e37fd9c9aa124a3c867e8/hV9Hu8he7f1kZJy_SS9X6.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/668e37fd9c9aa124a3c867e8/hV9Hu8he7f1kZJy_SS9X6.png",
+      "alt": "Training loss, iteration time and throughput, and peak GPU memory breakdown for online distillation versus the three offline loss implementations, at 8K context on a single H200",
+      "id": "image_c17b499be56503b0"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/e0VvKmFktQCyoOhhOTD4n.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/614a1ebb8f82f1df64d55126/e0VvKmFktQCyoOhhOTD4n.png",
+      "alt": "Short-context accuracy of the compact 3.2B student against the Llama 3.1 8B Instruct teacher on BoolQ, WinoGrande, MMLU, HellaSwag, and GSM8K",
+      "id": "image_2f73a83de78dbb76"
     }
   ],
   "videos": [],
@@ -102,164 +78,67 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T11:47:13.152231Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "808783bf5d563e755bed43a1f683a4f63253b2cc9d96106dd37865fa3682657d",
+  "mediaLayoutBodyHash": "4404b7dfd1d1294228025bb99fe9b0f88cc96b6e7189882283281832a25f72ab",
   "mediaLayout": [
-    {
-      "mediaId": "image_cca8affb10c4c522",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_e80c11d177472113",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_4229e1af1357d149",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_ae38db8cad6a0540",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
-    {
-      "mediaId": "image_fa7ea916f7256dc4",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 6
-    },
-    {
-      "mediaId": "image_41fc5eba68cfb08c",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 7
-    },
-    {
-      "mediaId": "image_39bdeb0a88b2747d",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 8
-    },
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 9
-    },
-    {
-      "mediaId": "image_cca8affb10c4c522",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 10
-    },
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 11
-    },
-    {
-      "mediaId": "image_aadf22ac520d0a54",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 12
-    },
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 13
-    },
-    {
-      "mediaId": "image_4229e1af1357d149",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 14
-    },
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 15
-    },
     {
       "mediaId": "image_efd4a2fa0bc0b54b",
       "type": "image",
-      "afterBlockId": "b0002",
-      "order": 16
+      "afterBlockId": null,
+      "order": 0
     },
     {
       "mediaId": "image_ae173a2dceba449e",
       "type": "image",
-      "afterBlockId": "b0002",
-      "order": 17
+      "afterBlockId": null,
+      "order": 1
     },
     {
       "mediaId": "image_e6bdfa7dc6fc5651",
       "type": "image",
-      "afterBlockId": "b0002",
-      "order": 18
+      "afterBlockId": null,
+      "order": 2
     },
     {
-      "mediaId": "image_cca8affb10c4c522",
+      "mediaId": "image_0152025b176540f7",
       "type": "image",
-      "afterBlockId": "b0037",
-      "order": 57
+      "afterBlockId": null,
+      "order": 3
     },
     {
-      "mediaId": "image_e80c11d177472113",
+      "mediaId": "image_653a59845b5f8583",
       "type": "image",
-      "afterBlockId": "b0037",
-      "order": 58
+      "afterBlockId": "b0006",
+      "order": 4
     },
     {
-      "mediaId": "image_4229e1af1357d149",
+      "mediaId": "image_d68199fb800586d0",
       "type": "image",
-      "afterBlockId": "b0037",
-      "order": 59
+      "afterBlockId": "b0015",
+      "order": 5
     },
     {
-      "mediaId": "image_ae38db8cad6a0540",
+      "mediaId": "image_c17b499be56503b0",
       "type": "image",
       "afterBlockId": "b0037",
-      "order": 60
+      "order": 6
     },
     {
-      "mediaId": "image_fa7ea916f7256dc4",
+      "mediaId": "image_0152025b176540f7",
       "type": "image",
-      "afterBlockId": "b0037",
-      "order": 61
+      "afterBlockId": "b0040",
+      "order": 7
     },
     {
-      "mediaId": "image_41fc5eba68cfb08c",
+      "mediaId": "image_2f73a83de78dbb76",
       "type": "image",
-      "afterBlockId": "b0037",
-      "order": 62
+      "afterBlockId": "b0044",
+      "order": 8
     }
   ],
-  "mediaLayoutUnplaced": [
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 52
-    },
-    {
-      "mediaId": "image_6aa1eb343003e3ef",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 54
-    }
-  ],
-  "mediaLayoutMatched": 23,
-  "mediaLayoutStatus": "partial",
-  "mediaLayoutCheckedAt": "2026-09-27T01:47:46.831918Z",
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 9,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:08.688078Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -290,5 +169,586 @@
     "summaryZh": "本文介绍了降低大模型知识蒸馏成本的优化方案。针对大模型（如Kimi-K3）部署成本高昂的问题，作者提出了通过离线Top-K Logits缓存和融合分块KL散度损失函数的方法，显著降低了训练过程中的显存占用。这些技术改进使得在有限的硬件资源下进行高效模型压缩成为可能，为大规模模型落地提供了更具经济性的路径。",
     "glossary": [],
     "duplicateKey": "huggingface-distillation-optimization"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Knowledge distillation, training a smaller student model to match the performance of a larger teacher, is a well-known technique in Machine Learning. With the recent wave of open-source Large Language Models, such as gpt-oss, Qwen, GLM, or Kimi, it has become a mainstream research topic again. Deploying these very large models is expensive: the recent Kimi-K3 model has 2.8 trillion parameters and needs roughly 3TB of VRAM just to load. Compressing them into smaller models and recovering the original capabilities through knowledge distillation has therefore become standard practice, with companies like Nvidia (Nemotron 3 Puzzle 75B) or Multiverse Computing (Hypernova 60B) recently releasing high-quality compressed models.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1503.02531"
+        },
+        {
+          "start": 217,
+          "end": 224,
+          "kind": "a",
+          "href": "https://huggingface.co/openai/gpt-oss-120b"
+        },
+        {
+          "start": 226,
+          "end": 230,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/Qwen/qwen35"
+        },
+        {
+          "start": 232,
+          "end": 235,
+          "kind": "a",
+          "href": "https://huggingface.co/zai-org/GLM-5.2"
+        },
+        {
+          "start": 240,
+          "end": 244,
+          "kind": "a",
+          "href": "https://huggingface.co/moonshotai/Kimi-K3"
+        },
+        {
+          "start": 354,
+          "end": 367,
+          "kind": "a",
+          "href": "https://huggingface.co/moonshotai/Kimi-K3"
+        },
+        {
+          "start": 617,
+          "end": 638,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4"
+        },
+        {
+          "start": 665,
+          "end": 678,
+          "kind": "a",
+          "href": "https://huggingface.co/MultiverseComputingCAI/Hypernova-60B-2605"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "The distillation step is what decides most of the final quality, but it's also usually the most expensive part of the pipeline. Keeping both the teacher and student loaded, and producing a probability distribution over the entire vocabulary for every token, requires enormous amounts of VRAM, typically feasible only with hundreds of GPUs and careful tensor-parallelism strategies. Our latest paper, Efficient Knowledge Distillation for LLMs: Offline Top-K Logits and a Fused Chunked KL Loss, tackles this with two systems changes: caching the teacher's top-K logits once so the teacher never has to sit in memory alongside the student, and a new, memory-efficient KL-divergence loss that avoids ever materializing the full vocabulary-size × sequence-length matrix, cutting VRAM use far below what the default implementations in libraries like PyTorch or NVIDIA Megatron-Bridge achieve. Together, these two changes cut training cost enough to make long-context healing possible on a single GPU, and cheap enough to make large-scale experimentation practical.",
+      "spans": [
+        {
+          "start": 400,
+          "end": 491,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2608.03796"
+        },
+        {
+          "start": 844,
+          "end": 851,
+          "kind": "a",
+          "href": "https://pytorch.org"
+        },
+        {
+          "start": 855,
+          "end": 877,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA-NeMo/Megatron-Bridge"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Why distillation recovery is expensive",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "The standard setup, online distillation using the Kullback-Leibler divergence loss (KL loss), keeps both the teacher and the student loaded at the same time. At every training step, the teacher runs a full forward pass to produce its output distribution, and the student is trained to match it. This is the most expressive setup, since the full teacher distribution is available, but it is also the most memory- and compute-intensive: two full-vocabulary tensors have to be held per token position, and the teacher has to be recomputed on every single step even though its behavior does not change across a training run.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 26,
+          "kind": "em"
+        },
+        {
+          "start": 50,
+          "end": 82,
+          "kind": "a",
+          "href": "https://docs.pytorch.org/docs/2.13/generated/torch.nn.KLDivLoss.html"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "As a practical example, gpt-oss-120b has a vocabulary of 201,088 tokens. At a sequence length of 32K and batch size 4, the teacher-probability tensor alone has shape 4 × 201,088 × 32,768; in bfloat16, that's already about 50GB of VRAM for a single tensor. Add gradients, activations, model weights, and optimizer states, and a single training iteration of distillation can peak at roughly 250GB of VRAM, more than even an H200 or B200 GPU can provide. In this post, we show that reformulating the KL loss to process the data in chunks reduces this cost to almost nothing.",
+      "spans": [
+        {
+          "start": 166,
+          "end": 186,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Dense KL spikes to roughly 250GB, above a single H200's 141GB capacity. The fused chunked loss never forms that spike and peaks at about 128GB. Source: paper Figure 1.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 167,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Two systems changes",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Offline distillation. Instead of recomputing the teacher at every step, we compute its output once, cache the top-100 most likely tokens per position, and train the student against that cache. The teacher never has to sit in memory during training and does not need to be run again once the cache exists, so the same cache can be reused across many ablations.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "A fused, chunked KL loss. To see why the loss itself is expensive, picture what it actually builds: for every token position in a sequence and every word in the vocabulary, the loss needs a number describing how much the student's prediction disagrees with the teacher's. Laid out as a grid, that's one row per vocabulary entry and one column per sequence position, for a vocabulary of 100K+ words and a long sequence, that grid is enormous, and the default way of computing a KL loss builds the whole thing before it can produce a single number.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "We compare three ways of computing this same loss, all mathematically equivalent:",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Dense KL is the textbook approach. It rebuilds a full, dense teacher-probability grid from the cached top-100 logits and compares it against the student's own dense grid of log-probabilities. This is the version closest to how online distillation already works, so we use it as our correctness baseline, but it holds the full vocabulary × sequence grid in memory, twice over.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Forward-chunked KL keeps the teacher sparse (only its cached top-100 logits per position, never expanded into a dense grid) and computes the loss piece by piece, one slice of sequence positions at a time. This removes the dense teacher and the dense comparison, and turns out to be the fastest of the three methods in our benchmarks. It still has one blind spot, though: the student's own logits, the grid produced by the model's output layer, are still computed in full and kept around for the backward pass, so memory still grows steeply with sequence length.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Fused chunked KL, our main contribution, goes a step further and fuses the model's output projection directly into the loss computation. It never produces the student's full logits grid at all: it processes one chunk of the sequence at a time end to end, projecting hidden states to logits for that chunk, folding the result into the running loss, and discarding the chunk before moving to the next one. The backward pass recomputes each chunk on the fly instead of storing it. The cost is doing that projection twice, once forward, once in backward, but in exchange, peak memory grows only linearly with sequence length instead of spiking with the full vocabulary × sequence size.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "The GIF below shows the difference between the dense and fused-chunked approaches: one builds the whole comparison grid and holds onto all of it, the other builds and discards one slice at a time, so memory never grows beyond a single chunk.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "We have open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss",
+      "spans": [
+        {
+          "start": 54,
+          "end": 97,
+          "kind": "a",
+          "href": "https://github.com/CompactifAI/Full-Chunked-KL-Loss"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "What this changes in practice",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "The table below puts all four setups head to head: online distillation, and the three offline loss implementations just described. Comparing them on a single H200 GPU with Llama 3.1 8B Instruct as teacher and a 3.2B Llama model as student at an 8K token context, all four reach near-identical training loss, even though the offline runs train against only the cached top-100 logits per token.",
+      "spans": [
+        {
+          "start": 172,
+          "end": 193,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Method (8K context, single H200)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "Peak memory",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "Iteration time",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Throughput",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "Online distillation",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "102.8 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "25.9 s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "237 TFLOP/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "Offline, dense KL",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "78.3 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "18.5 s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "331 TFLOP/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "Offline, forward-chunked KL",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "61.8 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "18.4 s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "335 TFLOP/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "Offline, fused chunked KL",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "58.3 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "20.2 s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "304 TFLOP/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "The loss curves overlap almost exactly across all four methods, confirming offline distillation with top-100 cached logits is lossless relative to online distillation. Source: paper Figure 2. At this sequence length, the fused chunked loss is not yet the fastest option, its extra backward-pass projection costs a bit of speed, but its real advantage only shows up as context length grows, which the next section demonstrates.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Scaling to long context lengths",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "To see the scaling pattern more starkly, we ran an isolated benchmark on a toy output-projection network (no transformer body, just the loss kernel). At 32K tokens, peak memory falls from 85.2 GiB with the dense loss to 5.45 GiB with the fully chunked version, a 15.6× reduction, and the dense loss fails outright from 64K tokens onward. At 256K tokens, the fully chunked loss uses 11.6 GiB against 134.2 GiB for the next-best chunked variant, and is about 3.3× faster per iteration at that length.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Distilling a GPT-OSS 20B model at a 32,768-token context, the memory freed by the fused loss let the setup shrink from four GPU nodes down to one. Step time fell from 57.0 to 12.23 seconds, about 5× faster, and throughput per GPU rose from 74.2 to 345.7 TFLOP/s.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "The resulting student",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "The efficient offline setup is what made a large-scale distillation campaign affordable in the first place. The resulting compact student, distilled from Llama 3.1 8B Instruct down to about 3.2B parameters, retains most of the teacher's accuracy on BoolQ and HellaSwag, stays within about nine points of it on MMLU, at less than half the parameter count.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "The student retains most of the teacher's short-context accuracy at less than half the size. Source: paper Figure 6.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 116,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "This work is part of Multiverse Computing's ongoing research into making distillation and healing practical to run at scale, not just as a one-off recipe, but as something teams can iterate on cheaply. The paper also covers additional ablations, such as how the choice of loss function and sequence packing affect recovery quality.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 43,
+          "kind": "a",
+          "href": "https://multiversecomputing.com"
+        },
+        {
+          "start": 52,
+          "end": 123,
+          "kind": "a",
+          "href": "https://multiversecomputing.com/compactifai"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Want the full technical details, including the closed-form gradient behind the fused chunked loss and the complete training configuration? Read the full paper, or get in touch with our team to talk about applying this to your own distillation pipelines.",
+      "spans": [
+        {
+          "start": 148,
+          "end": 158,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2608.03796"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "We have also open-sourced the chunked-loss implementation: github.com/CompactifAI/Full-Chunked-KL-Loss",
+      "spans": [
+        {
+          "start": 59,
+          "end": 102,
+          "kind": "a",
+          "href": "https://github.com/CompactifAI/Full-Chunked-KL-Loss"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "4404b7dfd1d1294228025bb99fe9b0f88cc96b6e7189882283281832a25f72ab",
+  "codeContent": [],
+  "contentIntegrity": {
+    "sourceImages": 8,
+    "savedImages": 8,
+    "sourceImageOccurrences": 9,
+    "placedImageOccurrences": 9,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-02T14:02:08.688018Z"
 }

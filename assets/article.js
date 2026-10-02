@@ -301,7 +301,10 @@ function appendReadableText(element, text, blockId, translations, wiseEntries, u
   element.dataset.blockId = blockId;
   const source = document.createElement("span");
   source.className = "reader-source-text";
-  decorateWordWise(source, text, wiseEntries, usedTerms);
+  const annotation = readingState.item?.inlineContent?.find(block => block.id === blockId);
+  const decorated = window.LLMInlineContent?.append(source, text, annotation,
+    (target, value) => decorateWordWise(target, value, wiseEntries, usedTerms));
+  if (!decorated) decorateWordWise(source, text, wiseEntries, usedTerms);
   element.append(source);
   const translated = translations.get(blockId);
   if (translated) {
@@ -352,6 +355,11 @@ async function loadTranslation(articleId, location) {
   if (!record) return null;
   if (record.articleId !== articleId || record.targetLanguage !== "zh-CN") return null;
   if (!Array.isArray(record.blocks)) return null;
+  if (record.sourceBodyHash && globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(readingState.body || ''));
+    const hash = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+    if (hash !== record.sourceBodyHash) return null;
+  }
   return record;
 }
 
@@ -364,8 +372,10 @@ function renderBody(body) {
   let blockNumber = 0;
   let codeNumber = 0;
   const appendCode = (text, language) => {
-    const element = renderCode(text, language);
-    element.dataset.blockId = `c${String(++codeNumber).padStart(4, "0")}`;
+    const id = `c${String(++codeNumber).padStart(4, "0")}`;
+    const archived = readingState.item?.codeContent?.find(block => block.id === id);
+    const element = renderCode(archived?.source ?? text, language);
+    element.dataset.blockId = id;
     elements.articleBody.append(element);
   };
   const translations = translatedBlocks();
@@ -373,10 +383,10 @@ function renderBody(body) {
   const usedTerms = new Set();
   const nextBlockId = () => `b${String(++blockNumber).padStart(4, "0")}`;
   const appendParagraph = (lines) => {
-    const text = lines.join(" ").trim();
+    const text = lines.join(" ").trim().replace(/^\\(?=[#*+>\-]|\d+[.)]\s)/, '');
     if (!text) return;
     const blockId = nextBlockId();
-    const tags = parseTags(text);
+    const tags = readingState.item?.hfContentVersion ? [] : parseTags(text);
     if (tags.length) {
       const element = renderTags(tags);
       element.dataset.blockId = blockId;
@@ -464,7 +474,7 @@ function renderBody(body) {
       flushProse();
       return;
     }
-    proseLines.push(normalizeProseMarkup(trimmed));
+    proseLines.push(readingState.item?.hfContentVersion ? trimmed : normalizeProseMarkup(trimmed));
   });
   if (codeLines !== null) {
     appendCode(codeLines.join("\n"), codeLanguage);
@@ -478,6 +488,7 @@ function renderBody(body) {
     empty.textContent = "暂无可用的内部正文，请查看原文。";
     elements.articleBody.append(empty);
   }
+  window.LLMInlineContent?.tables(elements.articleBody, readingState.item?.inlineContent);
   void window.LLMMediaLayout?.render(readingState.item, body, elements.articleBody);
   applyReadingPreferences();
 }

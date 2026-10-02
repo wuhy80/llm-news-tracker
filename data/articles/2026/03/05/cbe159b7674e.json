@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:09.771408Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Introducing Modular Diffusers - Composable Building Blocks for Diffusion Pipelines\n\nModular Diffusers introduces a new way to build diffusion pipelines by composing reusable blocks. Instead of writing entire pipelines from scratch, you can mix and match blocks to create workflows tailored to your needs! This complements the existing DiffusionPipeline class with a more flexible, composable alternative.\n\nIn this post, we'll walk through how Modular Diffusers works — from the familiar API to run a modular pipeline, to building fully custom blocks and composing them into your own workflow. We'll also show how it integrates with Mellon, a node-based visual workflow interface that you can use to wire Modular Diffusers blocks together.\n\nHere is a simple example of how to run inference with FLUX.2 Klein 4B using pre-built blocks:\n\n```\nimport torch\nfrom diffusers import ModularPipeline\n\n# Create a modular pipeline - this only defines the workflow, model weights have not been loaded yet\npipe = ModularPipeline.from_pretrained(\n    \"black-forest-labs/FLUX.2-klein-4B\"\n)\n#  Now load the model weights — configure dtype, quantization, etc in this step\npipe.load_components(torch_dtype=torch.bfloat16)\npipe.to(\"cuda\")\n\n# Generate an image - API remains the same as DiffusionPipeline\nimage = pipe(\n    prompt=\"a serene landscape at sunset\",\n    num_inference_steps=4,\n).images[0]\n\nimage.save(\"output.png\")\n```\n\nYou get the same results as with a standard DiffusionPipeline , but the pipeline is very different under the hood: it's composed of flexible blocks — text encoding, image encoding, denoising, and decoding — that you can inspect directly:\n\n```\nprint(pipe.blocks)\n```\n\n```\nFlux2KleinAutoBlocks(\n  ...\n  Sub-Blocks:\n    [0] text_encoder (Flux2KleinTextEncoderStep)\n    [1] vae_encoder (Flux2KleinAutoVaeEncoderStep)\n    [2] denoise (Flux2KleinCoreDenoiseStep)\n    [3] decode (Flux2DecodeStep)\n)\n```\n\nEach block is self-contained with its own inputs and outputs. You can run any block independently as its own pipeline, or add, remove, and swap blocks freely — they dynamically recompose to work with whatever blocks remain. Use .init_pipeline() to convert blocks into a runnable pipeline, and .load_components() to load the model weights.\n\n```\n# get a copy of the blocks\nblocks = pipe.blocks\n\n# pop out the text_encoder block\ntext_blocks = blocks.sub_blocks.pop(\"text_encoder\")\n\n# run it as its own pipeline\ntext_pipe = text_blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\n\n# load the text_encoder, or reuse already loaded components: text_pipe.update_components(text_encoder=pipe.text_encoder)\ntext_pipe.load_components(torch_dtype=torch.bfloat16)\ntext_pipe.to(\"cuda\")\nprompt_embeds = text_pipe(prompt=\"a serene landscape at sunset\").prompt_embeds\n\n# create a new pipeline from the remaining blocks\n# it now accepts prompt_embeds directly instead of prompt\nremaining_pipe = blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\nremaining_pipe.load_components(torch_dtype=torch.bfloat16)\nremaining_pipe.to(\"cuda\")\nimage = remaining_pipe(prompt_embeds=prompt_embeds, num_inference_steps=4).images[0]\n```\n\nFor more on block types, composition patterns, lazy loading, and memory management with ComponentsManager , check out the Modular Diffusers documentation .\n\nModular Diffusers really shines when creating your own blocks. A custom block is a Python class that defines its components, inputs, outputs, and computation logic — and once defined, you can plug it into any workflow.\n\nHere's an example block that extracts depth maps from images using Depth Anything V2 .\n\n```\nclass DepthProcessorBlock(ModularPipelineBlocks):\n    @property\n    def expected_components(self):\n        return [\n            ComponentSpec(\"depth_processor\", DepthPreprocessor,\n                          pretrained_model_name_or_path=\"depth-anything/Depth-Anything-V2-Large-hf\")\n        ]\n\n    @property\n    def inputs(self):\n        return [\n            InputParam(\"image\", required=True,\n                       description=\"Image(s) to extract depth maps from\"),\n        ]\n\n    @property\n    def intermediate_outputs(self):\n        return [\n            OutputParam(\"control_image\", type_hint=torch.Tensor,\n                        description=\"Depth map(s) of input image(s)\"),\n        ]\n\n    @torch.no_grad()\n    def __call__(self, components, state):\n        block_state = self.get_block_state(state)\n        depth_map = components.depth_processor(block_state.image)\n        block_state.control_image = depth_map.to(block_state.device)\n        self.set_block_state(state, block_state)\n        return components, state\n```\n\nexpected_components defines what models the block needs — in this case, a depth estimation model. The pretrained_model_name_or_path parameter sets a default Hub repo to load from, so load_components automatically fetches the depth model unless you override it in modular_model_index.json .\n\ninputs and intermediate_outputs define what goes in and comes out.\n\n__call__ is where the computation logic lives.\n\nComposing Blocks into Workflows\n\nLet's use this block with Qwen's ControlNet workflow. Extract the ControlNet workflow and insert the depth block at the beginning:\n\n```\n# Create Qwen Image pipeline\npipe = ModularPipeline.from_pretrained(\"Qwen/Qwen-Image\")\n\nprint(pipe.blocks.available_workflows)\n#       Supported workflows:\n#        - `text2image`: requires `prompt`\n#        - `image2image`: requires `prompt`, `image`\n#        - `inpainting`: requires `prompt`, `mask_image`, `image`\n#        - `controlnet_text2image`: requires `prompt`, `control_image`\n#        - `controlnet_image2image`: requires `prompt`, `image`, `control_image`\n\n# Extract the ControlNet workflow — it expects a control_image input\nblocks = pipe.blocks.get_workflow(\"controlnet_text2image\")\n# Show the blocks this workflow uses\nprint(blocks)\n\n# Insert depth block at the beginning — its output (control_image)\n# automatically flows to the ControlNet block that needs it\nblocks.sub_blocks.insert(\"depth\", DepthProcessorBlock(), 0)\n\n# You can inspect any block's inputs and outputs with print(blocks.doc)\nblocks.sub_blocks['depth'].doc\n```\n\nBlocks in a sequence share data automatically: the depth block's control_image output flows to downstream blocks that need it, and its image input becomes a pipeline input since no earlier block provides it.\n\n```\nfrom diffusers import ComponentsManager, AutoModel\nfrom diffusers.utils import load_image\n\n# ComponentsManager handles memory across multiple pipelines —\n# it automatically offloads models to CPU when not in use\nmanager = ComponentsManager()\n\npipeline = blocks.init_pipeline(\"Qwen/Qwen-Image\", components_manager=manager)\npipeline.load_components(torch_dtype=torch.bfloat16)\n\n# The depth model loads automatically from the default path we set in expected_components —\n# no need to load it manually even though it's not part of the Qwen repo.\n# But controlnet is not included by default, so we do need to load it from a different repo\ncontrolnet = AutoModel.from_pretrained(\"InstantX/Qwen-Image-ControlNet-Union\", torch_dtype=torch.bfloat16)\npipeline.update_components(controlnet=controlnet)\n\n# pipeline now takes image as input\nimage = load_image(\"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg\")\noutput = pipeline(\n    prompt=\"an astronaut hatching from an egg, detailed, fantasy, Pixar, Disney\",\n    image=image,\n).images[0]\n```\n\nSharing Custom Blocks on the Hub\n\nYou can publish your custom block to the Hub so anyone can load it with trust_remote_code=True . We've created a template to get you started — check out the Building Custom Blocks guide for the full walkthrough.\n\n```\npipeline.save_pretrained(local_dir, repo_id=\"your-username/your-block-name\", push_to_hub=True)\n```\n\nThe DepthProcessorBlock from this post is published at diffusers/depth-processor-custom-block — you can load and use it directly:\n\n```\nfrom diffusers import ModularPipelineBlocks\n\ndepth_block = ModularPipelineBlocks.from_pretrained(\n    \"diffusers/depth-processor-custom-block\", trust_remote_code=True\n)\n```\n\nWe've published a collection of ready-to-use custom blocks here .\n\nModularPipeline.from_pretrained works with any existing Diffusers repo out of the box, but Modular Diffusers also introduces a new kind of repo: the Modular Repository.\n\nA modular repository is able to reference components from their original model repos. For example, diffusers/flux2-bnb-4bit-modular contains a quantized transformer and loads the remaining components from the original repo.\n\n```\n// diffusers/flux2-bnb-4bit-modular/modular_model_index.json\n{\n    \"transformer\": [\n        \"diffusers\", \n        \"Flux2Transformer2DModel\", \n        {\n            \"pretrained_model_name_or_path\": \"diffusers/flux2-bnb-4bit-modular\",\n            \"subfolder\": \"transformer\",\n            \"type_hint\": [\"diffusers\", \"Flux2Transformer2DModel\"]\n        }\n    ],\n    \"vae\": [\n        \"diffusers\", \n        \"AutoencoderKLFlux2\", \n        {\n            \"pretrained_model_name_or_path\": \"black-forest-labs/FLUX.2-dev\",\n            \"subfolder\": \"vae\",\n            \"type_hint\": [\"diffusers\", \"AutoencoderKLFlux2\"]\n        }\n    ],\n    ...\n}\n```\n\nModular repositories can also host custom pipeline blocks as Python code and visual UI configurations for tools like Mellon — all in one place.\n\nThe community has already started building complete pipelines with Modular Diffusers and publishing them on the Hub, with model weights and ready-to-run code.\n\nKrea Realtime Video — A 14B parameter real-time video generation model distilled from Wan 2.1, achieving 11fps on a single B200 GPU. It supports text-to-video, video-to-video, and streaming video-to-video — all built as modular blocks. Users can modify prompts mid-generation, restyle videos on-the-fly, and see first frames within 1 second.\n\n```\nimport torch\nfrom diffusers import ModularPipeline\n\npipe = ModularPipeline.from_pretrained(\"krea/krea-realtime-video\", trust_remote_code=True)\npipe.load_components(\n    trust_remote_code=True, \n    device_map=\"cuda\",\n    torch_dtype={\"default\": torch.bfloat16, \"vae\": torch.float16}\n)\n```\n\nWaypoint-1 — A 2.3B parameter real-time diffusion world model from Overworld . It autoregressively generates interactive worlds from control inputs and text prompts — you can explore and interact with generated environments in real time on consumer hardware.\n\nTeams can build novel architectures, package them as blocks, and publish the entire pipeline on the Hub for anyone to use with ModularPipeline.from_pretrained .\n\nCheck out the full collection of community pipelines for more.\n\n💡 Mellon is in early development and not ready for production use yet. Consider this a sneak peek of how the integration works!\n\nMellon is a node graph interface integrated with Modular Diffusers. If you're familiar with node-based tools like ComfyUI, you'll feel right at home — but there are some key differences:\n\nDynamic nodes — Instead of dozens of model-specific nodes, we have a small set of nodes that automatically adapt their interface based on the model you select. Learn them once, use them with any model.\n\nSingle-node workflows — Thanks to Modular Diffusers' composable block system, you can collapse an entire pipeline into a single node. Run multiple workflows on the same canvas without the clutter.\n\nHub integration out of the box — Custom blocks published to the Hugging Face Hub work instantly in Mellon. We provide a utility function to automatically generate the node interface from your block definition — no UI code required.\n\nThis integration is possible because every block exposes the same properties ( inputs , intermediate_outputs , expected_components ). This consistent API means Mellon can automatically generate a node's UI from any block definition and compose blocks into higher-level nodes.\n\nFor example, diffusers/FLUX.2-klein-4B-modular contains a pipeline definition, component references, and a mellon_pipeline_config.json — all in one repo. Load it in Python with ModularPipeline.from_pretrained(\"diffusers/FLUX.2-klein-4B-modular\") or in Mellon to create either a single-node or multi-node workflow.\n\nHere's a quick example. We add a Gemini prompt expansion node — hosted as a modular repo at diffusers/gemini-prompt-expander-mellon — to an existing text-to-image workflow:\n\nDrag in a Dynamic Block node and enter the repo_id (i.e. diffusers/gemini-prompt-expander-mellon )\n\nClick LOAD CUSTOM BLOCK — the node automatically grows a textbox for your prompt input and an output socket named \"prompt\", all configured from the repo\n\nType a short prompt, connect the output to the Encode Prompt node, and run\n\nGemini expands your short prompt into a detailed description before generating the image. No code, no configuration — just a Hub repo id.\n\nYour browser does not support the video tag.\n\nThis is just one example. For a detailed walkthrough, check out the Mellon x Modular Diffusers guide . You can also check out this video !\n\nModular Diffusers brings the composability and flexibility the community has been asking for, without compromising the features that make Diffusers powerful. It's still early — we want your input to shape what comes next. Give it a try and tell us what works, what doesn't, and what's missing.\n\nOverview of Modular Diffusers\n\nMellon x Modular Diffusers\n\nCollection of custom blocks\n\nCollection of community pipelines with Modular Diffusers\n\nThanks to Chun Te Lee for the thumbnail, and to Poli, Pedro, Lysandre, Linoy, Aritra, and Steven for their thoughtful reviews.\n\nModels mentioned in this article 8\n\nCollections mentioned in this article 2\n\nMore Articles from our Blog\n\nA Dive into Text-to-Video Models\n\nethics text-generation guide\n\nVisible Watermarking with Gradio\n\nThis is such a well written blog post! Thanks to the diffusers team for blessing us with this.\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Modular Diffusers introduces a new way to build diffusion pipelines by composing reusable blocks. Instead of writing entire pipelines from scratch, you can mix and match blocks to create workflows tailored to your needs! This complements the existing DiffusionPipeline class with a more flexible, composable alternative.\n\nIn this post, we'll walk through how Modular Diffusers works — from the familiar API to run a modular pipeline, to building fully custom blocks and composing them into your own workflow. We'll also show how it integrates with Mellon, a node-based visual workflow interface that you can use to wire Modular Diffusers blocks together.\n\nTable of contents\n\n- Quickstart\n\n- Custom Blocks\n\n- Modular Repositories\n\n- Community Pipelines\n\n- Integration with Mellon\n\n## Quickstart\n\nHere is a simple example of how to run inference with FLUX.2 Klein 4B using pre-built blocks:\n\n```\nimport torch\nfrom diffusers import ModularPipeline\n\n# Create a modular pipeline - this only defines the workflow, model weights have not been loaded yet\npipe = ModularPipeline.from_pretrained(\n    \"black-forest-labs/FLUX.2-klein-4B\"\n)\n#  Now load the model weights — configure dtype, quantization, etc in this step\npipe.load_components(torch_dtype=torch.bfloat16)\npipe.to(\"cuda\")\n\n# Generate an image - API remains the same as DiffusionPipeline\nimage = pipe(\n    prompt=\"a serene landscape at sunset\",\n    num_inference_steps=4,\n).images[0]\n\nimage.save(\"output.png\")\n```\n\nYou get the same results as with a standard DiffusionPipeline, but the pipeline is very different under the hood: it's composed of flexible blocks — text encoding, image encoding, denoising, and decoding — that you can inspect directly:\n\n```\nprint(pipe.blocks)\n```\n\n```\nFlux2KleinAutoBlocks(\n  ...\n  Sub-Blocks:\n    [0] text_encoder (Flux2KleinTextEncoderStep)\n    [1] vae_encoder (Flux2KleinAutoVaeEncoderStep)\n    [2] denoise (Flux2KleinCoreDenoiseStep)\n    [3] decode (Flux2DecodeStep)\n)\n```\n\nEach block is self-contained with its own inputs and outputs. You can run any block independently as its own pipeline, or add, remove, and swap blocks freely — they dynamically recompose to work with whatever blocks remain. Use .init_pipeline() to convert blocks into a runnable pipeline, and .load_components() to load the model weights.\n\n```\n# get a copy of the blocks\nblocks = pipe.blocks\n\n# pop out the text_encoder block\ntext_blocks = blocks.sub_blocks.pop(\"text_encoder\")\n\n# run it as its own pipeline\ntext_pipe = text_blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\n\n# load the text_encoder, or reuse already loaded components: text_pipe.update_components(text_encoder=pipe.text_encoder)\ntext_pipe.load_components(torch_dtype=torch.bfloat16)\ntext_pipe.to(\"cuda\")\nprompt_embeds = text_pipe(prompt=\"a serene landscape at sunset\").prompt_embeds\n\n# create a new pipeline from the remaining blocks\n# it now accepts prompt_embeds directly instead of prompt\nremaining_pipe = blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\nremaining_pipe.load_components(torch_dtype=torch.bfloat16)\nremaining_pipe.to(\"cuda\")\nimage = remaining_pipe(prompt_embeds=prompt_embeds, num_inference_steps=4).images[0]\n```\n\nFor more on block types, composition patterns, lazy loading, and memory management with ComponentsManager, check out the Modular Diffusers documentation.\n\n## Custom Blocks\n\nModular Diffusers really shines when creating your own blocks. A custom block is a Python class that defines its components, inputs, outputs, and computation logic — and once defined, you can plug it into any workflow.\n\n### Writing a Custom Block\n\nHere's an example block that extracts depth maps from images using Depth Anything V2.\n\n```\nclass DepthProcessorBlock(ModularPipelineBlocks):\n    @property\n    def expected_components(self):\n        return [\n            ComponentSpec(\"depth_processor\", DepthPreprocessor,\n                          pretrained_model_name_or_path=\"depth-anything/Depth-Anything-V2-Large-hf\")\n        ]\n\n    @property\n    def inputs(self):\n        return [\n            InputParam(\"image\", required=True,\n                       description=\"Image(s) to extract depth maps from\"),\n        ]\n\n    @property\n    def intermediate_outputs(self):\n        return [\n            OutputParam(\"control_image\", type_hint=torch.Tensor,\n                        description=\"Depth map(s) of input image(s)\"),\n        ]\n\n    @torch.no_grad()\n    def __call__(self, components, state):\n        block_state = self.get_block_state(state)\n        depth_map = components.depth_processor(block_state.image)\n        block_state.control_image = depth_map.to(block_state.device)\n        self.set_block_state(state, block_state)\n        return components, state\n```\n\n- expected_components defines what models the block needs — in this case, a depth estimation model. The pretrained_model_name_or_path parameter sets a default Hub repo to load from, so load_components automatically fetches the depth model unless you override it in modular_model_index.json.\n\n- inputs and intermediate_outputs define what goes in and comes out.\n\n- __call__ is where the computation logic lives.\n\n### Composing Blocks into Workflows\n\nLet's use this block with Qwen's ControlNet workflow. Extract the ControlNet workflow and insert the depth block at the beginning:\n\n```\n# Create Qwen Image pipeline\npipe = ModularPipeline.from_pretrained(\"Qwen/Qwen-Image\")\n\nprint(pipe.blocks.available_workflows)\n#       Supported workflows:\n#        - `text2image`: requires `prompt`\n#        - `image2image`: requires `prompt`, `image`\n#        - `inpainting`: requires `prompt`, `mask_image`, `image`\n#        - `controlnet_text2image`: requires `prompt`, `control_image`\n#        - `controlnet_image2image`: requires `prompt`, `image`, `control_image`\n\n# Extract the ControlNet workflow — it expects a control_image input\nblocks = pipe.blocks.get_workflow(\"controlnet_text2image\")\n# Show the blocks this workflow uses\nprint(blocks)\n\n# Insert depth block at the beginning — its output (control_image)\n# automatically flows to the ControlNet block that needs it\nblocks.sub_blocks.insert(\"depth\", DepthProcessorBlock(), 0)\n\n# You can inspect any block's inputs and outputs with print(blocks.doc)\nblocks.sub_blocks['depth'].doc\n```\n\nBlocks in a sequence share data automatically: the depth block's control_image output flows to downstream blocks that need it, and its image input becomes a pipeline input since no earlier block provides it.\n\n```\nfrom diffusers import ComponentsManager, AutoModel\nfrom diffusers.utils import load_image\n\n# ComponentsManager handles memory across multiple pipelines —\n# it automatically offloads models to CPU when not in use\nmanager = ComponentsManager()\n\npipeline = blocks.init_pipeline(\"Qwen/Qwen-Image\", components_manager=manager)\npipeline.load_components(torch_dtype=torch.bfloat16)\n\n# The depth model loads automatically from the default path we set in expected_components —\n# no need to load it manually even though it's not part of the Qwen repo.\n# But controlnet is not included by default, so we do need to load it from a different repo\ncontrolnet = AutoModel.from_pretrained(\"InstantX/Qwen-Image-ControlNet-Union\", torch_dtype=torch.bfloat16)\npipeline.update_components(controlnet=controlnet)\n\n# pipeline now takes image as input\nimage = load_image(\"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg\")\noutput = pipeline(\n    prompt=\"an astronaut hatching from an egg, detailed, fantasy, Pixar, Disney\",\n    image=image,\n).images[0]\n```\n\n### Sharing Custom Blocks on the Hub\n\nYou can publish your custom block to the Hub so anyone can load it with trust_remote_code=True. We've created a template to get you started — check out the Building Custom Blocks guide for the full walkthrough.\n\n```\npipeline.save_pretrained(local_dir, repo_id=\"your-username/your-block-name\", push_to_hub=True)\n```\n\nThe DepthProcessorBlock from this post is published at diffusers/depth-processor-custom-block — you can load and use it directly:\n\n```\nfrom diffusers import ModularPipelineBlocks\n\ndepth_block = ModularPipelineBlocks.from_pretrained(\n    \"diffusers/depth-processor-custom-block\", trust_remote_code=True\n)\n```\n\nWe've published a collection of ready-to-use custom blocks here.\n\n## Modular Repositories\n\nModularPipeline.from_pretrained works with any existing Diffusers repo out of the box, but Modular Diffusers also introduces a new kind of repo: the Modular Repository.\n\nA modular repository is able to reference components from their original model repos. For example, diffusers/flux2-bnb-4bit-modular contains a quantized transformer and loads the remaining components from the original repo.\n\n```\n// diffusers/flux2-bnb-4bit-modular/modular_model_index.json\n{\n    \"transformer\": [\n        \"diffusers\", \n        \"Flux2Transformer2DModel\", \n        {\n            \"pretrained_model_name_or_path\": \"diffusers/flux2-bnb-4bit-modular\",\n            \"subfolder\": \"transformer\",\n            \"type_hint\": [\"diffusers\", \"Flux2Transformer2DModel\"]\n        }\n    ],\n    \"vae\": [\n        \"diffusers\", \n        \"AutoencoderKLFlux2\", \n        {\n            \"pretrained_model_name_or_path\": \"black-forest-labs/FLUX.2-dev\",\n            \"subfolder\": \"vae\",\n            \"type_hint\": [\"diffusers\", \"AutoencoderKLFlux2\"]\n        }\n    ],\n    ...\n}\n```\n\nModular repositories can also host custom pipeline blocks as Python code and visual UI configurations for tools like Mellon — all in one place.\n\n## Community Pipelines\n\nThe community has already started building complete pipelines with Modular Diffusers and publishing them on the Hub, with model weights and ready-to-run code.\n\n- Krea Realtime Video — A 14B parameter real-time video generation model distilled from Wan 2.1, achieving 11fps on a single B200 GPU. It supports text-to-video, video-to-video, and streaming video-to-video — all built as modular blocks. Users can modify prompts mid-generation, restyle videos on-the-fly, and see first frames within 1 second.\n\n```\nimport torch\nfrom diffusers import ModularPipeline\n\npipe = ModularPipeline.from_pretrained(\"krea/krea-realtime-video\", trust_remote_code=True)\npipe.load_components(\n    trust_remote_code=True, \n    device_map=\"cuda\",\n    torch_dtype={\"default\": torch.bfloat16, \"vae\": torch.float16}\n)\n```\n\n- Waypoint-1 — A 2.3B parameter real-time diffusion world model from Overworld. It autoregressively generates interactive worlds from control inputs and text prompts — you can explore and interact with generated environments in real time on consumer hardware.\n\nTeams can build novel architectures, package them as blocks, and publish the entire pipeline on the Hub for anyone to use with ModularPipeline.from_pretrained.\n\nCheck out the full collection of community pipelines for more.\n\n## Integration with Mellon\n\n💡 Mellon is in early development and not ready for production use yet. Consider this a sneak peek of how the integration works!\n\nMellon is a node graph interface integrated with Modular Diffusers. If you're familiar with node-based tools like ComfyUI, you'll feel right at home — but there are some key differences:\n\n- Dynamic nodes — Instead of dozens of model-specific nodes, we have a small set of nodes that automatically adapt their interface based on the model you select. Learn them once, use them with any model.\n\n- Single-node workflows — Thanks to Modular Diffusers' composable block system, you can collapse an entire pipeline into a single node. Run multiple workflows on the same canvas without the clutter.\n\n- Hub integration out of the box — Custom blocks published to the Hugging Face Hub work instantly in Mellon. We provide a utility function to automatically generate the node interface from your block definition — no UI code required.\n\nThis integration is possible because every block exposes the same properties (inputs, intermediate_outputs, expected_components). This consistent API means Mellon can automatically generate a node's UI from any block definition and compose blocks into higher-level nodes.\n\nFor example, diffusers/FLUX.2-klein-4B-modular contains a pipeline definition, component references, and a mellon_pipeline_config.json — all in one repo. Load it in Python with ModularPipeline.from_pretrained(\"diffusers/FLUX.2-klein-4B-modular\") or in Mellon to create either a single-node or multi-node workflow.\n\nHere's a quick example. We add a Gemini prompt expansion node — hosted as a modular repo at diffusers/gemini-prompt-expander-mellon — to an existing text-to-image workflow:\n\n- Drag in a Dynamic Block node and enter the repo_id (i.e. diffusers/gemini-prompt-expander-mellon)\n\n- Click LOAD CUSTOM BLOCK — the node automatically grows a textbox for your prompt input and an output socket named \"prompt\", all configured from the repo\n\n- Type a short prompt, connect the output to the Encode Prompt node, and run\n\nGemini expands your short prompt into a detailed description before generating the image. No code, no configuration — just a Hub repo id.\n\nThis is just one example. For a detailed walkthrough, check out the Mellon x Modular Diffusers guide. You can also check out this video!\n\n## Conclusion\n\nModular Diffusers brings the composability and flexibility the community has been asking for, without compromising the features that make Diffusers powerful. It's still early — we want your input to shape what comes next. Give it a try and tell us what works, what doesn't, and what's missing.\n\n## Resources\n\n- Overview of Modular Diffusers\n\n- Mellon\n\n- Mellon x Modular Diffusers\n\n- Collection of custom blocks\n\n- Collection of community pipelines with Modular Diffusers\n\nThanks to Chun Te Lee for the thumbnail, and to Poli, Pedro, Lysandre, Linoy, Aritra, and Steven for their thoughtful reviews.",
   "summaryZh": "Hugging Face发布了Modular Diffusers，这是一种全新的扩散模型流水线构建方式。它将传统的DiffusionPipeline拆解为可重用的模块化组件，允许开发者根据需求灵活组合文本编码、图像编码、去噪及解码等步骤。该方案不仅兼容现有的API，还支持与Mellon等可视化工作流工具集成，极大地降低了构建自定义生成式工作流的复杂度，为开发者提供了更高效的实验与部署路径。",
   "summaryGeneratedAt": "2026-08-30T12:00:16.862962Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -75,5 +75,781 @@
       }
     ],
     "duplicateKey": "modular-diffusers-release"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/diffusers/modular-diffusers-blog/resolve/main/blocks_composed.png",
+      "originalUrl": "https://huggingface.co/datasets/diffusers/modular-diffusers-blog/resolve/main/blocks_composed.png",
+      "alt": "blocks_composed",
+      "id": "image_8da089312882df45"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Modular Diffusers introduces a new way to build diffusion pipelines by composing reusable blocks. Instead of writing entire pipelines from scratch, you can mix and match blocks to create workflows tailored to your needs! This complements the existing DiffusionPipeline class with a more flexible, composable alternative.",
+      "spans": [
+        {
+          "start": 251,
+          "end": 268,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "In this post, we'll walk through how Modular Diffusers works — from the familiar API to run a modular pipeline, to building fully custom blocks and composing them into your own workflow. We'll also show how it integrates with Mellon, a node-based visual workflow interface that you can use to wire Modular Diffusers blocks together.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Table of contents",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Quickstart",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/modular-diffusers#quickstart"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Custom Blocks",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/modular-diffusers#custom-blocks"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Modular Repositories",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/modular-diffusers#modular-repositories"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Community Pipelines",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/modular-diffusers#community-pipelines"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Integration with Mellon",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/modular-diffusers#integration-with-mellon"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Quickstart",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Here is a simple example of how to run inference with FLUX.2 Klein 4B using pre-built blocks:",
+      "spans": [
+        {
+          "start": 54,
+          "end": 69,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "You get the same results as with a standard DiffusionPipeline, but the pipeline is very different under the hood: it's composed of flexible blocks — text encoding, image encoding, denoising, and decoding — that you can inspect directly:",
+      "spans": [
+        {
+          "start": 44,
+          "end": 61,
+          "kind": "code"
+        },
+        {
+          "start": 140,
+          "end": 146,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Each block is self-contained with its own inputs and outputs. You can run any block independently as its own pipeline, or add, remove, and swap blocks freely — they dynamically recompose to work with whatever blocks remain. Use .init_pipeline() to convert blocks into a runnable pipeline, and .load_components() to load the model weights.",
+      "spans": [
+        {
+          "start": 228,
+          "end": 244,
+          "kind": "code"
+        },
+        {
+          "start": 293,
+          "end": 311,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "For more on block types, composition patterns, lazy loading, and memory management with ComponentsManager, check out the Modular Diffusers documentation.",
+      "spans": [
+        {
+          "start": 88,
+          "end": 105,
+          "kind": "code"
+        },
+        {
+          "start": 121,
+          "end": 152,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/en/modular_diffusers/overview"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Custom Blocks",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Modular Diffusers really shines when creating your own blocks. A custom block is a Python class that defines its components, inputs, outputs, and computation logic — and once defined, you can plug it into any workflow.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Writing a Custom Block",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Here's an example block that extracts depth maps from images using Depth Anything V2.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 84,
+          "kind": "a",
+          "href": "https://huggingface.co/depth-anything/Depth-Anything-V2-Large"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "expected_components defines what models the block needs — in this case, a depth estimation model. The pretrained_model_name_or_path parameter sets a default Hub repo to load from, so load_components automatically fetches the depth model unless you override it in modular_model_index.json.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 102,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 183,
+          "end": 198,
+          "kind": "code"
+        },
+        {
+          "start": 263,
+          "end": 287,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "inputs and intermediate_outputs define what goes in and comes out.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 11,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "__call__ is where the computation logic lives.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Composing Blocks into Workflows",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Let's use this block with Qwen's ControlNet workflow. Extract the ControlNet workflow and insert the depth block at the beginning:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Blocks in a sequence share data automatically: the depth block's control_image output flows to downstream blocks that need it, and its image input becomes a pipeline input since no earlier block provides it.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 135,
+          "end": 140,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Sharing Custom Blocks on the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "You can publish your custom block to the Hub so anyone can load it with trust_remote_code=True. We've created a template to get you started — check out the Building Custom Blocks guide for the full walkthrough.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 94,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 120,
+          "kind": "a",
+          "href": "https://huggingface.co/diffusers/custom-block-template"
+        },
+        {
+          "start": 156,
+          "end": 184,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/modular_diffusers/custom_blocks#quick-start-with-template"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "The DepthProcessorBlock from this post is published at diffusers/depth-processor-custom-block — you can load and use it directly:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 23,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 93,
+          "kind": "a",
+          "href": "https://huggingface.co/diffusers/depth-processor-custom-block"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "We've published a collection of ready-to-use custom blocks here.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 63,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/diffusers/modular-diffusers-custom-blocks"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Modular Repositories",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "ModularPipeline.from_pretrained works with any existing Diffusers repo out of the box, but Modular Diffusers also introduces a new kind of repo: the Modular Repository.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "A modular repository is able to reference components from their original model repos. For example, diffusers/flux2-bnb-4bit-modular contains a quantized transformer and loads the remaining components from the original repo.",
+      "spans": [
+        {
+          "start": 99,
+          "end": 131,
+          "kind": "a",
+          "href": "https://huggingface.co/diffusers/flux2-bnb-4bit-modular"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Modular repositories can also host custom pipeline blocks as Python code and visual UI configurations for tools like Mellon — all in one place.",
+      "spans": [
+        {
+          "start": 117,
+          "end": 123,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/modular_diffusers/mellon"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Community Pipelines",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "The community has already started building complete pipelines with Modular Diffusers and publishing them on the Hub, with model weights and ready-to-run code.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Krea Realtime Video — A 14B parameter real-time video generation model distilled from Wan 2.1, achieving 11fps on a single B200 GPU. It supports text-to-video, video-to-video, and streaming video-to-video — all built as modular blocks. Users can modify prompts mid-generation, restyle videos on-the-fly, and see first frames within 1 second.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://huggingface.co/krea/krea-realtime-video"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Waypoint-1 — A 2.3B parameter real-time diffusion world model from Overworld. It autoregressively generates interactive worlds from control inputs and text prompts — you can explore and interact with generated environments in real time on consumer hardware.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/Overworld/Waypoint-1-Small"
+        },
+        {
+          "start": 67,
+          "end": 76,
+          "kind": "a",
+          "href": "https://over.world"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Teams can build novel architectures, package them as blocks, and publish the entire pipeline on the Hub for anyone to use with ModularPipeline.from_pretrained.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 158,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Check out the full collection of community pipelines for more.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/diffusers/modular-pipelines"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Integration with Mellon",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "💡 Mellon is in early development and not ready for production use yet. Consider this a sneak peek of how the integration works!",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Mellon is a node graph interface integrated with Modular Diffusers. If you're familiar with node-based tools like ComfyUI, you'll feel right at home — but there are some key differences:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://github.com/cubiq/Mellon"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Dynamic nodes — Instead of dozens of model-specific nodes, we have a small set of nodes that automatically adapt their interface based on the model you select. Learn them once, use them with any model.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Single-node workflows — Thanks to Modular Diffusers' composable block system, you can collapse an entire pipeline into a single node. Run multiple workflows on the same canvas without the clutter.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Hub integration out of the box — Custom blocks published to the Hugging Face Hub work instantly in Mellon. We provide a utility function to automatically generate the node interface from your block definition — no UI code required.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "This integration is possible because every block exposes the same properties (inputs, intermediate_outputs, expected_components). This consistent API means Mellon can automatically generate a node's UI from any block definition and compose blocks into higher-level nodes.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 84,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 106,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 127,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "For example, diffusers/FLUX.2-klein-4B-modular contains a pipeline definition, component references, and a mellon_pipeline_config.json — all in one repo. Load it in Python with ModularPipeline.from_pretrained(\"diffusers/FLUX.2-klein-4B-modular\") or in Mellon to create either a single-node or multi-node workflow.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/diffusers/FLUX.2-klein-4B-modular"
+        },
+        {
+          "start": 107,
+          "end": 134,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 245,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Here's a quick example. We add a Gemini prompt expansion node — hosted as a modular repo at diffusers/gemini-prompt-expander-mellon — to an existing text-to-image workflow:",
+      "spans": [
+        {
+          "start": 92,
+          "end": 131,
+          "kind": "a",
+          "href": "https://huggingface.co/diffusers/gemini-prompt-expander-mellon"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Drag in a Dynamic Block node and enter the repo_id (i.e. diffusers/gemini-prompt-expander-mellon)",
+      "spans": [
+        {
+          "start": 10,
+          "end": 23,
+          "kind": "strong"
+        },
+        {
+          "start": 43,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 96,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Click LOAD CUSTOM BLOCK — the node automatically grows a textbox for your prompt input and an output socket named \"prompt\", all configured from the repo",
+      "spans": [
+        {
+          "start": 6,
+          "end": 23,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Type a short prompt, connect the output to the Encode Prompt node, and run",
+      "spans": [
+        {
+          "start": 47,
+          "end": 60,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Gemini expands your short prompt into a detailed description before generating the image. No code, no configuration — just a Hub repo id.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "This is just one example. For a detailed walkthrough, check out the Mellon x Modular Diffusers guide. You can also check out this video!",
+      "spans": [
+        {
+          "start": 68,
+          "end": 100,
+          "kind": "a",
+          "href": "https://www.notion.so/Mellon-x-Modular-Diffusers-2fd1384ebcac819993d8f9ae94c7e866?pvs=21"
+        },
+        {
+          "start": 125,
+          "end": 135,
+          "kind": "a",
+          "href": "https://youtu.be/XogoQnkQUO8"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Modular Diffusers brings the composability and flexibility the community has been asking for, without compromising the features that make Diffusers powerful. It's still early — we want your input to shape what comes next. Give it a try and tell us what works, what doesn't, and what's missing.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Overview of Modular Diffusers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/modular_diffusers/overview"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Mellon",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://github.com/cubiq/Mellon"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Mellon x Modular Diffusers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "a",
+          "href": "https://www.notion.so/Mellon-x-Modular-Diffusers-2fd1384ebcac819993d8f9ae94c7e866?pvs=21"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Collection of custom blocks",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/diffusers/modular-diffusers-custom-blocks"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Collection of community pipelines with Modular Diffusers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/diffusers/modular-pipelines"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Thanks to Chun Te Lee for the thumbnail, and to Poli, Pedro, Lysandre, Linoy, Aritra, and Steven for their thoughtful reviews.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 126,
+          "kind": "em"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "acbac2092fc8a82e0c118d5c2cdc08262574c083e82f869d6c0d2f94d650b9a3",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import torch\nfrom diffusers import ModularPipeline\n\n# Create a modular pipeline - this only defines the workflow, model weights have not been loaded yet\npipe = ModularPipeline.from_pretrained(\n    \"black-forest-labs/FLUX.2-klein-4B\"\n)\n#  Now load the model weights — configure dtype, quantization, etc in this step\npipe.load_components(torch_dtype=torch.bfloat16)\npipe.to(\"cuda\")\n\n# Generate an image - API remains the same as DiffusionPipeline\nimage = pipe(\n    prompt=\"a serene landscape at sunset\",\n    num_inference_steps=4,\n).images[0]\n\nimage.save(\"output.png\")"
+    },
+    {
+      "id": "c0002",
+      "source": "print(pipe.blocks)"
+    },
+    {
+      "id": "c0003",
+      "source": "Flux2KleinAutoBlocks(\n  ...\n  Sub-Blocks:\n    [0] text_encoder (Flux2KleinTextEncoderStep)\n    [1] vae_encoder (Flux2KleinAutoVaeEncoderStep)\n    [2] denoise (Flux2KleinCoreDenoiseStep)\n    [3] decode (Flux2DecodeStep)\n)"
+    },
+    {
+      "id": "c0004",
+      "source": "# get a copy of the blocks\nblocks = pipe.blocks\n\n# pop out the text_encoder block\ntext_blocks = blocks.sub_blocks.pop(\"text_encoder\")\n\n# run it as its own pipeline\ntext_pipe = text_blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\n\n# load the text_encoder, or reuse already loaded components: text_pipe.update_components(text_encoder=pipe.text_encoder)\ntext_pipe.load_components(torch_dtype=torch.bfloat16)\ntext_pipe.to(\"cuda\")\nprompt_embeds = text_pipe(prompt=\"a serene landscape at sunset\").prompt_embeds\n\n# create a new pipeline from the remaining blocks\n# it now accepts prompt_embeds directly instead of prompt\nremaining_pipe = blocks.init_pipeline(\"black-forest-labs/FLUX.2-klein-4B\")\nremaining_pipe.load_components(torch_dtype=torch.bfloat16)\nremaining_pipe.to(\"cuda\")\nimage = remaining_pipe(prompt_embeds=prompt_embeds, num_inference_steps=4).images[0]"
+    },
+    {
+      "id": "c0005",
+      "source": "class DepthProcessorBlock(ModularPipelineBlocks):\n    @property\n    def expected_components(self):\n        return [\n            ComponentSpec(\"depth_processor\", DepthPreprocessor,\n                          pretrained_model_name_or_path=\"depth-anything/Depth-Anything-V2-Large-hf\")\n        ]\n\n    @property\n    def inputs(self):\n        return [\n            InputParam(\"image\", required=True,\n                       description=\"Image(s) to extract depth maps from\"),\n        ]\n\n    @property\n    def intermediate_outputs(self):\n        return [\n            OutputParam(\"control_image\", type_hint=torch.Tensor,\n                        description=\"Depth map(s) of input image(s)\"),\n        ]\n\n    @torch.no_grad()\n    def __call__(self, components, state):\n        block_state = self.get_block_state(state)\n        depth_map = components.depth_processor(block_state.image)\n        block_state.control_image = depth_map.to(block_state.device)\n        self.set_block_state(state, block_state)\n        return components, state"
+    },
+    {
+      "id": "c0006",
+      "source": "# Create Qwen Image pipeline\npipe = ModularPipeline.from_pretrained(\"Qwen/Qwen-Image\")\n\nprint(pipe.blocks.available_workflows)\n#       Supported workflows:\n#        - `text2image`: requires `prompt`\n#        - `image2image`: requires `prompt`, `image`\n#        - `inpainting`: requires `prompt`, `mask_image`, `image`\n#        - `controlnet_text2image`: requires `prompt`, `control_image`\n#        - `controlnet_image2image`: requires `prompt`, `image`, `control_image`\n\n# Extract the ControlNet workflow — it expects a control_image input\nblocks = pipe.blocks.get_workflow(\"controlnet_text2image\")\n# Show the blocks this workflow uses\nprint(blocks)\n\n# Insert depth block at the beginning — its output (control_image)\n# automatically flows to the ControlNet block that needs it\nblocks.sub_blocks.insert(\"depth\", DepthProcessorBlock(), 0)\n\n# You can inspect any block's inputs and outputs with print(blocks.doc)\nblocks.sub_blocks['depth'].doc"
+    },
+    {
+      "id": "c0007",
+      "source": "from diffusers import ComponentsManager, AutoModel\nfrom diffusers.utils import load_image\n\n# ComponentsManager handles memory across multiple pipelines —\n# it automatically offloads models to CPU when not in use\nmanager = ComponentsManager()\n\npipeline = blocks.init_pipeline(\"Qwen/Qwen-Image\", components_manager=manager)\npipeline.load_components(torch_dtype=torch.bfloat16)\n\n# The depth model loads automatically from the default path we set in expected_components —\n# no need to load it manually even though it's not part of the Qwen repo.\n# But controlnet is not included by default, so we do need to load it from a different repo\ncontrolnet = AutoModel.from_pretrained(\"InstantX/Qwen-Image-ControlNet-Union\", torch_dtype=torch.bfloat16)\npipeline.update_components(controlnet=controlnet)\n\n# pipeline now takes image as input\nimage = load_image(\"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg\")\noutput = pipeline(\n    prompt=\"an astronaut hatching from an egg, detailed, fantasy, Pixar, Disney\",\n    image=image,\n).images[0]"
+    },
+    {
+      "id": "c0008",
+      "source": "pipeline.save_pretrained(local_dir, repo_id=\"your-username/your-block-name\", push_to_hub=True)"
+    },
+    {
+      "id": "c0009",
+      "source": "from diffusers import ModularPipelineBlocks\n\ndepth_block = ModularPipelineBlocks.from_pretrained(\n    \"diffusers/depth-processor-custom-block\", trust_remote_code=True\n)"
+    },
+    {
+      "id": "c0010",
+      "source": "// diffusers/flux2-bnb-4bit-modular/modular_model_index.json\n{\n    \"transformer\": [\n        \"diffusers\", \n        \"Flux2Transformer2DModel\", \n        {\n            \"pretrained_model_name_or_path\": \"diffusers/flux2-bnb-4bit-modular\",\n            \"subfolder\": \"transformer\",\n            \"type_hint\": [\"diffusers\", \"Flux2Transformer2DModel\"]\n        }\n    ],\n    \"vae\": [\n        \"diffusers\", \n        \"AutoencoderKLFlux2\", \n        {\n            \"pretrained_model_name_or_path\": \"black-forest-labs/FLUX.2-dev\",\n            \"subfolder\": \"vae\",\n            \"type_hint\": [\"diffusers\", \"AutoencoderKLFlux2\"]\n        }\n    ],\n    ...\n}"
+    },
+    {
+      "id": "c0011",
+      "source": "import torch\nfrom diffusers import ModularPipeline\n\npipe = ModularPipeline.from_pretrained(\"krea/krea-realtime-video\", trust_remote_code=True)\npipe.load_components(\n    trust_remote_code=True, \n    device_map=\"cuda\",\n    torch_dtype={\"default\": torch.bfloat16, \"vae\": torch.float16}\n)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "acbac2092fc8a82e0c118d5c2cdc08262574c083e82f869d6c0d2f94d650b9a3",
+  "mediaLayout": [
+    {
+      "mediaId": "image_8da089312882df45",
+      "type": "image",
+      "afterBlockId": "b0023",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:16.257017Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:16.257033Z"
 }

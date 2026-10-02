@@ -19,79 +19,25 @@
   "contentKind": "page",
   "archiveVersion": 2,
   "bodyFormatVersion": 3,
-  "body": "# How to Use NVIDIA Warp and MjWarp to Accelerate Robotics Simulation and Learning Workflows\n\nPublished September 23, 2026\n\nClassic MuJoCo provides fast CPU-based robot simulation for developing, testing, and controlling robots and it can parallelize sampling across CPU cores. But as learning workloads grow, the question shifts from how quickly one world can run to how many worlds can run at once. GPU acceleration makes it possible to advance those worlds in large batches while keeping simulation and learning data close to the device.\n\nMuJoCo Warp (MJWarp) , built on NVIDIA Warp , takes compatible MuJoCo models into that GPU-scale regime. In this article, we will move an SO-101 follower arm from a familiar MuJoCo workflow to as many as 2,048 parallel MJWarp environments and examine the technology and validation steps that make the transition possible.\n\nFigure 1. How MJWarp connects Python to GPU simulation. MuJoCo loads and compiles the MJCF model; MJWarp implements the physics in NVIDIA Warp, which compiles CUDA kernels to advance simulation states on NVIDIA GPUs.\n\nThis is the second article in our State of Simulation for Physical AI series. The first article mapped the robot-simulation landscape. Here, we prepare and scale the simulation environment; we do not train a policy. The later Newton and Isaac Lab installments cover the next integration layers.\n\nPython kernel language: single instruction, multiple threads (SIMT), autodiff, PyTorch/JAX interop\n\nMuJoCo physics on Warp: same MJCF, batched GPU throughput\n\nFamiliar Menagerie / Robot Studio assets + task geometry\n\nNext (Newton / Isaac Lab)\n\nMulti-solver API, USD, sensors, managers, training loops\n\nSingle-robot MPC / teleop\n\nMax throughput on raw MuJoCo physics\n\nMuJoCo Playground / MJX (impl='warp')\n\nMulti-solver + Isaac Lab integration\n\nNewton — next post in this series\n\n## Start with one useful Warp Kernel\n\nNVIDIA Warp is a Python framework for writing high-performance, GPU-accelerated kernels. Warp lets developers author statically typed kernels in Python and compiles them for CPU or CUDA execution. The first launch builds and caches a native module; later launches reuse it. The kernel language is a performance-oriented subset of Python, while ordinary Python remains responsible for configuration, allocation, and launch orchestration.\n\nThis small robotics-oriented kernel advances point positions under gravity. One logical thread handles one point, so the same code scales from two points to millions without introducing GPU terminology into the control flow.\n\nThe three value propositions of Warp are:\n\nNative-CUDA speed via JIT compilation, kernel fusion, and CUDA Graphs\n\nPure Python authoring with built-in vectors, matrices, quaternions, BVHs, hash grids, sparse matrices, and tile primitives\n\nDifferentiable kernels and DLPack-style interop so simulation can sit inside an ML training loop\n\n```\nimport numpy as np\nimport warp as wp\n\n@wp.kernel\ndef integrate(\n   positions: wp.array[wp.vec3],\n   velocities: wp.array[wp.vec3],\n   dt: float,\n):\n   i = wp.tid()\n   velocities[i] += wp.vec3(0.0, 0.0, -9.81) * dt\n   positions[i] += velocities[i] * dt\n\nwp.init()\ndevice = \"cuda:0\" if wp.is_cuda_available() else \"cpu\"\nstart = np.array([[0.0, 0.0, 0.5], [0.2, 0.0, 0.5]], dtype=np.float32)\npositions = wp.array(start, dtype=wp.vec3, device=device)\nvelocities = wp.zeros_like(positions)\n\nwp.launch(\n   integrate,\n   dim=len(start),\n   inputs=[positions, velocities, 0.01],\n   device=device,\n)\nwp.synchronize_device(device)\nprint(positions.numpy())\n```\n\n### Three properties make this useful in robotics:\n\n- Explicit parallel work. wp.tid() identifies the point, contact, body, or world owned by the current logical thread.\n\n- Explicit device arrays. An array lives on the selected device. Calling .numpy() on a CUDA array synchronizes and copies it to CPU memory; it is not a zero-copy path. For a device-resident PyTorch or JAX pipeline, use Warp’s framework adapters or DLPack-compatible sharing instead.\n\n- Composable kernel launches. A program can launch a sequence of focused kernels and capture supported CUDA work into a graph to reduce repeated dispatch overhead. Graph capture replays launches against existing buffers; it does not fuse arbitrary kernels.\n\n### Differentiability and Determinism.\n\nTwo further Warp capabilities are worth knowing, even though neither is used in the SO-101 workflow in this article. Warp kernels are differentiable : a wp.Tape records the forward kernel launches made inside its context and replays their adjoints in reverse when backward() is called, which is why teams build differentiable geometry, CFD, and custom physics in Warp, including CAE workflows for simulation and design optimization. Warp also supports deterministic execution , introduced in Warp 1.15 : GPU atomics are scheduler-dependent by default, so repeated launches of the same kernel can differ slightly, and the opt-in deterministic modes trade some performance for reproducible ordering in simulation, validation, and regression tests. These are Warp capabilities, not guarantees of differentiability or determinism for an entire MJWarp rollout. See the Warp documentation on differentiability and deterministic execution for the details.\n\nTry Warp: pip install warp-lang (≥ 1.15 for GPU determinism), then python -m warp.examples.browse, or the tutorial notebooks .\n\n## What is MuJoCo Warp (MJWarp)?\n\nA robot simulator repeatedly computes what happens next: given the current joint positions, velocities, controls, and contacts, it advances the scene by one small timestep. In this article, a world means one independent copy of that scene and its state. One world might contain the SO-101 arm reaching for a cube; another can contain the same arm starting from a slightly different pose.\n\nMuJoCo and MJWarp can run the same compatible robot and task, but they organize the work differently. MuJoCo naturally suits developing and inspecting one or a few CPU worlds. MJWarp is a NVIDIA Warp implementation of MuJoCo ’s physics pipeline that places the model and a batch of independent states on NVIDIA GPUs; one call to mjw.step advances the entire batch.\n\nMJWarp’s value is not necessarily a faster step for one world. It is the ability to advance hundreds or thousands together, giving the GPU enough parallel work to improve aggregate throughput , the total world-steps completed per second. That favors reinforcement learning and large-scale sampling, where collecting experience matters more than minimizing one environment’s latency.\n\nThis blog covers the following:\n\n- validate one MuJoCo world,\n\n- move it to MJWarp, form a batch,\n\n- verify it, and measure it correctly.\n\nSolver tuning, Jacobian representation, and specialized multi-GPU or determinism topics are not required for this migration and can be covered separately.\n\nThen, the distinction is precise:\n\n- Latency is wall-clock time for one simulation step.\n\n- Aggregate throughput is the total number of world-steps completed per measured wall-clock second.\n\n### Basic usage: structs, batch sizes, and a minimal step\n\n- The core API transition is small:\n\nMuJoCo host workflow MJWarp workflow\n\nmjw.put_model(mjm) creates a device model\n\nmjw.put_data(mjm, mjd, ...) preserves and batches an existing state\n\nmujoco.mj_step(mjm, mjd)\n\nmjw.step(m, d) advances every world in d\n\nHost arrays such as mjd.ctrl\n\nBatched device arrays such as d.ctrl with shape (nworld, nu)\n\nUse mjw.make_data() when default/fresh state is intended. Use mjw.put_data() when the exact initialized MuJoCo state must cross the migration boundary.\n\nAllocating batched resources requires defining the following parameters (refer to Batch sizes ):\n\nTotal number of parallel environments\n\nExpected contacts per individual world (overall capacity ≈ nconmax * nworld)\n\nAlternative setting: global maximum contacts across all environments combined (takes precedence if both are defined)\n\nHard upper limit on constraints per world\n\n1. CUDA graph capture :mjw.step is many kernel launches; capture once, replay often:\n\n```\nwith wp.ScopedCapture() as capture:\n     mjw.step(m, d)\nwp.capture_launch(capture.graph)\n```\n\n2. Size nconmax / naconmax / njmax tightly : memory and work scale with them. Tune with mjwarp-testspeed: --measure_alloc and watch overflows in mjwarp-viewer.\n\nAdditional tuning considerations. After sizing contact and constraint buffers, test solver iteration limits without changing task behavior. Meshes and CCD settings can increase memory use; nccdmax / naccdmax can reduce CCD buffer allocation when the measured contact counts allow it. MJWarp’s compact solver uses MuJoCo’s Newton constraint solver and sleeping, not the separate Newton physics-engine framework. Compact-solver and multi-GPU configuration are beyond this walkthrough; consult the MJWarp performance-tuning documentation.\n\nTo train policies on MJWarp physics:\n\n- mjlab (manager API directly on MJWarp + PyTorch)\n\n- MuJoCo Playground via MJX (impl='warp')\n\nInstall / try: pip install mujoco-warp · mjwarp-viewer path/to/scene.xml · Colab tutorial\n\n## Workflow to migrate a MuJoCo scene to MjWarp\n\n### Establish a MuJoCo CPU baseline\n\nThe scene. Nothing here is MJWarp-specific yet: an SO-101 arm, a table, and two cubes to stack, written as ordinary MJCF.\n\nFigure 2. SO-101 pick-and-place scene, rendered from the MuJoCo CPU simulation. The task is to grasp the red 44 mm cube and stack it on the blue cube; the same robot and scene are used for MJWarp validation.\n\n```\n<mujoco model=\"so101_pick_place\">\n  <include file=\"so101.xml\"/>\n\n  <worldbody>\n    <light pos=\"0.3 0 1.5\" dir=\"0 0 -1\" directional=\"true\"/>\n    <geom name=\"floor\" type=\"plane\" size=\"0 0 0.05\"/>\n\n    <geom name=\"table\" type=\"box\" pos=\"0.35 -0.04 0.012\"\n          size=\"0.16 0.26 0.012\" rgba=\"0.32 0.32 0.32 1\"\n          friction=\"1 0.005 0.0005\" condim=\"3\"/>\n\n    <body name=\"red_cube\" pos=\"0.33 -0.13 0.046\">\n      <freejoint name=\"red_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.85 0.05 0.04 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n\n    <body name=\"blue_cube\" pos=\"0.33 0.06 0.046\">\n      <freejoint name=\"blue_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.05 0.20 0.90 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n  </worldbody>\n</mujoco>\n```\n\nFor an MJCF box, the size values are half-extents: size=”0.022 …” defines a cube with 44 mm edges. The task uses this size for its success thresholds. The arm base is at the origin, its reach is along +X, and the cubes are arranged along Y.\n\nIn the companion repository this file is generated rather than hand-written: resolve_pick_place_scene() copies the Menagerie arm into .generated/, fills the table and cube coordinates from a robot profile, and writes scene_pick_place.xml. The walkthrough uses the SO-101 profile; the optional reBot variant is described below.\n\nLoading it. Compilation and stepping are ordinary MuJoCo:\n\n```\nimport mujoco\n\nmjm = mujoco.MjModel.from_xml_path(\"scene_pick_place.xml\")\nmjd = mujoco.MjData(mjm)\n\nfps = 50 # controller rate\nsim_substeps = 10 # physics steps per control frame\nframe_dt = 1.0 / fps\nmjm.opt.timestep = frame_dt / sim_substeps\n\ncontroller = PickPlaceController(spec=spec) # waypoints + damped-least-squares IK\n\nfor _ in range(600): # 600 control frames\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        mujoco.mj_step(mjm, mjd)\n```\n\nKeep that shape in mind: compute controls once per frame, step physics sim_substeps times. Gate 2 changes only the inner loop, which is what makes the migration easy to review.\n\nMatch the simulation and control rates. At 50 control frames per second and 10 physics substeps per frame, use a physics timestep of 0.002 seconds. Set it before the CPU rollout and before uploading the model with mjw.put_model so both backends advance the same simulated time:\n\n```\nmjm.opt.timestep = frame_dt / sim_substeps # 50 Hz × 10 substeps -> 0.002 s\n```\n\nWithout that line, every later measurement inherits the mismatch: parity comparisons, throughput numbers quoted as “simulated seconds,” and any learned policy whose action rate no longer matches deployment.\n\nCheck whether the cubes are stacked successfully. With 44 mm cubes, success becomes two measurable conditions: a horizontal center error of xy_err ≤ 0.015 m (measured between the cube centers) and a vertical separation of 0.035 m ≤ dz ≤ 0.055 m between cube centers (one cube edge, with slack for settling). Evaluate both conditions after the cubes have settled; a successful process exit alone does not establish task success.\n\nRun the CPU task from the companion checkout. Publication blocker: confirm the accessible repository URL and pinned dependency and asset versions before publishing these instructions; the repository placeholder below is not an executable URL.\n\n```\ngit clone https://github.com/NVIDIA/accelerated-computing-hub.git blogs\ncd blogs/tutorials/sim2real-blogs/notebooks/mujoco\nuv venv --python 3.12 && source .venv/bin/activate\nuv pip install -r requirements.txt\n\ncd /tutorials/sim2real-blogs/notebooks/mujoco\npython solutions/so101_pick_place_solution.py --headless-steps 600 --debug\n```\n\nThe run ends by printing the two numbers above (stack check: xy_err=… dz=…), which is the assertion the rest of the article compares against. so101_pick_place.py next to it is the same program with the physics steps left as exercises.\n\nThe arm comes straight from MuJoCo Menagerie pinned to a known-good commit, since Menagerie assets change, so treat the scene as a template. Optional reBot variant. The companion code also exposes --robot rebot with a separate profile for the scene layout, gripper, and capacity limits (nconmax=256, njmax=500). This walkthrough uses SO-101. Validate the reBot asset and task separately before reporting its results.\n\n### Validate one-world MJWarp parity\n\nRun one world on the GPU first, with the host still in the loop, so you can watch the same task in the same viewer and compare the same two numbers. Upload the model, allocate batched state, seed it from the initialized host state, and run one forward pass before stepping:\n\n```\nwp.init()\nimport mujoco_warp as mjw\n\ndevice = wp.get_device()\n\nm = mjw.put_model(mjm)\nd = mjw.make_data(mjm, nworld=1, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(mjd.qpos[None, :], dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(mjd.qvel[None, :], dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\nmjw.forward(m, d)\n```\n\nEvery device array carries a leading world dimension, which is why the host state is indexed as mjd.qpos[None, :], shape (1, nq) instead of (nq,). Scaling to thousands of worlds later changes only that leading dimension, not the calls. mjw.put_model() also doubles as a compatibility check: it raises if the model uses unsupported features rather than silently dropping them.\n\nSeeding the three fields explicitly is the transparent option, and it makes clear exactly what crosses to the device; mjw.put_data(mjm, mjd, nworld=…) carries the whole initialized struct over in one call instead.\n\nThe frame loop is then the Gate 1 loop with its inner step redirected to the GPU and mirrored back:\n\n```\ndef simulate_frame() -> None:\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        wp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\n        mjw.step(m, d)\n        mjd.qpos[:] = d.qpos.numpy()[0]\n        mjd.qvel[:] = d.qvel.numpy()[0]\n    mujoco.mj_forward(mjm, mjd)\n```\n\nThe .numpy() reads synchronize and copy data to the host on every substep, so this is a task-validation path, not a throughput benchmark. It keeps inverse kinematics, viewing, and task checks on the host. After copying qpos and qvel, call mujoco.mj_forward(mjm, mjd) to refresh derived host quantities such as mjd.xpos before using them for control, viewing, or the stack check. Reading those fields after the loop does not refresh them automatically. Gate 4 removes these per-step host copies from the throughput path.\n\n### Size contact and constraint capacity\n\nMJWarp allocates contact and constraint buffers before stepping. Exceeding those capacities invalidates the affected rollout for verification or benchmarking, even when execution continues with an overflow warning rather than an exception. Increase the relevant limit and rerun the task. Larger buffers use more GPU memory, so verify capacity over the full task before tightening the allocation.\n\nSet contact and constraint limits for the robot and task being simulated. The SO-101 profile uses nconmax=128 and njmax=300 as starting capacities. Check that these limits are sufficient during the most contact-heavy part of the task:\n\n```\nd = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)\n```\n\nSize them against the most contact-heavy moment of the task, for pick-and-place, the instant both jaws and the table touch a cube, not the arm hovering in free space. An overflow is reported rather than raised: with Option.warn_overflow at its default, MJWarp prints the budget to increase (“narrowphase overflow - please increase nconmax to …”) to the terminal running your script or the viewer, and flags the affected worlds in Data.overflow for you to read back after a step. Only mjw.put_data raises an error outright, because it can compare the budgets against a MuJoCo state it already holds. mjwarp-testspeed --measure_alloc reports the contacts and constraints a scene actually consumed, and it aborts the rollout with the offending world IDs as soon as any world overflows. Treat those reports as failures: raise the limit and re-run before trusting either the trajectory or the benchmark, then tighten again whenever the model, collision geometry, or task changes.\n\n### Scale to 2,048 worlds\n\nOnce one-world parity passes, reallocate at the target size and replicate the initialized state across the batch. Two things change relative to Gate 2: nworld, and the fact that nothing crosses the PCIe bus per step.\n\n```\nnworld = 2_048\nd = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(np.tile(mjd.qpos, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(np.tile(mjd.qvel, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(np.tile(mjd.ctrl, (nworld, 1)), dtype=wp.float32, device=device))\nmjw.forward(m, d)\n\nwith wp.ScopedCapture() as capture:\n    mjw.step(m, d)\nstep_graph = capture.graph\n```\n\nnp.tile gives every world the same starting state, which is the right baseline for a throughput measurement; per-world randomization would instead write different rows of d.qpos on the device.\n\nCUDA Graphs reuse the model and data buffers captured here. Update d.ctrl in place between replays, and capture a new graph after replacing buffers, changing nworld, or rebuilding the model. Graph capture requires CUDA.\n\nFigure 3. Scaling the SO-101 task from one CPU world to 2,048 independent GPU states using the same compatible model. A single MJWarp step advances the full batch. This conceptual illustration highlights aggregate throughput, measured as world-steps per wall-clock second.\n\n### Verify, then measure\n\nGPU launches are asynchronous, so a naive timer measures how fast Python queued work, not how fast the GPU finished it. Warm up first — the first launches pay kernel compilation and allocation — then synchronize immediately before and after the timed region:\n\n```\nimport time\nfor _ in range(10): # warm-up: compilation, allocation, caches\n    wp.capture_launch(step_graph)\nwp.synchronize()\n\nt0 = time.perf_counter()\nfor _ in range(200):\n    wp.capture_launch(step_graph)\nwp.synchronize() # without this you time the queue, not the work\nelapsed = time.perf_counter() - t0\ntotal = 200 * nworld\nprint(f\"{total / elapsed:,.0f} world-steps/second\")\n```\n\nReport both aggregate world-steps per second and milliseconds per batched step, together with the batch size. Use the measured curve to identify where additional worlds improve throughput and where memory or compute limits reduce the benefit. Results depend on the scene, simulation settings, and hardware; a one-world latency comparison does not establish batched throughput.\n\nTo see that curve on your own hardware, scaling_study.py sweeps the batch size and prints ms/step alongside throughput and speedup:\n\n```\ncd /tutorials/sim2real-blogs/notebooks/mujoco/part2\npython solutions/so101_mjwarp_solution.py --headless-steps 600     # parity, needs CUDA\npython scaling_study.py --worlds 1 64 1024 2048 8192 --steps 100\n```\n\npip install warp-lang → python -m warp.examples.browse → docs · GitHub\n\npip install mujoco-warp → mjwarp-viewer benchmarks/humanoid/humanoid.xml → docs · GitHub · Colab tutorial\n\nSO-101 sim-to-real course · Physical AI learning paths\n\nmjlab · MuJoCo Playground · Isaac Lab + Newton (upcoming posts)\n\nThis post covered raw Warp → MJWarp : GPU kernels, batched stepping, and an SO-101 scene using mjw.step.\n\nNext, we will port the same MJCF environment into Newton , using MuJoCo Warp as its rigid-body solver (newton.solvers.SolverMuJoCo). Newton will manage the model, state, controls, and contacts, while MJWarp runs underneath.\n\nYou will also see what Newton adds: multi-format assets, swappable solvers, sensors/IK helpers, and an Isaac Lab path.\n\nThe migration guide continues with the same SO-101 task and its optional reBot profile, explaining the changes required by Newton and the separate Isaac Lab integration.\n\nIf you build something with Warp or MJWarp, open an issue on the linked repositories or find us on Discord NVIDIA Omniverse .\n\n- Blog 1: * The State of Simulation for Physical AI: An Overview* — Post 1 of this series.\n\n- NVIDIA Warp — GitHub · Documentation · v1.15.0 release (GPU determinism) · Deterministic execution guide\n\n- MuJoCo Warp — GitHub · Official MJWarp docs\n\n- Build Accelerated, Differentiable Computational Physics Code for AI with NVIDIA Warp\n\n- Introducing Tile-Based Programming in Warp 1.5.0\n\n- mjlab · arXiv:2601.22074\n\n- NVIDIA SO-101 sim-to-real course\n\n- Newton next post: MJWarp as SolverMuJoCo and porting this environment\n\n## **Know Who Spoke When: Build Real-Time, Multi-Speaker AI with NVIDIA Nemotron 3 Diarization**\n\n## Build Low-Latency Multilingual Voice Agents: Open Weights & Full Deployment Control with NVIDIA Magpie TTS\n\nel manejo de los agentes de ia para el entrenamiendo de rbajadores en simulacion con ia a sido bastante buena la ia ya que aprte de eso nos ahyuda hacerlo mas rapido y me jorar las cosas que nosotros como personas nos ayuda\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "body": "Classic MuJoCo provides fast CPU-based robot simulation for developing, testing, and controlling robots and it can parallelize sampling across CPU cores. But as learning workloads grow, the question shifts from how quickly one world can run to how many worlds can run at once. GPU acceleration makes it possible to advance those worlds in large batches while keeping simulation and learning data close to the device.\n\nMuJoCo Warp (MJWarp), built on NVIDIA Warp, takes compatible MuJoCo models into that GPU-scale regime. In this article, we will move an SO-101 follower arm from a familiar MuJoCo workflow to as many as 2,048 parallel MJWarp environments and examine the technology and validation steps that make the transition possible.\n\nFigure 1. How MJWarp connects Python to GPU simulation. MuJoCo loads and compiles the MJCF model; MJWarp implements the physics in NVIDIA Warp, which compiles CUDA kernels to advance simulation states on NVIDIA GPUs.\n\nThis is the second article in our State of Simulation for Physical AI series. The first article mapped the robot-simulation landscape. Here, we prepare and scale the simulation environment; we do not train a policy. The later Newton and Isaac Lab installments cover the next integration layers.\n\n## Putting it together\n\nLayer\n\nRole in the stack\n\nNVIDIA Warp\n\nPython kernel language: single instruction, multiple threads (SIMT), autodiff, PyTorch/JAX interop\n\nMJWarp\n\nMuJoCo physics on Warp: same MJCF, batched GPU throughput\n\nYour scene (SO-101)\n\nFamiliar Menagerie / Robot Studio assets + task geometry\n\nNext (Newton / Isaac Lab)\n\nMulti-solver API, USD, sensors, managers, training loops\n\nDecision shortcut:\n\nIf you need…\n\nReach for…\n\nSingle-robot MPC / teleop\n\nMuJoCo CPU\n\nMax throughput on raw MuJoCo physics\n\nMJWarp (or mjlab)\n\nJAX training recipes\n\nMuJoCo Playground / MJX (impl='warp')\n\nMulti-solver + Isaac Lab integration\n\nNewton — next post in this series\n\n## Start with one useful Warp Kernel\n\nNVIDIA Warp is a Python framework for writing high-performance, GPU-accelerated kernels. Warp lets developers author statically typed kernels in Python and compiles them for CPU or CUDA execution. The first launch builds and caches a native module; later launches reuse it. The kernel language is a performance-oriented subset of Python, while ordinary Python remains responsible for configuration, allocation, and launch orchestration.\n\nThis small robotics-oriented kernel advances point positions under gravity. One logical thread handles one point, so the same code scales from two points to millions without introducing GPU terminology into the control flow.\n\nThe three value propositions of Warp are:\n\nPillar\n\nWhat you get\n\nPerformance\n\nNative-CUDA speed via JIT compilation, kernel fusion, and CUDA Graphs\n\nEase of use\n\nPure Python authoring with built-in vectors, matrices, quaternions, BVHs, hash grids, sparse matrices, and tile primitives\n\nCapability\n\nDifferentiable kernels and DLPack-style interop so simulation can sit inside an ML training loop\n\n```\nimport numpy as np\nimport warp as wp\n\n@wp.kernel\ndef integrate(\n   positions: wp.array[wp.vec3],\n   velocities: wp.array[wp.vec3],\n   dt: float,\n):\n   i = wp.tid()\n   velocities[i] += wp.vec3(0.0, 0.0, -9.81) * dt\n   positions[i] += velocities[i] * dt\n\nwp.init()\ndevice = \"cuda:0\" if wp.is_cuda_available() else \"cpu\"\nstart = np.array([[0.0, 0.0, 0.5], [0.2, 0.0, 0.5]], dtype=np.float32)\npositions = wp.array(start, dtype=wp.vec3, device=device)\nvelocities = wp.zeros_like(positions)\n\nwp.launch(\n   integrate,\n   dim=len(start),\n   inputs=[positions, velocities, 0.01],\n   device=device,\n)\nwp.synchronize_device(device)\nprint(positions.numpy())\n```\n\n### Three properties make this useful in robotics:\n\n- Explicit parallel work. wp.tid() identifies the point, contact, body, or world owned by the current logical thread.\n\n- Explicit device arrays. An array lives on the selected device. Calling .numpy() on a CUDA array synchronizes and copies it to CPU memory; it is not a zero-copy path. For a device-resident PyTorch or JAX pipeline, use Warp’s framework adapters or DLPack-compatible sharing instead.\n\n- Composable kernel launches. A program can launch a sequence of focused kernels and capture supported CUDA work into a graph to reduce repeated dispatch overhead. Graph capture replays launches against existing buffers; it does not fuse arbitrary kernels.\n\n### Differentiability and Determinism.\n\nTwo further Warp capabilities are worth knowing, even though neither is used in the SO-101 workflow in this article. Warp kernels are differentiable: a wp.Tape records the forward kernel launches made inside its context and replays their adjoints in reverse when backward() is called, which is why teams build differentiable geometry, CFD, and custom physics in Warp, including CAE workflows for simulation and design optimization. Warp also supports deterministic execution, introduced in Warp 1.15: GPU atomics are scheduler-dependent by default, so repeated launches of the same kernel can differ slightly, and the opt-in deterministic modes trade some performance for reproducible ordering in simulation, validation, and regression tests. These are Warp capabilities, not guarantees of differentiability or determinism for an entire MJWarp rollout. See the Warp documentation on differentiability and deterministic execution for the details.\n\nTry Warp: pip install warp-lang (≥ 1.15 for GPU determinism), then python -m warp.examples.browse, or the tutorial notebooks.\n\n## What is MuJoCo Warp (MJWarp)?\n\nA robot simulator repeatedly computes what happens next: given the current joint positions, velocities, controls, and contacts, it advances the scene by one small timestep. In this article, a world means one independent copy of that scene and its state. One world might contain the SO-101 arm reaching for a cube; another can contain the same arm starting from a slightly different pose.\n\nMuJoCo and MJWarp can run the same compatible robot and task, but they organize the work differently. MuJoCo naturally suits developing and inspecting one or a few CPU worlds. MJWarp is a NVIDIA Warp implementation of MuJoCo’s physics pipeline that places the model and a batch of independent states on NVIDIA GPUs; one call to mjw.step advances the entire batch.\n\nMJWarp’s value is not necessarily a faster step for one world. It is the ability to advance hundreds or thousands together, giving the GPU enough parallel work to improve aggregate throughput, the total world-steps completed per second. That favors reinforcement learning and large-scale sampling, where collecting experience matters more than minimizing one environment’s latency.\n\nThis blog covers the following:\n\n- validate one MuJoCo world,\n\n- move it to MJWarp, form a batch,\n\n- verify it, and measure it correctly.\n\nSolver tuning, Jacobian representation, and specialized multi-GPU or determinism topics are not required for this migration and can be covered separately.\n\nThen, the distinction is precise:\n\n- Latency is wall-clock time for one simulation step.\n\n- Aggregate throughput is the total number of world-steps completed per measured wall-clock second.\n\n### Basic usage: structs, batch sizes, and a minimal step\n\n- The core API transition is small:\n\nMuJoCo host workflow\n\nMJWarp workflow\n\nmujoco.MjModel\n\nmjw.put_model(mjm) creates a device model\n\nmujoco.MjData\n\nmjw.put_data(mjm, mjd, ...) preserves and batches an existing state\n\nmujoco.mj_step(mjm, mjd)\n\nmjw.step(m, d) advances every world in d\n\nHost arrays such as mjd.ctrl\n\nBatched device arrays such as d.ctrl with shape (nworld, nu)\n\nUse mjw.make_data() when default/fresh state is intended. Use mjw.put_data() when the exact initialized MuJoCo state must cross the migration boundary.\n\nAllocating batched resources requires defining the following parameters (refer to Batch sizes):\n\nParameter\n\nMeaning\n\nnworld\n\nTotal number of parallel environments\n\nnconmax\n\nExpected contacts per individual world (overall capacity ≈ nconmax * nworld)\n\nnaconmax\n\nAlternative setting: global maximum contacts across all environments combined (takes precedence if both are defined)\n\nnjmax\n\nHard upper limit on constraints per world\n\n### Performance tuning\n\n\\1. CUDA graph capture:mjw.step is many kernel launches; capture once, replay often:\n\n```\nwith wp.ScopedCapture() as capture:\n     mjw.step(m, d)\nwp.capture_launch(capture.graph)\n```\n\n\\2. Size nconmax / naconmax / njmax tightly: memory and work scale with them. Tune with mjwarp-testspeed: --measure_alloc and watch overflows in mjwarp-viewer.\n\nAdditional tuning considerations. After sizing contact and constraint buffers, test solver iteration limits without changing task behavior. Meshes and CCD settings can increase memory use; nccdmax / naccdmax can reduce CCD buffer allocation when the measured contact counts allow it. MJWarp’s compact solver uses MuJoCo’s Newton constraint solver and sleeping, not the separate Newton physics-engine framework. Compact-solver and multi-GPU configuration are beyond this walkthrough; consult the MJWarp performance-tuning documentation.\n\nTo train policies on MJWarp physics:\n\n- Isaac Lab via Newton\n\n- mjlab (manager API directly on MJWarp + PyTorch)\n\n- MuJoCo Playground via MJX (impl='warp')\n\nInstall / try: pip install mujoco-warp · mjwarp-viewer path/to/scene.xml · Colab tutorial\n\n## Workflow to migrate a MuJoCo scene to MjWarp\n\n### Establish a MuJoCo CPU baseline\n\nThe scene. Nothing here is MJWarp-specific yet: an SO-101 arm, a table, and two cubes to stack, written as ordinary MJCF.\n\nFigure 2. SO-101 pick-and-place scene, rendered from the MuJoCo CPU simulation. The task is to grasp the red 44 mm cube and stack it on the blue cube; the same robot and scene are used for MJWarp validation.\n\n```\n<mujoco model=\"so101_pick_place\">\n  <include file=\"so101.xml\"/>\n\n  <worldbody>\n    <light pos=\"0.3 0 1.5\" dir=\"0 0 -1\" directional=\"true\"/>\n    <geom name=\"floor\" type=\"plane\" size=\"0 0 0.05\"/>\n\n    <geom name=\"table\" type=\"box\" pos=\"0.35 -0.04 0.012\"\n          size=\"0.16 0.26 0.012\" rgba=\"0.32 0.32 0.32 1\"\n          friction=\"1 0.005 0.0005\" condim=\"3\"/>\n\n    <body name=\"red_cube\" pos=\"0.33 -0.13 0.046\">\n      <freejoint name=\"red_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.85 0.05 0.04 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n\n    <body name=\"blue_cube\" pos=\"0.33 0.06 0.046\">\n      <freejoint name=\"blue_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.05 0.20 0.90 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n  </worldbody>\n</mujoco>\n```\n\nFor an MJCF box, the size values are half-extents: size=”0.022 …” defines a cube with 44 mm edges. The task uses this size for its success thresholds. The arm base is at the origin, its reach is along +X, and the cubes are arranged along Y.\n\nIn the companion repository this file is generated rather than hand-written: resolve_pick_place_scene() copies the Menagerie arm into .generated/, fills the table and cube coordinates from a robot profile, and writes scene_pick_place.xml. The walkthrough uses the SO-101 profile; the optional reBot variant is described below.\n\nLoading it. Compilation and stepping are ordinary MuJoCo:\n\n```\nimport mujoco\n\nmjm = mujoco.MjModel.from_xml_path(\"scene_pick_place.xml\")\nmjd = mujoco.MjData(mjm)\n\nfps = 50 # controller rate\nsim_substeps = 10 # physics steps per control frame\nframe_dt = 1.0 / fps\nmjm.opt.timestep = frame_dt / sim_substeps\n\ncontroller = PickPlaceController(spec=spec) # waypoints + damped-least-squares IK\n\nfor _ in range(600): # 600 control frames\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        mujoco.mj_step(mjm, mjd)\n```\n\nKeep that shape in mind: compute controls once per frame, step physics sim_substeps times. Gate 2 changes only the inner loop, which is what makes the migration easy to review.\n\nMatch the simulation and control rates. At 50 control frames per second and 10 physics substeps per frame, use a physics timestep of 0.002 seconds. Set it before the CPU rollout and before uploading the model with mjw.put_model so both backends advance the same simulated time:\n\n```\nmjm.opt.timestep = frame_dt / sim_substeps # 50 Hz × 10 substeps -> 0.002 s\n```\n\nWithout that line, every later measurement inherits the mismatch: parity comparisons, throughput numbers quoted as “simulated seconds,” and any learned policy whose action rate no longer matches deployment.\n\nCheck whether the cubes are stacked successfully. With 44 mm cubes, success becomes two measurable conditions: a horizontal center error of xy_err ≤ 0.015 m (measured between the cube centers) and a vertical separation of 0.035 m ≤ dz ≤ 0.055 m between cube centers (one cube edge, with slack for settling). Evaluate both conditions after the cubes have settled; a successful process exit alone does not establish task success.\n\nRun the CPU task from the companion checkout. Publication blocker: confirm the accessible repository URL and pinned dependency and asset versions before publishing these instructions; the repository placeholder below is not an executable URL.\n\n```\ngit clone https://github.com/NVIDIA/accelerated-computing-hub.git blogs\ncd blogs/tutorials/sim2real-blogs/notebooks/mujoco\nuv venv --python 3.12 && source .venv/bin/activate\nuv pip install -r requirements.txt\n\ncd /tutorials/sim2real-blogs/notebooks/mujoco\npython solutions/so101_pick_place_solution.py --headless-steps 600 --debug\n```\n\nThe run ends by printing the two numbers above (stack check: xy_err=… dz=…), which is the assertion the rest of the article compares against. so101_pick_place.py next to it is the same program with the physics steps left as exercises.\n\nThe arm comes straight from MuJoCo Menagerie pinned to a known-good commit, since Menagerie assets change, so treat the scene as a template. Optional reBot variant. The companion code also exposes --robot rebot with a separate profile for the scene layout, gripper, and capacity limits (nconmax=256, njmax=500). This walkthrough uses SO-101. Validate the reBot asset and task separately before reporting its results.\n\n### Validate one-world MJWarp parity\n\nRun one world on the GPU first, with the host still in the loop, so you can watch the same task in the same viewer and compare the same two numbers. Upload the model, allocate batched state, seed it from the initialized host state, and run one forward pass before stepping:\n\n```\nwp.init()\nimport mujoco_warp as mjw\n\ndevice = wp.get_device()\n\nm = mjw.put_model(mjm)\nd = mjw.make_data(mjm, nworld=1, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(mjd.qpos[None, :], dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(mjd.qvel[None, :], dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\nmjw.forward(m, d)\n```\n\nEvery device array carries a leading world dimension, which is why the host state is indexed as mjd.qpos[None, :], shape (1, nq) instead of (nq,). Scaling to thousands of worlds later changes only that leading dimension, not the calls. mjw.put_model() also doubles as a compatibility check: it raises if the model uses unsupported features rather than silently dropping them.\n\nSeeding the three fields explicitly is the transparent option, and it makes clear exactly what crosses to the device; mjw.put_data(mjm, mjd, nworld=…) carries the whole initialized struct over in one call instead.\n\nThe frame loop is then the Gate 1 loop with its inner step redirected to the GPU and mirrored back:\n\n```\ndef simulate_frame() -> None:\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        wp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\n        mjw.step(m, d)\n        mjd.qpos[:] = d.qpos.numpy()[0]\n        mjd.qvel[:] = d.qvel.numpy()[0]\n    mujoco.mj_forward(mjm, mjd)\n```\n\nThe .numpy() reads synchronize and copy data to the host on every substep, so this is a task-validation path, not a throughput benchmark. It keeps inverse kinematics, viewing, and task checks on the host. After copying qpos and qvel, call mujoco.mj_forward(mjm, mjd) to refresh derived host quantities such as mjd.xpos before using them for control, viewing, or the stack check. Reading those fields after the loop does not refresh them automatically. Gate 4 removes these per-step host copies from the throughput path.\n\n### Size contact and constraint capacity\n\nMJWarp allocates contact and constraint buffers before stepping. Exceeding those capacities invalidates the affected rollout for verification or benchmarking, even when execution continues with an overflow warning rather than an exception. Increase the relevant limit and rerun the task. Larger buffers use more GPU memory, so verify capacity over the full task before tightening the allocation.\n\nSet contact and constraint limits for the robot and task being simulated. The SO-101 profile uses nconmax=128 and njmax=300 as starting capacities. Check that these limits are sufficient during the most contact-heavy part of the task:\n\n```\nd = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)\n```\n\nSize them against the most contact-heavy moment of the task, for pick-and-place, the instant both jaws and the table touch a cube, not the arm hovering in free space. An overflow is reported rather than raised: with Option.warn_overflow at its default, MJWarp prints the budget to increase (“narrowphase overflow - please increase nconmax to …”) to the terminal running your script or the viewer, and flags the affected worlds in Data.overflow for you to read back after a step. Only mjw.put_data raises an error outright, because it can compare the budgets against a MuJoCo state it already holds. mjwarp-testspeed --measure_alloc reports the contacts and constraints a scene actually consumed, and it aborts the rollout with the offending world IDs as soon as any world overflows. Treat those reports as failures: raise the limit and re-run before trusting either the trajectory or the benchmark, then tighten again whenever the model, collision geometry, or task changes.\n\n### Scale to 2,048 worlds\n\nOnce one-world parity passes, reallocate at the target size and replicate the initialized state across the batch. Two things change relative to Gate 2: nworld, and the fact that nothing crosses the PCIe bus per step.\n\n```\nnworld = 2_048\nd = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(np.tile(mjd.qpos, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(np.tile(mjd.qvel, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(np.tile(mjd.ctrl, (nworld, 1)), dtype=wp.float32, device=device))\nmjw.forward(m, d)\n\nwith wp.ScopedCapture() as capture:\n    mjw.step(m, d)\nstep_graph = capture.graph\n```\n\nnp.tile gives every world the same starting state, which is the right baseline for a throughput measurement; per-world randomization would instead write different rows of d.qpos on the device.\n\nCUDA Graphs reuse the model and data buffers captured here. Update d.ctrl in place between replays, and capture a new graph after replacing buffers, changing nworld, or rebuilding the model. Graph capture requires CUDA.\n\nFigure 3. Scaling the SO-101 task from one CPU world to 2,048 independent GPU states using the same compatible model. A single MJWarp step advances the full batch. This conceptual illustration highlights aggregate throughput, measured as world-steps per wall-clock second.\n\n### Verify, then measure\n\nGPU launches are asynchronous, so a naive timer measures how fast Python queued work, not how fast the GPU finished it. Warm up first — the first launches pay kernel compilation and allocation — then synchronize immediately before and after the timed region:\n\n```\nimport time\nfor _ in range(10): # warm-up: compilation, allocation, caches\n    wp.capture_launch(step_graph)\nwp.synchronize()\n\nt0 = time.perf_counter()\nfor _ in range(200):\n    wp.capture_launch(step_graph)\nwp.synchronize() # without this you time the queue, not the work\nelapsed = time.perf_counter() - t0\ntotal = 200 * nworld\nprint(f\"{total / elapsed:,.0f} world-steps/second\")\n```\n\nReport both aggregate world-steps per second and milliseconds per batched step, together with the batch size. Use the measured curve to identify where additional worlds improve throughput and where memory or compute limits reduce the benefit. Results depend on the scene, simulation settings, and hardware; a one-world latency comparison does not establish batched throughput.\n\nTo see that curve on your own hardware, scaling_study.py sweeps the batch size and prints ms/step alongside throughput and speedup:\n\n```\ncd /tutorials/sim2real-blogs/notebooks/mujoco/part2\npython solutions/so101_mjwarp_solution.py --headless-steps 600     # parity, needs CUDA\npython scaling_study.py --worlds 1 64 1024 2048 8192 --steps 100\n```\n\n## Get started\n\nWarp (kernel layer) pip install warp-lang → python -m warp.examples.browse → docs · GitHub\n\nMJWarp (GPU MuJoCo) pip install mujoco-warp → mjwarp-viewer benchmarks/humanoid/humanoid.xml → docs · GitHub · Colab tutorial\n\nSO-101 context SO-101 sim-to-real course · Physical AI learning paths\n\nTrain on top of MJWarp mjlab · MuJoCo Playground · Isaac Lab + Newton (upcoming posts)\n\n## What’s next\n\nThis post covered raw Warp → MJWarp: GPU kernels, batched stepping, and an SO-101 scene using mjw.step.\n\nNext, we will port the same MJCF environment into Newton, using MuJoCo Warp as its rigid-body solver (newton.solvers.SolverMuJoCo). Newton will manage the model, state, controls, and contacts, while MJWarp runs underneath.\n\nYou will also see what Newton adds: multi-format assets, swappable solvers, sensors/IK helpers, and an Isaac Lab path.\n\nThe migration guide continues with the same SO-101 task and its optional reBot profile, explaining the changes required by Newton and the separate Isaac Lab integration.\n\nIf you build something with Warp or MJWarp, open an issue on the linked repositories or find us on Discord NVIDIA Omniverse.\n\n## References\n\n- Blog 1: *The State of Simulation for Physical AI: An Overview* — Post 1 of this series.\n\n- NVIDIA Warp — GitHub · Documentation · v1.15.0 release (GPU determinism) · Deterministic execution guide\n\n- MuJoCo Warp — GitHub · Official MJWarp docs\n\n- Build Accelerated, Differentiable Computational Physics Code for AI with NVIDIA Warp\n\n- Introducing Tile-Based Programming in Warp 1.5.0\n\n- mjlab · arXiv:2601.22074\n\n- MuJoCo Playground\n\n- NVIDIA SO-101 sim-to-real course\n\n- Newton next post: MJWarp as SolverMuJoCo and porting this environment",
   "images": [
     {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/67f44bfc74216a95759e2aa5/WY9Kx2IFN0g6bKk9b_34t.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/67f44bfc74216a95759e2aa5/WY9Kx2IFN0g6bKk9b_34t.png",
-      "id": "image_7b272f8fec268f2f"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/Ch4bxWNOfA8jpRU1m8NKg.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/Ch4bxWNOfA8jpRU1m8NKg.png",
-      "id": "image_7bb071802151f161"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/7sTK8Q_gZRoOz0uaKnVNJ.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/7sTK8Q_gZRoOz0uaKnVNJ.png",
-      "id": "image_7596d7c870f39834"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/67a20d153fdd4dcfdd35d965/erPlUPw7G1_inapIO-owA.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/67a20d153fdd4dcfdd35d965/erPlUPw7G1_inapIO-owA.jpeg",
-      "id": "image_fc91e5e89457939d"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/0D1yOQM7JF-obqpce3VKZ.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/0D1yOQM7JF-obqpce3VKZ.png",
-      "id": "image_39c1deec57527863"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/CxnaS40J0AmFhZDX4vVS_.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/CxnaS40J0AmFhZDX4vVS_.png",
-      "id": "image_f6bb2c5deaa7dd90"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6994dc99f850a10f03fd0b21/pFu0WOu97JHFXISsHsz6f.jpeg",
-      "alt": "Johnny Nuñez Cano's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6994dc99f850a10f03fd0b21/pFu0WOu97JHFXISsHsz6f.jpeg",
-      "id": "image_7137fbef693f0ca9"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/65df9200dc3292a8983e5017/Vs5FPVCH-VZBipV3qKTuy.png",
-      "alt": "NVIDIA's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/65df9200dc3292a8983e5017/Vs5FPVCH-VZBipV3qKTuy.png",
-      "id": "image_ef881295bba2484a"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/69bb43c53823efb06022a02e/whnqlhLgFwNwnlj_P54aP.jpeg",
-      "alt": "Asier Arranz's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/69bb43c53823efb06022a02e/whnqlhLgFwNwnlj_P54aP.jpeg",
-      "id": "image_517557a63cea89f0"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/kaRxLMenXEARG7KGBZJUh.png",
-      "alt": "Rishabh Chadha's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/kaRxLMenXEARG7KGBZJUh.png",
-      "id": "image_cd705610a964019f"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/sFeK_sFS3aCoUd5rN5XjN.jpeg",
-      "alt": "Ben Oliveri's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/sFeK_sFS3aCoUd5rN5XjN.jpeg",
-      "id": "image_2dd31638b96a5e31"
-    },
-    {
       "src": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/8SmNNsqLiBHC0W31zT4cf.png",
-      "alt": "image1",
       "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/8SmNNsqLiBHC0W31zT4cf.png",
+      "alt": "image1",
       "id": "image_21cffa19061a1bd0"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/Tn07F7pRaVdJXRnB7jSV1.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/Tn07F7pRaVdJXRnB7jSV1.png",
+      "alt": "image2",
+      "id": "image_9dd4a84e04109045"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/UMuh1gwUTiT1VKcO6E6w1.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6994dc99f850a10f03fd0b21/UMuh1gwUTiT1VKcO6E6w1.png",
+      "alt": "image3",
+      "id": "image_6865782dbb754c29"
     }
   ],
   "mediaCheckedAt": "2026-09-26T23:09:58.374097Z",
@@ -111,163 +57,37 @@
   ],
   "mediaFormatVersion": 2,
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "e2e8a8e8d6ceb3adbbf35225035483ca3c9392ce344c74fb161773a2e7a4387b",
+  "mediaLayoutBodyHash": "f8753e0faaf01af87c62c8c114cfe3305c321e6eaf939982ca9628802d302925",
   "mediaLayout": [
-    {
-      "mediaId": "image_7b272f8fec268f2f",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_7bb071802151f161",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_7596d7c870f39834",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_fc91e5e89457939d",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
-    {
-      "mediaId": "image_39c1deec57527863",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 6
-    },
-    {
-      "mediaId": "image_f6bb2c5deaa7dd90",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 7
-    },
-    {
-      "mediaId": "image_7137fbef693f0ca9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 8
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 9
-    },
-    {
-      "mediaId": "image_517557a63cea89f0",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 10
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 11
-    },
-    {
-      "mediaId": "image_cd705610a964019f",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 12
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 13
-    },
-    {
-      "mediaId": "image_2dd31638b96a5e31",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 14
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 15
-    },
     {
       "mediaId": "image_21cffa19061a1bd0",
       "type": "image",
-      "afterBlockId": "b0004",
-      "order": 18
+      "afterBlockId": "b0003",
+      "order": 0
+    },
+    {
+      "mediaId": "image_9dd4a84e04109045",
+      "type": "image",
+      "afterBlockId": "b0093",
+      "order": 1
+    },
+    {
+      "mediaId": "image_6865782dbb754c29",
+      "type": "image",
+      "afterBlockId": "b0118",
+      "order": 2
     },
     {
       "mediaId": "video_e7a0538649307cf8",
       "type": "video",
       "afterBlockId": "c0012",
-      "order": 124
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0115",
-      "order": 143
-    },
-    {
-      "mediaId": "image_ef881295bba2484a",
-      "type": "image",
-      "afterBlockId": "b0116",
-      "order": 145
-    },
-    {
-      "mediaId": "image_39c1deec57527863",
-      "type": "image",
-      "afterBlockId": "b0116",
-      "order": 146
-    },
-    {
-      "mediaId": "image_7b272f8fec268f2f",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 150
-    },
-    {
-      "mediaId": "image_7bb071802151f161",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 151
-    },
-    {
-      "mediaId": "image_7596d7c870f39834",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 152
-    },
-    {
-      "mediaId": "image_fc91e5e89457939d",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 153
-    },
-    {
-      "mediaId": "image_39c1deec57527863",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 154
-    },
-    {
-      "mediaId": "image_f6bb2c5deaa7dd90",
-      "type": "image",
-      "afterBlockId": "b0119",
-      "order": 155
+      "order": 3
     }
   ],
   "mediaLayoutUnplaced": [],
-  "mediaLayoutMatched": 25,
+  "mediaLayoutMatched": 4,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-09-26T23:09:58.454747Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:05.737220Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -320,5 +140,1934 @@
       }
     ],
     "duplicateKey": "nvidia-warp-mujoco-simulation"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Classic MuJoCo provides fast CPU-based robot simulation for developing, testing, and controlling robots and it can parallelize sampling across CPU cores. But as learning workloads grow, the question shifts from how quickly one world can run to how many worlds can run at once. GPU acceleration makes it possible to advance those worlds in large batches while keeping simulation and learning data close to the device.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 55,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/use-cases/robotics-simulation/"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "MuJoCo Warp (MJWarp), built on NVIDIA Warp, takes compatible MuJoCo models into that GPU-scale regime. In this article, we will move an SO-101 follower arm from a familiar MuJoCo workflow to as many as 2,048 parallel MJWarp environments and examine the technology and validation steps that make the transition possible.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://mujoco.readthedocs.io/en/latest/mjwarp/"
+        },
+        {
+          "start": 31,
+          "end": 42,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/warp-python"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Figure 1. How MJWarp connects Python to GPU simulation. MuJoCo loads and compiles the MJCF model; MJWarp implements the physics in NVIDIA Warp, which compiles CUDA kernels to advance simulation states on NVIDIA GPUs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 216,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This is the second article in our State of Simulation for Physical AI series. The first article mapped the robot-simulation landscape. Here, we prepare and scale the simulation environment; we do not train a policy. The later Newton and Isaac Lab installments cover the next integration layers.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 294,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Putting it together",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Layer",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0007",
+      "source": "Role in the stack",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0008",
+      "source": "NVIDIA Warp",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0009",
+      "source": "Python kernel language: single instruction, multiple threads (SIMT), autodiff, PyTorch/JAX interop",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0010",
+      "source": "MJWarp",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0011",
+      "source": "MuJoCo physics on Warp: same MJCF, batched GPU throughput",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0012",
+      "source": "Your scene (SO-101)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0013",
+      "source": "Familiar Menagerie / Robot Studio assets + task geometry",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0014",
+      "source": "Next (Newton / Isaac Lab)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0015",
+      "source": "Multi-solver API, USD, sensors, managers, training loops",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0016",
+      "source": "Decision shortcut:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "If you need…",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "Reach for…",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "Single-robot MPC / teleop",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "MuJoCo CPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Max throughput on raw MuJoCo physics",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "MJWarp (or mjlab)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 11,
+          "end": 16,
+          "kind": "em"
+        },
+        {
+          "start": 11,
+          "end": 16,
+          "kind": "a",
+          "href": "https://github.com/mujocolab/mjlab"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "JAX training recipes",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "MuJoCo Playground / MJX (impl='warp')",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_playground"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "Multi-solver + Isaac Lab integration",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "Newton — next post in this series",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "Start with one useful Warp Kernel",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "NVIDIA Warp is a Python framework for writing high-performance, GPU-accelerated kernels. Warp lets developers author statically typed kernels in Python and compiles them for CPU or CUDA execution. The first launch builds and caches a native module; later launches reuse it. The kernel language is a performance-oriented subset of Python, while ordinary Python remains responsible for configuration, allocation, and launch orchestration.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/warp"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "This small robotics-oriented kernel advances point positions under gravity. One logical thread handles one point, so the same code scales from two points to millions without introducing GPU terminology into the control flow.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "The three value propositions of Warp are:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Pillar",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "What you get",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "Performance",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "Native-CUDA speed via JIT compilation, kernel fusion, and CUDA Graphs",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "Ease of use",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "Pure Python authoring with built-in vectors, matrices, quaternions, BVHs, hash grids, sparse matrices, and tile primitives",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "Capability",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Differentiable kernels and DLPack-style interop so simulation can sit inside an ML training loop",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "Three properties make this useful in robotics:",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Explicit parallel work. wp.tid() identifies the point, contact, body, or world owned by the current logical thread.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Explicit device arrays. An array lives on the selected device. Calling .numpy() on a CUDA array synchronizes and copies it to CPU memory; it is not a zero-copy path. For a device-resident PyTorch or JAX pipeline, use Warp’s framework adapters or DLPack-compatible sharing instead.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Composable kernel launches. A program can launch a sequence of focused kernels and capture supported CUDA work into a graph to reduce repeated dispatch overhead. Graph capture replays launches against existing buffers; it does not fuse arbitrary kernels.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Differentiability and Determinism.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Two further Warp capabilities are worth knowing, even though neither is used in the SO-101 workflow in this article. Warp kernels are differentiable: a wp.Tape records the forward kernel launches made inside its context and replays their adjoints in reverse when backward() is called, which is why teams build differentiable geometry, CFD, and custom physics in Warp, including CAE workflows for simulation and design optimization. Warp also supports deterministic execution, introduced in Warp 1.15: GPU atomics are scheduler-dependent by default, so repeated launches of the same kernel can differ slightly, and the opt-in deterministic modes trade some performance for reproducible ordering in simulation, validation, and regression tests. These are Warp capabilities, not guarantees of differentiability or determinism for an entire MJWarp rollout. See the Warp documentation on differentiability and deterministic execution for the details.",
+      "spans": [
+        {
+          "start": 134,
+          "end": 148,
+          "kind": "strong"
+        },
+        {
+          "start": 378,
+          "end": 391,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/topics/cae"
+        },
+        {
+          "start": 451,
+          "end": 474,
+          "kind": "strong"
+        },
+        {
+          "start": 490,
+          "end": 499,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Try Warp: pip install warp-lang (≥ 1.15 for GPU determinism), then python -m warp.examples.browse, or the tutorial notebooks.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 106,
+          "end": 124,
+          "kind": "em"
+        },
+        {
+          "start": 106,
+          "end": 124,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/accelerated-computing-hub/tree/main/tutorials/warp/notebooks"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "What is MuJoCo Warp (MJWarp)?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "A robot simulator repeatedly computes what happens next: given the current joint positions, velocities, controls, and contacts, it advances the scene by one small timestep. In this article, a world means one independent copy of that scene and its state. One world might contain the SO-101 arm reaching for a cube; another can contain the same arm starting from a slightly different pose.",
+      "spans": [
+        {
+          "start": 192,
+          "end": 197,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "MuJoCo and MJWarp can run the same compatible robot and task, but they organize the work differently. MuJoCo naturally suits developing and inspecting one or a few CPU worlds. MJWarp is a NVIDIA Warp implementation of MuJoCo’s physics pipeline that places the model and a batch of independent states on NVIDIA GPUs; one call to mjw.step advances the entire batch.",
+      "spans": [
+        {
+          "start": 176,
+          "end": 182,
+          "kind": "strong"
+        },
+        {
+          "start": 188,
+          "end": 199,
+          "kind": "strong"
+        },
+        {
+          "start": 218,
+          "end": 224,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "MJWarp’s value is not necessarily a faster step for one world. It is the ability to advance hundreds or thousands together, giving the GPU enough parallel work to improve aggregate throughput, the total world-steps completed per second. That favors reinforcement learning and large-scale sampling, where collecting experience matters more than minimizing one environment’s latency.",
+      "spans": [
+        {
+          "start": 171,
+          "end": 191,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "This blog covers the following:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "validate one MuJoCo world,",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "move it to MJWarp, form a batch,",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "verify it, and measure it correctly.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Solver tuning, Jacobian representation, and specialized multi-GPU or determinism topics are not required for this migration and can be covered separately.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Then, the distinction is precise:",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Latency is wall-clock time for one simulation step.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Aggregate throughput is the total number of world-steps completed per measured wall-clock second.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Basic usage: structs, batch sizes, and a minimal step",
+      "spans": [
+        {
+          "start": 0,
+          "end": 53,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "The core API transition is small:",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "MuJoCo host workflow",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "MJWarp workflow",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "mujoco.MjModel",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "mjw.put_model(mjm) creates a device model",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "mujoco.MjData",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "mjw.put_data(mjm, mjd, ...) preserves and batches an existing state",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "mujoco.mj_step(mjm, mjd)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "mjw.step(m, d) advances every world in d",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "Host arrays such as mjd.ctrl",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Batched device arrays such as d.ctrl with shape (nworld, nu)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Use mjw.make_data() when default/fresh state is intended. Use mjw.put_data() when the exact initialized MuJoCo state must cross the migration boundary.",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Allocating batched resources requires defining the following parameters (refer to Batch sizes):",
+      "spans": [
+        {
+          "start": 82,
+          "end": 93,
+          "kind": "em"
+        },
+        {
+          "start": 82,
+          "end": 93,
+          "kind": "a",
+          "href": "https://mujoco.readthedocs.io/en/latest/mjwarp/#batch-sizes"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Parameter",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "Meaning",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "nworld",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "Total number of parallel environments",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "nconmax",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "Expected contacts per individual world (overall capacity ≈ nconmax * nworld)",
+      "spans": [
+        {
+          "start": 18,
+          "end": 38,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "naconmax",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "Alternative setting: global maximum contacts across all environments combined (takes precedence if both are defined)",
+      "spans": [
+        {
+          "start": 45,
+          "end": 77,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "njmax",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "Hard upper limit on constraints per world",
+      "spans": [
+        {
+          "start": 32,
+          "end": 41,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "Performance tuning",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "1. CUDA graph capture:mjw.step is many kernel launches; capture once, replay often:",
+      "spans": [
+        {
+          "start": 3,
+          "end": 21,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "2. Size nconmax / naconmax / njmax tightly: memory and work scale with them. Tune with mjwarp-testspeed: --measure_alloc and watch overflows in mjwarp-viewer.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 42,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Additional tuning considerations. After sizing contact and constraint buffers, test solver iteration limits without changing task behavior. Meshes and CCD settings can increase memory use; nccdmax / naccdmax can reduce CCD buffer allocation when the measured contact counts allow it. MJWarp’s compact solver uses MuJoCo’s Newton constraint solver and sleeping, not the separate Newton physics-engine framework. Compact-solver and multi-GPU configuration are beyond this walkthrough; consult the MJWarp performance-tuning documentation.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 535,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "To train policies on MJWarp physics:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Isaac Lab via Newton",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://github.com/isaac-sim/IsaacLab/tree/feature/newton"
+        },
+        {
+          "start": 14,
+          "end": 20,
+          "kind": "em"
+        },
+        {
+          "start": 14,
+          "end": 20,
+          "kind": "a",
+          "href": "https://github.com/newton-physics/newton"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "mjlab (manager API directly on MJWarp + PyTorch)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://github.com/mujocolab/mjlab"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "MuJoCo Playground via MJX (impl='warp')",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_playground"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Install / try: pip install mujoco-warp · mjwarp-viewer path/to/scene.xml · Colab tutorial",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 75,
+          "end": 89,
+          "kind": "em"
+        },
+        {
+          "start": 75,
+          "end": 89,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/google-deepmind/mujoco_warp/blob/main/notebooks/tutorial.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "Workflow to migrate a MuJoCo scene to MjWarp",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "Establish a MuJoCo CPU baseline",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "The scene. Nothing here is MJWarp-specific yet: an SO-101 arm, a table, and two cubes to stack, written as ordinary MJCF.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0094",
+      "source": "Figure 2. SO-101 pick-and-place scene, rendered from the MuJoCo CPU simulation. The task is to grasp the red 44 mm cube and stack it on the blue cube; the same robot and scene are used for MJWarp validation.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 207,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "For an MJCF box, the size values are half-extents: size=”0.022 …” defines a cube with 44 mm edges. The task uses this size for its success thresholds. The arm base is at the origin, its reach is along +X, and the cubes are arranged along Y.",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "In the companion repository this file is generated rather than hand-written: resolve_pick_place_scene() copies the Menagerie arm into .generated/, fills the table and cube coordinates from a robot profile, and writes scene_pick_place.xml. The walkthrough uses the SO-101 profile; the optional reBot variant is described below.",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "Loading it. Compilation and stepping are ordinary MuJoCo:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Keep that shape in mind: compute controls once per frame, step physics sim_substeps times. Gate 2 changes only the inner loop, which is what makes the migration easy to review.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 90,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "Match the simulation and control rates. At 50 control frames per second and 10 physics substeps per frame, use a physics timestep of 0.002 seconds. Set it before the CPU rollout and before uploading the model with mjw.put_model so both backends advance the same simulated time:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 277,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "Without that line, every later measurement inherits the mismatch: parity comparisons, throughput numbers quoted as “simulated seconds,” and any learned policy whose action rate no longer matches deployment.",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "Check whether the cubes are stacked successfully. With 44 mm cubes, success becomes two measurable conditions: a horizontal center error of xy_err ≤ 0.015 m (measured between the cube centers) and a vertical separation of 0.035 m ≤ dz ≤ 0.055 m between cube centers (one cube edge, with slack for settling). Evaluate both conditions after the cubes have settled; a successful process exit alone does not establish task success.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "Run the CPU task from the companion checkout. Publication blocker: confirm the accessible repository URL and pinned dependency and asset versions before publishing these instructions; the repository placeholder below is not an executable URL.",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "The run ends by printing the two numbers above (stack check: xy_err=… dz=…), which is the assertion the rest of the article compares against. so101_pick_place.py next to it is the same program with the physics steps left as exercises.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "The arm comes straight from MuJoCo Menagerie pinned to a known-good commit, since Menagerie assets change, so treat the scene as a template. Optional reBot variant. The companion code also exposes --robot rebot with a separate profile for the scene layout, gripper, and capacity limits (nconmax=256, njmax=500). This walkthrough uses SO-101. Validate the reBot asset and task separately before reporting its results.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 44,
+          "kind": "em"
+        },
+        {
+          "start": 28,
+          "end": 44,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotstudio_so101"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "Validate one-world MJWarp parity",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "Run one world on the GPU first, with the host still in the loop, so you can watch the same task in the same viewer and compare the same two numbers. Upload the model, allocate batched state, seed it from the initialized host state, and run one forward pass before stepping:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "Every device array carries a leading world dimension, which is why the host state is indexed as mjd.qpos[None, :], shape (1, nq) instead of (nq,). Scaling to thousands of worlds later changes only that leading dimension, not the calls. mjw.put_model() also doubles as a compatibility check: it raises if the model uses unsupported features rather than silently dropping them.",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "Seeding the three fields explicitly is the transparent option, and it makes clear exactly what crosses to the device; mjw.put_data(mjm, mjd, nworld=…) carries the whole initialized struct over in one call instead.",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "The frame loop is then the Gate 1 loop with its inner step redirected to the GPU and mirrored back:",
+      "spans": []
+    },
+    {
+      "id": "b0110",
+      "source": "The .numpy() reads synchronize and copy data to the host on every substep, so this is a task-validation path, not a throughput benchmark. It keeps inverse kinematics, viewing, and task checks on the host. After copying qpos and qvel, call mujoco.mj_forward(mjm, mjd) to refresh derived host quantities such as mjd.xpos before using them for control, viewing, or the stack check. Reading those fields after the loop does not refresh them automatically. Gate 4 removes these per-step host copies from the throughput path.",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "Size contact and constraint capacity",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "MJWarp allocates contact and constraint buffers before stepping. Exceeding those capacities invalidates the affected rollout for verification or benchmarking, even when execution continues with an overflow warning rather than an exception. Increase the relevant limit and rerun the task. Larger buffers use more GPU memory, so verify capacity over the full task before tightening the allocation.",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "Set contact and constraint limits for the robot and task being simulated. The SO-101 profile uses nconmax=128 and njmax=300 as starting capacities. Check that these limits are sufficient during the most contact-heavy part of the task:",
+      "spans": []
+    },
+    {
+      "id": "b0114",
+      "source": "Size them against the most contact-heavy moment of the task, for pick-and-place, the instant both jaws and the table touch a cube, not the arm hovering in free space. An overflow is reported rather than raised: with Option.warn_overflow at its default, MJWarp prints the budget to increase (“narrowphase overflow - please increase nconmax to …”) to the terminal running your script or the viewer, and flags the affected worlds in Data.overflow for you to read back after a step. Only mjw.put_data raises an error outright, because it can compare the budgets against a MuJoCo state it already holds. mjwarp-testspeed --measure_alloc reports the contacts and constraints a scene actually consumed, and it aborts the rollout with the offending world IDs as soon as any world overflows. Treat those reports as failures: raise the limit and re-run before trusting either the trajectory or the benchmark, then tighten again whenever the model, collision geometry, or task changes.",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "Scale to 2,048 worlds",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "Once one-world parity passes, reallocate at the target size and replicate the initialized state across the batch. Two things change relative to Gate 2: nworld, and the fact that nothing crosses the PCIe bus per step.",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "np.tile gives every world the same starting state, which is the right baseline for a throughput measurement; per-world randomization would instead write different rows of d.qpos on the device.",
+      "spans": []
+    },
+    {
+      "id": "b0118",
+      "source": "CUDA Graphs reuse the model and data buffers captured here. Update d.ctrl in place between replays, and capture a new graph after replacing buffers, changing nworld, or rebuilding the model. Graph capture requires CUDA.",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "Figure 3. Scaling the SO-101 task from one CPU world to 2,048 independent GPU states using the same compatible model. A single MJWarp step advances the full batch. This conceptual illustration highlights aggregate throughput, measured as world-steps per wall-clock second.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 272,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0120",
+      "source": "Verify, then measure",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "GPU launches are asynchronous, so a naive timer measures how fast Python queued work, not how fast the GPU finished it. Warm up first — the first launches pay kernel compilation and allocation — then synchronize immediately before and after the timed region:",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "Report both aggregate world-steps per second and milliseconds per batched step, together with the batch size. Use the measured curve to identify where additional worlds improve throughput and where memory or compute limits reduce the benefit. Results depend on the scene, simulation settings, and hardware; a one-world latency comparison does not establish batched throughput.",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "To see that curve on your own hardware, scaling_study.py sweeps the batch size and prints ms/step alongside throughput and speedup:",
+      "spans": []
+    },
+    {
+      "id": "b0124",
+      "source": "Get started",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0125",
+      "source": "Warp (kernel layer) pip install warp-lang → python -m warp.examples.browse → docs · GitHub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 77,
+          "end": 81,
+          "kind": "em"
+        },
+        {
+          "start": 77,
+          "end": 81,
+          "kind": "a",
+          "href": "https://nvidia.github.io/warp/"
+        },
+        {
+          "start": 84,
+          "end": 90,
+          "kind": "em"
+        },
+        {
+          "start": 84,
+          "end": 90,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/warp"
+        }
+      ]
+    },
+    {
+      "id": "b0126",
+      "source": "MJWarp (GPU MuJoCo) pip install mujoco-warp → mjwarp-viewer benchmarks/humanoid/humanoid.xml → docs · GitHub · Colab tutorial",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 95,
+          "end": 99,
+          "kind": "em"
+        },
+        {
+          "start": 95,
+          "end": 99,
+          "kind": "a",
+          "href": "https://mujoco.readthedocs.io/en/latest/mjwarp/"
+        },
+        {
+          "start": 102,
+          "end": 108,
+          "kind": "em"
+        },
+        {
+          "start": 102,
+          "end": 108,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_warp"
+        },
+        {
+          "start": 111,
+          "end": 125,
+          "kind": "em"
+        },
+        {
+          "start": 111,
+          "end": 125,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/google-deepmind/mujoco_warp/blob/main/notebooks/tutorial.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "SO-101 context SO-101 sim-to-real course · Physical AI learning paths",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 15,
+          "end": 40,
+          "kind": "em"
+        },
+        {
+          "start": 15,
+          "end": 40,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/learning/physical-ai/sim-to-real-so-101/latest/index.html"
+        },
+        {
+          "start": 43,
+          "end": 69,
+          "kind": "em"
+        },
+        {
+          "start": 43,
+          "end": 69,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/learning/physical-ai/"
+        }
+      ]
+    },
+    {
+      "id": "b0128",
+      "source": "Train on top of MJWarp mjlab · MuJoCo Playground · Isaac Lab + Newton (upcoming posts)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "strong"
+        },
+        {
+          "start": 23,
+          "end": 28,
+          "kind": "em"
+        },
+        {
+          "start": 23,
+          "end": 28,
+          "kind": "a",
+          "href": "https://github.com/mujocolab/mjlab"
+        },
+        {
+          "start": 31,
+          "end": 48,
+          "kind": "em"
+        },
+        {
+          "start": 31,
+          "end": 48,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_playground"
+        }
+      ]
+    },
+    {
+      "id": "b0129",
+      "source": "What’s next",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0130",
+      "source": "This post covered raw Warp → MJWarp: GPU kernels, batched stepping, and an SO-101 scene using mjw.step.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 35,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0131",
+      "source": "Next, we will port the same MJCF environment into Newton, using MuJoCo Warp as its rigid-body solver (newton.solvers.SolverMuJoCo). Newton will manage the model, state, controls, and contacts, while MJWarp runs underneath.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 56,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0132",
+      "source": "You will also see what Newton adds: multi-format assets, swappable solvers, sensors/IK helpers, and an Isaac Lab path.",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "The migration guide continues with the same SO-101 task and its optional reBot profile, explaining the changes required by Newton and the separate Isaac Lab integration.",
+      "spans": []
+    },
+    {
+      "id": "b0134",
+      "source": "If you build something with Warp or MJWarp, open an issue on the linked repositories or find us on Discord NVIDIA Omniverse.",
+      "spans": [
+        {
+          "start": 107,
+          "end": 123,
+          "kind": "em"
+        },
+        {
+          "start": 107,
+          "end": 123,
+          "kind": "a",
+          "href": "https://discord.com/invite/nvidiaomniverse"
+        }
+      ]
+    },
+    {
+      "id": "b0135",
+      "source": "References",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0136",
+      "source": "Blog 1: *The State of Simulation for Physical AI: An Overview* — Post 1 of this series.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 9,
+          "end": 62,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/nvidia/state-of-simulation-for-physical-ai"
+        }
+      ]
+    },
+    {
+      "id": "b0137",
+      "source": "NVIDIA Warp — GitHub · Documentation · v1.15.0 release (GPU determinism) · Deterministic execution guide",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/warp"
+        },
+        {
+          "start": 23,
+          "end": 36,
+          "kind": "em"
+        },
+        {
+          "start": 23,
+          "end": 36,
+          "kind": "a",
+          "href": "https://nvidia.github.io/warp/"
+        },
+        {
+          "start": 39,
+          "end": 72,
+          "kind": "em"
+        },
+        {
+          "start": 39,
+          "end": 72,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/warp/releases/tag/v1.15.0"
+        },
+        {
+          "start": 75,
+          "end": 104,
+          "kind": "em"
+        },
+        {
+          "start": 75,
+          "end": 104,
+          "kind": "a",
+          "href": "https://nvidia.github.io/warp/latest/user_guide/execution_and_performance/deterministic_execution.html"
+        }
+      ]
+    },
+    {
+      "id": "b0138",
+      "source": "MuJoCo Warp — GitHub · Official MJWarp docs",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_warp"
+        },
+        {
+          "start": 23,
+          "end": 43,
+          "kind": "em"
+        },
+        {
+          "start": 23,
+          "end": 43,
+          "kind": "a",
+          "href": "https://mujoco.readthedocs.io/en/latest/mjwarp/"
+        }
+      ]
+    },
+    {
+      "id": "b0139",
+      "source": "Build Accelerated, Differentiable Computational Physics Code for AI with NVIDIA Warp",
+      "spans": [
+        {
+          "start": 0,
+          "end": 84,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 84,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/blog/build-accelerated-differentiable-computational-physics-code-for-ai-with-nvidia-warp/"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "Introducing Tile-Based Programming in Warp 1.5.0",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "a",
+          "href": "https://developer.nvidia.com/blog/introducing-tile-based-programming-in-warp-1-5-0/"
+        }
+      ]
+    },
+    {
+      "id": "b0141",
+      "source": "mjlab · arXiv:2601.22074",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://github.com/mujocolab/mjlab"
+        },
+        {
+          "start": 8,
+          "end": 24,
+          "kind": "em"
+        },
+        {
+          "start": 8,
+          "end": 24,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2601.22074"
+        }
+      ]
+    },
+    {
+      "id": "b0142",
+      "source": "MuJoCo Playground",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://github.com/google-deepmind/mujoco_playground"
+        }
+      ]
+    },
+    {
+      "id": "b0143",
+      "source": "NVIDIA SO-101 sim-to-real course",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/learning/physical-ai/sim-to-real-so-101/latest/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0144",
+      "source": "Newton next post: MJWarp as SolverMuJoCo and porting this environment",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://github.com/newton-physics/newton"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "f8753e0faaf01af87c62c8c114cfe3305c321e6eaf939982ca9628802d302925",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import numpy as np\nimport warp as wp\n\n@wp.kernel\ndef integrate(\n   positions: wp.array[wp.vec3],\n   velocities: wp.array[wp.vec3],\n   dt: float,\n):\n   i = wp.tid()\n   velocities[i] += wp.vec3(0.0, 0.0, -9.81) * dt\n   positions[i] += velocities[i] * dt\n\nwp.init()\ndevice = \"cuda:0\" if wp.is_cuda_available() else \"cpu\"\nstart = np.array([[0.0, 0.0, 0.5], [0.2, 0.0, 0.5]], dtype=np.float32)\npositions = wp.array(start, dtype=wp.vec3, device=device)\nvelocities = wp.zeros_like(positions)\n\nwp.launch(\n   integrate,\n   dim=len(start),\n   inputs=[positions, velocities, 0.01],\n   device=device,\n)\nwp.synchronize_device(device)\nprint(positions.numpy())"
+    },
+    {
+      "id": "c0002",
+      "source": "with wp.ScopedCapture() as capture:\n     mjw.step(m, d)\nwp.capture_launch(capture.graph)"
+    },
+    {
+      "id": "c0003",
+      "source": "<mujoco model=\"so101_pick_place\">\n  <include file=\"so101.xml\"/>\n\n  <worldbody>\n    <light pos=\"0.3 0 1.5\" dir=\"0 0 -1\" directional=\"true\"/>\n    <geom name=\"floor\" type=\"plane\" size=\"0 0 0.05\"/>\n\n    <geom name=\"table\" type=\"box\" pos=\"0.35 -0.04 0.012\"\n          size=\"0.16 0.26 0.012\" rgba=\"0.32 0.32 0.32 1\"\n          friction=\"1 0.005 0.0005\" condim=\"3\"/>\n\n    <body name=\"red_cube\" pos=\"0.33 -0.13 0.046\">\n      <freejoint name=\"red_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.85 0.05 0.04 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n\n    <body name=\"blue_cube\" pos=\"0.33 0.06 0.046\">\n      <freejoint name=\"blue_cube_joint\"/>\n      <geom type=\"box\" size=\"0.022 0.022 0.022\" mass=\"0.08\"\n            rgba=\"0.05 0.20 0.90 1\" friction=\"1.2 0.005 0.0005\" condim=\"3\"/>\n    </body>\n  </worldbody>\n</mujoco>"
+    },
+    {
+      "id": "c0004",
+      "source": "import mujoco\n\nmjm = mujoco.MjModel.from_xml_path(\"scene_pick_place.xml\")\nmjd = mujoco.MjData(mjm)\n\nfps = 50 # controller rate\nsim_substeps = 10 # physics steps per control frame\nframe_dt = 1.0 / fps\nmjm.opt.timestep = frame_dt / sim_substeps\n\ncontroller = PickPlaceController(spec=spec) # waypoints + damped-least-squares IK\n\nfor _ in range(600): # 600 control frames\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        mujoco.mj_step(mjm, mjd)"
+    },
+    {
+      "id": "c0005",
+      "source": "mjm.opt.timestep = frame_dt / sim_substeps # 50 Hz × 10 substeps -> 0.002 s"
+    },
+    {
+      "id": "c0006",
+      "source": "git clone https://github.com/NVIDIA/accelerated-computing-hub.git blogs\ncd blogs/tutorials/sim2real-blogs/notebooks/mujoco\nuv venv --python 3.12 && source .venv/bin/activate\nuv pip install -r requirements.txt\n\ncd /tutorials/sim2real-blogs/notebooks/mujoco\npython solutions/so101_pick_place_solution.py --headless-steps 600 --debug"
+    },
+    {
+      "id": "c0007",
+      "source": "wp.init()\nimport mujoco_warp as mjw\n\ndevice = wp.get_device()\n\nm = mjw.put_model(mjm)\nd = mjw.make_data(mjm, nworld=1, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(mjd.qpos[None, :], dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(mjd.qvel[None, :], dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\nmjw.forward(m, d)"
+    },
+    {
+      "id": "c0008",
+      "source": "def simulate_frame() -> None:\n    ctrl = controller.step(mjm, mjd, frame_dt)\n    for _ in range(sim_substeps):\n        mjd.ctrl[: mjm.nu] = ctrl\n        wp.copy(d.ctrl, wp.array(mjd.ctrl[None, :], dtype=wp.float32, device=device))\n        mjw.step(m, d)\n        mjd.qpos[:] = d.qpos.numpy()[0]\n        mjd.qvel[:] = d.qvel.numpy()[0]\n    mujoco.mj_forward(mjm, mjd)"
+    },
+    {
+      "id": "c0009",
+      "source": "d = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)"
+    },
+    {
+      "id": "c0010",
+      "source": "nworld = 2_048\nd = mjw.make_data(mjm, nworld=nworld, nconmax=spec.nconmax, njmax=spec.njmax)\n\nwp.copy(d.qpos, wp.array(np.tile(mjd.qpos, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.qvel, wp.array(np.tile(mjd.qvel, (nworld, 1)), dtype=wp.float32, device=device))\nwp.copy(d.ctrl, wp.array(np.tile(mjd.ctrl, (nworld, 1)), dtype=wp.float32, device=device))\nmjw.forward(m, d)\n\nwith wp.ScopedCapture() as capture:\n    mjw.step(m, d)\nstep_graph = capture.graph"
+    },
+    {
+      "id": "c0011",
+      "source": "import time\nfor _ in range(10): # warm-up: compilation, allocation, caches\n    wp.capture_launch(step_graph)\nwp.synchronize()\n\nt0 = time.perf_counter()\nfor _ in range(200):\n    wp.capture_launch(step_graph)\nwp.synchronize() # without this you time the queue, not the work\nelapsed = time.perf_counter() - t0\ntotal = 200 * nworld\nprint(f\"{total / elapsed:,.0f} world-steps/second\")"
+    },
+    {
+      "id": "c0012",
+      "source": "cd /tutorials/sim2real-blogs/notebooks/mujoco/part2\npython solutions/so101_mjwarp_solution.py --headless-steps 600     # parity, needs CUDA\npython scaling_study.py --worlds 1 64 1024 2048 8192 --steps 100"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 1,
+    "savedVideos": 1,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-02T14:02:05.737202Z"
 }

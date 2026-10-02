@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:06.599723Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Designing the hf CLI as an agent-optimized way to work with the Hub\n\nhf is the official command-line entrypoint to the Hugging Face Hub. Anything you can do on the Hub from the Python SDK, you can do from your terminal: download and upload models, datasets and Spaces; create and manage repos, branches, tags and pull requests; run Jobs on HF infrastructure; manage Buckets, Collections, webhooks and Inference Endpoints.\n\nThe hf CLI has been primarily built for our users over the years. But it's now increasingly used by coding agents : Claude Code, Codex, Cursor and more. So we rebuilt it to make it work for both audiences at once. This blog post summarizes what we did, and how we benchmarked it. We found that on complex, multi-step tasks the no-CLI baseline (an agent hand-rolling curl or the Python SDK) uses up to 6× as many tokens as the hf CLI.\n\nAI agent traffic on the Hub\n\nWe started tracking agent usage of the Hub in April 2026. The hf CLI (and the huggingface_hub Python SDK it's built on) detects when a coding agent is driving it by reading the environment variables agents set: CLAUDECODE / CLAUDE_CODE for Claude Code, CODEX_SANDBOX for Codex, plus Cursor, Gemini, Pi, and the universal AI_AGENT . That single signal does two jobs: it shapes the CLI's output (more on that below) and it tags each Hub request with an agent/<name> user-agent, so we can attribute traffic to the agent driving it. The two largest by distinct users are Claude Code and Codex , well ahead of everything else, and they're the two agents we benchmark later in this article.\n\nThe bars count distinct users per agent; request volume is the sub-label. Claude Code alone is ~40k users and nearly 49M requests, with Codex close behind. These are early numbers (we only began attributing agent traffic in April 2026), but the scale is already significant, and we expect it to keep growing as coding agents become a standard way to work with the Hub.\n\nBuilt for humans and agents\n\nHumans and coding agents expect different outputs for the same hf commands. A human wants rich terminal output: ANSI color, padded tables truncated to fit the screen, a green ✅ on success, ✔ for booleans, progress bars, prose hints. An agent wants the inverse: no ANSI, nothing truncated, every value in full since an agent can handle far denser output than a human, kept compact and structured to stay light on tokens. It also can't answer a CLI prompt and will happily re-run a command after a timeout. The rest of this section is how hf gives each side what it needs. We introduced agent-mode output in hf v1.9.0 and have been migrating the rest of the CLI to it gradually in the following releases.\n\nOne command, multiple renderings\n\nWhen hf auto-detects agent use (via the environment variables mentioned above), it renders the same command differently. It optimizes output format for humans or agents without passing a flag:\n\n```\n# human (default in a terminal): aligned table, truncated to fit, with a hint\n> hf models ls --author Qwen --sort downloads --limit 3\nID                       CREATED_AT DOWNLOADS LIBRARY_NAME LIKES PIPELINE_TAG    PRIVATE TAGS\n------------------------ ---------- --------- ------------ ----- --------------- ------- -------------------------\nQwen/Qwen3-0.6B          2025-04-27  21156913 transformers  1285 text-generation         transformers, safetens...\nQwen/Qwen2.5-1.5B-Ins... 2024-09-17  15143953 transformers   725 text-generation         transformers, safetens...\nQwen/Qwen3-4B            2025-04-27  14808352 transformers   625 text-generation         transformers, safetens...\nHint: Use `--no-truncate` or `--format json` to display full values.\n\n# agent (auto-detected): TSV, full ids + ISO timestamps + every tag, nothing truncated\n$ hf models ls --author Qwen --sort downloads --limit 3\nid      created_at      downloads       library_name    likes   pipeline_tag    private tags\nQwen/Qwen3-0.6B 2025-04-27T03:40:08+00:00       21156913        transformers    1285    text-generation False   ['transformers', 'safetensors', 'qwen3', 'text-generation', 'conversational', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-0.6B-Base', 'base_model:finetune:Qwen/Qwen3-0.6B-Base', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen2.5-1.5B-Instruct      2024-09-17T14:10:29+00:00       15143953        transformers    725     text-generation False['transformers', 'safetensors', 'qwen2', 'text-generation', 'chat', 'conversational', 'en', 'arxiv:2407.10671', 'base_model:Qwen/Qwen2.5-1.5B', 'base_model:finetune:Qwen/Qwen2.5-1.5B', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen3-4B   2025-04-27T03:41:29+00:00       14808352        transformers    625     text-generation False   ['transformers', 'safetensors', 'text-generation', 'arxiv:2309.00071', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-4B-Base', 'base_model:finetune:Qwen/Qwen3-4B-Base', 'license:apache-2.0', 'endpoints_compatible', 'deploy:azure', 'region:us']\n```\n\nA human gets an aligned table, truncated to fit the terminal, plus a hint on how to see more, with color cues for status (a green ✓ on success, red on error). An agent gets the complete record as TSV: full repo ids, full ISO timestamps, every tag, no ANSI codes, nothing truncated, clean to parse and light on tokens.\n\nIn practice, we've implemented logging methods like .table(...) , .result(...) , .json() , etc., which take raw data as input and handle the formatting. In addition to human and agent modes, we've introduced --json and --quiet options to make it easier to pipe commands together. The default mode is automatically chosen based on context, but users can always force the format of their choice with --format human | agent | json | quiet .\n\nCLI commands rarely run in isolation: one step usually implies the next ( git add , then git commit ). Many hf commands now end with a hint : the exact next command to run, pre-filled with the IDs you just used, so a user or agent can chain straight to the next step instead of working it out from scratch. Start a Job in the background and it points you to its logs; create a Space and it points you to its boot status:\n\n```\n$ hf jobs run --detach python:3.12 python train.py\n✓ Job started\n  id: 6f3a1c2e9b\n  url: https://huggingface.co/jobs/celinah/6f3a1c2e9b\nHint: Use `hf jobs logs 6f3a1c2e9b` to fetch the logs.\n```\n\nFor a human that's a convenience. For an agent it's a rail: the next action is named, parameterized with the right ids, and ready to run, so it takes fewer steps working out what to do. Errors behave the same way, naming the fix instead of just failing:\n\n```\nError: Not logged in. Run `hf auth login` first.\n```\n\nHints, warnings and errors all go to stderr while data goes to stdout, so none of this guidance pollutes the output the agent is parsing.\n\nNon-blocking and safe to retry\n\nhf never sits on an interactive prompt waiting for a key an agent can't press. A destructive command still asks a human to confirm, but in agent mode it fails fast with the fix in the message ( Use --yes to skip confirmation. ), and -y / --yes skips it. And because agents retry on timeouts and lost context, operations are built to be safe to repeat: hf repos create --exist-ok is a no-op if the repo already exists, and re-running an upload re-commits cleanly. Separately, the commands that move real data take a --dry-run that shows exactly what they'll transfer before they run, which proves handy for humans and agents alike, since neither has to commit to a long download or blind sync:\n\n```\n# agent mode: a destructive command without --yes refuses, with the fix in the message\n$ hf repos delete my-org/old-model\nError: You are about to permanently delete model 'my-org/old-model'. Proceed? Use --yes to skip confirmation.\n\n# commands that move data take --dry-run to preview the transfer first\n$ hf download deepseek-ai/DeepSeek-V4-Pro config.json --dry-run\n[dry-run] Will download 1 files (out of 1) totalling 1.8K.\nfile         size\nconfig.json  1.8K\n```\n\nDiscoverable, predictable commands\n\nhf is built to be probed: run hf to see the resource groups, run --help on the one you need, and every --help ends with real, copy-pasteable examples (which an agent matches against far faster than it parses a description):\n\n```\n$ hf models ls --help\n...\nExamples\n  $ hf models ls --sort downloads --limit 10\n  $ hf models ls --search \"qwen\" --author Qwen\n  $ hf models ls Qwen/Qwen3-4B --tree\n```\n\nThe command tree is consistent, resource + verb with the obvious aliases ( hf models ls , hf repos create , hf jobs ps , hf collections delete ; list / ls , remove / rm ), so once an agent learns one command it can guess the rest. And the output composes: -q prints one id per line to pipe into the next command, --json gives you something to hand to jq .\n\n```\n$ hf models ls --author Qwen -q | head -3\nQwen/Qwen3-0.6B\nQwen/Qwen2.5-1.5B-Instruct\nQwen/Qwen3-4B\n```\n\nBenchmarking the hf CLI for Coding Agents\n\nTo find out whether the hf CLI is really more efficient for agents, we measured it. We built a small evaluation harness and ran the same set of Hub tasks through each way of driving the Hub, many times over, grading every run against the live Hub. Here's the headline before the methodology: across both agents the hf CLI comes out ahead, most clearly on complex, multi-step tasks where it uses far fewer tokens.\n\nagent tool success score token usage self-report error\n\nClaude Code (Sonnet 4.6)\n\n(self-report error = the agent reported success on the 17 solvable tasks but the Hub said otherwise. The hf CLI rows are the CLI with its skill installed; what the skill adds on top of the bare CLI (chiefly fewer tool calls) is broken out in the skill section below. Representative transcripts are published in this bucket .)\n\nWe defined 18 non-trivial Hub tasks . Not \"download a file\", but the kind of thing you'd actually ask for: aggregate a trending org's models, inspect a repo's files and their sizes, upload a folder with include/exclude rules, delete files, copy files across repos, open a PR that adds a license, create a repo with a branch and a tag, sync and prune a bucket, build a collection. Each task goes to a fresh coding agent with exactly one way to talk to the Hub:\n\ncurl / the Python SDK : no hf CLI at all, so the agent falls back to curl against the REST API or the huggingface_hub Python library.\n\nWe run the hf CLI in two configurations, with and without its skill (a generated command reference we come back to in its own section ). But the headline comparison below is simply hf CLI vs curl / the SDK ; the skill's incremental effect is small enough that we break it out on its own rather than crowd it into the main results.\n\nThe config is deliberately clean: a fresh instance per run, no custom MCP servers, no CLAUDE.md or AGENTS.md , nothing in context to nudge behavior. The task and the tool go into a single prompt, and the agent finishes with a TASK_COMPLETE or TASK_FAILED marker, but we don't trust that marker (an agent will report success on work that never landed), so we grade every run independently by re-querying the live Hub : did the branch really get created, is the file actually gone, does the bucket exist? Each task/tool combination is run 10 times , since coding agents are non-deterministic, about 520 runs per agent (18 tasks × 3 tools × 10 reps, minus a cap on one billable Jobs task) and ~1,000 graded runs in total. We ran the whole thing twice, on the two most popular coding agents ( Claude Code with Sonnet 4.6 and OpenAI Codex with GPT-5.5).\n\nThe two charts below unpack the table above. First, task success on Sonnet , the agent where curl and the SDK struggle most:\n\nWithout the CLI, curl and the SDK trail by ten points, because on Sonnet they simply can't finish parts of the job (the writes, mostly), while the hf CLI clears them.\n\nThe second image shows token impact on GPT-5.5 , broken down per task. Each bar is the curl/SDK tokens divided by the CLI's on the same task, so 2.4× means the non-hf version burned 2.4 times as many tokens to do the same thing:\n\nOn a one-shot read (count dataset rows, batch metadata) curl and the SDK are fine, and sometimes lighter. But as tasks get more complex and involve several dependent steps, the agent has to hand-roll the entire chain of REST calls (or dig through the SDK) and the cost blows up: 2.4× to 6× the CLI's on creating a repo with a branch and tag, deleting files, copying across repos, or syncing a bucket. The hf CLI lets the agent express the task as a few higher-level commands, rather than crafting a complex workflow.\n\nThe hf CLI is far leaner than curl or the SDK. For the same task, at equal-or-better success, curl and the SDK burn roughly 1.3× to 1.8× the tokens . On easy reads they're fine, but on real multi-step work they pay 2× to 6× : the CLI composes a chain of REST calls into a few high-level commands, while curl or the SDK re-derives the chain by hand every run.\n\nOn a stronger model, curl and the SDK work but stay wasteful. On Sonnet they can't finish parts of the job (the writes, mostly); on GPT-5.5 they mostly succeed, hand-rolling the REST calls (or using the SDK) correctly, but still pay well over the CLI's token bill.\n\nhf ships a skill : a compact reference of the whole command surface that an agent loads as context. It's auto-generated from the live hf command tree, one line per command (its signature, a one-line description, and the flags that matter), grouped by resource, with a short glossary of common options. It deliberately skips the self-explanatory flags so it stays terse and light on context, and it's regenerated every release. Run hf skills preview to print it, or install it with:\n\n```\n# for Codex, Cursor, OpenCode, Pi and other agents that load skills from `.agents/skills`\nhf skills add\n# includes the above + Claude Code\nhf skills add --claude\n```\n\nWhat does it buy you? Mostly, the agent stops guessing. The clearest single view is how many commands each run takes, with the skill and without:\n\nOn both agents that's about ten commands per task down to about seven, roughly 30% fewer tool calls. That's because the agent isn't probing --help to find the right command and argument. The skill won't cut your token bill, because it prepends a fixed slice of info to the context, so tokens remain about the same or slightly tick up for the same task. The Skill won't make the CLI more reliable either, but it will help the agent spend time running your task rather than finding out how the tool works. This could be particularly helpful when using hf with local models.\n\nWe ran each task in a fresh session, so the skill pays its context cost on every task. In a real multi-task session that cost amortizes (the agent learns the command surface once), so the token picture likely improves there; we didn't measure that case.\n\nWe benchmarked all this because we think it matters. Agents are becoming real users of the Hub: they train models, build and clean datasets, and ship demos as Spaces, almost always on behalf of a person. A Hub that works well for agents is also a Hub that works better for the people using them. The better an agent's tools are, the more it can do for you.\n\nIf your agent interacts with the Hugging Face Hub, we recommend giving it the hf CLI:\n\n```\n# macOS / Linux\ncurl -LsSf https://hf.co/cli/install.sh | bash\n\n# Windows (PowerShell)\npowershell -ExecutionPolicy ByPass -c \"irm https://hf.co/cli/install.ps1 | iex\"\n```\n\nThen hand it the skill, so it knows the whole command surface from the first turn:\n\n```\nhf skills add            # Codex, Cursor, OpenCode, Pi and other agents that load skills from .agents/skills\nhf skills add --claude   # the above + Claude Code\n```\n\nThen point your agent at the Hub and let it work. Make sure you're logged in ( hf auth login ), then hand it a prompt like:\n\n```\nUse `hf` to list my Hugging Face Hub models, datasets, and Spaces.\nTake a look at how I am currently using the Hub and suggest a few ways you could help me.\n```\n\nIt'll work out the commands on its own and come back with something useful.\n\nThe full command reference lives in the hf CLI guide .\n\nRegister an agent harness\n\nBuilding an agent harness? Get it registered! That's how hf learns to detect it, and how the Hub attributes its traffic to your harness. You simply need to open a small PR adding an entry to agent-harnesses.ts . Read the Register your agent harness guide for more details.\n\nMore Articles from our Blog\n\nci huggingface_hub agents\n\nShipping huggingface_hub every week with AI, open tools, and a human in the loop\n\nagents transformers evaluation\n\nIs it agentic enough? Benchmarking open models on your own tooling\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "hf is the official command-line entrypoint to the Hugging Face Hub. Anything you can do on the Hub from the Python SDK, you can do from your terminal: download and upload models, datasets and Spaces; create and manage repos, branches, tags and pull requests; run Jobs on HF infrastructure; manage Buckets, Collections, webhooks and Inference Endpoints.\n\nThe hf CLI has been primarily built for our users over the years. But it's now increasingly used by coding agents: Claude Code, Codex, Cursor and more. So we rebuilt it to make it work for both audiences at once. This blog post summarizes what we did, and how we benchmarked it. We found that on complex, multi-step tasks the no-CLI baseline (an agent hand-rolling curl or the Python SDK) uses up to 6× as many tokens as the hf CLI.\n\n## AI agent traffic on the Hub\n\nWe started tracking agent usage of the Hub in April 2026. The hf CLI (and the huggingface_hub Python SDK it's built on) detects when a coding agent is driving it by reading the environment variables agents set: CLAUDECODE/CLAUDE_CODE for Claude Code, CODEX_SANDBOX for Codex, plus Cursor, Gemini, Pi, and the universal AI_AGENT. That single signal does two jobs: it shapes the CLI's output (more on that below) and it tags each Hub request with an agent/<name> user-agent, so we can attribute traffic to the agent driving it. The two largest by distinct users are Claude Code and Codex, well ahead of everything else, and they're the two agents we benchmark later in this article.\n\nThe bars count distinct users per agent; request volume is the sub-label. Claude Code alone is ~40k users and nearly 49M requests, with Codex close behind. These are early numbers (we only began attributing agent traffic in April 2026), but the scale is already significant, and we expect it to keep growing as coding agents become a standard way to work with the Hub.\n\n## Built for humans and agents\n\nHumans and coding agents expect different outputs for the same hf commands. A human wants rich terminal output: ANSI color, padded tables truncated to fit the screen, a green ✅ on success, ✔ for booleans, progress bars, prose hints. An agent wants the inverse: no ANSI, nothing truncated, every value in full since an agent can handle far denser output than a human, kept compact and structured to stay light on tokens. It also can't answer a CLI prompt and will happily re-run a command after a timeout. The rest of this section is how hf gives each side what it needs. We introduced agent-mode output in hf v1.9.0 and have been migrating the rest of the CLI to it gradually in the following releases.\n\n### One command, multiple renderings\n\nWhen hf auto-detects agent use (via the environment variables mentioned above), it renders the same command differently. It optimizes output format for humans or agents without passing a flag:\n\n```\n# human (default in a terminal): aligned table, truncated to fit, with a hint\n> hf models ls --author Qwen --sort downloads --limit 3\nID                       CREATED_AT DOWNLOADS LIBRARY_NAME LIKES PIPELINE_TAG    PRIVATE TAGS\n------------------------ ---------- --------- ------------ ----- --------------- ------- -------------------------\nQwen/Qwen3-0.6B          2025-04-27  21156913 transformers  1285 text-generation         transformers, safetens...\nQwen/Qwen2.5-1.5B-Ins... 2024-09-17  15143953 transformers   725 text-generation         transformers, safetens...\nQwen/Qwen3-4B            2025-04-27  14808352 transformers   625 text-generation         transformers, safetens...\nHint: Use `--no-truncate` or `--format json` to display full values.\n\n# agent (auto-detected): TSV, full ids + ISO timestamps + every tag, nothing truncated\n$ hf models ls --author Qwen --sort downloads --limit 3\nid      created_at      downloads       library_name    likes   pipeline_tag    private tags\nQwen/Qwen3-0.6B 2025-04-27T03:40:08+00:00       21156913        transformers    1285    text-generation False   ['transformers', 'safetensors', 'qwen3', 'text-generation', 'conversational', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-0.6B-Base', 'base_model:finetune:Qwen/Qwen3-0.6B-Base', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen2.5-1.5B-Instruct      2024-09-17T14:10:29+00:00       15143953        transformers    725     text-generation False['transformers', 'safetensors', 'qwen2', 'text-generation', 'chat', 'conversational', 'en', 'arxiv:2407.10671', 'base_model:Qwen/Qwen2.5-1.5B', 'base_model:finetune:Qwen/Qwen2.5-1.5B', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen3-4B   2025-04-27T03:41:29+00:00       14808352        transformers    625     text-generation False   ['transformers', 'safetensors', 'text-generation', 'arxiv:2309.00071', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-4B-Base', 'base_model:finetune:Qwen/Qwen3-4B-Base', 'license:apache-2.0', 'endpoints_compatible', 'deploy:azure', 'region:us']\n```\n\nA human gets an aligned table, truncated to fit the terminal, plus a hint on how to see more, with color cues for status (a green ✓ on success, red on error). An agent gets the complete record as TSV: full repo ids, full ISO timestamps, every tag, no ANSI codes, nothing truncated, clean to parse and light on tokens.\n\nIn practice, we've implemented logging methods like .table(...), .result(...), .json(), etc., which take raw data as input and handle the formatting. In addition to human and agent modes, we've introduced --json and --quiet options to make it easier to pipe commands together. The default mode is automatically chosen based on context, but users can always force the format of their choice with --format human | agent | json | quiet.\n\n### Next-command hints\n\nCLI commands rarely run in isolation: one step usually implies the next (git add, then git commit). Many hf commands now end with a hint: the exact next command to run, pre-filled with the IDs you just used, so a user or agent can chain straight to the next step instead of working it out from scratch. Start a Job in the background and it points you to its logs; create a Space and it points you to its boot status:\n\n```\n$ hf jobs run --detach python:3.12 python train.py\n✓ Job started\n  id: 6f3a1c2e9b\n  url: https://huggingface.co/jobs/celinah/6f3a1c2e9b\nHint: Use `hf jobs logs 6f3a1c2e9b` to fetch the logs.\n```\n\nFor a human that's a convenience. For an agent it's a rail: the next action is named, parameterized with the right ids, and ready to run, so it takes fewer steps working out what to do. Errors behave the same way, naming the fix instead of just failing:\n\n```\nError: Not logged in. Run `hf auth login` first.\n```\n\nHints, warnings and errors all go to stderr while data goes to stdout, so none of this guidance pollutes the output the agent is parsing.\n\n### Non-blocking and safe to retry\n\nhf never sits on an interactive prompt waiting for a key an agent can't press. A destructive command still asks a human to confirm, but in agent mode it fails fast with the fix in the message (Use --yes to skip confirmation.), and -y/--yes skips it. And because agents retry on timeouts and lost context, operations are built to be safe to repeat: hf repos create --exist-ok is a no-op if the repo already exists, and re-running an upload re-commits cleanly. Separately, the commands that move real data take a --dry-run that shows exactly what they'll transfer before they run, which proves handy for humans and agents alike, since neither has to commit to a long download or blind sync:\n\n```\n# agent mode: a destructive command without --yes refuses, with the fix in the message\n$ hf repos delete my-org/old-model\nError: You are about to permanently delete model 'my-org/old-model'. Proceed? Use --yes to skip confirmation.\n\n# commands that move data take --dry-run to preview the transfer first\n$ hf download deepseek-ai/DeepSeek-V4-Pro config.json --dry-run\n[dry-run] Will download 1 files (out of 1) totalling 1.8K.\nfile         size\nconfig.json  1.8K\n```\n\n### Discoverable, predictable commands\n\nhf is built to be probed: run hf to see the resource groups, run --help on the one you need, and every --help ends with real, copy-pasteable examples (which an agent matches against far faster than it parses a description):\n\n```\n$ hf models ls --help\n...\nExamples\n  $ hf models ls --sort downloads --limit 10\n  $ hf models ls --search \"qwen\" --author Qwen\n  $ hf models ls Qwen/Qwen3-4B --tree\n```\n\nThe command tree is consistent, resource + verb with the obvious aliases (hf models ls, hf repos create, hf jobs ps, hf collections delete; list/ls, remove/rm), so once an agent learns one command it can guess the rest. And the output composes: -q prints one id per line to pipe into the next command, --json gives you something to hand to jq.\n\n```\n$ hf models ls --author Qwen -q | head -3\nQwen/Qwen3-0.6B\nQwen/Qwen2.5-1.5B-Instruct\nQwen/Qwen3-4B\n```\n\n## Benchmarking the hf CLI for Coding Agents\n\nTo find out whether the hf CLI is really more efficient for agents, we measured it. We built a small evaluation harness and ran the same set of Hub tasks through each way of driving the Hub, many times over, grading every run against the live Hub. Here's the headline before the methodology: across both agents the hf CLI comes out ahead, most clearly on complex, multi-step tasks where it uses far fewer tokens.\n\nagent\n\ntool\n\nsuccess score\n\ntoken usage\n\nself-report error\n\nClaude Code (Sonnet 4.6)\n\nhf CLI\n\n0.94\n\nbaseline\n\n2 / 163\n\n—\n\ncurl / Python SDK\n\n0.84\n\n1.3-1.6× tokens\n\n11 / 163\n\nCodex (GPT-5.5)\n\nhf CLI\n\n0.93\n\nbaseline\n\n3 / 163\n\n—\n\ncurl / Python SDK\n\n0.92\n\n1.6-1.8× tokens\n\n10 / 163\n\n(self-report error = the agent reported success on the 17 solvable tasks but the Hub said otherwise. The hf CLI rows are the CLI with its skill installed; what the skill adds on top of the bare CLI (chiefly fewer tool calls) is broken out in the skill section below. Representative transcripts are published in this bucket.)\n\n### The setup\n\nWe defined 18 non-trivial Hub tasks. Not \"download a file\", but the kind of thing you'd actually ask for: aggregate a trending org's models, inspect a repo's files and their sizes, upload a folder with include/exclude rules, delete files, copy files across repos, open a PR that adds a license, create a repo with a branch and a tag, sync and prune a bucket, build a collection. Each task goes to a fresh coding agent with exactly one way to talk to the Hub:\n\n- the hf CLI, or\n\n- curl / the Python SDK: no hf CLI at all, so the agent falls back to curl against the REST API or the huggingface_hub Python library.\n\nWe run the hf CLI in two configurations, with and without its skill (a generated command reference we come back to in its own section). But the headline comparison below is simply hf CLI vs curl / the SDK; the skill's incremental effect is small enough that we break it out on its own rather than crowd it into the main results.\n\nThe config is deliberately clean: a fresh instance per run, no custom MCP servers, no CLAUDE.md or AGENTS.md, nothing in context to nudge behavior. The task and the tool go into a single prompt, and the agent finishes with a TASK_COMPLETE or TASK_FAILED marker, but we don't trust that marker (an agent will report success on work that never landed), so we grade every run independently by re-querying the live Hub: did the branch really get created, is the file actually gone, does the bucket exist? Each task/tool combination is run 10 times, since coding agents are non-deterministic, about 520 runs per agent (18 tasks × 3 tools × 10 reps, minus a cap on one billable Jobs task) and ~1,000 graded runs in total. We ran the whole thing twice, on the two most popular coding agents (Claude Code with Sonnet 4.6 and OpenAI Codex with GPT-5.5).\n\n### The results\n\nThe two charts below unpack the table above. First, task success on Sonnet, the agent where curl and the SDK struggle most:\n\nWithout the CLI, curl and the SDK trail by ten points, because on Sonnet they simply can't finish parts of the job (the writes, mostly), while the hf CLI clears them.\n\nThe second image shows token impact on GPT-5.5, broken down per task. Each bar is the curl/SDK tokens divided by the CLI's on the same task, so 2.4× means the non-hf version burned 2.4 times as many tokens to do the same thing:\n\nOn a one-shot read (count dataset rows, batch metadata) curl and the SDK are fine, and sometimes lighter. But as tasks get more complex and involve several dependent steps, the agent has to hand-roll the entire chain of REST calls (or dig through the SDK) and the cost blows up: 2.4× to 6× the CLI's on creating a repo with a branch and tag, deleting files, copying across repos, or syncing a bucket. The hf CLI lets the agent express the task as a few higher-level commands, rather than crafting a complex workflow.\n\n### Key findings\n\n- The hf CLI is far leaner than curl or the SDK. For the same task, at equal-or-better success, curl and the SDK burn roughly 1.3× to 1.8× the tokens. On easy reads they're fine, but on real multi-step work they pay 2× to 6×: the CLI composes a chain of REST calls into a few high-level commands, while curl or the SDK re-derives the chain by hand every run.\n\n- On a stronger model, curl and the SDK work but stay wasteful. On Sonnet they can't finish parts of the job (the writes, mostly); on GPT-5.5 they mostly succeed, hand-rolling the REST calls (or using the SDK) correctly, but still pay well over the CLI's token bill.\n\n## The hf-cli skill\n\nhf ships a skill: a compact reference of the whole command surface that an agent loads as context. It's auto-generated from the live hf command tree, one line per command (its signature, a one-line description, and the flags that matter), grouped by resource, with a short glossary of common options. It deliberately skips the self-explanatory flags so it stays terse and light on context, and it's regenerated every release. Run hf skills preview to print it, or install it with:\n\n```\n# for Codex, Cursor, OpenCode, Pi and other agents that load skills from `.agents/skills`\nhf skills add\n# includes the above + Claude Code\nhf skills add --claude\n```\n\nWhat does it buy you? Mostly, the agent stops guessing. The clearest single view is how many commands each run takes, with the skill and without:\n\nOn both agents that's about ten commands per task down to about seven, roughly 30% fewer tool calls. That's because the agent isn't probing --help to find the right command and argument. The skill won't cut your token bill, because it prepends a fixed slice of info to the context, so tokens remain about the same or slightly tick up for the same task. The Skill won't make the CLI more reliable either, but it will help the agent spend time running your task rather than finding out how the tool works. This could be particularly helpful when using hf with local models.\n\nWe ran each task in a fresh session, so the skill pays its context cost on every task. In a real multi-task session that cost amortizes (the agent learns the command surface once), so the token picture likely improves there; we didn't measure that case.\n\n## Try it yourself\n\nWe benchmarked all this because we think it matters. Agents are becoming real users of the Hub: they train models, build and clean datasets, and ship demos as Spaces, almost always on behalf of a person. A Hub that works well for agents is also a Hub that works better for the people using them. The better an agent's tools are, the more it can do for you.\n\nIf your agent interacts with the Hugging Face Hub, we recommend giving it the hf CLI:\n\n```\n# macOS / Linux\ncurl -LsSf https://hf.co/cli/install.sh | bash\n\n# Windows (PowerShell)\npowershell -ExecutionPolicy ByPass -c \"irm https://hf.co/cli/install.ps1 | iex\"\n```\n\nThen hand it the skill, so it knows the whole command surface from the first turn:\n\n```\nhf skills add            # Codex, Cursor, OpenCode, Pi and other agents that load skills from .agents/skills\nhf skills add --claude   # the above + Claude Code\n```\n\nThen point your agent at the Hub and let it work. Make sure you're logged in (hf auth login), then hand it a prompt like:\n\n```\nUse `hf` to list my Hugging Face Hub models, datasets, and Spaces.\nTake a look at how I am currently using the Hub and suggest a few ways you could help me.\n```\n\nIt'll work out the commands on its own and come back with something useful.\n\nThe full command reference lives in the hf CLI guide.\n\n## Register an agent harness\n\nBuilding an agent harness? Get it registered! That's how hf learns to detect it, and how the Hub attributes its traffic to your harness. You simply need to open a small PR adding an entry to agent-harnesses.ts. Read the Register your agent harness guide for more details.",
   "summaryZh": "Hugging Face宣布对其官方命令行入口hf CLI进行彻底重构，使其能够同时服务于人类开发者与编码智能体（如Claude Code、Codex等）。通过读取环境变量与特定的User-Agent标记，平台自2026年4月起追踪并发现智能体流量巨大（其中Claude Code单日用户达4万、请求达4900万）。测试表明，针对智能体优化的CLI在处理复杂多步骤任务时，较直接使用curl或Python SDK可节省高达6倍的Token消耗。",
   "summaryGeneratedAt": "2026-08-30T11:00:45.291183Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -71,5 +71,1398 @@
       }
     ],
     "duplicateKey": "huggingface-hf-cli-agent-optimized"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-users.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-users.png",
+      "alt": "Distinct users of the Hugging Face Hub by coding agent since April 2026. Claude Code leads with 39.5k users and 48.6M requests, then Codex with 34.8k users and 36.4M requests, followed by antigravity, cursor-cli, openclaw, cursor, gemini and pi.",
+      "id": "image_ce685c4081a1a07c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-users-dark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-users-dark.png",
+      "alt": "Distinct users of the Hugging Face Hub by coding agent since April 2026. Claude Code leads with 39.5k users and 48.6M requests, then Codex with 34.8k users and 36.4M requests, followed by antigravity, cursor-cli, openclaw, cursor, gemini and pi.",
+      "id": "image_37c095aca033e6b9"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-success.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-success.png",
+      "alt": "Task success on Claude Code with Sonnet 4.6: hf CLI 94%, curl / Python SDK 84%.",
+      "id": "image_8e47838822c608c3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-success-dark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-success-dark.png",
+      "alt": "Task success on Claude Code with Sonnet 4.6: hf CLI 94%, curl / Python SDK 84%.",
+      "id": "image_70ce12e280a89089"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-tokens.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-tokens.png",
+      "alt": "Per-task token ratio of curl/Python SDK divided by the hf CLI on GPT-5.5, sorted high to low. Multi-step tasks cost curl/Python SDK far more: bucket create+sync+prune 6.0x, rank orgs by trending models 4.1x, repo create+branch+tag / delete files / copy files across repos 2.4x each. Simple one-shot reads sit near parity or cheaper: batch model metadata 0.5x, count dataset rows 0.3x.",
+      "id": "image_c02b75299146f298"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-tokens-dark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-tokens-dark.png",
+      "alt": "Per-task token ratio of curl/Python SDK divided by the hf CLI on GPT-5.5, sorted high to low. Multi-step tasks cost curl/Python SDK far more: bucket create+sync+prune 6.0x, rank orgs by trending models 4.1x, repo create+branch+tag / delete files / copy files across repos 2.4x each. Simple one-shot reads sit near parity or cheaper: batch model metadata 0.5x, count dataset rows 0.3x.",
+      "id": "image_b4117aed3fbb39a8"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-skill.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-skill.png",
+      "alt": "Mean commands (tool calls) per run, with and without the hf-cli skill, on both agents. Claude Code (Sonnet 4.6): 10.4 without the skill, 6.9 with it. Codex (GPT-5.5): 10.1 without, 7.3 with. Fewer is better.",
+      "id": "image_ef643697eb3741c8"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-skill-dark.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/huggingface_hub/chart-skill-dark.png",
+      "alt": "Mean commands (tool calls) per run, with and without the hf-cli skill, on both agents. Claude Code (Sonnet 4.6): 10.4 without the skill, 6.9 with it. Codex (GPT-5.5): 10.1 without, 7.3 with. Fewer is better.",
+      "id": "image_907da2c9154b1fbe"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "hf is the official command-line entrypoint to the Hugging Face Hub. Anything you can do on the Hub from the Python SDK, you can do from your terminal: download and upload models, datasets and Spaces; create and manage repos, branches, tags and pull requests; run Jobs on HF infrastructure; manage Buckets, Collections, webhooks and Inference Endpoints.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "The hf CLI has been primarily built for our users over the years. But it's now increasingly used by coding agents: Claude Code, Codex, Cursor and more. So we rebuilt it to make it work for both audiences at once. This blog post summarizes what we did, and how we benchmarked it. We found that on complex, multi-step tasks the no-CLI baseline (an agent hand-rolling curl or the Python SDK) uses up to 6× as many tokens as the hf CLI.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 113,
+          "kind": "strong"
+        },
+        {
+          "start": 365,
+          "end": 369,
+          "kind": "code"
+        },
+        {
+          "start": 400,
+          "end": 417,
+          "kind": "strong"
+        },
+        {
+          "start": 425,
+          "end": 427,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "AI agent traffic on the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "We started tracking agent usage of the Hub in April 2026. The hf CLI (and the huggingface_hub Python SDK it's built on) detects when a coding agent is driving it by reading the environment variables agents set: CLAUDECODE/CLAUDE_CODE for Claude Code, CODEX_SANDBOX for Codex, plus Cursor, Gemini, Pi, and the universal AI_AGENT. That single signal does two jobs: it shapes the CLI's output (more on that below) and it tags each Hub request with an agent/<name> user-agent, so we can attribute traffic to the agent driving it. The two largest by distinct users are Claude Code and Codex, well ahead of everything else, and they're the two agents we benchmark later in this article.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 78,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 211,
+          "end": 221,
+          "kind": "code"
+        },
+        {
+          "start": 222,
+          "end": 233,
+          "kind": "code"
+        },
+        {
+          "start": 251,
+          "end": 264,
+          "kind": "code"
+        },
+        {
+          "start": 319,
+          "end": 327,
+          "kind": "code"
+        },
+        {
+          "start": 448,
+          "end": 460,
+          "kind": "code"
+        },
+        {
+          "start": 564,
+          "end": 585,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "The bars count distinct users per agent; request volume is the sub-label. Claude Code alone is ~40k users and nearly 49M requests, with Codex close behind. These are early numbers (we only began attributing agent traffic in April 2026), but the scale is already significant, and we expect it to keep growing as coding agents become a standard way to work with the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Built for humans and agents",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Humans and coding agents expect different outputs for the same hf commands. A human wants rich terminal output: ANSI color, padded tables truncated to fit the screen, a green ✅ on success, ✔ for booleans, progress bars, prose hints. An agent wants the inverse: no ANSI, nothing truncated, every value in full since an agent can handle far denser output than a human, kept compact and structured to stay light on tokens. It also can't answer a CLI prompt and will happily re-run a command after a timeout. The rest of this section is how hf gives each side what it needs. We introduced agent-mode output in hf v1.9.0 and have been migrating the rest of the CLI to it gradually in the following releases.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 189,
+          "end": 190,
+          "kind": "code"
+        },
+        {
+          "start": 537,
+          "end": 539,
+          "kind": "code"
+        },
+        {
+          "start": 606,
+          "end": 608,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "One command, multiple renderings",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "When hf auto-detects agent use (via the environment variables mentioned above), it renders the same command differently. It optimizes output format for humans or agents without passing a flag:",
+      "spans": [
+        {
+          "start": 5,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 107,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "A human gets an aligned table, truncated to fit the terminal, plus a hint on how to see more, with color cues for status (a green ✓ on success, red on error). An agent gets the complete record as TSV: full repo ids, full ISO timestamps, every tag, no ANSI codes, nothing truncated, clean to parse and light on tokens.",
+      "spans": [
+        {
+          "start": 2,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 130,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 167,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "In practice, we've implemented logging methods like .table(...), .result(...), .json(), etc., which take raw data as input and handle the formatting. In addition to human and agent modes, we've introduced --json and --quiet options to make it easier to pipe commands together. The default mode is automatically chosen based on context, but users can always force the format of their choice with --format human | agent | json | quiet.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 86,
+          "kind": "code"
+        },
+        {
+          "start": 205,
+          "end": 211,
+          "kind": "code"
+        },
+        {
+          "start": 216,
+          "end": 223,
+          "kind": "code"
+        },
+        {
+          "start": 395,
+          "end": 432,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Next-command hints",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "CLI commands rarely run in isolation: one step usually implies the next (git add, then git commit). Many hf commands now end with a hint: the exact next command to run, pre-filled with the IDs you just used, so a user or agent can chain straight to the next step instead of working it out from scratch. Start a Job in the background and it points you to its logs; create a Space and it points you to its boot status:",
+      "spans": [
+        {
+          "start": 73,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 87,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 136,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "For a human that's a convenience. For an agent it's a rail: the next action is named, parameterized with the right ids, and ready to run, so it takes fewer steps working out what to do. Errors behave the same way, naming the fix instead of just failing:",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Hints, warnings and errors all go to stderr while data goes to stdout, so none of this guidance pollutes the output the agent is parsing.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Non-blocking and safe to retry",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "hf never sits on an interactive prompt waiting for a key an agent can't press. A destructive command still asks a human to confirm, but in agent mode it fails fast with the fix in the message (Use --yes to skip confirmation.), and -y/--yes skips it. And because agents retry on timeouts and lost context, operations are built to be safe to repeat: hf repos create --exist-ok is a no-op if the repo already exists, and re-running an upload re-commits cleanly. Separately, the commands that move real data take a --dry-run that shows exactly what they'll transfer before they run, which proves handy for humans and agents alike, since neither has to commit to a long download or blind sync:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 163,
+          "kind": "em"
+        },
+        {
+          "start": 193,
+          "end": 224,
+          "kind": "code"
+        },
+        {
+          "start": 231,
+          "end": 233,
+          "kind": "code"
+        },
+        {
+          "start": 234,
+          "end": 239,
+          "kind": "code"
+        },
+        {
+          "start": 348,
+          "end": 374,
+          "kind": "code"
+        },
+        {
+          "start": 511,
+          "end": 520,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Discoverable, predictable commands",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "hf is built to be probed: run hf to see the resource groups, run --help on the one you need, and every --help ends with real, copy-pasteable examples (which an agent matches against far faster than it parses a description):",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        },
+        {
+          "start": 30,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 103,
+          "end": 109,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "The command tree is consistent, resource + verb with the obvious aliases (hf models ls, hf repos create, hf jobs ps, hf collections delete; list/ls, remove/rm), so once an agent learns one command it can guess the rest. And the output composes: -q prints one id per line to pipe into the next command, --json gives you something to hand to jq.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 47,
+          "kind": "strong"
+        },
+        {
+          "start": 74,
+          "end": 86,
+          "kind": "code"
+        },
+        {
+          "start": 88,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 115,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 138,
+          "kind": "code"
+        },
+        {
+          "start": 140,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 145,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 155,
+          "kind": "code"
+        },
+        {
+          "start": 156,
+          "end": 158,
+          "kind": "code"
+        },
+        {
+          "start": 245,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 302,
+          "end": 308,
+          "kind": "code"
+        },
+        {
+          "start": 340,
+          "end": 342,
+          "kind": "code"
+        },
+        {
+          "start": 340,
+          "end": 342,
+          "kind": "a",
+          "href": "https://jqlang.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Benchmarking the hf CLI for Coding Agents",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "To find out whether the hf CLI is really more efficient for agents, we measured it. We built a small evaluation harness and ran the same set of Hub tasks through each way of driving the Hub, many times over, grading every run against the live Hub. Here's the headline before the methodology: across both agents the hf CLI comes out ahead, most clearly on complex, multi-step tasks where it uses far fewer tokens.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 315,
+          "end": 317,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "agent",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "tool",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "success score",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "token usage",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "self-report error",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "Claude Code (Sonnet 4.6)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "hf CLI",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "0.94",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "baseline",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "2 / 163",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "curl / Python SDK",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "0.84",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "1.3-1.6× tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "11 / 163",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Codex (GPT-5.5)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "hf CLI",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "0.93",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "baseline",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "3 / 163",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "curl / Python SDK",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "0.92",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "1.6-1.8× tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "10 / 163",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "(self-report error = the agent reported success on the 17 solvable tasks but the Hub said otherwise. The hf CLI rows are the CLI with its skill installed; what the skill adds on top of the bare CLI (chiefly fewer tool calls) is broken out in the skill section below. Representative transcripts are published in this bucket.)",
+      "spans": [
+        {
+          "start": 105,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 242,
+          "end": 259,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/hf-cli-for-agents#the-hf-cli-skill"
+        },
+        {
+          "start": 308,
+          "end": 322,
+          "kind": "a",
+          "href": "https://huggingface.co/buckets/celinah/hf-cli-agent-benchmark"
+        },
+        {
+          "start": 0,
+          "end": 324,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "The setup",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "We defined 18 non-trivial Hub tasks. Not \"download a file\", but the kind of thing you'd actually ask for: aggregate a trending org's models, inspect a repo's files and their sizes, upload a folder with include/exclude rules, delete files, copy files across repos, open a PR that adds a license, create a repo with a branch and a tag, sync and prune a bucket, build a collection. Each task goes to a fresh coding agent with exactly one way to talk to the Hub:",
+      "spans": [
+        {
+          "start": 11,
+          "end": 35,
+          "kind": "strong"
+        },
+        {
+          "start": 431,
+          "end": 434,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "the hf CLI, or",
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "curl / the Python SDK: no hf CLI at all, so the agent falls back to curl against the REST API or the huggingface_hub Python library.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 68,
+          "end": 72,
+          "kind": "code"
+        },
+        {
+          "start": 101,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "We run the hf CLI in two configurations, with and without its skill (a generated command reference we come back to in its own section). But the headline comparison below is simply hf CLI vs curl / the SDK; the skill's incremental effect is small enough that we break it out on its own rather than crowd it into the main results.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 118,
+          "end": 133,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/hf-cli-for-agents#the-hf-cli-skill"
+        },
+        {
+          "start": 180,
+          "end": 182,
+          "kind": "code"
+        },
+        {
+          "start": 180,
+          "end": 204,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The config is deliberately clean: a fresh instance per run, no custom MCP servers, no CLAUDE.md or AGENTS.md, nothing in context to nudge behavior. The task and the tool go into a single prompt, and the agent finishes with a TASK_COMPLETE or TASK_FAILED marker, but we don't trust that marker (an agent will report success on work that never landed), so we grade every run independently by re-querying the live Hub: did the branch really get created, is the file actually gone, does the bucket exist? Each task/tool combination is run 10 times, since coding agents are non-deterministic, about 520 runs per agent (18 tasks × 3 tools × 10 reps, minus a cap on one billable Jobs task) and ~1,000 graded runs in total. We ran the whole thing twice, on the two most popular coding agents (Claude Code with Sonnet 4.6 and OpenAI Codex with GPT-5.5).",
+      "spans": [
+        {
+          "start": 86,
+          "end": 95,
+          "kind": "code"
+        },
+        {
+          "start": 99,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 225,
+          "end": 238,
+          "kind": "code"
+        },
+        {
+          "start": 242,
+          "end": 253,
+          "kind": "code"
+        },
+        {
+          "start": 390,
+          "end": 414,
+          "kind": "strong"
+        },
+        {
+          "start": 535,
+          "end": 543,
+          "kind": "strong"
+        },
+        {
+          "start": 594,
+          "end": 612,
+          "kind": "strong"
+        },
+        {
+          "start": 785,
+          "end": 796,
+          "kind": "strong"
+        },
+        {
+          "start": 817,
+          "end": 829,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "The results",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "The two charts below unpack the table above. First, task success on Sonnet, the agent where curl and the SDK struggle most:",
+      "spans": [
+        {
+          "start": 52,
+          "end": 74,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Without the CLI, curl and the SDK trail by ten points, because on Sonnet they simply can't finish parts of the job (the writes, mostly), while the hf CLI clears them.",
+      "spans": [
+        {
+          "start": 147,
+          "end": 149,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "The second image shows token impact on GPT-5.5, broken down per task. Each bar is the curl/SDK tokens divided by the CLI's on the same task, so 2.4× means the non-hf version burned 2.4 times as many tokens to do the same thing:",
+      "spans": [
+        {
+          "start": 23,
+          "end": 46,
+          "kind": "strong"
+        },
+        {
+          "start": 144,
+          "end": 148,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "On a one-shot read (count dataset rows, batch metadata) curl and the SDK are fine, and sometimes lighter. But as tasks get more complex and involve several dependent steps, the agent has to hand-roll the entire chain of REST calls (or dig through the SDK) and the cost blows up: 2.4× to 6× the CLI's on creating a repo with a branch and tag, deleting files, copying across repos, or syncing a bucket. The hf CLI lets the agent express the task as a few higher-level commands, rather than crafting a complex workflow.",
+      "spans": [
+        {
+          "start": 279,
+          "end": 299,
+          "kind": "strong"
+        },
+        {
+          "start": 405,
+          "end": 407,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Key findings",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "The hf CLI is far leaner than curl or the SDK. For the same task, at equal-or-better success, curl and the SDK burn roughly 1.3× to 1.8× the tokens. On easy reads they're fine, but on real multi-step work they pay 2× to 6×: the CLI composes a chain of REST calls into a few high-level commands, while curl or the SDK re-derives the chain by hand every run.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 46,
+          "kind": "strong"
+        },
+        {
+          "start": 116,
+          "end": 147,
+          "kind": "strong"
+        },
+        {
+          "start": 214,
+          "end": 222,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "On a stronger model, curl and the SDK work but stay wasteful. On Sonnet they can't finish parts of the job (the writes, mostly); on GPT-5.5 they mostly succeed, hand-rolling the REST calls (or using the SDK) correctly, but still pay well over the CLI's token bill.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 61,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "The hf-cli skill",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "hf ships a skill: a compact reference of the whole command surface that an agent loads as context. It's auto-generated from the live hf command tree, one line per command (its signature, a one-line description, and the flags that matter), grouped by resource, with a short glossary of common options. It deliberately skips the self-explanatory flags so it stays terse and light on context, and it's regenerated every release. Run hf skills preview to print it, or install it with:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "code"
+        },
+        {
+          "start": 11,
+          "end": 16,
+          "kind": "strong"
+        },
+        {
+          "start": 104,
+          "end": 118,
+          "kind": "strong"
+        },
+        {
+          "start": 133,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 430,
+          "end": 447,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "What does it buy you? Mostly, the agent stops guessing. The clearest single view is how many commands each run takes, with the skill and without:",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "On both agents that's about ten commands per task down to about seven, roughly 30% fewer tool calls. That's because the agent isn't probing --help to find the right command and argument. The skill won't cut your token bill, because it prepends a fixed slice of info to the context, so tokens remain about the same or slightly tick up for the same task. The Skill won't make the CLI more reliable either, but it will help the agent spend time running your task rather than finding out how the tool works. This could be particularly helpful when using hf with local models.",
+      "spans": [
+        {
+          "start": 140,
+          "end": 146,
+          "kind": "code"
+        },
+        {
+          "start": 550,
+          "end": 552,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "We ran each task in a fresh session, so the skill pays its context cost on every task. In a real multi-task session that cost amortizes (the agent learns the command surface once), so the token picture likely improves there; we didn't measure that case.",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Try it yourself",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "We benchmarked all this because we think it matters. Agents are becoming real users of the Hub: they train models, build and clean datasets, and ship demos as Spaces, almost always on behalf of a person. A Hub that works well for agents is also a Hub that works better for the people using them. The better an agent's tools are, the more it can do for you.",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "If your agent interacts with the Hugging Face Hub, we recommend giving it the hf CLI:",
+      "spans": [
+        {
+          "start": 78,
+          "end": 80,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "Then hand it the skill, so it knows the whole command surface from the first turn:",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Then point your agent at the Hub and let it work. Make sure you're logged in (hf auth login), then hand it a prompt like:",
+      "spans": [
+        {
+          "start": 78,
+          "end": 91,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "It'll work out the commands on its own and come back with something useful.",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "The full command reference lives in the hf CLI guide.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 40,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/huggingface_hub/guides/cli"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "Register an agent harness",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Building an agent harness? Get it registered! That's how hf learns to detect it, and how the Hub attributes its traffic to your harness. You simply need to open a small PR adding an entry to agent-harnesses.ts. Read the Register your agent harness guide for more details.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 45,
+          "kind": "strong"
+        },
+        {
+          "start": 57,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 209,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 209,
+          "kind": "a",
+          "href": "https://github.com/huggingface/huggingface.js/blob/main/packages/tasks/src/agent-harnesses.ts"
+        },
+        {
+          "start": 220,
+          "end": 247,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/agents-overview#register-your-agent-harness"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "55f723f038995742e926ffce16ce713b646d6fa82c0327f324702b66407756f1",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "# human (default in a terminal): aligned table, truncated to fit, with a hint\n> hf models ls --author Qwen --sort downloads --limit 3\nID                       CREATED_AT DOWNLOADS LIBRARY_NAME LIKES PIPELINE_TAG    PRIVATE TAGS\n------------------------ ---------- --------- ------------ ----- --------------- ------- -------------------------\nQwen/Qwen3-0.6B          2025-04-27  21156913 transformers  1285 text-generation         transformers, safetens...\nQwen/Qwen2.5-1.5B-Ins... 2024-09-17  15143953 transformers   725 text-generation         transformers, safetens...\nQwen/Qwen3-4B            2025-04-27  14808352 transformers   625 text-generation         transformers, safetens...\nHint: Use `--no-truncate` or `--format json` to display full values.\n\n# agent (auto-detected): TSV, full ids + ISO timestamps + every tag, nothing truncated\n$ hf models ls --author Qwen --sort downloads --limit 3\nid      created_at      downloads       library_name    likes   pipeline_tag    private tags\nQwen/Qwen3-0.6B 2025-04-27T03:40:08+00:00       21156913        transformers    1285    text-generation False   ['transformers', 'safetensors', 'qwen3', 'text-generation', 'conversational', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-0.6B-Base', 'base_model:finetune:Qwen/Qwen3-0.6B-Base', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen2.5-1.5B-Instruct      2024-09-17T14:10:29+00:00       15143953        transformers    725     text-generation False['transformers', 'safetensors', 'qwen2', 'text-generation', 'chat', 'conversational', 'en', 'arxiv:2407.10671', 'base_model:Qwen/Qwen2.5-1.5B', 'base_model:finetune:Qwen/Qwen2.5-1.5B', 'license:apache-2.0', 'text-generation-inference', 'endpoints_compatible', 'deploy:azure', 'region:us']\nQwen/Qwen3-4B   2025-04-27T03:41:29+00:00       14808352        transformers    625     text-generation False   ['transformers', 'safetensors', 'text-generation', 'arxiv:2309.00071', 'arxiv:2505.09388', 'base_model:Qwen/Qwen3-4B-Base', 'base_model:finetune:Qwen/Qwen3-4B-Base', 'license:apache-2.0', 'endpoints_compatible', 'deploy:azure', 'region:us']"
+    },
+    {
+      "id": "c0002",
+      "source": "$ hf jobs run --detach python:3.12 python train.py\n✓ Job started\n  id: 6f3a1c2e9b\n  url: https://huggingface.co/jobs/celinah/6f3a1c2e9b\nHint: Use `hf jobs logs 6f3a1c2e9b` to fetch the logs."
+    },
+    {
+      "id": "c0003",
+      "source": "Error: Not logged in. Run `hf auth login` first."
+    },
+    {
+      "id": "c0004",
+      "source": "# agent mode: a destructive command without --yes refuses, with the fix in the message\n$ hf repos delete my-org/old-model\nError: You are about to permanently delete model 'my-org/old-model'. Proceed? Use --yes to skip confirmation.\n\n# commands that move data take --dry-run to preview the transfer first\n$ hf download deepseek-ai/DeepSeek-V4-Pro config.json --dry-run\n[dry-run] Will download 1 files (out of 1) totalling 1.8K.\nfile         size\nconfig.json  1.8K"
+    },
+    {
+      "id": "c0005",
+      "source": "$ hf models ls --help\n...\nExamples\n  $ hf models ls --sort downloads --limit 10\n  $ hf models ls --search \"qwen\" --author Qwen\n  $ hf models ls Qwen/Qwen3-4B --tree"
+    },
+    {
+      "id": "c0006",
+      "source": "$ hf models ls --author Qwen -q | head -3\nQwen/Qwen3-0.6B\nQwen/Qwen2.5-1.5B-Instruct\nQwen/Qwen3-4B"
+    },
+    {
+      "id": "c0007",
+      "source": "# for Codex, Cursor, OpenCode, Pi and other agents that load skills from `.agents/skills`\nhf skills add\n# includes the above + Claude Code\nhf skills add --claude"
+    },
+    {
+      "id": "c0008",
+      "source": "# macOS / Linux\ncurl -LsSf https://hf.co/cli/install.sh | bash\n\n# Windows (PowerShell)\npowershell -ExecutionPolicy ByPass -c \"irm https://hf.co/cli/install.ps1 | iex\""
+    },
+    {
+      "id": "c0009",
+      "source": "hf skills add            # Codex, Cursor, OpenCode, Pi and other agents that load skills from .agents/skills\nhf skills add --claude   # the above + Claude Code"
+    },
+    {
+      "id": "c0010",
+      "source": "Use `hf` to list my Hugging Face Hub models, datasets, and Spaces.\nTake a look at how I am currently using the Hub and suggest a few ways you could help me."
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "55f723f038995742e926ffce16ce713b646d6fa82c0327f324702b66407756f1",
+  "mediaLayout": [
+    {
+      "mediaId": "image_ce685c4081a1a07c",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 0
+    },
+    {
+      "mediaId": "image_37c095aca033e6b9",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 1
+    },
+    {
+      "mediaId": "image_8e47838822c608c3",
+      "type": "image",
+      "afterBlockId": "b0056",
+      "order": 2
+    },
+    {
+      "mediaId": "image_70ce12e280a89089",
+      "type": "image",
+      "afterBlockId": "b0056",
+      "order": 3
+    },
+    {
+      "mediaId": "image_c02b75299146f298",
+      "type": "image",
+      "afterBlockId": "b0058",
+      "order": 4
+    },
+    {
+      "mediaId": "image_b4117aed3fbb39a8",
+      "type": "image",
+      "afterBlockId": "b0058",
+      "order": 5
+    },
+    {
+      "mediaId": "image_ef643697eb3741c8",
+      "type": "image",
+      "afterBlockId": "b0065",
+      "order": 6
+    },
+    {
+      "mediaId": "image_907da2c9154b1fbe",
+      "type": "image",
+      "afterBlockId": "b0065",
+      "order": 7
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 8,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 8,
+    "savedImages": 8,
+    "sourceImageOccurrences": 8,
+    "placedImageOccurrences": 8,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:11.889721Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:11.889741Z"
 }

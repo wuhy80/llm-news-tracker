@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:09:06.059408Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP\n\nThis article is also available in Chinese 简体中文 .\n\nThis is the second post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:\n\nProfiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler\n\nProfiling in PyTorch (Part 2): From nn.Linear to a Fused MLP (current)\n\nProfiling in PyTorch (Part 3): Attention is all you profile\n\nIn the first part of this series \"Profiling in PyTorch\" , we used torch.add(torch.matmul(x, w), b) to learn how to read PyTorch profiler traces. We also discussed several other topics that came our way - the CPU dispatch chain, launch overhead, the difference between an overhead-bound and a compute-bound regime, and some internals of torch.compile .\n\nIn the second iteration (this blog post), we climb one rung up the ladder. We replace the hand-written matmul-add pair with an nn.Linear (with bias=True ). This is the building block every deep learning model uses. We then stack three of them (specific to our example), with an activation in between, to form a Multilayer Perceptron (MLP) block.\n\nThe scripts for this blog post live here: 02_linear.py , 03_simple_mlp.py , and 03_kernels_mlp.py . Like before, it helps to open them in a separate tab and walk through the code as you read. We use an NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to set up a GPU on the Hugging Face infrastructure and experiment with the scripts using Dev Mode with Spaces . One could also run the scripts with the Hugging Face Jobs pipeline .\n\nBefore we begin, a quick recap of two ideas we will lean on repeatedly:\n\nA GPU kernel is a program that runs in parallel on many threads of the GPU.\n\nThe CPU schedules and launches these kernels. Most of the PyTorch overhead you see in a profiler trace is this scheduling work.\n\nFrom matmul-add to Linear\n\nnn.Linear is a module wrapper around the same matrix multiplication and addition we already profiled in Part 1 . The only difference is that it owns its weight and bias as parameters and exposes a forward method that PyTorch users have grown familiar with.\n\n```\n# bias=True would truly emulate the multiplication and addition\n# operations we have seen in part 1 of the series\nlinear_layer = nn.Linear(in_dim, out_dim, bias=True)\ny = linear_layer(x)\n```\n\nThe operation at hand can be written as:\n\n```\ny = x @ w.T + b\n```\n\nWhere x is the input, w is the weight and b is the bias. Let's run 02_linear.py and check the profile.\n\n```\nuv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\ntrace-util is a utility that will sync your traces to a Hugging Face bucket and then provide the Preffeto URLs on your terminal.\n\nFigure 1: Profiler trace of nn.Linear\n\nFigure 1 shows the profiler trace of a forward call of the linear layer. We trace the forward call of the linear layer with a similar schedule setup as the previous traces, with wait=1 , warmup=1 and active=3 . This is why we see three Profile Steps in the CPU and GPU lanes.\n\nWhat is the transpose doing?\n\nFigure 2: The transpose CPU row\n\nIf we zoom into the profiler trace, as we do in Figure 2, we notice an aten::t (transpose) op before the aten::addmm (multiplication and addition) op. We can already figure out that nn.Linear transposes the weight parameter and then multiplies it with the input. This is the reason we see an aten::t op.\n\nAn important thing to notice is that aten::t does not really copy or reorganize data: it only rewrites tensor metadata (shape and stride) on the CPU to represent the transposed matrix. It does not launch a kernel on the GPU. One can verify this two ways: by looking at the GPU lane in the trace, or by checking the aten::t row in the profiler table and the time it took on CUDA.\n\nWhy are there no separate mul and add kernels?\n\nFigure 3: No aten::add in the profile of a linear layer\n\nThere is no aten::add (the bias addition) in the dispatch chain of the linear layer, as seen in Figure 3. This is because the bias addition has been folded into the matrix multiplication kernel, using what is called an epilogue .\n\nAn epilogue is a small computation that a GEMM (GEneral Matrix Multiply) kernel does at the very end, just before it writes its result back to HBM (High Bandwidth Memory, the GPU's main memory). Adding a bias, applying an activation, or scaling by a constant are all classic epilogues. The point of an epilogue is to avoid loading or writing to HBM a second time, since memory traffic makes an operation expensive.\n\nnn.Linear calls torch.nn.functional.linear , which, in turn, calls aten::linear . aten::linear looks at the inputs, notices that a bias was passed, and dispatches aten::addmm(bias, x, weight) instead of doing a matmul and an add separately. addmm computes:\n\n```\nout = x @ weight.T + bias\n```\n\nThe cuBLAS GEMM kernel that runs on the GPU has a bias-add variant built in, and that's the kernel aten::addmm picks. The add never appears as a separate kernel because it is part of the matmul kernel's writeback , which is exactly what an epilogue is.\n\nThis is the moment to notice something subtle. The kernel you saw in Part 1 under --compile ( addmm ) is the kernel that eager nn.Linear already uses. There is nothing left for torch.compile to fuse here, which is the next thing we will verify.\n\nCan --compile help a single Linear?\n\nLet's compile the forward call and look at the profiler trace. (The profiler trace is visualized in the next section )\n\n```\nuv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64 --compile\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nIf you compare the eager and compiled traces for a single nn.Linear 's forward , you will find:\n\nThe same cuBLAS GEMM kernel on the GPU.\n\nThe same aten::addmm op on the CPU.\n\nA few extra rows on the CPU lane unique to compile.\n\nThis is worth internalizing. A common reflex is to reach for torch.compile whenever a model feels slow. For a single GEMM-with-bias, compile has very little to do. This is not a bug, this is just that compile needs more than one operation to possibly do any fusing. Let's prove that by looking at an MLP .\n\nWhere did the transpose go? Kernel layouts and pre-ops\n\nA careful reader of the two traces (eager vs compile) will notice that the eager CPU dispatch chain has more in it than the compiled one.\n\nFigure 4: Eager dispatch chain where aten::linear walks through aten::t (transpose) and then aten::addmm\n\nFigure 5: Compiled dispatch chain where aten::addmm is called directly, with no transpose\n\nThe eager CPU dispatch chain inside aten::linear is aten::t followed by aten::addmm (Figure 4). To understand what aten::t actually does, we need a quick detour into strides and views .\n\nA tensor stores its data as one flat, contiguous run of numbers in memory. The shape and stride are metadata that sit on top of that run and tell PyTorch how to walk it: a stride of (s0, s1) means \"step s0 elements to move one row, step s1 to move one column\". Change the metadata and you get a different view of the same raw data, with no copy:\n\n```\n>>> M = torch.tensor([[0, 1],\n...                   [2, 3],\n...                   [4, 5]])\n>>> M.shape, M.stride()\n(torch.Size([3, 2]), (2, 1))   # two steps per row, one step per column\n\n>>> T = M.t()                  # transpose\n>>> T.shape, T.stride()\n(torch.Size([2, 3]), (1, 2))   # shape and stride swapped, data untouched\n>>> T\ntensor([[0, 2, 4],\n        [1, 3, 5]])\n>>> T.flatten()                # forced to materialize, so the data is reordered\ntensor([0, 2, 4, 1, 3, 5])\n```\n\nM.t() did not move a single number. It returned a new view whose strides are swapped, so reading it row-by-row now walks the original buffer 0, 1, 2, 3, 4, 5 in transposed order. The underlying data is identical; only the metadata differs.\n\nThis is exactly what aten::t does inside the linear layer: it does not allocate a new tensor or copy any data, it produces a view of the weight with rewritten strides.\n\nAs we can see in Figure 5, compile did not remove a GPU kernel: it removed the CPU overhead of dispatching that view. Inductor traced through the view chain at compile time, computed the resulting strides once, and emitted a direct aten::addmm call with those strides hard-coded. A few microseconds of CPU work disappear while the GPU does identical math.\n\nAs one would expect, when the input data violates the strides precomputed by the compiler, it will throw an error.\n\nIf you look at the GPU lane in both traces, there is exactly one kernel per forward, and it is the same kernel both times:\n\n```\ncutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8\n```\n\nIf no transpose kernel ran, who taught the GEMM to read the weight matrix in transposed order? The answer is in the kernel's name. Look at the suffix:\n\n```\ncutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8\n                                                          ^^\n```\n\nThat tn is the layout descriptor. cuBLAS and CUTLASS precompile a separate kernel binary for each combination of input layouts.\n\nn (non-transposed) and t (transposed) describe how a kernel walks its input during the inner loop. The dispatcher's job is to look at the input strides, decide which suffix combination matches, and pick the right precompiled kernel.\n\nThe kernel name in a profiler trace is a hash dump of the kernel's identity. If two runs show the same kernel name, the GPU is doing the same work. If they differ (e.g., _tn_ vs _nn_ , bf16 vs fp16 , or s16816gemm vs s161616gemm ) then the GPU is doing different work, and the dispatcher took a different branch. Learning to read this name is one of the most useful habits when comparing traces.\n\nStacking three Linears: the MLP\n\nIn this section, we will profile a Multilayer Perceptron (MLP). To make this more interesting, we will profile a feed-forward network with the GeGLU activation variant (which is quite heavily used in practice). This is also our way of paying tribute to one of the greatest lines ever written in the history of deep learning research (Figure 6).\n\nFigure 6: The conclusion section of the GLU Variants Improve Transformer paper.\n\n```\nclass SimpleGeGLUMLP(nn.Module):\n    def __init__(self, dim, hidden):\n        super().__init__()\n        self.gate_proj = nn.Linear(dim, hidden, bias=False)\n        self.up_proj = nn.Linear(dim, hidden, bias=False)\n        self.down_proj = nn.Linear(hidden, dim, bias=False)\n\n    def forward(self, x):\n        g = self.gate_proj(x)\n        u = self.up_proj(x)\n        h = F.gelu(g, approximate=\"tanh\")\n        m = h * u\n        y = self.down_proj(m)\n        return y\n```\n\nYou will find the entire script here: 03_simple_mlp.py . Execute it like so:\n\n```\nuv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nBefore we open the trace, let's think together about what we should expect to see. The forward function does a fair amount of computation, but most of it is already familiar to us.\n\nWe should expect three aten::linear dispatches, one for each nn.Linear layer. We should also expect two pointwise kernel launches, one for the GeLU and one for the multiplication. Forming this expectation before looking is the single most useful habit in the profiling journey: you read the trace to confirm or break a guess, not to form one from scratch.\n\nFigure 7: The profiler trace for a GeGLU MLP\n\nFigure 8: The occupancy queries highlighted in the linear projection CPU lane\n\nFrom Figure 7 we can pat ourselves on the back, as our intuition was correct. Per forward pass (one mlp_fwd ), the GPU runs exactly 5 kernels. Figure 8 highlights the \"occupancy query\" as seen in the CPU lane for the linear projection layers.\n\nOp CPU op GPU kernel launches\n\nampere_bf16_s16816gemm_bf16_128x128_...\n\noccupancy query + cudaLaunchKernel\n\nvectorized_elementwise_kernel<4, GeluCUDAKernelImpl...>\n\nvectorized_elementwise_kernel<4, ...MulFunctor...>\n\nampere_bf16_s16816gemm_bf16_128x256_...\n\nThe three GEMMs each do an extra cudaOccupancyMaxActiveBlocksPerMultiprocessor call before the launch. We have a separate section on this in Part 1, you can find it here . That is cuBLAS sizing the grid. The pointwise ops (GeLU and mul) launch directly, with no occupancy query. So \"a linear\" is actually query + launch, while \"a pointwise op\" is just launch.\n\nFigure 9: The table shows that some ops launch zero kernels\n\nThe aten::t , aten::transpose , aten::reshape , aten::view , aten::as_strided , and aten::_unsafe_view ops launch zero kernels. They show 0.000us of CUDA time in the table (Figure 9) because they only rewrite tensor metadata (shape and stride) on the CPU. A reader scanning the table sees around six op names per linear, but only one of them ( mm ) ever reaches the GPU.\n\nWhy are there two types of GEMM kernels?\n\nThe MLP flattens [batch, seq, dim] to [batch * seq, dim] for the matmul. In our command-line invocation we used 64 for batch and 128 for seq , so that's where the 8192 ( batch * seq = 64 * 128 ) below comes from.\n\nLinear aten::mm input dims M·K·N cuBLAS kernel avg CUDA\n\n[8192,3072] x [3072,768]\n\nAll three GEMMs have the same FLOP count, 2·8192·768·3072 ≈ 38.7 GFLOP each, yet down_proj is about 10% faster. Same work, different shape ( N=768 instead of 3072 ), so cuBLAS picks a different tile ( 128×256 , with a deeper stages_64x3 pipeline) that gets better reuse for that shape.\n\nIf you want to learn more about tiling in depth, here is a great resource to get started with.\n\nThis is exactly why the table had two GEMM rows (Figure 9): the 128x128 row is gate+up and the 128x256 row is down.\n\nWhat does torch.compile do?\n\nBefore compiling the forward method and visualizing it, let's do the mental exercise again of asking ourselves what we expect to see in the trace. This is a fun experiment, and an important one to repeat every time you profile something yourself. Always build on your intuition, and the moment something does not match, stop and figure out why.\n\n```\nuv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072 --compile\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nFigure 10: The profiler trace for the compiled GeGLU MLP\n\nIn eager mode, each nn.Linear was expanded into a chain of dispatcher ops ( aten::linear → aten::t → aten::transpose → aten::matmul → aten::reshape → aten::mm ). Those are the high-level wrappers that ATen walks through before reaching the real GEMM. torch.compile removes that chain.\n\nBy the time the compiled graph runs, there is no linear, no matmul, no transpose or reshape and those metadata ops were folded into how mm is called. We can see three bare aten::mm external calls (Figure 10). The proof that it is the same GEMM is that the kernel names are byte-for-byte identical to eager: ...128x128...stages_32x5_tn for gate and up, and ...128x256...stages_64x3_tn for down.\n\nFigure 11: The fused Triton kernel\n\nThis is the headline of the whole compile lesson. The two eager pointwise kernels (GeLU and mul) plus a reshape collapsed into one kernel, triton_poi_fused__unsafe_view_gelu_mul_0 (Figure 11). Let's decode the name:\n\ntriton : generated by Inductor's Triton backend (not cuBLAS, not ATen).\n\npoi : pointwise (Inductor tags pointwise kernels poi , reductions red , and persistent reductions per ).\n\nfused__unsafe_view_gelu_mul : the ops it merged: the _unsafe_view (reshape), the GeLU, and the mul.\n\n0 : the unique id within the graph.\n\nWhy is this a win? In eager mode, the intermediate h = gelu(g) is a full [8192, 3072] bf16 tensor (around 50 MB) that the GeLU kernel writes to HBM and the mul kernel immediately reads back. Fusion keeps it in registers (memory that resides inside the chip and are closer than the HBM). The Triton kernel reads g and u once, computes gelu(g) * u , and writes the result once. One whole round trip of the intermediate through global memory is gone.\n\nLet's use hand tuned kernels\n\nSo far we have let PyTorch (eager) and the compiler ( torch.compile ) pick our kernels. Now we plug in a kernel that a human expert wrote and tuned by hand. We use the LigerGEGLUMLP layer, that we can easily fetch from the Hugging Face Hub with the kernels library.\n\n```\nfrom kernels import get_kernel\n\nkernels_layers = get_kernel(\"kernels-community/liger-kernels\", version=1).layers\nkernels_geglu_mlp = kernels_layers.LigerGEGLUMLP(Config()).to(device, dtype=torch.bfloat16).eval()\n```\n\nThe full script is here: 03_kernels_mlp.py .\n\n```\nuv run 03_kernels_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nFigure 12: The profiler trace for the LigerGEGLUMLP layer\n\nFigure 12 shows the profile for the LigerGEGLUMLP layer using the Liger kernels from the Hub.\n\nWhy use the kernels library\n\nWriting kernels in Triton or CUDA is one problem and shipping them is another. The kernel has to be compiled for your exact combination of GPU architecture, CUDA version, and PyTorch version. This is the step that usually breaks (\"works on my machine\", missing nvcc , wrong Triton version).\n\nThe kernels library moves that build step off your machine. get_kernel(\"kernels-community/liger-kernels\", version=1) downloads a pre-built, version-pinned kernel package from the Hugging Face Hub and caches it locally (here under ~/.cache/...kernels-community--liger-kernels ). The benefits are:\n\nThe kernels are compiled once, in CI, for many architectures and version combinations. You download the right binary instead of compiling it yourself.\n\nversion=1 pins the exact build, so everyone running your script gets the same kernel. There is no \"it got slower after I updated a package\".\n\nThe package exposes a .layers attribute with drop-in nn.Module s (like LigerGEGLUMLP ). You swap your module for theirs and nothing else in your model changes.\n\nWhy tuned kernels are better\n\nWhen we say \"tuned\", we mean two concrete things, and both are visible in the trace.\n\nFigure 13: The compiled run pays for pre-ops (Dynamo, guards, prologue) before any GEMM runs\n\nFigure 14: The Liger kernel has no pre-ops — the box where they would be is empty\n\nThe fusion is baked in. The LigerGEGLUMLP forward is down_proj(LigerGELUMulFunction.apply(gate_proj(x), up_proj(x))) . The LigerGELUMulFunction runs a single Triton kernel, _geglu_tanh_forward_kernel , that computes gelu(gate) * up in one pass. This is exactly what we saw from torch.compile , where the intermediate never makes a round-trip through HBM. We get it here without the compiler , as shown in Figures 13 and 14 (no Dynamo guards, no compile latency, no recompilation risk).\n\nThe launch parameters were chosen for the hardware. The kernel does not guess its block size at random. Liger's calculate_settings picks them from the column count.\n\nIt is worth being honest about the trade-off here, because the raw numbers can be misleading. The Liger kernel runs in 92.8 µs , while Inductor's fused kernel from the compile run was 89.4 µs . At first glance the hand-written kernel looks slightly slower, but that comparison hides the cost that makes it worthwhile.\n\ntorch.compile specializes for a static shape . Inductor's 89.4 µs kernel is fast precisely because it was generated for this exact [8192, 3072] problem. Change the batch size, the sequence length, or the hidden dimension, Dynamo re-traces, and you pay the compile cost all over again to get a new specialized kernel.\n\nSo the real choice is not \"slow human kernel vs fast compiled kernel\". It is a fast generic kernel vs a kernel specialized for one particular input shape . The Liger kernel takes one set of launch parameters and runs them for any shape with no recompilation. It gives up the last few microseconds that per-shape specialization would buy, in exchange for being robust to changing shapes.\n\nThe table below collects what each step changed on the GPU and what it left untouched.\n\nSetup What changed What stayed the same\n\nBaseline: bias add is already folded into the GEMM epilogue ( addmm ), so it is one cuBLAS kernel, not a matmul plus an add\n\nA few CPU dispatch ops (the aten::t view bookkeeping) disappear\n\nSame single cuBLAS GEMM kernel, byte-for-byte. Compile has nothing to fuse\n\n5 GPU kernels: 3 GEMMs + a GeLU + a mul. The [8192, 3072] intermediate makes a full round-trip through HBM\n\nEach GEMM is still the same bias-free cuBLAS kernel as a standalone linear\n\nGeLU + mul + reshape collapse into one fused Triton kernel; the intermediate stays in registers. Pays compile pre-ops (Dynamo, guards)\n\nThe 3 GEMMs are untouched with identical cuBLAS kernel names\n\nSame fusion, but baked into a hand-written Triton kernel with hardware-tuned launch params with no Dynamo, guards, or compile latency\n\nThe 3 GEMMs are still the same cuBLAS kernels\n\nIf there is one habit to carry forward, it is the one we practiced before every trace: guess first, then look. State what you expect the trace to contain, open it, and treat any mismatch as the most interesting thing on the screen.\n\nThis was the second stop in the Profiling in PyTorch series. In the next post we will keep climbing the ladder, moving from this MLP block towards the attention block and, eventually, a full model.\n\nThanks to Noe Flandre and Pedro Gabriel Gengo Lourenço for their reviews on the early draft of the post!\n\nThe blog post was polished using an LLM. This in no way means that we have let an agent run in the background and let it generate the blog. Some of us in the team are non-english speakers and think LLMs (which are mostly trained in the English Language) can rectify silly grammar mistakes or rephrase sentences that sound less intimidating and cleaner. Hope this helps with the idea of \"why should I read, if this was LLM generated\". 🤗\n\nDatasets mentioned in this article 1\n\nMore Articles from our Blog\n\nthanks bro, it's really help, looking forward your next blog!\n\nThank you for your kind words! 🤗\n\nThanks a bunch for this blog post series! A good habit: Reason first, then look 👍.\n\nThere are some parts I have been thinking about:\n\nWhen the input data violates the strides precomputed by the compiler, will it throw an error or re-compile?\n\nIt is said that \"Each GEMM is still the same bias-free cuBLAS kernel as a standalone linear\", but the current one has never had a bias in the first place. The previous one was bias-free, with aten::addmm , the current one is also bias-free but with aten::mm .\n\nWDYT? I am looking forward to the third blog post!\n\nGreat questions as usual.\n\nI think it would recompile, as has been the case with torch.compile . There is an official article on how to deal with recompilation from the torch team.\n\nGreat catch! That is correct.\n\nThanks for the intuition-led blog. Really appreciate it! :)\n\nGlad you liked it @ deependujha 🔥\n\nI am incredibly excited for the third blog post.\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "This is the second post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:\n\n- Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler\n\n- Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP (current)\n\n- Profiling in PyTorch (Part 3): Attention is all you profile\n\nIn the first part of this series \"Profiling in PyTorch\", we used torch.add(torch.matmul(x, w), b) to learn how to read PyTorch profiler traces. We also discussed several other topics that came our way - the CPU dispatch chain, launch overhead, the difference between an overhead-bound and a compute-bound regime, and some internals of torch.compile.\n\nIn the second iteration (this blog post), we climb one rung up the ladder. We replace the hand-written matmul-add pair with an nn.Linear (with bias=True). This is the building block every deep learning model uses. We then stack three of them (specific to our example), with an activation in between, to form a Multilayer Perceptron (MLP) block.\n\nThe scripts for this blog post live here: 02_linear.py, 03_simple_mlp.py, and 03_kernels_mlp.py. Like before, it helps to open them in a separate tab and walk through the code as you read. We use an NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to set up a GPU on the Hugging Face infrastructure and experiment with the scripts using Dev Mode with Spaces. One could also run the scripts with the Hugging Face Jobs pipeline.\n\nBefore we begin, a quick recap of two ideas we will lean on repeatedly:\n\n- A GPU kernel is a program that runs in parallel on many threads of the GPU.\n\n- The CPU schedules and launches these kernels. Most of the PyTorch overhead you see in a profiler trace is this scheduling work.\n\n## From matmul-add to Linear\n\nnn.Linear is a module wrapper around the same matrix multiplication and addition we already profiled in Part 1. The only difference is that it owns its weight and bias as parameters and exposes a forward method that PyTorch users have grown familiar with.\n\n```\n# bias=True would truly emulate the multiplication and addition\n# operations we have seen in part 1 of the series\nlinear_layer = nn.Linear(in_dim, out_dim, bias=True)\ny = linear_layer(x)\n```\n\nThe operation at hand can be written as:\n\n```\ny = x @ w.T + b\n```\n\nWhere x is the input, w is the weight and b is the bias. Let's run 02_linear.py and check the profile.\n\n```\nuv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\ntrace-util is a utility that will sync your traces to a Hugging Face bucket and then provide the Preffeto URLs on your terminal.\n\n—\n\nFigure 1: Profiler trace of nn.Linear\n\nFigure 1 shows the profiler trace of a forward call of the linear layer. We trace the forward call of the linear layer with a similar schedule setup as the previous traces, with wait=1, warmup=1 and active=3. This is why we see three Profile Steps in the CPU and GPU lanes.\n\n### What is the transpose doing?\n\n—\n\nFigure 2: The transpose CPU row\n\nIf we zoom into the profiler trace, as we do in Figure 2, we notice an aten::t (transpose) op before the aten::addmm (multiplication and addition) op. We can already figure out that nn.Linear transposes the weight parameter and then multiplies it with the input. This is the reason we see an aten::t op.\n\nAn important thing to notice is that aten::t does not really copy or reorganize data: it only rewrites tensor metadata (shape and stride) on the CPU to represent the transposed matrix. It does not launch a kernel on the GPU. One can verify this two ways: by looking at the GPU lane in the trace, or by checking the aten::t row in the profiler table and the time it took on CUDA.\n\n### Why are there no separate mul and add kernels?\n\n—\n\nFigure 3: No aten::add in the profile of a linear layer\n\nThere is no aten::add (the bias addition) in the dispatch chain of the linear layer, as seen in Figure 3. This is because the bias addition has been folded into the matrix multiplication kernel, using what is called an epilogue.\n\nAn epilogue is a small computation that a GEMM (GEneral Matrix Multiply) kernel does at the very end, just before it writes its result back to HBM (High Bandwidth Memory, the GPU's main memory). Adding a bias, applying an activation, or scaling by a constant are all classic epilogues. The point of an epilogue is to avoid loading or writing to HBM a second time, since memory traffic makes an operation expensive.\n\nnn.Linear calls torch.nn.functional.linear, which, in turn, calls aten::linear. aten::linear looks at the inputs, notices that a bias was passed, and dispatches aten::addmm(bias, x, weight) instead of doing a matmul and an add separately. addmm computes:\n\n```\nout = x @ weight.T + bias\n```\n\nThe cuBLAS GEMM kernel that runs on the GPU has a bias-add variant built in, and that's the kernel aten::addmm picks. The add never appears as a separate kernel because it is part of the matmul kernel's writeback, which is exactly what an epilogue is.\n\nThis is the moment to notice something subtle. The kernel you saw in Part 1 under --compile (addmm) is the kernel that eager nn.Linear already uses. There is nothing left for torch.compile to fuse here, which is the next thing we will verify.\n\n### Can --compile help a single Linear?\n\nLet's compile the forward call and look at the profiler trace. (The profiler trace is visualized in the next section)\n\n```\nuv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64 --compile\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nIf you compare the eager and compiled traces for a single nn.Linear's forward, you will find:\n\n- The same cuBLAS GEMM kernel on the GPU.\n\n- The same aten::addmm op on the CPU.\n\n- A few extra rows on the CPU lane unique to compile.\n\nThis is worth internalizing. A common reflex is to reach for torch.compile whenever a model feels slow. For a single GEMM-with-bias, compile has very little to do. This is not a bug, this is just that compile needs more than one operation to possibly do any fusing. Let's prove that by looking at an MLP.\n\n### Where did the transpose go? Kernel layouts and pre-ops\n\nA careful reader of the two traces (eager vs compile) will notice that the eager CPU dispatch chain has more in it than the compiled one.\n\n—\n\nFigure 4: Eager dispatch chain where aten::linear walks through aten::t (transpose) and then aten::addmm\n\n—\n\nFigure 5: Compiled dispatch chain where aten::addmm is called directly, with no transpose\n\nThe eager CPU dispatch chain inside aten::linear is aten::t followed by aten::addmm (Figure 4). To understand what aten::t actually does, we need a quick detour into strides and views.\n\nA tensor stores its data as one flat, contiguous run of numbers in memory. The shape and stride are metadata that sit on top of that run and tell PyTorch how to walk it: a stride of (s0, s1) means \"step s0 elements to move one row, step s1 to move one column\". Change the metadata and you get a different view of the same raw data, with no copy:\n\n```\n>>> M = torch.tensor([[0, 1],\n...                   [2, 3],\n...                   [4, 5]])\n>>> M.shape, M.stride()\n(torch.Size([3, 2]), (2, 1))   # two steps per row, one step per column\n\n>>> T = M.t()                  # transpose\n>>> T.shape, T.stride()\n(torch.Size([2, 3]), (1, 2))   # shape and stride swapped, data untouched\n>>> T\ntensor([[0, 2, 4],\n        [1, 3, 5]])\n>>> T.flatten()                # forced to materialize, so the data is reordered\ntensor([0, 2, 4, 1, 3, 5])\n```\n\nM.t() did not move a single number. It returned a new view whose strides are swapped, so reading it row-by-row now walks the original buffer 0, 1, 2, 3, 4, 5 in transposed order. The underlying data is identical; only the metadata differs.\n\nThis is exactly what aten::t does inside the linear layer: it does not allocate a new tensor or copy any data, it produces a view of the weight with rewritten strides.\n\nAs we can see in Figure 5, compile did not remove a GPU kernel: it removed the CPU overhead of dispatching that view. Inductor traced through the view chain at compile time, computed the resulting strides once, and emitted a direct aten::addmm call with those strides hard-coded. A few microseconds of CPU work disappear while the GPU does identical math.\n\nAs one would expect, when the input data violates the strides precomputed by the compiler, it will throw an error.\n\nIf you look at the GPU lane in both traces, there is exactly one kernel per forward, and it is the same kernel both times:\n\n```\ncutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8\n```\n\nIf no transpose kernel ran, who taught the GEMM to read the weight matrix in transposed order? The answer is in the kernel's name. Look at the suffix:\n\n```\ncutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8\n                                                          ^^\n```\n\nThat tn is the layout descriptor. cuBLAS and CUTLASS precompile a separate kernel binary for each combination of input layouts.\n\nn (non-transposed) and t (transposed) describe how a kernel walks its input during the inner loop. The dispatcher's job is to look at the input strides, decide which suffix combination matches, and pick the right precompiled kernel.\n\nThe kernel name in a profiler trace is a hash dump of the kernel's identity. If two runs show the same kernel name, the GPU is doing the same work. If they differ (e.g., _tn_ vs _nn_, bf16 vs fp16, or s16816gemm vs s161616gemm) then the GPU is doing different work, and the dispatcher took a different branch. Learning to read this name is one of the most useful habits when comparing traces.\n\n## Stacking three Linears: the MLP\n\nIn this section, we will profile a Multilayer Perceptron (MLP). To make this more interesting, we will profile a feed-forward network with the GeGLU activation variant (which is quite heavily used in practice). This is also our way of paying tribute to one of the greatest lines ever written in the history of deep learning research (Figure 6).\n\n—\n\nFigure 6: The conclusion section of the GLU Variants Improve Transformer paper.\n\n```\nclass SimpleGeGLUMLP(nn.Module):\n    def __init__(self, dim, hidden):\n        super().__init__()\n        self.gate_proj = nn.Linear(dim, hidden, bias=False)\n        self.up_proj = nn.Linear(dim, hidden, bias=False)\n        self.down_proj = nn.Linear(hidden, dim, bias=False)\n\n    def forward(self, x):\n        g = self.gate_proj(x)\n        u = self.up_proj(x)\n        h = F.gelu(g, approximate=\"tanh\")\n        m = h * u\n        y = self.down_proj(m)\n        return y\n```\n\nYou will find the entire script here: 03_simple_mlp.py. Execute it like so:\n\n```\nuv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\nBefore we open the trace, let's think together about what we should expect to see. The forward function does a fair amount of computation, but most of it is already familiar to us.\n\nWe should expect three aten::linear dispatches, one for each nn.Linear layer. We should also expect two pointwise kernel launches, one for the GeLU and one for the multiplication. Forming this expectation before looking is the single most useful habit in the profiling journey: you read the trace to confirm or break a guess, not to form one from scratch.\n\n—\n\nFigure 7: The profiler trace for a GeGLU MLP\n\n—\n\nFigure 8: The occupancy queries highlighted in the linear projection CPU lane\n\nFrom Figure 7 we can pat ourselves on the back, as our intuition was correct. Per forward pass (one mlp_fwd), the GPU runs exactly 5 kernels. Figure 8 highlights the \"occupancy query\" as seen in the CPU lane for the linear projection layers.\n\nOp\n\nCPU op\n\nGPU kernel\n\nlaunches\n\ngate_proj\n\naten::linear\n\nampere_bf16_s16816gemm_bf16_128x128_...\n\noccupancy query + cudaLaunchKernel\n\nup_proj\n\naten::linear\n\nampere_bf16_s16816gemm_bf16_128x128_...\n\noccupancy query + cudaLaunchKernel\n\ngelu\n\naten::gelu\n\nvectorized_elementwise_kernel<4, GeluCUDAKernelImpl...>\n\ncudaLaunchKernel\n\nh * u\n\naten::mul\n\nvectorized_elementwise_kernel<4, ...MulFunctor...>\n\ncudaLaunchKernel\n\ndown_proj\n\naten::linear\n\nampere_bf16_s16816gemm_bf16_128x256_...\n\noccupancy query + cudaLaunchKernel\n\nThe three GEMMs each do an extra cudaOccupancyMaxActiveBlocksPerMultiprocessor call before the launch. We have a separate section on this in Part 1, you can find it here. That is cuBLAS sizing the grid. The pointwise ops (GeLU and mul) launch directly, with no occupancy query. So \"a linear\" is actually query + launch, while \"a pointwise op\" is just launch.\n\n—\n\nFigure 9: The table shows that some ops launch zero kernels\n\nThe aten::t, aten::transpose, aten::reshape, aten::view, aten::as_strided, and aten::_unsafe_view ops launch zero kernels. They show 0.000us of CUDA time in the table (Figure 9) because they only rewrite tensor metadata (shape and stride) on the CPU. A reader scanning the table sees around six op names per linear, but only one of them (mm) ever reaches the GPU.\n\n### Why are there two types of GEMM kernels?\n\nThe MLP flattens [batch, seq, dim] to [batch * seq, dim] for the matmul. In our command-line invocation we used 64 for batch and 128 for seq, so that's where the 8192 (batch * seq = 64 * 128) below comes from.\n\nFrom the trace:\n\nLinear\n\naten::mm input dims\n\nM·K·N\n\ncuBLAS kernel\n\navg CUDA\n\ngate_proj\n\n[8192,768] x [768,3072]\n\n8192·768·3072\n\n…128x128…stages_32x5_tn\n\n0.19ms\n\nup_proj\n\n[8192,768] x [768,3072]\n\n8192·768·3072\n\n…128x128…stages_32x5_tn\n\n0.19ms\n\ndown_proj\n\n[8192,3072] x [3072,768]\n\n8192·3072·768\n\n…128x256…stages_64x3_tn\n\n0.17ms\n\nAll three GEMMs have the same FLOP count, 2·8192·768·3072 ≈ 38.7 GFLOP each, yet down_proj is about 10% faster. Same work, different shape (N=768 instead of 3072), so cuBLAS picks a different tile (128×256, with a deeper stages_64x3 pipeline) that gets better reuse for that shape.\n\nIf you want to learn more about tiling in depth, here is a great resource to get started with.\n\nThis is exactly why the table had two GEMM rows (Figure 9): the 128x128 row is gate+up and the 128x256 row is down.\n\n### What does torch.compile do?\n\nBefore compiling the forward method and visualizing it, let's do the mental exercise again of asking ourselves what we expect to see in the trace. This is a fun experiment, and an important one to repeat every time you profile something yourself. Always build on your intuition, and the moment something does not match, stop and figure out why.\n\n```\nuv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072 --compile\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\n—\n\nFigure 10: The profiler trace for the compiled GeGLU MLP\n\nIn eager mode, each nn.Linear was expanded into a chain of dispatcher ops (aten::linear → aten::t → aten::transpose → aten::matmul → aten::reshape → aten::mm). Those are the high-level wrappers that ATen walks through before reaching the real GEMM. torch.compile removes that chain.\n\nBy the time the compiled graph runs, there is no linear, no matmul, no transpose or reshape and those metadata ops were folded into how mm is called. We can see three bare aten::mm external calls (Figure 10). The proof that it is the same GEMM is that the kernel names are byte-for-byte identical to eager: ...128x128...stages_32x5_tn for gate and up, and ...128x256...stages_64x3_tn for down.\n\n### The fused Triton kernel\n\n—\n\nFigure 11: The fused Triton kernel\n\nThis is the headline of the whole compile lesson. The two eager pointwise kernels (GeLU and mul) plus a reshape collapsed into one kernel, triton_poi_fused__unsafe_view_gelu_mul_0 (Figure 11). Let's decode the name:\n\n- triton: generated by Inductor's Triton backend (not cuBLAS, not ATen).\n\n- poi: pointwise (Inductor tags pointwise kernels poi, reductions red, and persistent reductions per).\n\n- fused__unsafe_view_gelu_mul: the ops it merged: the _unsafe_view (reshape), the GeLU, and the mul.\n\n- 0: the unique id within the graph.\n\nWhy is this a win? In eager mode, the intermediate h = gelu(g) is a full [8192, 3072] bf16 tensor (around 50 MB) that the GeLU kernel writes to HBM and the mul kernel immediately reads back. Fusion keeps it in registers (memory that resides inside the chip and are closer than the HBM). The Triton kernel reads g and u once, computes gelu(g) * u, and writes the result once. One whole round trip of the intermediate through global memory is gone.\n\n## Let's use hand tuned kernels\n\nSo far we have let PyTorch (eager) and the compiler (torch.compile) pick our kernels. Now we plug in a kernel that a human expert wrote and tuned by hand. We use the LigerGEGLUMLP layer, that we can easily fetch from the Hugging Face Hub with the kernels library.\n\n```\nfrom kernels import get_kernel\n\nkernels_layers = get_kernel(\"kernels-community/liger-kernels\", version=1).layers\nkernels_geglu_mlp = kernels_layers.LigerGEGLUMLP(Config()).to(device, dtype=torch.bfloat16).eval()\n```\n\nThe full script is here: 03_kernels_mlp.py.\n\n```\nuv run 03_kernels_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces\n```\n\n—\n\nFigure 12: The profiler trace for the LigerGEGLUMLP layer\n\nFigure 12 shows the profile for the LigerGEGLUMLP layer using the Liger kernels from the Hub.\n\n### Why use the kernels library\n\nWriting kernels in Triton or CUDA is one problem and shipping them is another. The kernel has to be compiled for your exact combination of GPU architecture, CUDA version, and PyTorch version. This is the step that usually breaks (\"works on my machine\", missing nvcc, wrong Triton version).\n\nThe kernels library moves that build step off your machine. get_kernel(\"kernels-community/liger-kernels\", version=1) downloads a pre-built, version-pinned kernel package from the Hugging Face Hub and caches it locally (here under ~/.cache/...kernels-community--liger-kernels). The benefits are:\n\n- The kernels are compiled once, in CI, for many architectures and version combinations. You download the right binary instead of compiling it yourself.\n\n- version=1 pins the exact build, so everyone running your script gets the same kernel. There is no \"it got slower after I updated a package\".\n\n- The package exposes a .layers attribute with drop-in nn.Modules (like LigerGEGLUMLP). You swap your module for theirs and nothing else in your model changes.\n\n### Why tuned kernels are better\n\nWhen we say \"tuned\", we mean two concrete things, and both are visible in the trace.\n\n—\n\nFigure 13: The compiled run pays for pre-ops (Dynamo, guards, prologue) before any GEMM runs\n\n—\n\nFigure 14: The Liger kernel has no pre-ops — the box where they would be is empty\n\nThe fusion is baked in. The LigerGEGLUMLP forward is down_proj(LigerGELUMulFunction.apply(gate_proj(x), up_proj(x))). The LigerGELUMulFunction runs a single Triton kernel, _geglu_tanh_forward_kernel, that computes gelu(gate) * up in one pass. This is exactly what we saw from torch.compile, where the intermediate never makes a round-trip through HBM. We get it here without the compiler, as shown in Figures 13 and 14 (no Dynamo guards, no compile latency, no recompilation risk).\n\nThe launch parameters were chosen for the hardware. The kernel does not guess its block size at random. Liger's calculate_settings picks them from the column count.\n\nIt is worth being honest about the trade-off here, because the raw numbers can be misleading. The Liger kernel runs in 92.8 µs, while Inductor's fused kernel from the compile run was 89.4 µs. At first glance the hand-written kernel looks slightly slower, but that comparison hides the cost that makes it worthwhile.\n\ntorch.compile specializes for a static shape. Inductor's 89.4 µs kernel is fast precisely because it was generated for this exact [8192, 3072] problem. Change the batch size, the sequence length, or the hidden dimension, Dynamo re-traces, and you pay the compile cost all over again to get a new specialized kernel.\n\nSo the real choice is not \"slow human kernel vs fast compiled kernel\". It is a fast generic kernel vs a kernel specialized for one particular input shape. The Liger kernel takes one set of launch parameters and runs them for any shape with no recompilation. It gives up the last few microseconds that per-shape specialization would buy, in exchange for being robust to changing shapes.\n\n## Conclusion\n\nThe table below collects what each step changed on the GPU and what it left untouched.\n\nSetup\n\nWhat changed\n\nWhat stayed the same\n\nEager nn.Linear\n\nBaseline: bias add is already folded into the GEMM epilogue (addmm), so it is one cuBLAS kernel, not a matmul plus an add\n\n—\n\nCompiled nn.Linear\n\nA few CPU dispatch ops (the aten::t view bookkeeping) disappear\n\nSame single cuBLAS GEMM kernel, byte-for-byte. Compile has nothing to fuse\n\nEager MLP\n\n5 GPU kernels: 3 GEMMs + a GeLU + a mul. The [8192, 3072] intermediate makes a full round-trip through HBM\n\nEach GEMM is still the same bias-free cuBLAS kernel as a standalone linear\n\nCompiled MLP\n\nGeLU + mul + reshape collapse into one fused Triton kernel; the intermediate stays in registers. Pays compile pre-ops (Dynamo, guards)\n\nThe 3 GEMMs are untouched with identical cuBLAS kernel names\n\nLiger MLP\n\nSame fusion, but baked into a hand-written Triton kernel with hardware-tuned launch params with no Dynamo, guards, or compile latency\n\nThe 3 GEMMs are still the same cuBLAS kernels\n\nIf there is one habit to carry forward, it is the one we practiced before every trace: guess first, then look. State what you expect the trace to contain, open it, and treat any mismatch as the most interesting thing on the screen.\n\nThis was the second stop in the Profiling in PyTorch series. In the next post we will keep climbing the ladder, moving from this MLP block towards the attention block and, eventually, a full model.\n\nThanks to Noe Flandre and Pedro Gabriel Gengo Lourenço for their reviews on the early draft of the post!\n\nThe blog post was polished using an LLM. This in no way means that we have let an agent run in the background and let it generate the blog. Some of us in the team are non-english speakers and think LLMs (which are mostly trained in the English Language) can rectify silly grammar mistakes or rephrase sentences that sound less intimidating and cleaner. Hope this helps with the idea of \"why should I read, if this was LLM generated\". 🤗",
   "summaryZh": "Hugging Face发布了PyTorch性能分析（Profiling）系列的第二篇文章，重点探讨如何从基础的nn.Linear过渡并构建一个融合的MLP（多层感知机）模块。文章结合NVIDIA A100 GPU硬件环境与代码实例，深入讲解了GPU内核调度、计算密集型与开销瓶颈的分析方法。",
   "summaryGeneratedAt": "2026-08-30T10:44:44.534608Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -76,5 +76,3275 @@
       }
     ],
     "duplicateKey": "huggingface-pytorch-profiling-fused-mlp"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/thumbnail.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/thumbnail.png",
+      "alt": "Thumbnail of the blog post",
+      "id": "image_f81ee49191958eaf"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/linear-profile-trace.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/linear-profile-trace.png",
+      "alt": "PyTorch profiler trace of an `nn.Linear` forward pass: three short Profile Steps and `linear_fwd` annotations on the CPU lane, a tiny kernel on the GPU lane, and a long `cudaDeviceSynchronize` bar at the end",
+      "id": "image_625acdc1654d57d1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/transpose-cpu-dispatch.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/transpose-cpu-dispatch.png",
+      "alt": "Zoomed in CPU dispatch chain showing the aten::t transpose op nested before aten::addmm inside aten::linear, with no matching activity on the GPU lane",
+      "id": "image_ec04291ffbd7804e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/no-aten-add.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/no-aten-add.png",
+      "alt": "Profiler trace of the linear layer with the dispatch chain highlighted, showing aten::linear, aten::t and aten::addmm but no separate aten::add op",
+      "id": "image_f938d51ffacee355"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/eager.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/eager.png",
+      "alt": "Eager CPU dispatch chain with the aten::t transpose and aten::addmm boxed separately under aten::linear",
+      "id": "image_47f797997f58ee11"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/compile.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/compile.png",
+      "alt": "Compiled CPU dispatch chain showing a Torch-Compiled Region and a single aten::addmm call, with no transpose op",
+      "id": "image_8156096024b29887"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/geglu-paper.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/geglu-paper.png",
+      "alt": "Conclusions section of the GLU Variants Improve Transformer paper, with the closing sentence attributing the architectures' success to divine benevolence highlighted",
+      "id": "image_d3335c34cab88ee1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-eager.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-eager.png",
+      "alt": "Profiler trace of the GeGLU MLP forward pass, with five boxed groups on the CPU lane labelled linear, linear, gelu, mul, linear",
+      "id": "image_2c96a58e4e20571f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/occupancy-queries.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/occupancy-queries.png",
+      "alt": "Occupancy Queries highlighted in the linear projection traces",
+      "id": "image_249db1d40225eb08"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-table.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-table.png",
+      "alt": "Profiler table for the GeGLU MLP listing op names and their CUDA times, where metadata ops like aten::transpose and aten::as_strided show 0.000us of CUDA time",
+      "id": "image_2f02ed61ab288f8e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-compile-trace.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/simple-mlp-compile-trace.png",
+      "alt": "Profiler trace of the compiled GeGLU MLP showing three aten::mm calls and one fused triton kernel on the CPU lane, labelled mm, mm, fused, mm",
+      "id": "image_1d0b7dcfc11527d3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/fused.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/fused.png",
+      "alt": "Compiled MLP trace with the triton_poi_fused__unsafe_view_gelu_mul_0 kernel boxed on the CPU lane, replacing the separate gelu and mul kernels from the eager run",
+      "id": "image_e9952e812e49ee50"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/kernels-profile.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/kernels-profile.png",
+      "alt": "Profiler trace of the LigerGEGLUMLP forward pass showing three aten::linear groups and a single LigerGELUMulFunction group on the CPU lane",
+      "id": "image_7129bb30ea145384"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/compile-preops.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/compile-preops.png",
+      "alt": "Compiled MLP trace with the TorchDynamo, prologue and guard pre-ops boxed on the CPU lane before the compiled graph runs",
+      "id": "image_5e5e0e96bb34230b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/no-preops.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/torch-mlp-fusion/no-preops.png",
+      "alt": "LigerGEGLUMLP trace with an empty box where the compile pre-ops would be, showing the hand-written kernel has no Dynamo or guard overhead",
+      "id": "image_dd61989942916d67"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "This is the second post of Profiling in PyTorch, a series where we slowly build the skill of reading profiler traces and use it to drive optimization:",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Profiling in PyTorch (Part 1): A Beginner's Guide to torch.profiler",
+      "spans": [
+        {
+          "start": 0,
+          "end": 67,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Profiling in PyTorch (Part 2): From nn.Linear to a Fused MLP (current)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-mlp-fusion"
+        },
+        {
+          "start": 61,
+          "end": 70,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Profiling in PyTorch (Part 3): Attention is all you profile",
+      "spans": [
+        {
+          "start": 0,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-attention-profile"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "In the first part of this series \"Profiling in PyTorch\", we used torch.add(torch.matmul(x, w), b) to learn how to read PyTorch profiler traces. We also discussed several other topics that came our way - the CPU dispatch chain, launch overhead, the difference between an overhead-bound and a compute-bound regime, and some internals of torch.compile.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 55,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler"
+        },
+        {
+          "start": 65,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 335,
+          "end": 348,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "In the second iteration (this blog post), we climb one rung up the ladder. We replace the hand-written matmul-add pair with an nn.Linear (with bias=True). This is the building block every deep learning model uses. We then stack three of them (specific to our example), with an activation in between, to form a Multilayer Perceptron (MLP) block.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 136,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 152,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "The scripts for this blog post live here: 02_linear.py, 03_simple_mlp.py, and 03_kernels_mlp.py. Like before, it helps to open them in a separate tab and walk through the code as you read. We use an NVIDIA A100-SXM4-80GB GPU to run the scripts. It is really easy to set up a GPU on the Hugging Face infrastructure and experiment with the scripts using Dev Mode with Spaces. One could also run the scripts with the Hugging Face Jobs pipeline.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 42,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/02_linear.py"
+        },
+        {
+          "start": 56,
+          "end": 72,
+          "kind": "code"
+        },
+        {
+          "start": 56,
+          "end": 72,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/03_simple_mlp.py"
+        },
+        {
+          "start": 78,
+          "end": 95,
+          "kind": "code"
+        },
+        {
+          "start": 78,
+          "end": 95,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/03_kernels_mlp.py"
+        },
+        {
+          "start": 199,
+          "end": 220,
+          "kind": "code"
+        },
+        {
+          "start": 352,
+          "end": 372,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/spaces-dev-mode"
+        },
+        {
+          "start": 414,
+          "end": 440,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/huggingface_hub/en/guides/jobs"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Before we begin, a quick recap of two ideas we will lean on repeatedly:",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "A GPU kernel is a program that runs in parallel on many threads of the GPU.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 12,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "The CPU schedules and launches these kernels. Most of the PyTorch overhead you see in a profiler trace is this scheduling work.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "From matmul-add to Linear",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "nn.Linear is a module wrapper around the same matrix multiplication and addition we already profiled in Part 1. The only difference is that it owns its weight and bias as parameters and exposes a forward method that PyTorch users have grown familiar with.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 104,
+          "end": 110,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler"
+        },
+        {
+          "start": 196,
+          "end": 203,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "The operation at hand can be written as:",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Where x is the input, w is the weight and b is the bias. Let's run 02_linear.py and check the profile.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 22,
+          "end": 23,
+          "kind": "code"
+        },
+        {
+          "start": 42,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 67,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 67,
+          "end": 79,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/02_linear.py"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "trace-util is a utility that will sync your traces to a Hugging Face bucket and then provide the Preffeto URLs on your terminal.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://x.com/ariG23498/status/2054811716727517374"
+        },
+        {
+          "start": 56,
+          "end": 75,
+          "kind": "a",
+          "href": "https://huggingface.co/storage"
+        },
+        {
+          "start": 97,
+          "end": 110,
+          "kind": "a",
+          "href": "https://perfetto.dev/"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0017",
+      "source": "Figure 1: Profiler trace of nn.Linear",
+      "spans": [
+        {
+          "start": 28,
+          "end": 37,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "Figure 1 shows the profiler trace of a forward call of the linear layer. We trace the forward call of the linear layer with a similar schedule setup as the previous traces, with wait=1, warmup=1 and active=3. This is why we see three Profile Steps in the CPU and GPU lanes.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 134,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 178,
+          "end": 184,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 194,
+          "kind": "code"
+        },
+        {
+          "start": 199,
+          "end": 207,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "What is the transpose doing?",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Figure 2: The transpose CPU row",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "If we zoom into the profiler trace, as we do in Figure 2, we notice an aten::t (transpose) op before the aten::addmm (multiplication and addition) op. We can already figure out that nn.Linear transposes the weight parameter and then multiplies it with the input. This is the reason we see an aten::t op.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 116,
+          "kind": "code"
+        },
+        {
+          "start": 182,
+          "end": 191,
+          "kind": "code"
+        },
+        {
+          "start": 292,
+          "end": 299,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "An important thing to notice is that aten::t does not really copy or reorganize data: it only rewrites tensor metadata (shape and stride) on the CPU to represent the transposed matrix. It does not launch a kernel on the GPU. One can verify this two ways: by looking at the GPU lane in the trace, or by checking the aten::t row in the profiler table and the time it took on CUDA.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 315,
+          "end": 322,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Why are there no separate mul and add kernels?",
+      "spans": [
+        {
+          "start": 26,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 37,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "Figure 3: No aten::add in the profile of a linear layer",
+      "spans": [
+        {
+          "start": 13,
+          "end": 22,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "There is no aten::add (the bias addition) in the dispatch chain of the linear layer, as seen in Figure 3. This is because the bias addition has been folded into the matrix multiplication kernel, using what is called an epilogue.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 155,
+          "kind": "em"
+        },
+        {
+          "start": 219,
+          "end": 227,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "An epilogue is a small computation that a GEMM (GEneral Matrix Multiply) kernel does at the very end, just before it writes its result back to HBM (High Bandwidth Memory, the GPU's main memory). Adding a bias, applying an activation, or scaling by a constant are all classic epilogues. The point of an epilogue is to avoid loading or writing to HBM a second time, since memory traffic makes an operation expensive.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "nn.Linear calls torch.nn.functional.linear, which, in turn, calls aten::linear. aten::linear looks at the inputs, notices that a bias was passed, and dispatches aten::addmm(bias, x, weight) instead of doing a matmul and an add separately. addmm computes:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 16,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 80,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 189,
+          "kind": "code"
+        },
+        {
+          "start": 239,
+          "end": 244,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "The cuBLAS GEMM kernel that runs on the GPU has a bias-add variant built in, and that's the kernel aten::addmm picks. The add never appears as a separate kernel because it is part of the matmul kernel's writeback, which is exactly what an epilogue is.",
+      "spans": [
+        {
+          "start": 99,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 175,
+          "end": 212,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "This is the moment to notice something subtle. The kernel you saw in Part 1 under --compile (addmm) is the kernel that eager nn.Linear already uses. There is nothing left for torch.compile to fuse here, which is the next thing we will verify.",
+      "spans": [
+        {
+          "start": 82,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 69,
+          "end": 91,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler#did-we-fuse-the-matmul-and-add-kernels-into-one"
+        },
+        {
+          "start": 93,
+          "end": 98,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 134,
+          "kind": "code"
+        },
+        {
+          "start": 175,
+          "end": 188,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Can --compile help a single Linear?",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Let's compile the forward call and look at the profiler trace. (The profiler trace is visualized in the next section)",
+      "spans": [
+        {
+          "start": 104,
+          "end": 116,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-mlp-fusion#where-did-the-transpose-go-kernel-layouts-and-pre-ops"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "If you compare the eager and compiled traces for a single nn.Linear's forward, you will find:",
+      "spans": [
+        {
+          "start": 58,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 77,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "The same cuBLAS GEMM kernel on the GPU.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "The same aten::addmm op on the CPU.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "A few extra rows on the CPU lane unique to compile.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "This is worth internalizing. A common reflex is to reach for torch.compile whenever a model feels slow. For a single GEMM-with-bias, compile has very little to do. This is not a bug, this is just that compile needs more than one operation to possibly do any fusing. Let's prove that by looking at an MLP.",
+      "spans": [
+        {
+          "start": 61,
+          "end": 74,
+          "kind": "code"
+        },
+        {
+          "start": 286,
+          "end": 303,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-mlp-fusion#stacking-two-linears-the-mlp"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Where did the transpose go? Kernel layouts and pre-ops",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "A careful reader of the two traces (eager vs compile) will notice that the eager CPU dispatch chain has more in it than the compiled one.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "Figure 4: Eager dispatch chain where aten::linear walks through aten::t (transpose) and then aten::addmm",
+      "spans": [
+        {
+          "start": 37,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 93,
+          "end": 104,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Figure 5: Compiled dispatch chain where aten::addmm is called directly, with no transpose",
+      "spans": [
+        {
+          "start": 40,
+          "end": 51,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "The eager CPU dispatch chain inside aten::linear is aten::t followed by aten::addmm (Figure 4). To understand what aten::t actually does, we need a quick detour into strides and views.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 72,
+          "end": 83,
+          "kind": "code"
+        },
+        {
+          "start": 115,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 166,
+          "end": 173,
+          "kind": "em"
+        },
+        {
+          "start": 178,
+          "end": 183,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "A tensor stores its data as one flat, contiguous run of numbers in memory. The shape and stride are metadata that sit on top of that run and tell PyTorch how to walk it: a stride of (s0, s1) means \"step s0 elements to move one row, step s1 to move one column\". Change the metadata and you get a different view of the same raw data, with no copy:",
+      "spans": [
+        {
+          "start": 79,
+          "end": 84,
+          "kind": "code"
+        },
+        {
+          "start": 89,
+          "end": 95,
+          "kind": "code"
+        },
+        {
+          "start": 182,
+          "end": 190,
+          "kind": "code"
+        },
+        {
+          "start": 203,
+          "end": 205,
+          "kind": "code"
+        },
+        {
+          "start": 237,
+          "end": 239,
+          "kind": "code"
+        },
+        {
+          "start": 305,
+          "end": 309,
+          "kind": "em"
+        },
+        {
+          "start": 317,
+          "end": 321,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "M.t() did not move a single number. It returned a new view whose strides are swapped, so reading it row-by-row now walks the original buffer 0, 1, 2, 3, 4, 5 in transposed order. The underlying data is identical; only the metadata differs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        },
+        {
+          "start": 141,
+          "end": 157,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "This is exactly what aten::t does inside the linear layer: it does not allocate a new tensor or copy any data, it produces a view of the weight with rewritten strides.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 129,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "As we can see in Figure 5, compile did not remove a GPU kernel: it removed the CPU overhead of dispatching that view. Inductor traced through the view chain at compile time, computed the resulting strides once, and emitted a direct aten::addmm call with those strides hard-coded. A few microseconds of CPU work disappear while the GPU does identical math.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 91,
+          "kind": "em"
+        },
+        {
+          "start": 232,
+          "end": 243,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "As one would expect, when the input data violates the strides precomputed by the compiler, it will throw an error.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "If you look at the GPU lane in both traces, there is exactly one kernel per forward, and it is the same kernel both times:",
+      "spans": [
+        {
+          "start": 99,
+          "end": 103,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "If no transpose kernel ran, who taught the GEMM to read the weight matrix in transposed order? The answer is in the kernel's name. Look at the suffix:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "That tn is the layout descriptor. cuBLAS and CUTLASS precompile a separate kernel binary for each combination of input layouts.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 88,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "n (non-transposed) and t (transposed) describe how a kernel walks its input during the inner loop. The dispatcher's job is to look at the input strides, decide which suffix combination matches, and pick the right precompiled kernel.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        },
+        {
+          "start": 23,
+          "end": 24,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "The kernel name in a profiler trace is a hash dump of the kernel's identity. If two runs show the same kernel name, the GPU is doing the same work. If they differ (e.g., _tn_ vs _nn_, bf16 vs fp16, or s16816gemm vs s161616gemm) then the GPU is doing different work, and the dispatcher took a different branch. Learning to read this name is one of the most useful habits when comparing traces.",
+      "spans": [
+        {
+          "start": 170,
+          "end": 174,
+          "kind": "code"
+        },
+        {
+          "start": 178,
+          "end": 182,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 188,
+          "kind": "code"
+        },
+        {
+          "start": 192,
+          "end": 196,
+          "kind": "code"
+        },
+        {
+          "start": 201,
+          "end": 211,
+          "kind": "code"
+        },
+        {
+          "start": 215,
+          "end": 226,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Stacking three Linears: the MLP",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "In this section, we will profile a Multilayer Perceptron (MLP). To make this more interesting, we will profile a feed-forward network with the GeGLU activation variant (which is quite heavily used in practice). This is also our way of paying tribute to one of the greatest lines ever written in the history of deep learning research (Figure 6).",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "Figure 6: The conclusion section of the GLU Variants Improve Transformer paper.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 72,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2002.05202"
+        }
+      ],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "You will find the entire script here: 03_simple_mlp.py. Execute it like so:",
+      "spans": [
+        {
+          "start": 38,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/03_simple_mlp.py"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Before we open the trace, let's think together about what we should expect to see. The forward function does a fair amount of computation, but most of it is already familiar to us.",
+      "spans": [
+        {
+          "start": 87,
+          "end": 94,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "We should expect three aten::linear dispatches, one for each nn.Linear layer. We should also expect two pointwise kernel launches, one for the GeLU and one for the multiplication. Forming this expectation before looking is the single most useful habit in the profiling journey: you read the trace to confirm or break a guess, not to form one from scratch.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 35,
+          "kind": "code"
+        },
+        {
+          "start": 61,
+          "end": 70,
+          "kind": "code"
+        },
+        {
+          "start": 300,
+          "end": 316,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "Figure 7: The profiler trace for a GeGLU MLP",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "Figure 8: The occupancy queries highlighted in the linear projection CPU lane",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "From Figure 7 we can pat ourselves on the back, as our intuition was correct. Per forward pass (one mlp_fwd), the GPU runs exactly 5 kernels. Figure 8 highlights the \"occupancy query\" as seen in the CPU lane for the linear projection layers.",
+      "spans": [
+        {
+          "start": 100,
+          "end": 107,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Op",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "CPU op",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "GPU kernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "launches",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "gate_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "aten::linear",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "ampere_bf16_s16816gemm_bf16_128x128_...",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "occupancy query + cudaLaunchKernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "up_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "aten::linear",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "ampere_bf16_s16816gemm_bf16_128x128_...",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "occupancy query + cudaLaunchKernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "gelu",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "aten::gelu",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "vectorized_elementwise_kernel<4, GeluCUDAKernelImpl...>",
+      "spans": [
+        {
+          "start": 0,
+          "end": 55,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "cudaLaunchKernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "h * u",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "aten::mul",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "vectorized_elementwise_kernel<4, ...MulFunctor...>",
+      "spans": [
+        {
+          "start": 0,
+          "end": 50,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "cudaLaunchKernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "down_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "aten::linear",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "ampere_bf16_s16816gemm_bf16_128x256_...",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "occupancy query + cudaLaunchKernel",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "The three GEMMs each do an extra cudaOccupancyMaxActiveBlocksPerMultiprocessor call before the launch. We have a separate section on this in Part 1, you can find it here. That is cuBLAS sizing the grid. The pointwise ops (GeLU and mul) launch directly, with no occupancy query. So \"a linear\" is actually query + launch, while \"a pointwise op\" is just launch.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 169,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/torch-profiler#why-does-matmul-have-an-extra-cuda-runtime-call"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "Figure 9: The table shows that some ops launch zero kernels",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "The aten::t, aten::transpose, aten::reshape, aten::view, aten::as_strided, and aten::_unsafe_view ops launch zero kernels. They show 0.000us of CUDA time in the table (Figure 9) because they only rewrite tensor metadata (shape and stride) on the CPU. A reader scanning the table sees around six op names per linear, but only one of them (mm) ever reaches the GPU.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 13,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 30,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 55,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 73,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 140,
+          "kind": "code"
+        },
+        {
+          "start": 338,
+          "end": 340,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "Why are there two types of GEMM kernels?",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "The MLP flattens [batch, seq, dim] to [batch * seq, dim] for the matmul. In our command-line invocation we used 64 for batch and 128 for seq, so that's where the 8192 (batch * seq = 64 * 128) below comes from.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 124,
+          "kind": "code"
+        },
+        {
+          "start": 137,
+          "end": 140,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 190,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "From the trace:",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "Linear",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "aten::mm input dims",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "M·K·N",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "cuBLAS kernel",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "avg CUDA",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "gate_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "[8192,768] x [768,3072]",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "8192·768·3072",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "…128x128…stages_32x5_tn",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "0.19ms",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "up_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "[8192,768] x [768,3072]",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "8192·768·3072",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "…128x128…stages_32x5_tn",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "0.19ms",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "down_proj",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "[8192,3072] x [3072,768]",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "8192·3072·768",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "…128x256…stages_64x3_tn",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "0.17ms",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "All three GEMMs have the same FLOP count, 2·8192·768·3072 ≈ 38.7 GFLOP each, yet down_proj is about 10% faster. Same work, different shape (N=768 instead of 3072), so cuBLAS picks a different tile (128×256, with a deeper stages_64x3 pipeline) that gets better reuse for that shape.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 70,
+          "kind": "code"
+        },
+        {
+          "start": 81,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 140,
+          "end": 145,
+          "kind": "code"
+        },
+        {
+          "start": 157,
+          "end": 161,
+          "kind": "code"
+        },
+        {
+          "start": 198,
+          "end": 205,
+          "kind": "code"
+        },
+        {
+          "start": 221,
+          "end": 232,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0120",
+      "source": "If you want to learn more about tiling in depth, here is a great resource to get started with.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 73,
+          "kind": "a",
+          "href": "https://alvinwan.com/how-to-tile-matrix-multiplication/"
+        }
+      ]
+    },
+    {
+      "id": "b0121",
+      "source": "This is exactly why the table had two GEMM rows (Figure 9): the 128x128 row is gate+up and the 128x256 row is down.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 102,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "What does torch.compile do?",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "Before compiling the forward method and visualizing it, let's do the mental exercise again of asking ourselves what we expect to see in the trace. This is a fun experiment, and an important one to repeat every time you profile something yourself. Always build on your intuition, and the moment something does not match, stop and figure out why.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "Figure 10: The profiler trace for the compiled GeGLU MLP",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "In eager mode, each nn.Linear was expanded into a chain of dispatcher ops (aten::linear → aten::t → aten::transpose → aten::matmul → aten::reshape → aten::mm). Those are the high-level wrappers that ATen walks through before reaching the real GEMM. torch.compile removes that chain.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 87,
+          "kind": "code"
+        },
+        {
+          "start": 90,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 115,
+          "kind": "code"
+        },
+        {
+          "start": 118,
+          "end": 130,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 146,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 157,
+          "kind": "code"
+        },
+        {
+          "start": 249,
+          "end": 262,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "By the time the compiled graph runs, there is no linear, no matmul, no transpose or reshape and those metadata ops were folded into how mm is called. We can see three bare aten::mm external calls (Figure 10). The proof that it is the same GEMM is that the kernel names are byte-for-byte identical to eager: ...128x128...stages_32x5_tn for gate and up, and ...128x256...stages_64x3_tn for down.",
+      "spans": [
+        {
+          "start": 136,
+          "end": 138,
+          "kind": "code"
+        },
+        {
+          "start": 172,
+          "end": 180,
+          "kind": "code"
+        },
+        {
+          "start": 307,
+          "end": 334,
+          "kind": "code"
+        },
+        {
+          "start": 356,
+          "end": 383,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0128",
+      "source": "The fused Triton kernel",
+      "spans": []
+    },
+    {
+      "id": "b0129",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t13",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "Figure 11: The fused Triton kernel",
+      "spans": [],
+      "table": {
+        "id": "t13",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "This is the headline of the whole compile lesson. The two eager pointwise kernels (GeLU and mul) plus a reshape collapsed into one kernel, triton_poi_fused__unsafe_view_gelu_mul_0 (Figure 11). Let's decode the name:",
+      "spans": [
+        {
+          "start": 139,
+          "end": 179,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0132",
+      "source": "triton: generated by Inductor's Triton backend (not cuBLAS, not ATen).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0133",
+      "source": "poi: pointwise (Inductor tags pointwise kernels poi, reductions red, and persistent reductions per).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "code"
+        },
+        {
+          "start": 48,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 98,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0134",
+      "source": "fused__unsafe_view_gelu_mul: the ops it merged: the _unsafe_view (reshape), the GeLU, and the mul.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0135",
+      "source": "0: the unique id within the graph.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0136",
+      "source": "Why is this a win? In eager mode, the intermediate h = gelu(g) is a full [8192, 3072] bf16 tensor (around 50 MB) that the GeLU kernel writes to HBM and the mul kernel immediately reads back. Fusion keeps it in registers (memory that resides inside the chip and are closer than the HBM). The Triton kernel reads g and u once, computes gelu(g) * u, and writes the result once. One whole round trip of the intermediate through global memory is gone.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 85,
+          "kind": "code"
+        },
+        {
+          "start": 311,
+          "end": 312,
+          "kind": "code"
+        },
+        {
+          "start": 317,
+          "end": 318,
+          "kind": "code"
+        },
+        {
+          "start": 334,
+          "end": 345,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0137",
+      "source": "Let's use hand tuned kernels",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "So far we have let PyTorch (eager) and the compiler (torch.compile) pick our kernels. Now we plug in a kernel that a human expert wrote and tuned by hand. We use the LigerGEGLUMLP layer, that we can easily fetch from the Hugging Face Hub with the kernels library.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 166,
+          "end": 179,
+          "kind": "code"
+        },
+        {
+          "start": 221,
+          "end": 237,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/kernels-community/liger-kernels"
+        },
+        {
+          "start": 247,
+          "end": 254,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0139",
+      "source": "The full script is here: 03_kernels_mlp.py.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 25,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/profiling-pytorch/blob/main/03_kernels_mlp.py"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t14",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "Figure 12: The profiler trace for the LigerGEGLUMLP layer",
+      "spans": [
+        {
+          "start": 38,
+          "end": 51,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t14",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "Figure 12 shows the profile for the LigerGEGLUMLP layer using the Liger kernels from the Hub.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 49,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0143",
+      "source": "Why use the kernels library",
+      "spans": []
+    },
+    {
+      "id": "b0144",
+      "source": "Writing kernels in Triton or CUDA is one problem and shipping them is another. The kernel has to be compiled for your exact combination of GPU architecture, CUDA version, and PyTorch version. This is the step that usually breaks (\"works on my machine\", missing nvcc, wrong Triton version).",
+      "spans": [
+        {
+          "start": 53,
+          "end": 61,
+          "kind": "em"
+        },
+        {
+          "start": 261,
+          "end": 265,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0145",
+      "source": "The kernels library moves that build step off your machine. get_kernel(\"kernels-community/liger-kernels\", version=1) downloads a pre-built, version-pinned kernel package from the Hugging Face Hub and caches it locally (here under ~/.cache/...kernels-community--liger-kernels). The benefits are:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "a",
+          "href": "https://github.com/huggingface/kernels"
+        },
+        {
+          "start": 60,
+          "end": 116,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 154,
+          "kind": "strong"
+        },
+        {
+          "start": 230,
+          "end": 274,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0146",
+      "source": "The kernels are compiled once, in CI, for many architectures and version combinations. You download the right binary instead of compiling it yourself.",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "version=1 pins the exact build, so everyone running your script gets the same kernel. There is no \"it got slower after I updated a package\".",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0148",
+      "source": "The package exposes a .layers attribute with drop-in nn.Modules (like LigerGEGLUMLP). You swap your module for theirs and nothing else in your model changes.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 53,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 83,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0149",
+      "source": "Why tuned kernels are better",
+      "spans": []
+    },
+    {
+      "id": "b0150",
+      "source": "When we say \"tuned\", we mean two concrete things, and both are visible in the trace.",
+      "spans": []
+    },
+    {
+      "id": "b0151",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t15",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "Figure 13: The compiled run pays for pre-ops (Dynamo, guards, prologue) before any GEMM runs",
+      "spans": [],
+      "table": {
+        "id": "t15",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "Figure 14: The Liger kernel has no pre-ops — the box where they would be is empty",
+      "spans": [],
+      "table": {
+        "id": "t16",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "The fusion is baked in. The LigerGEGLUMLP forward is down_proj(LigerGELUMulFunction.apply(gate_proj(x), up_proj(x))). The LigerGELUMulFunction runs a single Triton kernel, _geglu_tanh_forward_kernel, that computes gelu(gate) * up in one pass. This is exactly what we saw from torch.compile, where the intermediate never makes a round-trip through HBM. We get it here without the compiler, as shown in Figures 13 and 14 (no Dynamo guards, no compile latency, no recompilation risk).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        },
+        {
+          "start": 28,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 28,
+          "end": 41,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/kernels-community/liger-kernels/blob/v1/build/torch-cuda/layers.py#L307"
+        },
+        {
+          "start": 53,
+          "end": 116,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 142,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/kernels-community/liger-kernels/blob/v1/build/torch-cuda/geglu.py#L130"
+        },
+        {
+          "start": 172,
+          "end": 198,
+          "kind": "code"
+        },
+        {
+          "start": 172,
+          "end": 198,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/kernels-community/liger-kernels/blob/v1/build/torch-cuda/geglu.py#L97"
+        },
+        {
+          "start": 214,
+          "end": 229,
+          "kind": "code"
+        },
+        {
+          "start": 276,
+          "end": 289,
+          "kind": "code"
+        },
+        {
+          "start": 367,
+          "end": 387,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0156",
+      "source": "The launch parameters were chosen for the hardware. The kernel does not guess its block size at random. Liger's calculate_settings picks them from the column count.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 51,
+          "kind": "strong"
+        },
+        {
+          "start": 112,
+          "end": 130,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 130,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/kernels-community/liger-kernels/blob/v1/build/torch-cuda/geglu.py#L95"
+        }
+      ]
+    },
+    {
+      "id": "b0157",
+      "source": "It is worth being honest about the trade-off here, because the raw numbers can be misleading. The Liger kernel runs in 92.8 µs, while Inductor's fused kernel from the compile run was 89.4 µs. At first glance the hand-written kernel looks slightly slower, but that comparison hides the cost that makes it worthwhile.",
+      "spans": [
+        {
+          "start": 119,
+          "end": 126,
+          "kind": "strong"
+        },
+        {
+          "start": 183,
+          "end": 190,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0158",
+      "source": "torch.compile specializes for a static shape. Inductor's 89.4 µs kernel is fast precisely because it was generated for this exact [8192, 3072] problem. Change the batch size, the sequence length, or the hidden dimension, Dynamo re-traces, and you pay the compile cost all over again to get a new specialized kernel.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 32,
+          "end": 44,
+          "kind": "strong"
+        },
+        {
+          "start": 57,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 129,
+          "kind": "em"
+        },
+        {
+          "start": 130,
+          "end": 142,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0159",
+      "source": "So the real choice is not \"slow human kernel vs fast compiled kernel\". It is a fast generic kernel vs a kernel specialized for one particular input shape. The Liger kernel takes one set of launch parameters and runs them for any shape with no recompilation. It gives up the last few microseconds that per-shape specialization would buy, in exchange for being robust to changing shapes.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 153,
+          "kind": "strong"
+        },
+        {
+          "start": 225,
+          "end": 228,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0160",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "The table below collects what each step changed on the GPU and what it left untouched.",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "Setup",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "What changed",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "What stayed the same",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "Eager nn.Linear",
+      "spans": [
+        {
+          "start": 6,
+          "end": 15,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "Baseline: bias add is already folded into the GEMM epilogue (addmm), so it is one cuBLAS kernel, not a matmul plus an add",
+      "spans": [
+        {
+          "start": 61,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 78,
+          "end": 81,
+          "kind": "em"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "Compiled nn.Linear",
+      "spans": [
+        {
+          "start": 9,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "A few CPU dispatch ops (the aten::t view bookkeeping) disappear",
+      "spans": [
+        {
+          "start": 28,
+          "end": 35,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "Same single cuBLAS GEMM kernel, byte-for-byte. Compile has nothing to fuse",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "Eager MLP",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "5 GPU kernels: 3 GEMMs + a GeLU + a mul. The [8192, 3072] intermediate makes a full round-trip through HBM",
+      "spans": [
+        {
+          "start": 45,
+          "end": 57,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "Each GEMM is still the same bias-free cuBLAS kernel as a standalone linear",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "Compiled MLP",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "GeLU + mul + reshape collapse into one fused Triton kernel; the intermediate stays in registers. Pays compile pre-ops (Dynamo, guards)",
+      "spans": [
+        {
+          "start": 35,
+          "end": 38,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "The 3 GEMMs are untouched with identical cuBLAS kernel names",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "Liger MLP",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "Same fusion, but baked into a hand-written Triton kernel with hardware-tuned launch params with no Dynamo, guards, or compile latency",
+      "spans": [
+        {
+          "start": 96,
+          "end": 98,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t17",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "The 3 GEMMs are still the same cuBLAS kernels",
+      "spans": [],
+      "table": {
+        "id": "t17",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "If there is one habit to carry forward, it is the one we practiced before every trace: guess first, then look. State what you expect the trace to contain, open it, and treat any mismatch as the most interesting thing on the screen.",
+      "spans": [
+        {
+          "start": 87,
+          "end": 110,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0181",
+      "source": "This was the second stop in the Profiling in PyTorch series. In the next post we will keep climbing the ladder, moving from this MLP block towards the attention block and, eventually, a full model.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 52,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0182",
+      "source": "Thanks to Noe Flandre and Pedro Gabriel Gengo Lourenço for their reviews on the early draft of the post!",
+      "spans": [
+        {
+          "start": 10,
+          "end": 21,
+          "kind": "a",
+          "href": "https://huggingface.co/NoeFlandre"
+        },
+        {
+          "start": 26,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/pedrogengo"
+        }
+      ]
+    },
+    {
+      "id": "b0183",
+      "source": "The blog post was polished using an LLM. This in no way means that we have let an agent run in the background and let it generate the blog. Some of us in the team are non-english speakers and think LLMs (which are mostly trained in the English Language) can rectify silly grammar mistakes or rephrase sentences that sound less intimidating and cleaner. Hope this helps with the idea of \"why should I read, if this was LLM generated\". 🤗",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "0878b507a42b3f92c87587e8443dabb35a763448f55d079c9aa862963ca6f3ba",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "# bias=True would truly emulate the multiplication and addition\n# operations we have seen in part 1 of the series\nlinear_layer = nn.Linear(in_dim, out_dim, bias=True)\ny = linear_layer(x)"
+    },
+    {
+      "id": "c0002",
+      "source": "y = x @ w.T + b"
+    },
+    {
+      "id": "c0003",
+      "source": "uv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64\nuvx trace-util -f traces -b <hf_uname>/traces"
+    },
+    {
+      "id": "c0004",
+      "source": "out = x @ weight.T + bias"
+    },
+    {
+      "id": "c0005",
+      "source": "uv run 02_linear.py --batch 1024 --in_dim 32 --out_dim 64 --compile\nuvx trace-util -f traces -b <hf_uname>/traces"
+    },
+    {
+      "id": "c0006",
+      "source": ">>> M = torch.tensor([[0, 1],\n...                   [2, 3],\n...                   [4, 5]])\n>>> M.shape, M.stride()\n(torch.Size([3, 2]), (2, 1))   # two steps per row, one step per column\n\n>>> T = M.t()                  # transpose\n>>> T.shape, T.stride()\n(torch.Size([2, 3]), (1, 2))   # shape and stride swapped, data untouched\n>>> T\ntensor([[0, 2, 4],\n        [1, 3, 5]])\n>>> T.flatten()                # forced to materialize, so the data is reordered\ntensor([0, 2, 4, 1, 3, 5])"
+    },
+    {
+      "id": "c0007",
+      "source": "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8"
+    },
+    {
+      "id": "c0008",
+      "source": "cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_32x1_tn_align8\n                                                          ^^"
+    },
+    {
+      "id": "c0009",
+      "source": "class SimpleGeGLUMLP(nn.Module):\n    def __init__(self, dim, hidden):\n        super().__init__()\n        self.gate_proj = nn.Linear(dim, hidden, bias=False)\n        self.up_proj = nn.Linear(dim, hidden, bias=False)\n        self.down_proj = nn.Linear(hidden, dim, bias=False)\n\n    def forward(self, x):\n        g = self.gate_proj(x)\n        u = self.up_proj(x)\n        h = F.gelu(g, approximate=\"tanh\")\n        m = h * u\n        y = self.down_proj(m)\n        return y"
+    },
+    {
+      "id": "c0010",
+      "source": "uv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces"
+    },
+    {
+      "id": "c0011",
+      "source": "uv run 03_simple_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072 --compile\nuvx trace-util -f traces -b <hf_uname>/traces"
+    },
+    {
+      "id": "c0012",
+      "source": "from kernels import get_kernel\n\nkernels_layers = get_kernel(\"kernels-community/liger-kernels\", version=1).layers\nkernels_geglu_mlp = kernels_layers.LigerGEGLUMLP(Config()).to(device, dtype=torch.bfloat16).eval()"
+    },
+    {
+      "id": "c0013",
+      "source": "uv run 03_kernels_mlp.py --batch 64 --seq 128 --dim 768 --hidden 3072\nuvx trace-util -f traces -b <hf_uname>/traces"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "0878b507a42b3f92c87587e8443dabb35a763448f55d079c9aa862963ca6f3ba",
+  "mediaLayout": [
+    {
+      "mediaId": "image_f81ee49191958eaf",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_625acdc1654d57d1",
+      "type": "image",
+      "afterBlockId": "b0016",
+      "order": 1
+    },
+    {
+      "mediaId": "image_ec04291ffbd7804e",
+      "type": "image",
+      "afterBlockId": "b0020",
+      "order": 2
+    },
+    {
+      "mediaId": "image_f938d51ffacee355",
+      "type": "image",
+      "afterBlockId": "b0025",
+      "order": 3
+    },
+    {
+      "mediaId": "image_47f797997f58ee11",
+      "type": "image",
+      "afterBlockId": "b0041",
+      "order": 4
+    },
+    {
+      "mediaId": "image_8156096024b29887",
+      "type": "image",
+      "afterBlockId": "b0043",
+      "order": 5
+    },
+    {
+      "mediaId": "image_d3335c34cab88ee1",
+      "type": "image",
+      "afterBlockId": "b0058",
+      "order": 6
+    },
+    {
+      "mediaId": "image_2c96a58e4e20571f",
+      "type": "image",
+      "afterBlockId": "b0063",
+      "order": 7
+    },
+    {
+      "mediaId": "image_249db1d40225eb08",
+      "type": "image",
+      "afterBlockId": "b0065",
+      "order": 8
+    },
+    {
+      "mediaId": "image_2f02ed61ab288f8e",
+      "type": "image",
+      "afterBlockId": "b0093",
+      "order": 9
+    },
+    {
+      "mediaId": "image_1d0b7dcfc11527d3",
+      "type": "image",
+      "afterBlockId": "b0124",
+      "order": 10
+    },
+    {
+      "mediaId": "image_e9952e812e49ee50",
+      "type": "image",
+      "afterBlockId": "b0129",
+      "order": 11
+    },
+    {
+      "mediaId": "image_7129bb30ea145384",
+      "type": "image",
+      "afterBlockId": "b0140",
+      "order": 12
+    },
+    {
+      "mediaId": "image_5e5e0e96bb34230b",
+      "type": "image",
+      "afterBlockId": "b0151",
+      "order": 13
+    },
+    {
+      "mediaId": "image_dd61989942916d67",
+      "type": "image",
+      "afterBlockId": "b0153",
+      "order": 14
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 15,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 15,
+    "savedImages": 15,
+    "sourceImageOccurrences": 15,
+    "placedImageOccurrences": 15,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:11.268676Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:11.268695Z"
 }

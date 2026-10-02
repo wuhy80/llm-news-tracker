@@ -19,82 +19,28 @@
   "contentKind": "page",
   "archiveVersion": 2,
   "bodyFormatVersion": 3,
-  "body": "# Record, train, and deploy from one place with Strands Agents, LeRobot, and Hugging Face Storage Buckets\n\nPublished August 13, 2026\n\nA walkthrough of the streaming data loop in Strands Robots, one agent loop that records robot demonstrations, trains on them by reading straight from the Hub, and deploys the policy back to hardware, with the dataset in the same on-disk LeRobot format the whole way through.\n\nYou have an agent that can already record a demonstration and push it to the Hugging Face Hub . Now you want to run that loop continuously: collect episodes through the day, train a policy on the growing dataset, deploy it, and pull the next batch back to improve it. Run that loop once and every piece works. Run it every day and you start paying for the same byte transfers over and over. The recordings you upload keep growing, each training run copies the whole dataset to the GPUs before it starts, and every new checkpoint ships out while the next batch of recordings comes back.\n\nThe first post in this series introduced Strands Robots , an open source SDK from AWS ( Apache 2.0 ) that exposes robot abstractions, simulation, and the LeRobot stack as AgentTools you compose into a single Strands agent. It covered the Robot() factory, recording a demonstration in simulation, running a policy, and deploying the same agent code to a physical SO-101. That factory resolves a name against a registry of arms, humanoids, mobile bases, and hands, so the SO-100 used throughout this post is one of many supported embodiments. The robot catalog lists every robot the factory knows about. LeRobot's dataset format is already used by over 90,000 datasets and models on the Hub from more than 8,000 publishers ( LeRobot Project Pulse ). A Strands Robots recording is one more of them, so anything built to read LeRobot data can read it without conversion. If you are new to Strands Robots, start there; this post assumes that setup.\n\nThat post followed the agent loop in one direction, from a Hub dataset to a physical robot. This one follows the data the other way, from the first recorded frame back to the deployed policy, over Hugging Face Storage Buckets - a mutable, non-versioned, Xet -backed object-storage repository type announced in March 2026 . A bucket sits beside your dataset repositories in the same hf:// namespace and uses the hf CLI you already have, so it becomes the working layer that holds your data between the day you record it and the day you train on it.\n\nSomeone has to decide which episodes to keep, when the scene has drifted far enough to re-record, whether today's batch is enough to train on, and which checkpoint replaces the one on the arm. Each of those decisions comes up dozens of times over a collection campaign, and each one needs a look at what came back before the next command goes out. That is the work an agent is for. This post walks you through the data loop inside a single agent: record a demonstration into a Storage Bucket, store it so that each sync uploads only the bytes that changed, train by streaming the dataset straight from the Hub instead of downloading it, and deploy the checkpoint back to hardware with one keyword argument change. The runnable companion to this post lives at examples/notebooks/05_streaming_data_loop.ipynb .\n\nWhere the first post recorded a dataset and pushed it to the Hub, the agent you build here records a LeRobotDataset from a natural-language prompt, syncs it into a Storage Bucket, and streams that same dataset back frame by frame, decoding camera video on the fly, with no local copy. You read it back in the same process that wrote it: the same Strands Robots Robot() that recorded the dataset streams it. Your trained checkpoint then deploys to that same Robot() with one keyword argument change, and the demonstrations it records on hardware return to the same bucket.\n\nFigure 1. The four stages share one backend. Robot(\"so100\") records a LeRobotDataset through the shared DatasetRecorder ; sync_dataset_to_bucket(...) syncs it into a Storage Bucket; stream_dataset(...) reads it back over the Hub with no full download; and the trained checkpoint deploys to the same Robot with mode=\"real\" . The on-disk format stays exactly as LeRobot wrote it.\n\nBecause one Robot() both records a dataset and reads it back, collecting data and training on it are two methods on one object over one backend. The agent decides to run an episode and invokes one tool; the rollout then proceeds at the robot's control frequency until the episode ends, with the trained policy producing every action. The whole loop, in a handful of lines:\n\n```\nfrom strands import Agent\nfrom strands_robots import Robot\n\nsim = Robot(\"so100\")                 # mode=\"sim\" (default - safe, no hardware)\nagent = Agent(tools=[sim])\n\n# Record a demonstration and sync it to a bucket.\nagent(\"Record a pick-the-cube demo and sync it to my-org/robot-fave.\")\n\n# Stream it back from the bucket to train, without downloading it first.\nfor batch in sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\").dataloader(batch_size=64):\n    ...\n```\n\nWhat follows is what's actually happening inside that loop, step by step.\n\n#### Minimal (default simulation path)\n\n- Python 3.12+, on Linux or macOS (Apple Silicon supported for the MuJoCo backend).\n\n- A Strands-compatible model provider for the agent's reasoning. Amazon Bedrock with AWS credentials, the Anthropic API , OpenAI, or Ollama running locally.\n\n- Strands Robots with the dataset extras: uv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\" . The lerobot extra pulls in LeRobot (>=0.6.1), datasets , av , and torchcodec , so recording and video decode both work without further setup. Refer to installation guide .\n\nThat's it. Every stage in this post runs on a laptop with these three. What runs is the loop, not a working policy: the default path uses a mock policy, which records a valid dataset but not a useful one.\n\n#### Advanced (buckets, hardware, real policies)\n\n- A Hugging Face account and a token with write permission, plus the hf CLI for creating buckets and syncing datasets: pip install -U \"huggingface-hub>=1.6.0,<2.0.0\" , then hf auth login .\n\n- For the hardware path: an SO-101 follower and leader pair, or any other LeRobot-supported robot, with calibration files under ~/.cache/huggingface/lerobot/calibration/ .\n\n- For local vision-language-action (VLA) inference: an NVIDIA GPU. For training at scale, a GPU cluster reading from the Hub.\n\n- To run the training step: uv pip install \"lerobot[training]\" . Recording and streaming do not need it. If you skip it, trainer.train() returns an error result rather than a checkpoint. The troubleshooting guide names that error and the install that fixes it.\n\n## Step 1 - Record a demonstration into a bucket\n\nYou record new episodes through the day, each a continuous run of camera frames and joint state-action telemetry. LeRobot writes that as a small set of large files that grow as you record. Push them into a versioned dataset repository and every append becomes a commit, and every revision is retained. Collection wants the reverse: somewhere to write bytes and overwrite them in place. That is a Storage Bucket , which lives inside your Hugging Face workspace and uses the permissions you already have. There are no identity and access management (IAM) roles to configure, no cross-origin resource sharing (CORS) rules, and no upload service to maintain.\n\nYour agent records a LeRobotDataset in the same format LeRobot writes on hardware. Record the episode, then sync the finished dataset into a bucket. The prompt asks for the mock policy, a stand-in that produces joint actions without a trained model, so you can run the whole loop before you have a checkpoint to run:\n\n```\nfrom strands import Agent\nfrom strands_robots import Robot, sync_dataset_to_bucket\n\nsim = Robot(\"so100\")                 # mode=\"sim\" by default\nagent = Agent(tools=[sim])\n# One prompt drives scene setup, cameras, policy, and recording.\nagent(\n    \"Create a world with the so100 robot, add a red cube and a front camera, \"\n    \"start recording (repo_id='local/cube_pick', root='/tmp/cube_pick', fps=30, \"\n    \"overwrite=True, task='pick up the red cube'), run the mock policy for \"\n    \"60 steps, then stop recording.\"\n)\n# Sync the finished on-disk dataset into the bucket (no live recording session needed).\nsync_dataset_to_bucket(\"/tmp/cube_pick\", \"my-org/robot-fave\")\n# -> {\"status\": \"success\", \"bucket_uri\": \"hf://buckets/my-org/robot-fave/cube_pick\"}\n```\n\nThe sync writes to hf://buckets/bucket/run_id , where run_id defaults to the dataset directory name. The streaming read in Step 3 names the run too: the first two segments of the id are the bucket, and everything after them is the path inside it.\n\nsync_dataset_to_bucket(root, bucket, run_id=...) validates the dataset and syncs it through the hf CLI, decoupled from the recording lifecycle. The same capability is on DatasetRecorder.sync_to_bucket(bucket, run_id=...) if you drive an open recorder directly, and stop_recording(bucket=...) syncs at the moment you stop an active recording. The bucket is the working layer you write to through the day; for the versioned, published artifact you still call push_to_hub() . Both hold the same format.\n\nThe episode is structurally complete, but the actions are placeholders, so it is not training data you would want. Swap in a real policy with create_policy(\"<hf_repo>\") for actual grasping; the prompt, the format, and the bucket sync stay identical.\n\n#### Recording on hardware\n\nTo record on a physical SO-101, LeRobot's record CLI handles the leader-follower bring-up:\n\n```\nlerobot-record \\\n  --robot.type=so101_follower --robot.id=my_follower \\\n  --teleop.type=so101_leader  --teleop.id=my_leader \\\n  --dataset.repo_id=my_user/cube_picking \\\n  --dataset.single_task='Pick up the red cube'\n```\n\nThe dataset lands on disk in the same format as the simulation recording, so the same sync call takes it to a bucket: sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\") (or the hf sync ./recordings hf://buckets/my-org/robot-fave/run-021 CLI it wraps). Collection runs append into one place, and your published repositories only get the versions you choose to publish.\n\n## Step 2 - Store with byte-level deduplication\n\nNow that a dataset is in the bucket, the question is what the next sync costs you. Point two fixed cameras at an arm clearing the same table for eight hours and most of what you record is pixels you already have: the same lighting, the same chassis, the same background, across thousands of episodes. On a versioned repository it gets worse, because changing one frame in a multi-gigabyte video shard re-uploads the whole file.\n\nBuckets are backed by Xet , which deduplicates your uploads at the byte level using content-defined chunking. Chunk boundaries follow the content, so inserting a few bytes changes only the chunk it lands in instead of shifting every boundary after it. In Hugging Face's own measurements ( HF Storage ), content-defined chunking reduces data transferred per upload by about four times across the Hub, and on Enterprise plans billing is on the deduplicated footprint. Their bucket benchmarks show what that looks like on a single file. Starting from a 500 MB upload, changing 1% of the bytes and re-uploading moved 5.5 MB, changing 5% moved 27.5 MB, and changing 10% moved 55 MB. Without chunk-level deduplication, overwriting an object means sending all of its bytes again, whether or not they changed.\n\nHow much that saves you depends on the file layout, and the Strands Robots recorder uses LeRobot's. Episodes go into Parquet shards ( data/chunk-000/file-000.parquet ) and per-camera MP4 shards ( videos/observation.images.front/chunk-000/file-000.mp4 ), rolling to a new file only when the current one fills, at LeRobot's defaults of 100 MB for data Parquet and 200 MB for video MP4. So a sync after a day of recording uploads the new trailing shards plus the one partially-filled shard that grew, rather than the whole dataset. Sync the same bucket again tomorrow and Xet handles the deduplication.\n\nFigure 2. A sync uploads only what changed. The first sync of a fresh dataset uploads every chunk; after recording more episodes, Xet's content-defined chunking means the next sync uploads only the new chunks and skips the ones already stored.\n\n## Step 3 - Train by streaming from the Hub\n\nTo train, you point GPUs at your dataset. Download it first and those GPUs sit idle until hundreds of gigabytes finish copying. Streaming straight from the Hub works here because of the shard layout from Step 2: a batch becomes a few byte-range reads over large shards rather than thousands of small fetches. LeRobot's StreamingLeRobotDataset turns that into a drop-in torch iterable, and Strands Robots exposes it through stream_dataset() :\n\nFigure 3. Stream, don't download. The download path copies the whole dataset to local disk first, so the GPU waits; stream_dataset() reads batches straight from the bucket with nothing on local disk, so the GPU trains from the first batch.\n\n```\nreader = sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\",\n    shuffle=False, max_num_shards=1, buffer_size=1,  # one episode, in capture order\n)\n\nprint(reader.num_episodes, reader.num_frames, reader.fps)\nfor frame in reader:\n    frame[\"observation.images.front\"]   # (3, H, W) tensor, decoded on the fly from the MP4 shard\n    frame[\"observation.state\"]           # joint vector, from the Parquet shard\n    frame[\"action\"]\n    break\n```\n\nNothing lands on local disk except the small meta/ folder of schema, statistics, and episode index. Camera frames are decoded from the remote MP4 shards as you iterate; state and action come from the Parquet shards. That loop reads one frame at a time, which suits inspecting an episode. To train, pass the reader to a DataLoader and iterate batches instead. The streaming dataset shuffles internally through a bounded reservoir buffer, so video decoding parallelizes across worker processes, and the training step itself is the ordinary PyTorch one:\n\n```\n# policy here is a LeRobot policy you constructed, such as ACTPolicy.\nfor batch in reader.dataloader(batch_size=64, num_workers=4):\n    loss, _ = policy(batch)   # lerobot ACTPolicy.forward returns (loss, loss_dict)\n    loss.backward()\n```\n\nIf you would rather not write the loop at all, LeRobot's own trainer reads through the same engine, so the dataset your agent collected trains without a line of new code. It takes a bucket through the same keyword argument the in-process reader uses:\n\n```\nlerobot-train --policy.type=act \\\n  --dataset.repo_id=my-org/robot-fave/cube_pick \\\n  --dataset.repo_type=bucket \\\n  --dataset.streaming=true \\\n  --num_workers=4\n```\n\nBuckets are streaming-only, so --dataset.repo_type=bucket requires --dataset.streaming=true and the config rejects the combination otherwise. Reach for stream_dataset() when you want the loop in your own process: validating an episode, replaying it in simulation, or feeding a custom evaluation loop. For proprioceptive-only streaming, drop_videos=True skips video decode entirely, which is what makes this work on an edge device with no torchcodec wheel. The recording and datasets guide documents that argument along with the delta_timestamps map it requires.\n\nProvider names are shared between running a policy and training one. create_trainer(\"lerobot_local\") returns a Trainer that works like create_policy() , and a TrainSpec describes the run; the record-train-deploy loop then closes in a few lines:\n\n```\nimport os\nos.environ[\"STRANDS_TRUST_REMOTE_CODE\"] = \"1\"   # create_policy loads with trust_remote_code=True\n\nfrom strands_robots import create_policy\nfrom strands_robots.training import TrainSpec, create_trainer\n\ntrainer = create_trainer(\"lerobot_local\", device=\"cuda\")\nspec = TrainSpec(dataset_root=\"/tmp/cube_pick\", output_dir=\"/tmp/cube_pick_ft\",\n                 base_model=\"\", steps=500, extra={\"policy_type\": \"act\"})\nresult = trainer.train(spec)                    # train ACT on the streamed dataset\npolicy = create_policy(result.checkpoint_dir)   # load the checkpoint straight back\n```\n\nOn a single NVIDIA L4 ( g6.4xlarge ), 500 optimizer steps of ACT (51.6M parameters, effective batch size 8) over a 120-frame episode completed in 133 seconds and wrote a checkpoint that create_policy() loads back through the same entry point used to run any other policy. Training time scales with dataset size, batch size, and step count, so treat this as one measured configuration rather than a benchmark. The \"groot\" and \"cosmos3\" providers target the same TrainSpec and Trainer lifecycle, so the surrounding loop is unchanged; each one validates its own required fields first, so a GR00T run needs a base_model and an embodiment tag, and a Cosmos 3 run needs a base_model and an SFT recipe. Call trainer.validate(spec) before train() and it returns the exact list of what a given backend is missing.\n\nHugging Face's pre-warming caches bucket data at edge locations near the cloud and region where your jobs run, so your cluster reads locally and the dataloader stays ahead of the GPU. In Hugging Face's own bucket benchmarks , a warm content delivery network (CDN) read hit about 1,086 MB/s on a 10 GB payload against 780 MB/s cold, and roughly 1,124 MB/s warm at 100 GB, measured on an m5dn.24xlarge in us-east-1 . The full comparison against plain object storage, upload as well as download, is on that dashboard. Choosing where that data lives is a Storage Regions setting on Team and Enterprise plans, as of this writing US and EU, with Asia-Pacific and Gulf Cooperation Council (GCC) regions announced as coming; outside those plans repositories are stored in the US.\n\nOn macOS, import strands_robots puts Homebrew's ffmpeg on the loader path for you, so torchcodec decodes streamed video without extra setup.\n\n## Step 4 - Deploy the policy and return data to the loop\n\nIn this step you take the checkpoint you just trained, run it on a physical robot, and record the next round of demonstrations with it. This is the same agent code from the first post , with one keyword argument changed to mode=\"real\" :\n\n```\nrobot = Robot(\"so100\", mode=\"real\", port=\"/dev/ttyACM0\",\n              cameras={\"front\": {\"type\": \"opencv\", \"index_or_path\": \"/dev/video0\", \"fps\": 30}})\nagent = Agent(tools=[robot])\nagent(\"Pick up the red cube.\")\n```\n\nThe checkpoint runs against the physical arm, and the demonstrations that arm records are saved to disk in the same LeRobot format you started with, ready to sync back to the bucket for the next training run.\n\nIf your data already lives on Amazon Simple Storage Service (Amazon S3) , none of the format work in this post changes. A LeRobotDataset is a directory of Parquet and MP4 shards, so it stores on Amazon S3 the same as anywhere else, and the recording, training, and deploy steps read that format wherever it sits. What a bucket adds is the Hub-native route: sync_dataset_to_bucket and stream_dataset(repo_type=\"bucket\") target hf:// directly, so you get the sync and the streaming read with no separate storage path to wire up. Both paths run the same loop: Amazon S3 if that is where your data already sits, a bucket if you want the sync and the streaming read without provisioning storage first.\n\nRun the loop again tomorrow and you are recording into that bucket, syncing only the bytes that changed, and streaming those bytes to the GPUs without waiting for a download. The data never leaves the LeRobot format, and it never leaves the Hub.\n\n## Try it using the sample application\n\nThe full Strands Robots sample is on GitHub at strands-labs/robots in examples/notebooks/05_streaming_data_loop.ipynb . It walks you through the full loop cell by cell: record, render, sync to a bucket, stream back, train, and load the checkpoint. Every cell runs in simulation on the mock policy, so no GPU, no Docker, and no Hugging Face credentials are needed.\n\n```\ngit clone https://github.com/strands-labs/robots.git\ncd robots\nuv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\"\njupyter notebook examples/notebooks/05_streaming_data_loop.ipynb\n```\n\nRun the cells top to bottom. The recorded dataset lands under /tmp/nb5_dataset . To sync it to a bucket, set BUCKET = \"my-org/robot-fave\" in the first cell (after hf auth login ); the neighboring RUN_ID names the folder inside the bucket, and the notebook streams back from f\"BUCKET/RUN_ID\" . To train on a GPU, raise steps to 500 and set device=\"cuda\" . The agent-driven version of the same loop lives at examples/06_agent_collect_and_stream.py .\n\n## Security Considerations\n\nThe snippets here are a \"hello world\" of the Strands Robots data loop. Five things change once you run it against real data.\n\nPrompt injection. Supplying untrusted data to an agent can lead to prompt injection, where untrustworthy context is treated as LLM instructions. These agents actuate robots and now also write to and read from shared storage, so this is an important risk to track. Feed the agent only data from trusted sources. If not all input can be trusted, restrict the tools available to the agent so it cannot take safety-critical actions or overwrite bucket contents.\n\nTraining data is a trust boundary. An agent that can write into the collection bucket can also write episodes that a policy later trains on, and that policy drives a physical arm. Keep the credential that writes collection data separate from the one a training job reads with, sync each run under its own run_id so an episode can be traced to the run that produced it and removed on its own, and treat the versioned dataset repository as the reviewed artifact, because the bucket keeps no revisions to audit against.\n\nBucket credentials and scope. sync_dataset_to_bucket(...) , stop_recording(bucket=...) , and sync_to_bucket upload through the hf CLI using the token from hf auth login . Use a token scoped to the specific namespace you are writing to, prefer --private buckets for collection data, and keep the bucket distinct from the versioned dataset repository you push_to_hub and share.\n\nOverwrite in place keeps no revisions. A bucket overwrites in place and retains no revisions, which is what makes it a working layer and also means a repeated run_id replaces the run already stored there. Pass an explicit run_id per collection run, as in sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\") . For anything you need to be able to return to, push_to_hub() to a versioned dataset repository, where every revision is retained.\n\nOnly use trusted Hugging Face orgs. The local inference path loads Hugging Face models with trust_remote_code=True . Set STRANDS_TRUST_REMOTE_CODE=1 to opt in, and only load checkpoints from organizations you trust. When loading pre-trained weights from the Hub (e.g., via pretrained_name_or_path ), verify the organization is trusted before loading. Model weights can contain arbitrary code (pickle-based checkpoints). Prefer safetensors-format checkpoints where available.\n\nThe loop leaves a bucket, datasets under /tmp , and a checkpoint on disk. Bucket contents count toward your stored volume, so remove what you no longer need:\n\n```\nhf buckets rm my-org/robot-fave/cube_pick/ --recursive --dry-run  # lists, removes nothing\nhf buckets rm my-org/robot-fave/cube_pick/ --recursive            # --yes skips the prompt\nhf buckets delete my-org/robot-fave                               # takes everything in it\nrm -rf /tmp/cube_pick /tmp/cube_pick_ft /tmp/nb5_dataset /tmp/nb5_ft\n```\n\nStop any training process still on a GPU instance, and stop the instance. If you ran the notebook, substitute its RUN_ID ( nb5_demo by default) for cube_pick . Anything you published with push_to_hub() is in a versioned repository and is untouched.\n\n## Where to go from here\n\nThe Strands Robots documentation covers the robot catalog, simulation, policy providers, recording, and the mesh in depth. The recording and datasets guide documents the DatasetRecorder API, sync_dataset_to_bucket / sync_to_bucket , and stream_dataset in full.\n\nIf you collect from more than one robot, give each one its own run_id and they write into the same bucket in parallel. The multi-robot mesh fans one agent out across those robots, so the same loop becomes a fleet collecting through the day into shared storage. A streaming reader reads one run at a time. The recording and datasets guide describes how to train across several of them.\n\nIf you want a larger policy than ACT, the TrainSpec and Trainer lifecycle from Step 3 covers GR00T and Cosmos 3 behind their own provider names, so fine-tuning a VLA on the dataset you just streamed is the same calls with a different provider string and a base model. Running the result is where the paths diverge, because a VLA checkpoint deploys to hardware rather than to the simulator you trained from. For heavier simulation to generate that data, the Newton ( sim-newton ) and Isaac Sim ( isaac ) backends sit behind the same Robot() factory, so the agent code does not change as you scale up.\n\nBucket streaming reached LeRobot through contributions from both the Strands Robots and LeRobot teams, upstream in LeRobot itself, so the datasets your agent collects are readable by every tool in that ecosystem. That runs both ways: the reader in Step 3 opens any of the LeRobot datasets already published on the Hub, so an agent can replay and evaluate against existing demonstrations before it records one of its own.\n\nContributions are welcome under Apache 2.0. If you build something with this loop, open an issue with what worked and what didn't.\n\n- SDK, AgentTools, and the Robot() factory : github.com/strands-labs/robots , Apache 2.0\n\n- Documentation : strands-labs.github.io/robots\n\n- Recording and datasets guide : strands-labs.github.io/robots/recording\n\n- The notebook for this post : examples/notebooks/05_streaming_data_loop.ipynb - run the full loop cell by cell\n\n- Strands Agents SDK : github.com/strands-agents/harness-sdk\n\n- LeRobot : github.com/huggingface/lerobot - datasets, policies, hardware drivers\n\n- Hugging Face Storage Buckets : Storage Buckets documentation\n\n- Xet deduplication : From Files to Chunks\n\n- A pick-and-place dataset in the format this post records: lerobot/svla_so101_pickplace\n\n- SmolVLA : lerobot/smolvla_base\n\n- Pi0 : lerobot/pi0_base\n\n- NVIDIA Isaac-GR00T N1.7 : nvidia/GR00T-N1.7-3B\n\n- NVIDIA Cosmos 3 Nano : nvidia/Cosmos3-Nano\n\n- MolmoAct2 , trained for the SO-100/101: allenai/MolmoAct2-SO100_101 - loads through lerobot_local , needs the molmoact2 extra\n\n- First post in this series : From the Hugging Face Hub to robot hardware with Strands Agents and LeRobot\n\n- The physical-AI data loop that this workflow follows: The Physical AI Data Loop , Steven Palma, Hugging Face, 2026\n\n- Bucket throughput and dedup measurements : hf-buckets-benchmark\n\n## Models mentioned in this article 5\n\n## Datasets mentioned in this article 1\n\n## Spaces mentioned in this article 3\n\n## From Hugging Face to Amazon SageMaker Studio in one click\n\n## From the Hugging Face Hub to robot hardware with Strands Agents and LeRobot\n\nWhat makes this architecture particularly compelling is that the agent isn’t just executing a task—it’s sitting inside a continuous data, learning, and deployment loop. Connecting data collection, streaming, training, evaluation, and deployment through one agent workflow opens up some fascinating possibilities for adaptive systems. At the same time, the trust boundaries around data, credentials, and agent actions become critical. This is where custom AI agent development and enterprise AI agent solutions need to be designed as complete systems rather than isolated agent features. I came across Mobisoft Infotech while exploring this space: https://mobisoftinfotech.com/services/ai-agent-development-company\n\n¡Qué buena onda! Esta integración de Strands Robots con los Storage Buckets de Hugging Face está perrísima para automatizar todo el flujo de trabajo en robótica sin perder tiempo ni dinero. La verdad, la deduplicación de datos a nivel de bytes con Xet y el poder entrenar modelos mediante streaming directo desde la nube nos aligera un buen el trabajo con las GPU. ¡Es una chulada total para acelerar la recolección de demostraciones y el despliegue en hardware real sin complicarse la vida! https://starzbet.mx/\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "body": "A walkthrough of the streaming data loop in Strands Robots, one agent loop that records robot demonstrations, trains on them by reading straight from the Hub, and deploys the policy back to hardware, with the dataset in the same on-disk LeRobot format the whole way through.\n\nYou have an agent that can already record a demonstration and push it to the Hugging Face Hub. Now you want to run that loop continuously: collect episodes through the day, train a policy on the growing dataset, deploy it, and pull the next batch back to improve it. Run that loop once and every piece works. Run it every day and you start paying for the same byte transfers over and over. The recordings you upload keep growing, each training run copies the whole dataset to the GPUs before it starts, and every new checkpoint ships out while the next batch of recordings comes back.\n\nThe first post in this series introduced Strands Robots, an open source SDK from AWS (Apache 2.0) that exposes robot abstractions, simulation, and the LeRobot stack as AgentTools you compose into a single Strands agent. It covered the Robot() factory, recording a demonstration in simulation, running a policy, and deploying the same agent code to a physical SO-101. That factory resolves a name against a registry of arms, humanoids, mobile bases, and hands, so the SO-100 used throughout this post is one of many supported embodiments. The robot catalog lists every robot the factory knows about. LeRobot's dataset format is already used by over 90,000 datasets and models on the Hub from more than 8,000 publishers (LeRobot Project Pulse). A Strands Robots recording is one more of them, so anything built to read LeRobot data can read it without conversion. If you are new to Strands Robots, start there; this post assumes that setup.\n\nThat post followed the agent loop in one direction, from a Hub dataset to a physical robot. This one follows the data the other way, from the first recorded frame back to the deployed policy, over Hugging Face Storage Buckets - a mutable, non-versioned, Xet-backed object-storage repository type announced in March 2026. A bucket sits beside your dataset repositories in the same hf:// namespace and uses the hf CLI you already have, so it becomes the working layer that holds your data between the day you record it and the day you train on it.\n\nSomeone has to decide which episodes to keep, when the scene has drifted far enough to re-record, whether today's batch is enough to train on, and which checkpoint replaces the one on the arm. Each of those decisions comes up dozens of times over a collection campaign, and each one needs a look at what came back before the next command goes out. That is the work an agent is for. This post walks you through the data loop inside a single agent: record a demonstration into a Storage Bucket, store it so that each sync uploads only the bytes that changed, train by streaming the dataset straight from the Hub instead of downloading it, and deploy the checkpoint back to hardware with one keyword argument change. The runnable companion to this post lives at examples/notebooks/05_streaming_data_loop.ipynb.\n\n## What you'll build\n\nWhere the first post recorded a dataset and pushed it to the Hub, the agent you build here records a LeRobotDataset from a natural-language prompt, syncs it into a Storage Bucket, and streams that same dataset back frame by frame, decoding camera video on the fly, with no local copy. You read it back in the same process that wrote it: the same Strands Robots Robot() that recorded the dataset streams it. Your trained checkpoint then deploys to that same Robot() with one keyword argument change, and the demonstrations it records on hardware return to the same bucket.\n\nFigure 1. The four stages share one backend. Robot(\"so100\") records a LeRobotDataset through the shared DatasetRecorder; sync_dataset_to_bucket(...) syncs it into a Storage Bucket; stream_dataset(...) reads it back over the Hub with no full download; and the trained checkpoint deploys to the same Robot with mode=\"real\". The on-disk format stays exactly as LeRobot wrote it.\n\nBecause one Robot() both records a dataset and reads it back, collecting data and training on it are two methods on one object over one backend. The agent decides to run an episode and invokes one tool; the rollout then proceeds at the robot's control frequency until the episode ends, with the trained policy producing every action. The whole loop, in a handful of lines:\n\n```\nfrom strands import Agent\nfrom strands_robots import Robot\n\nsim = Robot(\"so100\")                 # mode=\"sim\" (default - safe, no hardware)\nagent = Agent(tools=[sim])\n\n# Record a demonstration and sync it to a bucket.\nagent(\"Record a pick-the-cube demo and sync it to my-org/robot-fave.\")\n\n# Stream it back from the bucket to train, without downloading it first.\nfor batch in sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\").dataloader(batch_size=64):\n    ...\n```\n\nWhat follows is what's actually happening inside that loop, step by step.\n\n## Prerequisites\n\n#### Minimal (default simulation path)\n\n- Python 3.12+, on Linux or macOS (Apple Silicon supported for the MuJoCo backend).\n\n- A Strands-compatible model provider for the agent's reasoning. Amazon Bedrock with AWS credentials, the Anthropic API, OpenAI, or Ollama running locally.\n\n- Strands Robots with the dataset extras: uv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\". The lerobot extra pulls in LeRobot (>=0.6.1), datasets, av, and torchcodec, so recording and video decode both work without further setup. Refer to installation guide.\n\nThat's it. Every stage in this post runs on a laptop with these three. What runs is the loop, not a working policy: the default path uses a mock policy, which records a valid dataset but not a useful one.\n\n#### Advanced (buckets, hardware, real policies)\n\n- A Hugging Face account and a token with write permission, plus the hf CLI for creating buckets and syncing datasets: pip install -U \"huggingface-hub>=1.6.0,<2.0.0\", then hf auth login.\n\n- For the hardware path: an SO-101 follower and leader pair, or any other LeRobot-supported robot, with calibration files under ~/.cache/huggingface/lerobot/calibration/.\n\n- For local vision-language-action (VLA) inference: an NVIDIA GPU. For training at scale, a GPU cluster reading from the Hub.\n\n- To run the training step: uv pip install \"lerobot[training]\". Recording and streaming do not need it. If you skip it, trainer.train() returns an error result rather than a checkpoint. The troubleshooting guide names that error and the install that fixes it.\n\n## Step 1 - Record a demonstration into a bucket\n\nYou record new episodes through the day, each a continuous run of camera frames and joint state-action telemetry. LeRobot writes that as a small set of large files that grow as you record. Push them into a versioned dataset repository and every append becomes a commit, and every revision is retained. Collection wants the reverse: somewhere to write bytes and overwrite them in place. That is a Storage Bucket, which lives inside your Hugging Face workspace and uses the permissions you already have. There are no identity and access management (IAM) roles to configure, no cross-origin resource sharing (CORS) rules, and no upload service to maintain.\n\nYour agent records a LeRobotDataset in the same format LeRobot writes on hardware. Record the episode, then sync the finished dataset into a bucket. The prompt asks for the mock policy, a stand-in that produces joint actions without a trained model, so you can run the whole loop before you have a checkpoint to run:\n\n```\nfrom strands import Agent\nfrom strands_robots import Robot, sync_dataset_to_bucket\n\nsim = Robot(\"so100\")                 # mode=\"sim\" by default\nagent = Agent(tools=[sim])\n# One prompt drives scene setup, cameras, policy, and recording.\nagent(\n    \"Create a world with the so100 robot, add a red cube and a front camera, \"\n    \"start recording (repo_id='local/cube_pick', root='/tmp/cube_pick', fps=30, \"\n    \"overwrite=True, task='pick up the red cube'), run the mock policy for \"\n    \"60 steps, then stop recording.\"\n)\n# Sync the finished on-disk dataset into the bucket (no live recording session needed).\nsync_dataset_to_bucket(\"/tmp/cube_pick\", \"my-org/robot-fave\")\n# -> {\"status\": \"success\", \"bucket_uri\": \"hf://buckets/my-org/robot-fave/cube_pick\"}\n```\n\nThe sync writes to hf://buckets/{bucket}/{run_id}, where run_id defaults to the dataset directory name. The streaming read in Step 3 names the run too: the first two segments of the id are the bucket, and everything after them is the path inside it.\n\nsync_dataset_to_bucket(root, bucket, run_id=...) validates the dataset and syncs it through the hf CLI, decoupled from the recording lifecycle. The same capability is on DatasetRecorder.sync_to_bucket(bucket, run_id=...) if you drive an open recorder directly, and stop_recording(bucket=...) syncs at the moment you stop an active recording. The bucket is the working layer you write to through the day; for the versioned, published artifact you still call push_to_hub(). Both hold the same format.\n\nThe episode is structurally complete, but the actions are placeholders, so it is not training data you would want. Swap in a real policy with create_policy(\"<hf_repo>\") for actual grasping; the prompt, the format, and the bucket sync stay identical.\n\n#### Recording on hardware\n\nTo record on a physical SO-101, LeRobot's record CLI handles the leader-follower bring-up:\n\n```\nlerobot-record \\\n  --robot.type=so101_follower --robot.id=my_follower \\\n  --teleop.type=so101_leader  --teleop.id=my_leader \\\n  --dataset.repo_id=my_user/cube_picking \\\n  --dataset.single_task='Pick up the red cube'\n```\n\nThe dataset lands on disk in the same format as the simulation recording, so the same sync call takes it to a bucket: sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\") (or the hf sync ./recordings hf://buckets/my-org/robot-fave/run-021 CLI it wraps). Collection runs append into one place, and your published repositories only get the versions you choose to publish.\n\n## Step 2 - Store with byte-level deduplication\n\nNow that a dataset is in the bucket, the question is what the next sync costs you. Point two fixed cameras at an arm clearing the same table for eight hours and most of what you record is pixels you already have: the same lighting, the same chassis, the same background, across thousands of episodes. On a versioned repository it gets worse, because changing one frame in a multi-gigabyte video shard re-uploads the whole file.\n\nBuckets are backed by Xet, which deduplicates your uploads at the byte level using content-defined chunking. Chunk boundaries follow the content, so inserting a few bytes changes only the chunk it lands in instead of shifting every boundary after it. In Hugging Face's own measurements (HF Storage), content-defined chunking reduces data transferred per upload by about four times across the Hub, and on Enterprise plans billing is on the deduplicated footprint. Their bucket benchmarks show what that looks like on a single file. Starting from a 500 MB upload, changing 1% of the bytes and re-uploading moved 5.5 MB, changing 5% moved 27.5 MB, and changing 10% moved 55 MB. Without chunk-level deduplication, overwriting an object means sending all of its bytes again, whether or not they changed.\n\nHow much that saves you depends on the file layout, and the Strands Robots recorder uses LeRobot's. Episodes go into Parquet shards (data/chunk-000/file-000.parquet) and per-camera MP4 shards (videos/observation.images.front/chunk-000/file-000.mp4), rolling to a new file only when the current one fills, at LeRobot's defaults of 100 MB for data Parquet and 200 MB for video MP4. So a sync after a day of recording uploads the new trailing shards plus the one partially-filled shard that grew, rather than the whole dataset. Sync the same bucket again tomorrow and Xet handles the deduplication.\n\nFigure 2. A sync uploads only what changed. The first sync of a fresh dataset uploads every chunk; after recording more episodes, Xet's content-defined chunking means the next sync uploads only the new chunks and skips the ones already stored.\n\n## Step 3 - Train by streaming from the Hub\n\nTo train, you point GPUs at your dataset. Download it first and those GPUs sit idle until hundreds of gigabytes finish copying. Streaming straight from the Hub works here because of the shard layout from Step 2: a batch becomes a few byte-range reads over large shards rather than thousands of small fetches. LeRobot's StreamingLeRobotDataset turns that into a drop-in torch iterable, and Strands Robots exposes it through stream_dataset():\n\nFigure 3. Stream, don't download. The download path copies the whole dataset to local disk first, so the GPU waits; stream_dataset() reads batches straight from the bucket with nothing on local disk, so the GPU trains from the first batch.\n\n```\nreader = sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\",\n    shuffle=False, max_num_shards=1, buffer_size=1,  # one episode, in capture order\n)\n\nprint(reader.num_episodes, reader.num_frames, reader.fps)\nfor frame in reader:\n    frame[\"observation.images.front\"]   # (3, H, W) tensor, decoded on the fly from the MP4 shard\n    frame[\"observation.state\"]           # joint vector, from the Parquet shard\n    frame[\"action\"]\n    break\n```\n\nNothing lands on local disk except the small meta/ folder of schema, statistics, and episode index. Camera frames are decoded from the remote MP4 shards as you iterate; state and action come from the Parquet shards. That loop reads one frame at a time, which suits inspecting an episode. To train, pass the reader to a DataLoader and iterate batches instead. The streaming dataset shuffles internally through a bounded reservoir buffer, so video decoding parallelizes across worker processes, and the training step itself is the ordinary PyTorch one:\n\n```\n# policy here is a LeRobot policy you constructed, such as ACTPolicy.\nfor batch in reader.dataloader(batch_size=64, num_workers=4):\n    loss, _ = policy(batch)   # lerobot ACTPolicy.forward returns (loss, loss_dict)\n    loss.backward()\n```\n\nIf you would rather not write the loop at all, LeRobot's own trainer reads through the same engine, so the dataset your agent collected trains without a line of new code. It takes a bucket through the same keyword argument the in-process reader uses:\n\n```\nlerobot-train --policy.type=act \\\n  --dataset.repo_id=my-org/robot-fave/cube_pick \\\n  --dataset.repo_type=bucket \\\n  --dataset.streaming=true \\\n  --num_workers=4\n```\n\nBuckets are streaming-only, so --dataset.repo_type=bucket requires --dataset.streaming=true and the config rejects the combination otherwise. Reach for stream_dataset() when you want the loop in your own process: validating an episode, replaying it in simulation, or feeding a custom evaluation loop. For proprioceptive-only streaming, drop_videos=True skips video decode entirely, which is what makes this work on an edge device with no torchcodec wheel. The recording and datasets guide documents that argument along with the delta_timestamps map it requires.\n\nProvider names are shared between running a policy and training one. create_trainer(\"lerobot_local\") returns a Trainer that works like create_policy(), and a TrainSpec describes the run; the record-train-deploy loop then closes in a few lines:\n\n```\nimport os\nos.environ[\"STRANDS_TRUST_REMOTE_CODE\"] = \"1\"   # create_policy loads with trust_remote_code=True\n\nfrom strands_robots import create_policy\nfrom strands_robots.training import TrainSpec, create_trainer\n\ntrainer = create_trainer(\"lerobot_local\", device=\"cuda\")\nspec = TrainSpec(dataset_root=\"/tmp/cube_pick\", output_dir=\"/tmp/cube_pick_ft\",\n                 base_model=\"\", steps=500, extra={\"policy_type\": \"act\"})\nresult = trainer.train(spec)                    # train ACT on the streamed dataset\npolicy = create_policy(result.checkpoint_dir)   # load the checkpoint straight back\n```\n\nOn a single NVIDIA L4 (g6.4xlarge), 500 optimizer steps of ACT (51.6M parameters, effective batch size 8) over a 120-frame episode completed in 133 seconds and wrote a checkpoint that create_policy() loads back through the same entry point used to run any other policy. Training time scales with dataset size, batch size, and step count, so treat this as one measured configuration rather than a benchmark. The \"groot\" and \"cosmos3\" providers target the same TrainSpec and Trainer lifecycle, so the surrounding loop is unchanged; each one validates its own required fields first, so a GR00T run needs a base_model and an embodiment tag, and a Cosmos 3 run needs a base_model and an SFT recipe. Call trainer.validate(spec) before train() and it returns the exact list of what a given backend is missing.\n\nHugging Face's pre-warming caches bucket data at edge locations near the cloud and region where your jobs run, so your cluster reads locally and the dataloader stays ahead of the GPU. In Hugging Face's own bucket benchmarks, a warm content delivery network (CDN) read hit about 1,086 MB/s on a 10 GB payload against 780 MB/s cold, and roughly 1,124 MB/s warm at 100 GB, measured on an m5dn.24xlarge in us-east-1. The full comparison against plain object storage, upload as well as download, is on that dashboard. Choosing where that data lives is a Storage Regions setting on Team and Enterprise plans, as of this writing US and EU, with Asia-Pacific and Gulf Cooperation Council (GCC) regions announced as coming; outside those plans repositories are stored in the US.\n\nOn macOS, import strands_robots puts Homebrew's ffmpeg on the loader path for you, so torchcodec decodes streamed video without extra setup.\n\n## Step 4 - Deploy the policy and return data to the loop\n\nIn this step you take the checkpoint you just trained, run it on a physical robot, and record the next round of demonstrations with it. This is the same agent code from the first post, with one keyword argument changed to mode=\"real\":\n\n```\nrobot = Robot(\"so100\", mode=\"real\", port=\"/dev/ttyACM0\",\n              cameras={\"front\": {\"type\": \"opencv\", \"index_or_path\": \"/dev/video0\", \"fps\": 30}})\nagent = Agent(tools=[robot])\nagent(\"Pick up the red cube.\")\n```\n\nThe checkpoint runs against the physical arm, and the demonstrations that arm records are saved to disk in the same LeRobot format you started with, ready to sync back to the bucket for the next training run.\n\nIf your data already lives on Amazon Simple Storage Service (Amazon S3), none of the format work in this post changes. A LeRobotDataset is a directory of Parquet and MP4 shards, so it stores on Amazon S3 the same as anywhere else, and the recording, training, and deploy steps read that format wherever it sits. What a bucket adds is the Hub-native route: sync_dataset_to_bucket and stream_dataset(repo_type=\"bucket\") target hf:// directly, so you get the sync and the streaming read with no separate storage path to wire up. Both paths run the same loop: Amazon S3 if that is where your data already sits, a bucket if you want the sync and the streaming read without provisioning storage first.\n\nRun the loop again tomorrow and you are recording into that bucket, syncing only the bytes that changed, and streaming those bytes to the GPUs without waiting for a download. The data never leaves the LeRobot format, and it never leaves the Hub.\n\n## Try it using the sample application\n\nThe full Strands Robots sample is on GitHub at strands-labs/robots in examples/notebooks/05_streaming_data_loop.ipynb. It walks you through the full loop cell by cell: record, render, sync to a bucket, stream back, train, and load the checkpoint. Every cell runs in simulation on the mock policy, so no GPU, no Docker, and no Hugging Face credentials are needed.\n\n```\ngit clone https://github.com/strands-labs/robots.git\ncd robots\nuv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\"\njupyter notebook examples/notebooks/05_streaming_data_loop.ipynb\n```\n\nRun the cells top to bottom. The recorded dataset lands under /tmp/nb5_dataset. To sync it to a bucket, set BUCKET = \"my-org/robot-fave\" in the first cell (after hf auth login); the neighboring RUN_ID names the folder inside the bucket, and the notebook streams back from f\"{BUCKET}/{RUN_ID}\". To train on a GPU, raise steps to 500 and set device=\"cuda\". The agent-driven version of the same loop lives at examples/06_agent_collect_and_stream.py.\n\n## Security Considerations\n\nThe snippets here are a \"hello world\" of the Strands Robots data loop. Five things change once you run it against real data.\n\nPrompt injection. Supplying untrusted data to an agent can lead to prompt injection, where untrustworthy context is treated as LLM instructions. These agents actuate robots and now also write to and read from shared storage, so this is an important risk to track. Feed the agent only data from trusted sources. If not all input can be trusted, restrict the tools available to the agent so it cannot take safety-critical actions or overwrite bucket contents.\n\nTraining data is a trust boundary. An agent that can write into the collection bucket can also write episodes that a policy later trains on, and that policy drives a physical arm. Keep the credential that writes collection data separate from the one a training job reads with, sync each run under its own run_id so an episode can be traced to the run that produced it and removed on its own, and treat the versioned dataset repository as the reviewed artifact, because the bucket keeps no revisions to audit against.\n\nBucket credentials and scope. sync_dataset_to_bucket(...), stop_recording(bucket=...), and sync_to_bucket upload through the hf CLI using the token from hf auth login. Use a token scoped to the specific namespace you are writing to, prefer --private buckets for collection data, and keep the bucket distinct from the versioned dataset repository you push_to_hub and share.\n\nOverwrite in place keeps no revisions. A bucket overwrites in place and retains no revisions, which is what makes it a working layer and also means a repeated run_id replaces the run already stored there. Pass an explicit run_id per collection run, as in sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\"). For anything you need to be able to return to, push_to_hub() to a versioned dataset repository, where every revision is retained.\n\nOnly use trusted Hugging Face orgs. The local inference path loads Hugging Face models with trust_remote_code=True. Set STRANDS_TRUST_REMOTE_CODE=1 to opt in, and only load checkpoints from organizations you trust. When loading pre-trained weights from the Hub (e.g., via pretrained_name_or_path), verify the organization is trusted before loading. Model weights can contain arbitrary code (pickle-based checkpoints). Prefer safetensors-format checkpoints where available.\n\n## Clean up\n\nThe loop leaves a bucket, datasets under /tmp, and a checkpoint on disk. Bucket contents count toward your stored volume, so remove what you no longer need:\n\n```\nhf buckets rm my-org/robot-fave/cube_pick/ --recursive --dry-run  # lists, removes nothing\nhf buckets rm my-org/robot-fave/cube_pick/ --recursive            # --yes skips the prompt\nhf buckets delete my-org/robot-fave                               # takes everything in it\nrm -rf /tmp/cube_pick /tmp/cube_pick_ft /tmp/nb5_dataset /tmp/nb5_ft\n```\n\nStop any training process still on a GPU instance, and stop the instance. If you ran the notebook, substitute its RUN_ID (nb5_demo by default) for cube_pick. Anything you published with push_to_hub() is in a versioned repository and is untouched.\n\n## Where to go from here\n\nThe Strands Robots documentation covers the robot catalog, simulation, policy providers, recording, and the mesh in depth. The recording and datasets guide documents the DatasetRecorder API, sync_dataset_to_bucket / sync_to_bucket, and stream_dataset in full.\n\nIf you collect from more than one robot, give each one its own run_id and they write into the same bucket in parallel. The multi-robot mesh fans one agent out across those robots, so the same loop becomes a fleet collecting through the day into shared storage. A streaming reader reads one run at a time. The recording and datasets guide describes how to train across several of them.\n\nIf you want a larger policy than ACT, the TrainSpec and Trainer lifecycle from Step 3 covers GR00T and Cosmos 3 behind their own provider names, so fine-tuning a VLA on the dataset you just streamed is the same calls with a different provider string and a base model. Running the result is where the paths diverge, because a VLA checkpoint deploys to hardware rather than to the simulator you trained from. For heavier simulation to generate that data, the Newton (sim-newton) and Isaac Sim (isaac) backends sit behind the same Robot() factory, so the agent code does not change as you scale up.\n\nBucket streaming reached LeRobot through contributions from both the Strands Robots and LeRobot teams, upstream in LeRobot itself, so the datasets your agent collects are readable by every tool in that ecosystem. That runs both ways: the reader in Step 3 opens any of the LeRobot datasets already published on the Hub, so an agent can replay and evaluate against existing demonstrations before it records one of its own.\n\nContributions are welcome under Apache 2.0. If you build something with this loop, open an issue with what worked and what didn't.\n\n## Resources\n\nStrands Robots\n\n- SDK, AgentTools, and the Robot() factory: github.com/strands-labs/robots, Apache 2.0\n\n- Documentation: strands-labs.github.io/robots\n\n- Recording and datasets guide: strands-labs.github.io/robots/recording\n\n- The notebook for this post: examples/notebooks/05_streaming_data_loop.ipynb - run the full loop cell by cell\n\n- Strands Agents SDK: github.com/strands-agents/harness-sdk\n\nLeRobot and the Hub\n\n- LeRobot: github.com/huggingface/lerobot - datasets, policies, hardware drivers\n\n- Hugging Face Storage Buckets: Storage Buckets documentation\n\n- Xet deduplication: From Files to Chunks\n\n- A pick-and-place dataset in the format this post records: lerobot/svla_so101_pickplace\n\nPolicies\n\n- SmolVLA: lerobot/smolvla_base\n\n- Pi0: lerobot/pi0_base\n\n- NVIDIA Isaac-GR00T N1.7: nvidia/GR00T-N1.7-3B\n\n- NVIDIA Cosmos 3 Nano: nvidia/Cosmos3-Nano\n\n- MolmoAct2, trained for the SO-100/101: allenai/MolmoAct2-SO100_101 - loads through lerobot_local, needs the molmoact2 extra\n\nBackground\n\n- First post in this series: From the Hugging Face Hub to robot hardware with Strands Agents and LeRobot\n\n- The physical-AI data loop that this workflow follows: The Physical AI Data Loop, Steven Palma, Hugging Face, 2026\n\n- Bucket throughput and dedup measurements: hf-buckets-benchmark",
   "summaryZh": "本文详细介绍了在机器人AI开发中，如何通过Strands Agents、LeRobot开源生态与Hugging Face Hub无缝集成，构建从示范录制、端到端训练到硬件部署的持续数据循环流。该方案打通了数据收集、云端训练和策略下发的完整链路，显著降低了多阶段机器人学习的工程复杂度与存储传输开销。",
   "summaryGeneratedAt": "2026-08-30T09:50:47.438365Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6498ef778fadf0ae7639b982/N9zJ6s7luJFTPM26kxWfe.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6498ef778fadf0ae7639b982/N9zJ6s7luJFTPM26kxWfe.jpeg",
-      "id": "image_808937b83e6e3734"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1627505688463-60107b385ac3e86b3ea4fc34.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1627505688463-60107b385ac3e86b3ea4fc34.jpeg",
-      "id": "image_7486bee7ddfbf6cb"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6a1dc0f2b4238bb17ff94794/GBPtGiJKZpCakTXYM_SJO.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6a1dc0f2b4238bb17ff94794/GBPtGiJKZpCakTXYM_SJO.jpeg",
-      "id": "image_502a6c51ff9d7885"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/67b124b081d4eae18b957606/QdQMOTzsHBkJIuXjk8O_h.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/67b124b081d4eae18b957606/QdQMOTzsHBkJIuXjk8O_h.png",
-      "id": "image_6aeb6e8db2c293c9"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6898e8353fd2a08d1b1caa65/9FMLVcH9uuLzaAV8tu2Jb.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6898e8353fd2a08d1b1caa65/9FMLVcH9uuLzaAV8tu2Jb.jpeg",
-      "id": "image_7acc1874c5bce727"
-    },
-    {
-      "src": "https://huggingface.co/avatars/77a5b375010867f48e99b6c78561f76f.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/77a5b375010867f48e99b6c78561f76f.svg",
-      "id": "image_e8eaf3379d857826"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/66f19ed428ae41c20c470792/8y7msN6A6W82LdQhQd85a.png",
-      "alt": "Amazon's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/66f19ed428ae41c20c470792/8y7msN6A6W82LdQhQd85a.png",
-      "id": "image_7672461de7ad0009"
-    },
-    {
-      "src": "https://huggingface.co/avatars/c5af9961560bf7b4108640e1c205234a.svg",
-      "alt": "Yin Song's avatar",
-      "originalUrl": "https://huggingface.co/avatars/c5af9961560bf7b4108640e1c205234a.svg",
-      "id": "image_a181f053f4c9cbdb"
-    },
-    {
       "src": "https://huggingface.co/spaces/rsundaraws/strands-robots-data-loop/resolve/main/fig1_loop_v2.gif",
-      "alt": "The four stages of the Strands Robots data loop, cycling one at a time: record writes a LeRobotDataset, store syncs it to a Hugging Face Bucket, train streams it back to the GPU, and deploy runs the checkpoint on hardware, with each stage l",
       "originalUrl": "https://huggingface.co/spaces/rsundaraws/strands-robots-data-loop/resolve/main/fig1_loop_v2.gif",
+      "alt": "The four stages of the Strands Robots data loop, cycling one at a time: record writes a LeRobotDataset, store syncs it to a Hugging Face Bucket, train streams it back to the GPU, and deploy runs the checkpoint on hardware, with each stage lighting the arrow that feeds it around one shared Robot()",
       "id": "image_abe9bf8f7ba769eb"
     },
     {
       "src": "https://cdn-uploads.huggingface.co/production/uploads/6a1dc0f2b4238bb17ff94794/mPnNR7MlxV9SeRoFqGIyv.png",
-      "alt": "fig2_xet_dedup",
       "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a1dc0f2b4238bb17ff94794/mPnNR7MlxV9SeRoFqGIyv.png",
+      "alt": "fig2_xet_dedup",
       "id": "image_c8cfd1a3c6124658"
     },
     {
       "src": "https://huggingface.co/spaces/rsundaraws/strands-robots-data-loop/resolve/main/fig3_stream_v2.gif",
-      "alt": "Two paths from a Hugging Face Bucket to a training GPU, shown one at a time: the download path moves the dataset to local disk and then to a GPU that waits, while the stream path sends it straight to a GPU that is already busy, with 100 KB ",
       "originalUrl": "https://huggingface.co/spaces/rsundaraws/strands-robots-data-loop/resolve/main/fig3_stream_v2.gif",
+      "alt": "Two paths from a Hugging Face Bucket to a training GPU, shown one at a time: the download path moves the dataset to local disk and then to a GPU that waits, while the stream path sends it straight to a GPU that is already busy, with 100 KB on local disk",
       "id": "image_5316bda4081bd67c"
-    },
-    {
-      "src": "https://cdn-uploads.huggingface.co/production/uploads/68abb71b13d7773ad97e9035/f1nX3dXVmvJcQzJfgfpnJ.webp",
-      "alt": "",
-      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/68abb71b13d7773ad97e9035/f1nX3dXVmvJcQzJfgfpnJ.webp",
-      "id": "image_507685976723970f"
     }
   ],
   "videos": [],
@@ -102,181 +48,31 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T11:47:13.851901Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "969c59bd749d4aadc2dde5840615b51c4dff7eb00f5618ffaea497c12ee09c93",
+  "mediaLayoutBodyHash": "e95613d16ca49aa756d5838e4f8850529f5c74393949f5d9b090e0839cf3f790",
   "mediaLayout": [
-    {
-      "mediaId": "image_808937b83e6e3734",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_7486bee7ddfbf6cb",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_502a6c51ff9d7885",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_6aeb6e8db2c293c9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
-    {
-      "mediaId": "image_7acc1874c5bce727",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 6
-    },
-    {
-      "mediaId": "image_e8eaf3379d857826",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 7
-    },
-    {
-      "mediaId": "image_502a6c51ff9d7885",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 8
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 9
-    },
-    {
-      "mediaId": "image_6aeb6e8db2c293c9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 10
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 11
-    },
-    {
-      "mediaId": "image_808937b83e6e3734",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 12
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 13
-    },
-    {
-      "mediaId": "image_7acc1874c5bce727",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 14
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 15
-    },
-    {
-      "mediaId": "image_a181f053f4c9cbdb",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 16
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 17
-    },
     {
       "mediaId": "image_abe9bf8f7ba769eb",
       "type": "image",
-      "afterBlockId": "b0008",
-      "order": 24
+      "afterBlockId": "b0007",
+      "order": 0
     },
     {
       "mediaId": "image_c8cfd1a3c6124658",
       "type": "image",
       "afterBlockId": "b0034",
-      "order": 54
+      "order": 1
     },
     {
       "mediaId": "image_5316bda4081bd67c",
       "type": "image",
       "afterBlockId": "b0037",
-      "order": 58
-    },
-    {
-      "mediaId": "image_507685976723970f",
-      "type": "image",
-      "afterBlockId": "b0088",
-      "order": 117
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0089",
-      "order": 119
-    },
-    {
-      "mediaId": "image_7672461de7ad0009",
-      "type": "image",
-      "afterBlockId": "b0090",
-      "order": 121
-    },
-    {
-      "mediaId": "image_808937b83e6e3734",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 126
-    },
-    {
-      "mediaId": "image_7486bee7ddfbf6cb",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 127
-    },
-    {
-      "mediaId": "image_502a6c51ff9d7885",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 128
-    },
-    {
-      "mediaId": "image_6aeb6e8db2c293c9",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 129
-    },
-    {
-      "mediaId": "image_7acc1874c5bce727",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 130
-    },
-    {
-      "mediaId": "image_e8eaf3379d857826",
-      "type": "image",
-      "afterBlockId": "b0094",
-      "order": 131
+      "order": 2
     }
   ],
   "mediaLayoutUnplaced": [],
-  "mediaLayoutMatched": 28,
+  "mediaLayoutMatched": 3,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-09-27T01:48:24.581823Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:08.367096Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -308,5 +104,1660 @@
     "summaryZh": "本文详细介绍了在机器人AI开发中，如何通过Strands Agents、LeRobot开源生态与Hugging Face Hub无缝集成，构建从示范录制、端到端训练到硬件部署的持续数据循环流。该方案打通了数据收集、云端训练和策略下发的完整链路，显著降低了多阶段机器人学习的工程复杂度与存储传输开销。",
     "glossary": [],
     "duplicateKey": "strands-agents-lerobot-hugging-face"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "A walkthrough of the streaming data loop in Strands Robots, one agent loop that records robot demonstrations, trains on them by reading straight from the Hub, and deploys the policy back to hardware, with the dataset in the same on-disk LeRobot format the whole way through.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 274,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "You have an agent that can already record a demonstration and push it to the Hugging Face Hub. Now you want to run that loop continuously: collect episodes through the day, train a policy on the growing dataset, deploy it, and pull the next batch back to improve it. Run that loop once and every piece works. Run it every day and you start paying for the same byte transfers over and over. The recordings you upload keep growing, each training run copies the whole dataset to the GPUs before it starts, and every new checkpoint ships out while the next batch of recordings comes back.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 93,
+          "kind": "a",
+          "href": "https://huggingface.co/"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "The first post in this series introduced Strands Robots, an open source SDK from AWS (Apache 2.0) that exposes robot abstractions, simulation, and the LeRobot stack as AgentTools you compose into a single Strands agent. It covered the Robot() factory, recording a demonstration in simulation, running a policy, and deploying the same agent code to a physical SO-101. That factory resolves a name against a registry of arms, humanoids, mobile bases, and hands, so the SO-100 used throughout this post is one of many supported embodiments. The robot catalog lists every robot the factory knows about. LeRobot's dataset format is already used by over 90,000 datasets and models on the Hub from more than 8,000 publishers (LeRobot Project Pulse). A Strands Robots recording is one more of them, so anything built to read LeRobot data can read it without conversion. If you are new to Strands Robots, start there; this post assumes that setup.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/amazon/strands-lerobot-hub-to-hardware"
+        },
+        {
+          "start": 41,
+          "end": 55,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots"
+        },
+        {
+          "start": 86,
+          "end": 96,
+          "kind": "a",
+          "href": "https://www.apache.org/licenses/LICENSE-2.0"
+        },
+        {
+          "start": 151,
+          "end": 158,
+          "kind": "a",
+          "href": "https://github.com/huggingface/lerobot"
+        },
+        {
+          "start": 235,
+          "end": 242,
+          "kind": "code"
+        },
+        {
+          "start": 542,
+          "end": 555,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/robots/"
+        },
+        {
+          "start": 719,
+          "end": 740,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/imstevenpmwork/lerobot-adoption-dashboard"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "That post followed the agent loop in one direction, from a Hub dataset to a physical robot. This one follows the data the other way, from the first recorded frame back to the deployed policy, over Hugging Face Storage Buckets - a mutable, non-versioned, Xet-backed object-storage repository type announced in March 2026. A bucket sits beside your dataset repositories in the same hf:// namespace and uses the hf CLI you already have, so it becomes the working layer that holds your data between the day you record it and the day you train on it.",
+      "spans": [
+        {
+          "start": 197,
+          "end": 225,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/storage-buckets"
+        },
+        {
+          "start": 254,
+          "end": 257,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        },
+        {
+          "start": 296,
+          "end": 319,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/storage-buckets"
+        },
+        {
+          "start": 380,
+          "end": 385,
+          "kind": "code"
+        },
+        {
+          "start": 409,
+          "end": 411,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Someone has to decide which episodes to keep, when the scene has drifted far enough to re-record, whether today's batch is enough to train on, and which checkpoint replaces the one on the arm. Each of those decisions comes up dozens of times over a collection campaign, and each one needs a look at what came back before the next command goes out. That is the work an agent is for. This post walks you through the data loop inside a single agent: record a demonstration into a Storage Bucket, store it so that each sync uploads only the bytes that changed, train by streaming the dataset straight from the Hub instead of downloading it, and deploy the checkpoint back to hardware with one keyword argument change. The runnable companion to this post lives at examples/notebooks/05_streaming_data_loop.ipynb.",
+      "spans": [
+        {
+          "start": 759,
+          "end": 806,
+          "kind": "code"
+        },
+        {
+          "start": 759,
+          "end": 806,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots/blob/main/examples/notebooks/05_streaming_data_loop.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "What you'll build",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Where the first post recorded a dataset and pushed it to the Hub, the agent you build here records a LeRobotDataset from a natural-language prompt, syncs it into a Storage Bucket, and streams that same dataset back frame by frame, decoding camera video on the fly, with no local copy. You read it back in the same process that wrote it: the same Strands Robots Robot() that recorded the dataset streams it. Your trained checkpoint then deploys to that same Robot() with one keyword argument change, and the demonstrations it records on hardware return to the same bucket.",
+      "spans": [
+        {
+          "start": 361,
+          "end": 368,
+          "kind": "code"
+        },
+        {
+          "start": 457,
+          "end": 464,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Figure 1. The four stages share one backend. Robot(\"so100\") records a LeRobotDataset through the shared DatasetRecorder; sync_dataset_to_bucket(...) syncs it into a Storage Bucket; stream_dataset(...) reads it back over the Hub with no full download; and the trained checkpoint deploys to the same Robot with mode=\"real\". The on-disk format stays exactly as LeRobot wrote it.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 10,
+          "end": 44,
+          "kind": "em"
+        },
+        {
+          "start": 45,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 60,
+          "end": 103,
+          "kind": "em"
+        },
+        {
+          "start": 104,
+          "end": 119,
+          "kind": "code"
+        },
+        {
+          "start": 121,
+          "end": 148,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 180,
+          "kind": "em"
+        },
+        {
+          "start": 181,
+          "end": 200,
+          "kind": "code"
+        },
+        {
+          "start": 201,
+          "end": 297,
+          "kind": "em"
+        },
+        {
+          "start": 298,
+          "end": 303,
+          "kind": "code"
+        },
+        {
+          "start": 304,
+          "end": 308,
+          "kind": "em"
+        },
+        {
+          "start": 309,
+          "end": 320,
+          "kind": "code"
+        },
+        {
+          "start": 322,
+          "end": 375,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Because one Robot() both records a dataset and reads it back, collecting data and training on it are two methods on one object over one backend. The agent decides to run an episode and invokes one tool; the rollout then proceeds at the robot's control frequency until the episode ends, with the trained policy producing every action. The whole loop, in a handful of lines:",
+      "spans": [
+        {
+          "start": 12,
+          "end": 19,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "What follows is what's actually happening inside that loop, step by step.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Prerequisites",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Minimal (default simulation path)",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Python 3.12+, on Linux or macOS (Apple Silicon supported for the MuJoCo backend).",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "A Strands-compatible model provider for the agent's reasoning. Amazon Bedrock with AWS credentials, the Anthropic API, OpenAI, or Ollama running locally.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 77,
+          "kind": "a",
+          "href": "https://aws.amazon.com/bedrock/"
+        },
+        {
+          "start": 104,
+          "end": 117,
+          "kind": "a",
+          "href": "https://docs.anthropic.com/"
+        },
+        {
+          "start": 130,
+          "end": 136,
+          "kind": "a",
+          "href": "https://ollama.com/"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Strands Robots with the dataset extras: uv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\". The lerobot extra pulls in LeRobot (>=0.6.1), datasets, av, and torchcodec, so recording and video decode both work without further setup. Refer to installation guide.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 101,
+          "kind": "code"
+        },
+        {
+          "start": 107,
+          "end": 114,
+          "kind": "code"
+        },
+        {
+          "start": 149,
+          "end": 157,
+          "kind": "code"
+        },
+        {
+          "start": 159,
+          "end": 161,
+          "kind": "code"
+        },
+        {
+          "start": 167,
+          "end": 177,
+          "kind": "code"
+        },
+        {
+          "start": 251,
+          "end": 269,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/getting-started/installation/"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "That's it. Every stage in this post runs on a laptop with these three. What runs is the loop, not a working policy: the default path uses a mock policy, which records a valid dataset but not a useful one.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Advanced (buckets, hardware, real policies)",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "A Hugging Face account and a token with write permission, plus the hf CLI for creating buckets and syncing datasets: pip install -U \"huggingface-hub>=1.6.0,<2.0.0\", then hf auth login.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 69,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 163,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 183,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "For the hardware path: an SO-101 follower and leader pair, or any other LeRobot-supported robot, with calibration files under ~/.cache/huggingface/lerobot/calibration/.",
+      "spans": [
+        {
+          "start": 126,
+          "end": 167,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "For local vision-language-action (VLA) inference: an NVIDIA GPU. For training at scale, a GPU cluster reading from the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "To run the training step: uv pip install \"lerobot[training]\". Recording and streaming do not need it. If you skip it, trainer.train() returns an error result rather than a checkpoint. The troubleshooting guide names that error and the install that fixes it.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 118,
+          "end": 133,
+          "kind": "code"
+        },
+        {
+          "start": 188,
+          "end": 209,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/troubleshooting/"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Step 1 - Record a demonstration into a bucket",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "You record new episodes through the day, each a continuous run of camera frames and joint state-action telemetry. LeRobot writes that as a small set of large files that grow as you record. Push them into a versioned dataset repository and every append becomes a commit, and every revision is retained. Collection wants the reverse: somewhere to write bytes and overwrite them in place. That is a Storage Bucket, which lives inside your Hugging Face workspace and uses the permissions you already have. There are no identity and access management (IAM) roles to configure, no cross-origin resource sharing (CORS) rules, and no upload service to maintain.",
+      "spans": [
+        {
+          "start": 396,
+          "end": 410,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/storage-buckets"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Your agent records a LeRobotDataset in the same format LeRobot writes on hardware. Record the episode, then sync the finished dataset into a bucket. The prompt asks for the mock policy, a stand-in that produces joint actions without a trained model, so you can run the whole loop before you have a checkpoint to run:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "The sync writes to hf://buckets/{bucket}/{run_id}, where run_id defaults to the dataset directory name. The streaming read in Step 3 names the run too: the first two segments of the id are the bucket, and everything after them is the path inside it.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 63,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "sync_dataset_to_bucket(root, bucket, run_id=...) validates the dataset and syncs it through the hf CLI, decoupled from the recording lifecycle. The same capability is on DatasetRecorder.sync_to_bucket(bucket, run_id=...) if you drive an open recorder directly, and stop_recording(bucket=...) syncs at the moment you stop an active recording. The bucket is the working layer you write to through the day; for the versioned, published artifact you still call push_to_hub(). Both hold the same format.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 96,
+          "end": 98,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 220,
+          "kind": "code"
+        },
+        {
+          "start": 265,
+          "end": 291,
+          "kind": "code"
+        },
+        {
+          "start": 457,
+          "end": 470,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The episode is structurally complete, but the actions are placeholders, so it is not training data you would want. Swap in a real policy with create_policy(\"<hf_repo>\") for actual grasping; the prompt, the format, and the bucket sync stay identical.",
+      "spans": [
+        {
+          "start": 142,
+          "end": 168,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Recording on hardware",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "To record on a physical SO-101, LeRobot's record CLI handles the leader-follower bring-up:",
+      "spans": [
+        {
+          "start": 32,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/lerobot/il_robots"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "The dataset lands on disk in the same format as the simulation recording, so the same sync call takes it to a bucket: sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\") (or the hf sync ./recordings hf://buckets/my-org/robot-fave/run-021 CLI it wraps). Collection runs append into one place, and your published repositories only get the versions you choose to publish.",
+      "spans": [
+        {
+          "start": 118,
+          "end": 195,
+          "kind": "code"
+        },
+        {
+          "start": 204,
+          "end": 263,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Step 2 - Store with byte-level deduplication",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Now that a dataset is in the bucket, the question is what the next sync costs you. Point two fixed cameras at an arm clearing the same table for eight hours and most of what you record is pixels you already have: the same lighting, the same chassis, the same background, across thousands of episodes. On a versioned repository it gets worse, because changing one frame in a multi-gigabyte video shard re-uploads the whole file.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Buckets are backed by Xet, which deduplicates your uploads at the byte level using content-defined chunking. Chunk boundaries follow the content, so inserting a few bytes changes only the chunk it lands in instead of shifting every boundary after it. In Hugging Face's own measurements (HF Storage), content-defined chunking reduces data transferred per upload by about four times across the Hub, and on Enterprise plans billing is on the deduplicated footprint. Their bucket benchmarks show what that looks like on a single file. Starting from a 500 MB upload, changing 1% of the bytes and re-uploading moved 5.5 MB, changing 5% moved 27.5 MB, and changing 10% moved 55 MB. Without chunk-level deduplication, overwriting an object means sending all of its bytes again, whether or not they changed.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        },
+        {
+          "start": 287,
+          "end": 297,
+          "kind": "a",
+          "href": "https://huggingface.co/storage"
+        },
+        {
+          "start": 469,
+          "end": 486,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/h-m-t/hf-buckets-benchmark"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "How much that saves you depends on the file layout, and the Strands Robots recorder uses LeRobot's. Episodes go into Parquet shards (data/chunk-000/file-000.parquet) and per-camera MP4 shards (videos/observation.images.front/chunk-000/file-000.mp4), rolling to a new file only when the current one fills, at LeRobot's defaults of 100 MB for data Parquet and 200 MB for video MP4. So a sync after a day of recording uploads the new trailing shards plus the one partially-filled shard that grew, rather than the whole dataset. Sync the same bucket again tomorrow and Xet handles the deduplication.",
+      "spans": [
+        {
+          "start": 133,
+          "end": 164,
+          "kind": "code"
+        },
+        {
+          "start": 193,
+          "end": 247,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Figure 2. A sync uploads only what changed. The first sync of a fresh dataset uploads every chunk; after recording more episodes, Xet's content-defined chunking means the next sync uploads only the new chunks and skips the ones already stored.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 10,
+          "end": 243,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Step 3 - Train by streaming from the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "To train, you point GPUs at your dataset. Download it first and those GPUs sit idle until hundreds of gigabytes finish copying. Streaming straight from the Hub works here because of the shard layout from Step 2: a batch becomes a few byte-range reads over large shards rather than thousands of small fetches. LeRobot's StreamingLeRobotDataset turns that into a drop-in torch iterable, and Strands Robots exposes it through stream_dataset():",
+      "spans": [
+        {
+          "start": 319,
+          "end": 342,
+          "kind": "code"
+        },
+        {
+          "start": 423,
+          "end": 439,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Figure 3. Stream, don't download. The download path copies the whole dataset to local disk first, so the GPU waits; stream_dataset() reads batches straight from the bucket with nothing on local disk, so the GPU trains from the first batch.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 10,
+          "end": 115,
+          "kind": "em"
+        },
+        {
+          "start": 116,
+          "end": 132,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 239,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Nothing lands on local disk except the small meta/ folder of schema, statistics, and episode index. Camera frames are decoded from the remote MP4 shards as you iterate; state and action come from the Parquet shards. That loop reads one frame at a time, which suits inspecting an episode. To train, pass the reader to a DataLoader and iterate batches instead. The streaming dataset shuffles internally through a bounded reservoir buffer, so video decoding parallelizes across worker processes, and the training step itself is the ordinary PyTorch one:",
+      "spans": [
+        {
+          "start": 45,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 319,
+          "end": 329,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "If you would rather not write the loop at all, LeRobot's own trainer reads through the same engine, so the dataset your agent collected trains without a line of new code. It takes a bucket through the same keyword argument the in-process reader uses:",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Buckets are streaming-only, so --dataset.repo_type=bucket requires --dataset.streaming=true and the config rejects the combination otherwise. Reach for stream_dataset() when you want the loop in your own process: validating an episode, replaying it in simulation, or feeding a custom evaluation loop. For proprioceptive-only streaming, drop_videos=True skips video decode entirely, which is what makes this work on an edge device with no torchcodec wheel. The recording and datasets guide documents that argument along with the delta_timestamps map it requires.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 67,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 152,
+          "end": 168,
+          "kind": "code"
+        },
+        {
+          "start": 336,
+          "end": 352,
+          "kind": "code"
+        },
+        {
+          "start": 438,
+          "end": 448,
+          "kind": "code"
+        },
+        {
+          "start": 460,
+          "end": 488,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/recording/"
+        },
+        {
+          "start": 528,
+          "end": 544,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Provider names are shared between running a policy and training one. create_trainer(\"lerobot_local\") returns a Trainer that works like create_policy(), and a TrainSpec describes the run; the record-train-deploy loop then closes in a few lines:",
+      "spans": [
+        {
+          "start": 69,
+          "end": 100,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 118,
+          "kind": "code"
+        },
+        {
+          "start": 135,
+          "end": 150,
+          "kind": "code"
+        },
+        {
+          "start": 158,
+          "end": 167,
+          "kind": "code"
+        },
+        {
+          "start": 158,
+          "end": 167,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/recording/"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "On a single NVIDIA L4 (g6.4xlarge), 500 optimizer steps of ACT (51.6M parameters, effective batch size 8) over a 120-frame episode completed in 133 seconds and wrote a checkpoint that create_policy() loads back through the same entry point used to run any other policy. Training time scales with dataset size, batch size, and step count, so treat this as one measured configuration rather than a benchmark. The \"groot\" and \"cosmos3\" providers target the same TrainSpec and Trainer lifecycle, so the surrounding loop is unchanged; each one validates its own required fields first, so a GR00T run needs a base_model and an embodiment tag, and a Cosmos 3 run needs a base_model and an SFT recipe. Call trainer.validate(spec) before train() and it returns the exact list of what a given backend is missing.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 33,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 62,
+          "kind": "a",
+          "href": "https://tonyzhaozh.github.io/aloha/"
+        },
+        {
+          "start": 184,
+          "end": 199,
+          "kind": "code"
+        },
+        {
+          "start": 411,
+          "end": 418,
+          "kind": "code"
+        },
+        {
+          "start": 423,
+          "end": 432,
+          "kind": "code"
+        },
+        {
+          "start": 459,
+          "end": 468,
+          "kind": "code"
+        },
+        {
+          "start": 473,
+          "end": 480,
+          "kind": "code"
+        },
+        {
+          "start": 603,
+          "end": 613,
+          "kind": "code"
+        },
+        {
+          "start": 621,
+          "end": 631,
+          "kind": "code"
+        },
+        {
+          "start": 664,
+          "end": 674,
+          "kind": "code"
+        },
+        {
+          "start": 699,
+          "end": 721,
+          "kind": "code"
+        },
+        {
+          "start": 729,
+          "end": 736,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Hugging Face's pre-warming caches bucket data at edge locations near the cloud and region where your jobs run, so your cluster reads locally and the dataloader stays ahead of the GPU. In Hugging Face's own bucket benchmarks, a warm content delivery network (CDN) read hit about 1,086 MB/s on a 10 GB payload against 780 MB/s cold, and roughly 1,124 MB/s warm at 100 GB, measured on an m5dn.24xlarge in us-east-1. The full comparison against plain object storage, upload as well as download, is on that dashboard. Choosing where that data lives is a Storage Regions setting on Team and Enterprise plans, as of this writing US and EU, with Asia-Pacific and Gulf Cooperation Council (GCC) regions announced as coming; outside those plans repositories are stored in the US.",
+      "spans": [
+        {
+          "start": 206,
+          "end": 223,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/h-m-t/hf-buckets-benchmark"
+        },
+        {
+          "start": 385,
+          "end": 398,
+          "kind": "code"
+        },
+        {
+          "start": 402,
+          "end": 411,
+          "kind": "code"
+        },
+        {
+          "start": 549,
+          "end": 564,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/storage-regions"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "On macOS, import strands_robots puts Homebrew's ffmpeg on the loader path for you, so torchcodec decodes streamed video without extra setup.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 31,
+          "kind": "code"
+        },
+        {
+          "start": 48,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 96,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Step 4 - Deploy the policy and return data to the loop",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "In this step you take the checkpoint you just trained, run it on a physical robot, and record the next round of demonstrations with it. This is the same agent code from the first post, with one keyword argument changed to mode=\"real\":",
+      "spans": [
+        {
+          "start": 173,
+          "end": 183,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/amazon/strands-lerobot-hub-to-hardware"
+        },
+        {
+          "start": 222,
+          "end": 233,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "The checkpoint runs against the physical arm, and the demonstrations that arm records are saved to disk in the same LeRobot format you started with, ready to sync back to the bucket for the next training run.",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "If your data already lives on Amazon Simple Storage Service (Amazon S3), none of the format work in this post changes. A LeRobotDataset is a directory of Parquet and MP4 shards, so it stores on Amazon S3 the same as anywhere else, and the recording, training, and deploy steps read that format wherever it sits. What a bucket adds is the Hub-native route: sync_dataset_to_bucket and stream_dataset(repo_type=\"bucket\") target hf:// directly, so you get the sync and the streaming read with no separate storage path to wire up. Both paths run the same loop: Amazon S3 if that is where your data already sits, a bucket if you want the sync and the streaming read without provisioning storage first.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 71,
+          "kind": "a",
+          "href": "https://aws.amazon.com/s3/"
+        },
+        {
+          "start": 356,
+          "end": 378,
+          "kind": "code"
+        },
+        {
+          "start": 383,
+          "end": 417,
+          "kind": "code"
+        },
+        {
+          "start": 425,
+          "end": 430,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Run the loop again tomorrow and you are recording into that bucket, syncing only the bytes that changed, and streaming those bytes to the GPUs without waiting for a download. The data never leaves the LeRobot format, and it never leaves the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Try it using the sample application",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "The full Strands Robots sample is on GitHub at strands-labs/robots in examples/notebooks/05_streaming_data_loop.ipynb. It walks you through the full loop cell by cell: record, render, sync to a bucket, stream back, train, and load the checkpoint. Every cell runs in simulation on the mock policy, so no GPU, no Docker, and no Hugging Face credentials are needed.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 66,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots"
+        },
+        {
+          "start": 70,
+          "end": 117,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 117,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots/blob/main/examples/notebooks/05_streaming_data_loop.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Run the cells top to bottom. The recorded dataset lands under /tmp/nb5_dataset. To sync it to a bucket, set BUCKET = \"my-org/robot-fave\" in the first cell (after hf auth login); the neighboring RUN_ID names the folder inside the bucket, and the notebook streams back from f\"{BUCKET}/{RUN_ID}\". To train on a GPU, raise steps to 500 and set device=\"cuda\". The agent-driven version of the same loop lives at examples/06_agent_collect_and_stream.py.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 136,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 175,
+          "kind": "code"
+        },
+        {
+          "start": 194,
+          "end": 200,
+          "kind": "code"
+        },
+        {
+          "start": 272,
+          "end": 292,
+          "kind": "code"
+        },
+        {
+          "start": 319,
+          "end": 324,
+          "kind": "code"
+        },
+        {
+          "start": 340,
+          "end": 353,
+          "kind": "code"
+        },
+        {
+          "start": 406,
+          "end": 445,
+          "kind": "code"
+        },
+        {
+          "start": 406,
+          "end": 445,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots/blob/main/examples/06_agent_collect_and_stream.py"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Security Considerations",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "The snippets here are a \"hello world\" of the Strands Robots data loop. Five things change once you run it against real data.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Prompt injection. Supplying untrusted data to an agent can lead to prompt injection, where untrustworthy context is treated as LLM instructions. These agents actuate robots and now also write to and read from shared storage, so this is an important risk to track. Feed the agent only data from trusted sources. If not all input can be trusted, restrict the tools available to the agent so it cannot take safety-critical actions or overwrite bucket contents.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Training data is a trust boundary. An agent that can write into the collection bucket can also write episodes that a policy later trains on, and that policy drives a physical arm. Keep the credential that writes collection data separate from the one a training job reads with, sync each run under its own run_id so an episode can be traced to the run that produced it and removed on its own, and treat the versioned dataset repository as the reviewed artifact, because the bucket keeps no revisions to audit against.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "strong"
+        },
+        {
+          "start": 305,
+          "end": 311,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Bucket credentials and scope. sync_dataset_to_bucket(...), stop_recording(bucket=...), and sync_to_bucket upload through the hf CLI using the token from hf auth login. Use a token scoped to the specific namespace you are writing to, prefer --private buckets for collection data, and keep the bucket distinct from the versioned dataset repository you push_to_hub and share.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        },
+        {
+          "start": 30,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 85,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 105,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 127,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 240,
+          "end": 249,
+          "kind": "code"
+        },
+        {
+          "start": 350,
+          "end": 361,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Overwrite in place keeps no revisions. A bucket overwrites in place and retains no revisions, which is what makes it a working layer and also means a repeated run_id replaces the run already stored there. Pass an explicit run_id per collection run, as in sync_dataset_to_bucket(\"./recordings\", \"my-org/robot-fave\", run_id=\"run-021\"). For anything you need to be able to return to, push_to_hub() to a versioned dataset repository, where every revision is retained.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 38,
+          "kind": "strong"
+        },
+        {
+          "start": 159,
+          "end": 165,
+          "kind": "code"
+        },
+        {
+          "start": 222,
+          "end": 228,
+          "kind": "code"
+        },
+        {
+          "start": 255,
+          "end": 332,
+          "kind": "code"
+        },
+        {
+          "start": 381,
+          "end": 394,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Only use trusted Hugging Face orgs. The local inference path loads Hugging Face models with trust_remote_code=True. Set STRANDS_TRUST_REMOTE_CODE=1 to opt in, and only load checkpoints from organizations you trust. When loading pre-trained weights from the Hub (e.g., via pretrained_name_or_path), verify the organization is trusted before loading. Model weights can contain arbitrary code (pickle-based checkpoints). Prefer safetensors-format checkpoints where available.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "strong"
+        },
+        {
+          "start": 92,
+          "end": 114,
+          "kind": "code"
+        },
+        {
+          "start": 120,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 272,
+          "end": 295,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Clean up",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "The loop leaves a bucket, datasets under /tmp, and a checkpoint on disk. Bucket contents count toward your stored volume, so remove what you no longer need:",
+      "spans": [
+        {
+          "start": 41,
+          "end": 45,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "Stop any training process still on a GPU instance, and stop the instance. If you ran the notebook, substitute its RUN_ID (nb5_demo by default) for cube_pick. Anything you published with push_to_hub() is in a versioned repository and is untouched.",
+      "spans": [
+        {
+          "start": 114,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 130,
+          "kind": "code"
+        },
+        {
+          "start": 147,
+          "end": 156,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 199,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Where to go from here",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "The Strands Robots documentation covers the robot catalog, simulation, policy providers, recording, and the mesh in depth. The recording and datasets guide documents the DatasetRecorder API, sync_dataset_to_bucket / sync_to_bucket, and stream_dataset in full.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 32,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/"
+        },
+        {
+          "start": 127,
+          "end": 155,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/recording/"
+        },
+        {
+          "start": 170,
+          "end": 185,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 213,
+          "kind": "code"
+        },
+        {
+          "start": 216,
+          "end": 230,
+          "kind": "code"
+        },
+        {
+          "start": 236,
+          "end": 250,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "If you collect from more than one robot, give each one its own run_id and they write into the same bucket in parallel. The multi-robot mesh fans one agent out across those robots, so the same loop becomes a fleet collecting through the day into shared storage. A streaming reader reads one run at a time. The recording and datasets guide describes how to train across several of them.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 69,
+          "kind": "code"
+        },
+        {
+          "start": 123,
+          "end": 139,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/mesh/"
+        },
+        {
+          "start": 309,
+          "end": 337,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/recording/"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "If you want a larger policy than ACT, the TrainSpec and Trainer lifecycle from Step 3 covers GR00T and Cosmos 3 behind their own provider names, so fine-tuning a VLA on the dataset you just streamed is the same calls with a different provider string and a base model. Running the result is where the paths diverge, because a VLA checkpoint deploys to hardware rather than to the simulator you trained from. For heavier simulation to generate that data, the Newton (sim-newton) and Isaac Sim (isaac) backends sit behind the same Robot() factory, so the agent code does not change as you scale up.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 56,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 465,
+          "end": 475,
+          "kind": "code"
+        },
+        {
+          "start": 492,
+          "end": 497,
+          "kind": "code"
+        },
+        {
+          "start": 528,
+          "end": 535,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Bucket streaming reached LeRobot through contributions from both the Strands Robots and LeRobot teams, upstream in LeRobot itself, so the datasets your agent collects are readable by every tool in that ecosystem. That runs both ways: the reader in Step 3 opens any of the LeRobot datasets already published on the Hub, so an agent can replay and evaluate against existing demonstrations before it records one of its own.",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "Contributions are welcome under Apache 2.0. If you build something with this loop, open an issue with what worked and what didn't.",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Strands Robots",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "SDK, AgentTools, and the Robot() factory: github.com/strands-labs/robots, Apache 2.0",
+      "spans": [
+        {
+          "start": 25,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 40,
+          "kind": "strong"
+        },
+        {
+          "start": 42,
+          "end": 72,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Documentation: strands-labs.github.io/robots",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        },
+        {
+          "start": 15,
+          "end": 44,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Recording and datasets guide: strands-labs.github.io/robots/recording",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        },
+        {
+          "start": 30,
+          "end": 69,
+          "kind": "a",
+          "href": "https://strands-labs.github.io/robots/recording/"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "The notebook for this post: examples/notebooks/05_streaming_data_loop.ipynb - run the full loop cell by cell",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        },
+        {
+          "start": 28,
+          "end": 75,
+          "kind": "code"
+        },
+        {
+          "start": 28,
+          "end": 75,
+          "kind": "a",
+          "href": "https://github.com/strands-labs/robots/blob/main/examples/notebooks/05_streaming_data_loop.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "Strands Agents SDK: github.com/strands-agents/harness-sdk",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        },
+        {
+          "start": 20,
+          "end": 57,
+          "kind": "a",
+          "href": "https://github.com/strands-agents/harness-sdk"
+        }
+      ]
+    },
+    {
+      "id": "b0077",
+      "source": "LeRobot and the Hub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "LeRobot: github.com/huggingface/lerobot - datasets, policies, hardware drivers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 9,
+          "end": 39,
+          "kind": "a",
+          "href": "https://github.com/huggingface/lerobot"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "Hugging Face Storage Buckets: Storage Buckets documentation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        },
+        {
+          "start": 30,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/storage-buckets"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Xet deduplication: From Files to Chunks",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        },
+        {
+          "start": 19,
+          "end": 39,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "A pick-and-place dataset in the format this post records: lerobot/svla_so101_pickplace",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        },
+        {
+          "start": 58,
+          "end": 86,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/lerobot/svla_so101_pickplace"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "Policies",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "SmolVLA: lerobot/smolvla_base",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 9,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/lerobot/smolvla_base"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "Pi0: lerobot/pi0_base",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        },
+        {
+          "start": 5,
+          "end": 21,
+          "kind": "a",
+          "href": "https://huggingface.co/lerobot/pi0_base"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "NVIDIA Isaac-GR00T N1.7: nvidia/GR00T-N1.7-3B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        },
+        {
+          "start": 25,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/GR00T-N1.7-3B"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "NVIDIA Cosmos 3 Nano: nvidia/Cosmos3-Nano",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        },
+        {
+          "start": 22,
+          "end": 41,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/Cosmos3-Nano"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "MolmoAct2, trained for the SO-100/101: allenai/MolmoAct2-SO100_101 - loads through lerobot_local, needs the molmoact2 extra",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        },
+        {
+          "start": 39,
+          "end": 66,
+          "kind": "a",
+          "href": "https://huggingface.co/allenai/MolmoAct2-SO100_101"
+        },
+        {
+          "start": 83,
+          "end": 96,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 117,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Background",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "First post in this series: From the Hugging Face Hub to robot hardware with Strands Agents and LeRobot",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        },
+        {
+          "start": 27,
+          "end": 102,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/amazon/strands-lerobot-hub-to-hardware"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "The physical-AI data loop that this workflow follows: The Physical AI Data Loop, Steven Palma, Hugging Face, 2026",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        },
+        {
+          "start": 54,
+          "end": 79,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/imstevenpmwork/LeRobot_and_HF_Buckets#phase-1-collect-and-ingest"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "Bucket throughput and dedup measurements: hf-buckets-benchmark",
+      "spans": [
+        {
+          "start": 0,
+          "end": 40,
+          "kind": "strong"
+        },
+        {
+          "start": 42,
+          "end": 62,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/h-m-t/hf-buckets-benchmark"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "e95613d16ca49aa756d5838e4f8850529f5c74393949f5d9b090e0839cf3f790",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from strands import Agent\nfrom strands_robots import Robot\n\nsim = Robot(\"so100\")                 # mode=\"sim\" (default - safe, no hardware)\nagent = Agent(tools=[sim])\n\n# Record a demonstration and sync it to a bucket.\nagent(\"Record a pick-the-cube demo and sync it to my-org/robot-fave.\")\n\n# Stream it back from the bucket to train, without downloading it first.\nfor batch in sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\").dataloader(batch_size=64):\n    ..."
+    },
+    {
+      "id": "c0002",
+      "source": "from strands import Agent\nfrom strands_robots import Robot, sync_dataset_to_bucket\n\nsim = Robot(\"so100\")                 # mode=\"sim\" by default\nagent = Agent(tools=[sim])\n# One prompt drives scene setup, cameras, policy, and recording.\nagent(\n    \"Create a world with the so100 robot, add a red cube and a front camera, \"\n    \"start recording (repo_id='local/cube_pick', root='/tmp/cube_pick', fps=30, \"\n    \"overwrite=True, task='pick up the red cube'), run the mock policy for \"\n    \"60 steps, then stop recording.\"\n)\n# Sync the finished on-disk dataset into the bucket (no live recording session needed).\nsync_dataset_to_bucket(\"/tmp/cube_pick\", \"my-org/robot-fave\")\n# -> {\"status\": \"success\", \"bucket_uri\": \"hf://buckets/my-org/robot-fave/cube_pick\"}"
+    },
+    {
+      "id": "c0003",
+      "source": "lerobot-record \\\n  --robot.type=so101_follower --robot.id=my_follower \\\n  --teleop.type=so101_leader  --teleop.id=my_leader \\\n  --dataset.repo_id=my_user/cube_picking \\\n  --dataset.single_task='Pick up the red cube'"
+    },
+    {
+      "id": "c0004",
+      "source": "reader = sim.stream_dataset(\"my-org/robot-fave/cube_pick\", repo_type=\"bucket\",\n    shuffle=False, max_num_shards=1, buffer_size=1,  # one episode, in capture order\n)\n\nprint(reader.num_episodes, reader.num_frames, reader.fps)\nfor frame in reader:\n    frame[\"observation.images.front\"]   # (3, H, W) tensor, decoded on the fly from the MP4 shard\n    frame[\"observation.state\"]           # joint vector, from the Parquet shard\n    frame[\"action\"]\n    break"
+    },
+    {
+      "id": "c0005",
+      "source": "# policy here is a LeRobot policy you constructed, such as ACTPolicy.\nfor batch in reader.dataloader(batch_size=64, num_workers=4):\n    loss, _ = policy(batch)   # lerobot ACTPolicy.forward returns (loss, loss_dict)\n    loss.backward()"
+    },
+    {
+      "id": "c0006",
+      "source": "lerobot-train --policy.type=act \\\n  --dataset.repo_id=my-org/robot-fave/cube_pick \\\n  --dataset.repo_type=bucket \\\n  --dataset.streaming=true \\\n  --num_workers=4"
+    },
+    {
+      "id": "c0007",
+      "source": "import os\nos.environ[\"STRANDS_TRUST_REMOTE_CODE\"] = \"1\"   # create_policy loads with trust_remote_code=True\n\nfrom strands_robots import create_policy\nfrom strands_robots.training import TrainSpec, create_trainer\n\ntrainer = create_trainer(\"lerobot_local\", device=\"cuda\")\nspec = TrainSpec(dataset_root=\"/tmp/cube_pick\", output_dir=\"/tmp/cube_pick_ft\",\n                 base_model=\"\", steps=500, extra={\"policy_type\": \"act\"})\nresult = trainer.train(spec)                    # train ACT on the streamed dataset\npolicy = create_policy(result.checkpoint_dir)   # load the checkpoint straight back"
+    },
+    {
+      "id": "c0008",
+      "source": "robot = Robot(\"so100\", mode=\"real\", port=\"/dev/ttyACM0\",\n              cameras={\"front\": {\"type\": \"opencv\", \"index_or_path\": \"/dev/video0\", \"fps\": 30}})\nagent = Agent(tools=[robot])\nagent(\"Pick up the red cube.\")"
+    },
+    {
+      "id": "c0009",
+      "source": "git clone https://github.com/strands-labs/robots.git\ncd robots\nuv pip install -U \"strands-robots[sim-mujoco,lerobot]>=0.5.1\"\njupyter notebook examples/notebooks/05_streaming_data_loop.ipynb"
+    },
+    {
+      "id": "c0010",
+      "source": "hf buckets rm my-org/robot-fave/cube_pick/ --recursive --dry-run  # lists, removes nothing\nhf buckets rm my-org/robot-fave/cube_pick/ --recursive            # --yes skips the prompt\nhf buckets delete my-org/robot-fave                               # takes everything in it\nrm -rf /tmp/cube_pick /tmp/cube_pick_ft /tmp/nb5_dataset /tmp/nb5_ft"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-02T14:02:08.367078Z"
 }

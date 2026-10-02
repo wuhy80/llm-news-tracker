@@ -17,10 +17,9 @@
   "originalUrl": "https://huggingface.co/blog/ServiceNow-AI/apriel-h1",
   "resolvedUrl": "https://huggingface.co/blog/ServiceNow-AI/apriel-h1",
   "fetchedAt": "2026-08-26T02:08:23.013870Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "We converted our 15B reasoning model to a Mamba hybrid achieving 2.1x throughput with minimal quality loss. The key? A non-obvious insight about what data to distill on, and why intuition fails here.\n\nWhen MiniMax published their M2 post-mortem in October explaining why they abandoned efficient attention at 230B scale, the narrative briefly became \"efficient attention is dead.\" Within days, Kimi Linear proved otherwise. The real lesson: it depends on your constraints.\n\nOur constraint was simple: we had a strong 15B reasoning model and needed to make it efficient without starting over. No infinite compute for 20T-token pretraining. No luxury of architectural co-design from day one. Just a practical question: can you retrofit efficiency into an existing model through distillation?\n\nSpoilers: yes, but only if you ignore your intuition about what data to use.\n\n## What We Built\n\nThe Apriel-H1 family: seven checkpoints spanning 25-40 Mamba layers (out of 50 total), showing the complete efficiency-quality frontier. Our flagship Apriel-H1-15b-Thinker-SFT achieves 2.1x throughput with minimal quality loss: MATH500 and MTBench improve a few points (0.90 → 0.92 and 8.30 → 8.58, respectively), while GSM8k (0.97 → 0.95), GPQA (0.59 → 0.55), and AIME24 (0.70 → 0.65) regress slightly. Total training: 76.8B tokens.\n\nApriel-H1-15b-Thinker-SFT (green) vs full-attention teacher (blue). Reasoning quality stays nearly flat across benchmarks while throughput increases 1.89-2.09x depending on context length.\n\nThe full details are in our Apriel-H1 paper. Here, we focus on the key insight that made it work.\n\n## The Non-Obvious Insight\n\nHere's what we initially thought would work: just distill on pretraining data and round it out with some SFT.\n\nThe reasoning seemed solid. We're inserting completely new Mamba layers that have never seen data. These linear SSMs need to learn general-purpose token mixing from scratch. How can they become effective mixers unless they get exposure to the same broad distribution the original attention layers saw?\n\nSo we tried it. Then we tried mixing pretraining and SFT data. It didn't work. The distilled hybrids lost reasoning quality, sometimes dramatically.\n\nWhat actually worked: high-quality reasoning traces from the teacher's SFT dataset.\n\nDistilling a reasoning model isn't about transferring general next-token prediction. The base model already has that, and we started from a strong 15B foundation. What we're preserving is specific and fragile: the teacher's multi-step reasoning patterns.\n\nThose patterns emerge from intricate attention mechanisms. Retrieval heads pulling context from thousands of tokens back. Induction heads recognizing and continuing logical chains. Long-range dependencies connecting premises to conclusions many steps later. When you replace attention wholesale with Mamba's linear recurrence, these computational mechanisms are disrupted. The hybrid must discover new paths to the same reasoning outcomes.\n\nThat discovery requires explicit examples where reasoning structure is visible and correct:\n\n- Multi-step math proofs where each thought follows from the previous\n\n- Coding tasks with clear logical dependencies\n\n- Scientific analysis with detailed explanatory chains\n\nPretraining data, on the other hand, is too noisy and too diffuse. The reasoning signal gets lost. You need concentrated examples of the specific capability you're trying to preserve.\n\nOnce we understood the data choice, our distillation method became clear too. We used reverse KL divergence (temperature 1) rather than forward KL. Reverse won consistently. Why? We're training on problems where the teacher has high confidence and clear structure. Reverse KL's mode-seeking behavior encourages the student to commit to those high-confidence predictions. When your teacher is confident and correct, you want your student to be confident too.\n\nThis insight is the key to the whole approach: match your distillation data to the capability you're preserving, not the capability you're building.\n\n## How to Apply It: Staged Distillation\n\nYou can't just swap 40 attention layers for Mamba and hope. We learned this the hard way, and eventually developed a staged distillation procedure to get there reliably.\n\nStage 1: Identify least-important layers. We used a Leave-One-Out (LOO) analysis on MMLU: remove each layer, replace with identity, then measure the drop. Sort by importance, replace the bottom 25 with Mamba-in-Llama (MIL) initialized mixers. Distill end-to-end. This worked for our H-25 checkpoint.\n\nStage 2: Progressive conversion beyond 25 layers. LOO broke down past 25 layers because layers unimportant in isolation became critical in combination. To address this, we developed a dynamic heuristic we call MIL-Mamba-Replacement (MMR). For each remaining attention layer, we initialize a Mamba mixer with MIL, run 100 training steps, and record the distillation loss. Layers converging to lower loss are \"easier\" to replace. This captures training dynamics rather than static importance.\n\nWe progressed incrementally: 25 → 27 → 30 → 34 → 37 → 40 Mamba layers, grouping replacements by MMR scores. Each checkpoint distills from the previous.\n\nStage 3: End-to-end training on SFT data. After reaching the target Mamba layer count, we did a final SFT pass until reasoning performance stabilized. After 55.9B distillation tokens and 20.9B SFT tokens, this produced our final Apriel-H1-15b-Thinker-SFT model.\n\nThe complete efficiency frontier. Each checkpoint shows cumulative training tokens. Our flagship H-30-SFT (released as Apriel-H1-15b-Thinker-SFT) used 76.8B total for 2.1x throughput at 0.76 average score. The aggressively converted H-40 variant used 136.5B tokens for 3.4x throughput. For reference: NVIDIA's Nemotron-Nano-9B-v2 achieves 4.6x at 0.77 score but required training from scratch with orders of magnitude more compute.\n\n## Making It Reproducible: Fast-LLM\n\nWe built all this on Fast-LLM, our open-source training framework. The core architectural principle: large language model transformers should be modular. Attention and Mamba are different implementations of the same \"mixing\" interface, and can be swapped freely.\n\nHere's a hybrid architecture in Fast-LLM's config format:\n\n```\ndecoder:\n  type: \"pattern\"\n  blocks:\n    attention_block:\n      mixer:\n        type: \"attention\"\n        heads: 32\n        head_groups: 8\n        head_size: 128\n      mlp:\n        type: \"gated\"\n        activation: \"silu\"\n    mamba_block:\n      mixer:\n        type: \"mamba\"\n        d_inner: 4096\n        state_size: 16\n        dt_rank: 16\n      mlp:\n        type: \"gated\"\n        activation: \"silu\"\n  num_blocks: 50\n  pattern: [\"attention_block\", \"attention_block\", \"mamba_block\", ...]\n```\n\nThe pattern field specifies layer order. For Apriel-H1-15b-Thinker-SFT: 30 mamba_block, 20 attention_block, placed by importance. That's it.\n\nDistillation is configuration too:\n\n```\nmodel:\n  base_model:\n    head:\n      distillation_model: teacher\n      distillation_loss_implementation: reverse_kl\nreference_models:\n  teacher:\n    pretrained:\n      format: mistral\n      path: path/to/Apriel-Nemotron-15b-Thinker\n```\n\nFast-LLM handles gradient accumulation, distributed training, tensor parallelism, checkpointing, everything you need for large-scale experimentation. It's open source, and licensed under Apache 2.0. You can reproduce this work because we designed the infrastructure to make it reproducible.\n\n## FAQs\n\nWhy release all checkpoints? Because optimal depends on your constraints. H-30 offers the best balance. H-40 maximizes throughput for latency-critical workloads. The intermediate checkpoints let you choose your exact trade-off.\n\nWhy do you get different speedups at different context lengths? Mamba's linear complexity advantage grows with sequence length, and attention degrades quadratically.\n\nWhy did you only try Mamba? We used Mamba-1 for three reasons: it has a proven distillation track record, has shown strong empirical performance, and was simple to implement in our framework. It let us focus on the data question first.\n\nWhat were the Mamba hyperparameters? State size 16, DT rank 16, inner dimension 4096. For our GQA setup in Apriel we expanded B (input projection) and x (state) to match total attention heads following M1.\n\nWhy didn't you try more advanced conversion methods? We used Mamba-in-Llama initialization and knowledge distillation rather than MOHAWK's multi-stage procedure because the latter didn't show significant advantages in preliminary experiments.\n\nWhy did you only SFT the H-30 model? We only applied SFT to H-30 to validate that distilled hybrids can be improved through standard post-training. The other checkpoints are pure distillation but can be fine-tuned similarly.\n\nWhy didn't you explore RL? This was a scoping decision to isolate the distillation question: can you transfer reasoning via knowledge distillation alone? Answer: yes. But RL should close remaining quality gaps further. We are exploring RL for future iterations.\n\nDid you really show that Apriel-H1 matches full-attention reasoning at similar compute budgets? We didn't do an apples-to-apples comparison between full-attention Apriel and a hybrid trained identically from pretraining forward. That would require repeating all mid-training and post-training of the teacher with the Apriel-H1 architecture, which was beyond our compute budget. What we can claim though is that retrofitting efficiency via distillation is practical and effective, and that the resulting hybrids can be fine-tuned to match or exceed the teacher's reasoning quality.\n\n## The Production Reality\n\nWe've implemented Apriel-H1 in Hugging Face Transformers and vLLM. Transformers integration is straightforward. We ship a new model class with interchangeable attention and Mamba layers. vLLM integration uses their recent Mamba cache operations for continuous batching, prefix caching, and chunked prefill. The vLLM plugin is ready. We are currently waiting for final legal approval to open-source it.\n\nHonest assessment: Deploying hybrids today means rough edges. The tooling is maturing fast but isn't turnkey. You will write custom code, validate numerical behavior carefully, and work around framework limitations. For teams that can absorb that cost, throughput gains are worth it. For those that can't, waiting might be the right call.\n\n## Takeaway\n\nMost teams don't have infinite compute for 20T-token pretraining. If you've invested in a strong base model and need efficiency gains, this work shows a practical path: distill into hybrids using high-quality task-specific data that matches the capability you're preserving.\n\nThe surprising finding, use reasoning data to distill reasoning, seems obvious in retrospect but contradicts initial intuition. We validated it, explained why it works, and built the infrastructure to make it reproducible.\n\n## Try It\n\nModels: Apriel-H1 Collection on HuggingFace Training framework: Fast-LLM on GitHub Teacher model: Apriel-Nemotron-15B-Thinker Paper: Apriel-H1: Towards Efficient Enterprise Reasoning Models\n\nFound something broken? File an issue. Discovered a better layer placement heuristic? Tell us. Built something interesting on Apriel-H1? We'd love to see it.\n\nCitation:\n\n```\n@article{apriel-h1-2025,\n  title={Apriel-H1: Towards Efficient Enterprise Reasoning Models},\n  author={SLAM Lab, ServiceNow},\n  journal={arXiv preprint arXiv:2511.02651},\n  year={2025}\n}\n```\n\nCore contributors: Oleksiy Ostapenko, Luke Kumar, Raymond Li, Denis Kocetkov, Joel Lamy-Poirier, Torsten Scholak Contributors: Shruthan Radhakrishna, Soham Parikh, Shambhavi Mishra Technical co-leads: Torsten Scholak, Sathwik Tejaswi Madhusudhan",
   "summaryZh": "文章分析了Apriel-H1模型在蒸馏高效推理模型中的作用。通过特定的蒸馏技术，研究人员能够将复杂推理模型的能力迁移至更小规模的模型中，从而在保持高性能的同时显著降低计算成本。该研究为当前大模型轻量化与推理能力优化提供了新的技术路径，对资源受限环境下的模型部署具有重要参考价值。",
   "summaryGeneratedAt": "2026-08-30T21:21:16.041162Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -66,5 +65,648 @@
       }
     ],
     "duplicateKey": "apriel-h1-distillation-reasoning"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/ServiceNow-AI/Apriel-H1-15b-Thinker-SFT/resolve/main/images/apriel_h_vs_apriel_15b_eval_thrput_comparison.png",
+      "originalUrl": "https://huggingface.co/ServiceNow-AI/Apriel-H1-15b-Thinker-SFT/resolve/main/images/apriel_h_vs_apriel_15b_eval_thrput_comparison.png",
+      "alt": "Apriel-H1 Evaluation Results",
+      "id": "image_18be1573c6291153"
+    },
+    {
+      "src": "https://huggingface.co/ServiceNow-AI/Apriel-H1-15b-Thinker-SFT/resolve/main/images/throughput_eval_score_vs_throughput_1-16k_annotated.png",
+      "originalUrl": "https://huggingface.co/ServiceNow-AI/Apriel-H1-15b-Thinker-SFT/resolve/main/images/throughput_eval_score_vs_throughput_1-16k_annotated.png",
+      "alt": "Apriel-H1 Family Performance",
+      "id": "image_8dab1a1732a6a289"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "We converted our 15B reasoning model to a Mamba hybrid achieving 2.1x throughput with minimal quality loss. The key? A non-obvious insight about what data to distill on, and why intuition fails here.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "When MiniMax published their M2 post-mortem in October explaining why they abandoned efficient attention at 230B scale, the narrative briefly became \"efficient attention is dead.\" Within days, Kimi Linear proved otherwise. The real lesson: it depends on your constraints.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/MiniMax-AI/why-did-m2-end-up-as-a-full-attention-model"
+        },
+        {
+          "start": 193,
+          "end": 204,
+          "kind": "a",
+          "href": "https://github.com/MoonshotAI/Kimi-Linear"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Our constraint was simple: we had a strong 15B reasoning model and needed to make it efficient without starting over. No infinite compute for 20T-token pretraining. No luxury of architectural co-design from day one. Just a practical question: can you retrofit efficiency into an existing model through distillation?",
+      "spans": [
+        {
+          "start": 27,
+          "end": 117,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Spoilers: yes, but only if you ignore your intuition about what data to use.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "What We Built",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "The Apriel-H1 family: seven checkpoints spanning 25-40 Mamba layers (out of 50 total), showing the complete efficiency-quality frontier. Our flagship Apriel-H1-15b-Thinker-SFT achieves 2.1x throughput with minimal quality loss: MATH500 and MTBench improve a few points (0.90 → 0.92 and 8.30 → 8.58, respectively), while GSM8k (0.97 → 0.95), GPQA (0.59 → 0.55), and AIME24 (0.70 → 0.65) regress slightly. Total training: 76.8B tokens.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/ServiceNow-AI/apriel-h1"
+        },
+        {
+          "start": 150,
+          "end": 175,
+          "kind": "a",
+          "href": "https://huggingface.co/ServiceNow-AI/Apriel-H1-15b-Thinker-SFT"
+        },
+        {
+          "start": 185,
+          "end": 226,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Apriel-H1-15b-Thinker-SFT (green) vs full-attention teacher (blue). Reasoning quality stays nearly flat across benchmarks while throughput increases 1.89-2.09x depending on context length.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 188,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "The full details are in our Apriel-H1 paper. Here, we focus on the key insight that made it work.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 43,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2511.02651"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "The Non-Obvious Insight",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Here's what we initially thought would work: just distill on pretraining data and round it out with some SFT.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "The reasoning seemed solid. We're inserting completely new Mamba layers that have never seen data. These linear SSMs need to learn general-purpose token mixing from scratch. How can they become effective mixers unless they get exposure to the same broad distribution the original attention layers saw?",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "So we tried it. Then we tried mixing pretraining and SFT data. It didn't work. The distilled hybrids lost reasoning quality, sometimes dramatically.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "What actually worked: high-quality reasoning traces from the teacher's SFT dataset.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 83,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Distilling a reasoning model isn't about transferring general next-token prediction. The base model already has that, and we started from a strong 15B foundation. What we're preserving is specific and fragile: the teacher's multi-step reasoning patterns.",
+      "spans": [
+        {
+          "start": 210,
+          "end": 254,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Those patterns emerge from intricate attention mechanisms. Retrieval heads pulling context from thousands of tokens back. Induction heads recognizing and continuing logical chains. Long-range dependencies connecting premises to conclusions many steps later. When you replace attention wholesale with Mamba's linear recurrence, these computational mechanisms are disrupted. The hybrid must discover new paths to the same reasoning outcomes.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "That discovery requires explicit examples where reasoning structure is visible and correct:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Multi-step math proofs where each thought follows from the previous",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Coding tasks with clear logical dependencies",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Scientific analysis with detailed explanatory chains",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Pretraining data, on the other hand, is too noisy and too diffuse. The reasoning signal gets lost. You need concentrated examples of the specific capability you're trying to preserve.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Once we understood the data choice, our distillation method became clear too. We used reverse KL divergence (temperature 1) rather than forward KL. Reverse won consistently. Why? We're training on problems where the teacher has high confidence and clear structure. Reverse KL's mode-seeking behavior encourages the student to commit to those high-confidence predictions. When your teacher is confident and correct, you want your student to be confident too.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 107,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "This insight is the key to the whole approach: match your distillation data to the capability you're preserving, not the capability you're building.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 148,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "How to Apply It: Staged Distillation",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "You can't just swap 40 attention layers for Mamba and hope. We learned this the hard way, and eventually developed a staged distillation procedure to get there reliably.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Stage 1: Identify least-important layers. We used a Leave-One-Out (LOO) analysis on MMLU: remove each layer, replace with identity, then measure the drop. Sort by importance, replace the bottom 25 with Mamba-in-Llama (MIL) initialized mixers. Distill end-to-end. This worked for our H-25 checkpoint.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        },
+        {
+          "start": 202,
+          "end": 216,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2408.15237"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Stage 2: Progressive conversion beyond 25 layers. LOO broke down past 25 layers because layers unimportant in isolation became critical in combination. To address this, we developed a dynamic heuristic we call MIL-Mamba-Replacement (MMR). For each remaining attention layer, we initialize a Mamba mixer with MIL, run 100 training steps, and record the distillation loss. Layers converging to lower loss are \"easier\" to replace. This captures training dynamics rather than static importance.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "strong"
+        },
+        {
+          "start": 210,
+          "end": 238,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "We progressed incrementally: 25 → 27 → 30 → 34 → 37 → 40 Mamba layers, grouping replacements by MMR scores. Each checkpoint distills from the previous.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Stage 3: End-to-end training on SFT data. After reaching the target Mamba layer count, we did a final SFT pass until reasoning performance stabilized. After 55.9B distillation tokens and 20.9B SFT tokens, this produced our final Apriel-H1-15b-Thinker-SFT model.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "The complete efficiency frontier. Each checkpoint shows cumulative training tokens. Our flagship H-30-SFT (released as Apriel-H1-15b-Thinker-SFT) used 76.8B total for 2.1x throughput at 0.76 average score. The aggressively converted H-40 variant used 136.5B tokens for 3.4x throughput. For reference: NVIDIA's Nemotron-Nano-9B-v2 achieves 4.6x at 0.77 score but required training from scratch with orders of magnitude more compute.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 431,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Making It Reproducible: Fast-LLM",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "We built all this on Fast-LLM, our open-source training framework. The core architectural principle: large language model transformers should be modular. Attention and Mamba are different implementations of the same \"mixing\" interface, and can be swapped freely.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 29,
+          "kind": "a",
+          "href": "https://github.com/ServiceNow/Fast-LLM"
+        },
+        {
+          "start": 101,
+          "end": 153,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Here's a hybrid architecture in Fast-LLM's config format:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "The pattern field specifies layer order. For Apriel-H1-15b-Thinker-SFT: 30 mamba_block, 20 attention_block, placed by importance. That's it.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 86,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 106,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Distillation is configuration too:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Fast-LLM handles gradient accumulation, distributed training, tensor parallelism, checkpointing, everything you need for large-scale experimentation. It's open source, and licensed under Apache 2.0. You can reproduce this work because we designed the infrastructure to make it reproducible.",
+      "spans": [
+        {
+          "start": 199,
+          "end": 226,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "FAQs",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Why release all checkpoints? Because optimal depends on your constraints. H-30 offers the best balance. H-40 maximizes throughput for latency-critical workloads. The intermediate checkpoints let you choose your exact trade-off.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Why do you get different speedups at different context lengths? Mamba's linear complexity advantage grows with sequence length, and attention degrades quadratically.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 63,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Why did you only try Mamba? We used Mamba-1 for three reasons: it has a proven distillation track record, has shown strong empirical performance, and was simple to implement in our framework. It let us focus on the data question first.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "strong"
+        },
+        {
+          "start": 36,
+          "end": 43,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "What were the Mamba hyperparameters? State size 16, DT rank 16, inner dimension 4096. For our GQA setup in Apriel we expanded B (input projection) and x (state) to match total attention heads following M1.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "strong"
+        },
+        {
+          "start": 202,
+          "end": 204,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2504.10449"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Why didn't you try more advanced conversion methods? We used Mamba-in-Llama initialization and knowledge distillation rather than MOHAWK's multi-stage procedure because the latter didn't show significant advantages in preliminary experiments.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 52,
+          "kind": "strong"
+        },
+        {
+          "start": 61,
+          "end": 75,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2408.15237"
+        },
+        {
+          "start": 130,
+          "end": 138,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2408.10189"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Why did you only SFT the H-30 model? We only applied SFT to H-30 to validate that distilled hybrids can be improved through standard post-training. The other checkpoints are pure distillation but can be fine-tuned similarly.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Why didn't you explore RL? This was a scoping decision to isolate the distillation question: can you transfer reasoning via knowledge distillation alone? Answer: yes. But RL should close remaining quality gaps further. We are exploring RL for future iterations.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Did you really show that Apriel-H1 matches full-attention reasoning at similar compute budgets? We didn't do an apples-to-apples comparison between full-attention Apriel and a hybrid trained identically from pretraining forward. That would require repeating all mid-training and post-training of the teacher with the Apriel-H1 architecture, which was beyond our compute budget. What we can claim though is that retrofitting efficiency via distillation is practical and effective, and that the resulting hybrids can be fine-tuned to match or exceed the teacher's reasoning quality.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 95,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "The Production Reality",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "We've implemented Apriel-H1 in Hugging Face Transformers and vLLM. Transformers integration is straightforward. We ship a new model class with interchangeable attention and Mamba layers. vLLM integration uses their recent Mamba cache operations for continuous batching, prefix caching, and chunked prefill. The vLLM plugin is ready. We are currently waiting for final legal approval to open-source it.",
+      "spans": [
+        {
+          "start": 222,
+          "end": 244,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/hybrid-models-as-first-class-citizens-in-vllm/"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Honest assessment: Deploying hybrids today means rough edges. The tooling is maturing fast but isn't turnkey. You will write custom code, validate numerical behavior carefully, and work around framework limitations. For teams that can absorb that cost, throughput gains are worth it. For those that can't, waiting might be the right call.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Takeaway",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Most teams don't have infinite compute for 20T-token pretraining. If you've invested in a strong base model and need efficiency gains, this work shows a practical path: distill into hybrids using high-quality task-specific data that matches the capability you're preserving.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "The surprising finding, use reasoning data to distill reasoning, seems obvious in retrospect but contradicts initial intuition. We validated it, explained why it works, and built the infrastructure to make it reproducible.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 63,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Try It",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Models: Apriel-H1 Collection on HuggingFace Training framework: Fast-LLM on GitHub Teacher model: Apriel-Nemotron-15B-Thinker Paper: Apriel-H1: Towards Efficient Enterprise Reasoning Models",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 8,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/ServiceNow-AI/apriel-h1"
+        },
+        {
+          "start": 44,
+          "end": 63,
+          "kind": "strong"
+        },
+        {
+          "start": 64,
+          "end": 82,
+          "kind": "a",
+          "href": "https://github.com/ServiceNow/Fast-LLM"
+        },
+        {
+          "start": 83,
+          "end": 97,
+          "kind": "strong"
+        },
+        {
+          "start": 98,
+          "end": 125,
+          "kind": "a",
+          "href": "https://huggingface.co/ServiceNow-AI/Apriel-Nemotron-15b-Thinker"
+        },
+        {
+          "start": 126,
+          "end": 132,
+          "kind": "strong"
+        },
+        {
+          "start": 133,
+          "end": 189,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2511.02651"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Found something broken? File an issue. Discovered a better layer placement heuristic? Tell us. Built something interesting on Apriel-H1? We'd love to see it.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Citation:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Core contributors: Oleksiy Ostapenko, Luke Kumar, Raymond Li, Denis Kocetkov, Joel Lamy-Poirier, Torsten Scholak Contributors: Shruthan Radhakrishna, Soham Parikh, Shambhavi Mishra Technical co-leads: Torsten Scholak, Sathwik Tejaswi Madhusudhan",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        },
+        {
+          "start": 113,
+          "end": 126,
+          "kind": "strong"
+        },
+        {
+          "start": 181,
+          "end": 200,
+          "kind": "strong"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "cc6d4b32e33232e29f25a610ae6cfad4219edfcd7f73207770b5642b3b4ac8c9",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "decoder:\n  type: \"pattern\"\n  blocks:\n    attention_block:\n      mixer:\n        type: \"attention\"\n        heads: 32\n        head_groups: 8\n        head_size: 128\n      mlp:\n        type: \"gated\"\n        activation: \"silu\"\n    mamba_block:\n      mixer:\n        type: \"mamba\"\n        d_inner: 4096\n        state_size: 16\n        dt_rank: 16\n      mlp:\n        type: \"gated\"\n        activation: \"silu\"\n  num_blocks: 50\n  pattern: [\"attention_block\", \"attention_block\", \"mamba_block\", ...]"
+    },
+    {
+      "id": "c0002",
+      "source": "model:\n  base_model:\n    head:\n      distillation_model: teacher\n      distillation_loss_implementation: reverse_kl\nreference_models:\n  teacher:\n    pretrained:\n      format: mistral\n      path: path/to/Apriel-Nemotron-15b-Thinker"
+    },
+    {
+      "id": "c0003",
+      "source": "@article{apriel-h1-2025,\n  title={Apriel-H1: Towards Efficient Enterprise Reasoning Models},\n  author={SLAM Lab, ServiceNow},\n  journal={arXiv preprint arXiv:2511.02651},\n  year={2025}\n}"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "cc6d4b32e33232e29f25a610ae6cfad4219edfcd7f73207770b5642b3b4ac8c9",
+  "mediaLayout": [
+    {
+      "mediaId": "image_18be1573c6291153",
+      "type": "image",
+      "afterBlockId": "b0006",
+      "order": 0
+    },
+    {
+      "mediaId": "image_8dab1a1732a6a289",
+      "type": "image",
+      "afterBlockId": "b0028",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:02:19.697624Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:02:19.697642Z"
 }
