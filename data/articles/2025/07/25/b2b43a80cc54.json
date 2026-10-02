@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:39:55.077179Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Parquet Content-Defined Chunking\n\nReduce Parquet file upload and download times on Hugging Face Hub by leveraging the new Xet storage layer and Apache Arrow’s Parquet Content-Defined Chunking (CDC) feature enabling more efficient and scalable data workflows.\n\nTL;DR: Parquet Content-Defined Chunking (CDC) is now available in PyArrow and Pandas, enabling efficient deduplication of Parquet files on content-addressable storage systems like Hugging Face's Xet storage layer. CDC dramatically reduces data transfer and storage costs by uploading or downloading only the changed data chunks. Enable CDC by passing the use_content_defined_chunking argument:\n\n```\nimport pandas as pd\nimport pyarrow.parquet as pq\n\ndf.to_parquet(\"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)\npq.write_table(table, \"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)\n```\n\nDifferent Use Cases for Parquet Deduplication\n\n1. Re-uploading an Exact Copies of the Table\n\n2. Adding and Removing Columns from the Table\n\n3. Changing Column Types in the Table\n\n4. Appending New Rows and Concatenating Tables\n\n5. Inserting / Deleting Rows in the Table\n\n6. Using Different Row-group Sizes\n\n7. Using Varying File-Level Splits\n\nUsing Parquet CDC feature with Pandas\n\nApache Parquet is a columnar storage format that is widely used in the data engineering community.\n\nAs of today, Hugging Face hosts nearly 21 PB of datasets, with Parquet files alone accounting for over 4 PB of that storage. Optimizing Parquet storage is therefore a high priority. Hugging Face has introduced a new storage layer called Xet that leverages content-defined chunking to efficiently deduplicate chunks of data reducing storage costs and improving download/upload speeds.\n\nWhile Xet is format agnostic, Parquet's layout and column-chunk (data page) based compression can produce entirely different byte-level representations for data with minor changes, leading to suboptimal deduplication performance. To address this, the Parquet files should be written in a way that minimizes the byte-level differences between similar data, which is where content-defined chunking (CDC) comes into play.\n\nLet's explore the performance benefits of the new Parquet CDC feature used alongside Hugging Face's Xet storage layer.\n\nFor demonstration purposes, we will use a manageable sized subset of OpenOrca dataset.\n\n```\nimport numpy as np\nimport pyarrow as pa\nimport pyarrow.compute as pc\nimport pyarrow.parquet as pq\nfrom huggingface_hub import hf_hub_download\n\n\ndef shuffle_table(table, seed=40):\n    rng = np.random.default_rng(seed)\n    indices = rng.permutation(len(table))\n    return table.take(indices)\n\n\n# download the dataset from Hugging Face Hub into local cache\npath = hf_hub_download(\n    repo_id=\"Open-Orca/OpenOrca\", \n    filename=\"3_5M-GPT3_5-Augmented.parquet\", \n    repo_type=\"dataset\"\n)\n\n# read the cached parquet file into a PyArrow table \norca = pq.read_table(path, schema=pa.schema([\n    pa.field(\"id\", pa.string()),\n    pa.field(\"system_prompt\", pa.string()),\n    pa.field(\"question\", pa.large_string()),\n    pa.field(\"response\", pa.large_string()),\n]))\n\n# augment the table with some additional columns\norca = orca.add_column(\n    orca.schema.get_field_index(\"question\"),\n    \"question_length\",\n    pc.utf8_length(orca[\"question\"])\n)\norca = orca.add_column(\n    orca.schema.get_field_index(\"response\"),\n    \"response_length\",\n    pc.utf8_length(orca[\"response\"])\n)\n\n# shuffle the table to make it unique to the Xet storage\norca = shuffle_table(orca)\n\n# limit the table to the first 100,000 rows \ntable = orca[:100_000]\n\n# take a look at the first 3 rows of the table\ntable[:3].to_pandas()\n```\n\nid system_prompt question_length question response_length response\n\nYou are an AI assistant that helps people find...\n\nConsider the question. What is the euphrates l...\n\nThe question is asking what the Euphrates Rive...\n\nYou are an AI assistant. You will be given a t...\n\nSingle/multi-select question: Is it possible t...\n\nIt is not possible to conclude that the cowboy...\n\nYou are an AI assistant. User will you give yo...\n\nQ:I'm taking a test and have to guess the righ...\n\nThe passage mainly tells us what things are im...\n\nUpload the table as a Parquet file to Hugging Face Hub\n\nSince pyarrow>=21.0.0 we can use Hugging Face URIs in the pyarrow functions to directly read and write parquet (and other file formats) files to the Hub using the hf:// URI scheme.\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 96.1MB / 96.1MB, 48.0kB/s  \nTotal Bytes:  96.1M\nTotal Transfer:  96.1M\n```\n\nWe can see that the table has been uploaded entirely (total bytes == total transfer) as new data because it is not known to the Xet storage layer yet. Now read it back as a pyarrow table:\n\n```\ndownloaded_table = pq.read_table(\"hf://datasets/kszucs/pq/orca.parquet\")\nassert downloaded_table.equals(table)\n```\n\nNote that all pyarrow functions that accept a file path also accept a Hugging Face URI, like pyarrow datasets , CSV functions , incremental Parquet writer or reading only the parquet metadata:\n\n```\npq.read_metadata(\"hf://datasets/kszucs/pq/orca.parquet\")\n```\n\n```\n<pyarrow._parquet.FileMetaData object at 0x16ebfa980>\n  created_by: parquet-cpp-arrow version 21.0.0-SNAPSHOT\n  num_columns: 6\n  num_rows: 100000\n  num_row_groups: 1\n  format_version: 2.6\n  serialized_size: 4143\n```\n\nTo demonstrate the effectiveness of the content-defined chunking feature, we will try out how it performs in case of:\n\nRe-uploading exact copies of the table\n\nAdding/removing columns from the table\n\nChanging column types in the table\n\nAppending new rows and concatenating tables\n\nInserting / deleting rows in the table\n\nChange row-group size of the table\n\nUsing Varying File-Level Splits\n\n1. Re-uploading Exact Copies of the Table\n\nWhile this use case sounds trivial, traditional file systems do not deduplicate files resulting in full re-upload and re-download of the data. In contrast, a system utilizing content-defined chunking can recognize that the file content is identical and avoid unnecessary data transfer.\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-copy.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00\n```\n\nWe can see that no new data has been uploaded, and the operation was instantaneous. Now let's see what happens if we upload the same file again but to a different repository:\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq-copy/orca-copy-again.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00\n```\n\nThe upload was instantaneous again since deduplication works across repositories as well. This is a key feature of the Xet storage layer, allowing efficient data sharing and collaboration. You can read more about the details and scaling challenges in the From Chunks to Blocks: Accelerating Uploads and Downloads on the Hub blog post.\n\nFirst write out the original and changed tables to local parquet files to see their sizes:\n\n```\ntable_with_new_columns = table.add_column(\n    table.schema.get_field_index(\"response\"),\n    \"response_short\",\n    pc.utf8_slice_codeunits(table[\"response\"], 0, 10)\n)\ntable_with_removed_columns = table.drop([\"response\"])\n    \npq.write_table(table, \"/tmp/original.parquet\")\npq.write_table(table_with_new_columns, \"/tmp/with-new-columns.parquet\")\npq.write_table(table_with_removed_columns, \"/tmp/with-removed-columns.parquet\")\n```\n\n```\n!ls -lah /tmp/*.parquet\n```\n\n```\n-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/original.parquet\n-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/with-new-columns.parquet\n-rw-r--r--  1 kszucs  wheel    67M Jul 22 14:47 /tmp/with-removed-columns.parquet\n```\n\nNow upload them to Hugging Face to see how much data is actually transferred:\n\n```\n>>> pq.write_table(table_with_new_columns, \"hf://datasets/kszucs/pq/orca-added-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  575kB /  575kB,  288kB/s  \nTotal Bytes:  96.6M\nTotal Transfer:  575k\n```\n\nWe can see that only the new columns and the new parquet metadata placed in the file's footer were uploaded, while the original data was not transferred again. This is a huge benefit of the Xet storage layer, as it allows us to efficiently add new columns without transferring the entire dataset again.\n\nSame applies to removing columns, as we can see below:\n\n```\n>>> pq.write_table(table_with_removed_columns, \"hf://datasets/kszucs/pq/orca-removed-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 37.7kB / 37.7kB, 27.0kB/s  \nTotal Bytes:  70.6M\nTotal Transfer:  37.7k\n```\n\nTo have a better understanding of what has been uploaded, we can visualize the differences between the two parquet files using the deduplication estimation tool :\n\n```\nfrom de import visualize\n\nvisualize(table, table_with_new_columns, title=\"With New Columns\", prefix=\"orca\")\n```\n\nCompression Vanilla Parquet\n\n157.4 MB / 313.8 MB = 50%\n\n96.7 MB / 192.7 MB = 50%\n\nAdding two new columns mean that we have unseen data pages which must be transferred (highlighted in red), but the rest of the data remains unchanged (highlighted in green), so it is not transferred again. Note the small red area in the footer metadata which almost always changes as we modify the parquet file. The dedup stats show <deduped size> / <total size> = <dedup ratio> where smaller ratios mean higher deduplication performance.\n\nAlso visualize the difference after removing a column:\n\n```\nvisualize(table, table_with_removed_columns, title=\"With Removed Columns\", prefix=\"orca\")\n```\n\n156.6 MB / 269.4 MB = 58%\n\n96.1 MB / 166.7 MB = 57%\n\nSince we are removing entire columns we can only see changes in the footer metadata, all the other columns remain unchanged and already existing in the storage layer, so they are not transferred again.\n\nAnother common use case is changing the column types in the table e.g. to reduce the storage size or to optimize the data for specific queries. Let's change the question_length column from int64 data type to int32 and see how much data is transferred:\n\n```\n# first make the table much smaller by removing the large string columns\n# to highlight the differences better\ntable_without_text = table_with_new_columns.drop([\"question\", \"response\"])\n\n# cast the question_length column to int64\ntable_with_casted_column = table_without_text.set_column(\n    table_without_text.schema.get_field_index(\"question_length\"),\n    \"question_length\",\n    table_without_text[\"question_length\"].cast(\"int32\")\n)\n```\n\n```\n>>> pq.write_table(table_with_casted_column, \"hf://datasets/kszucs/pq/orca-casted-column.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  181kB /  181kB,  113kB/s  \nTotal Bytes:  1.80M\nTotal Transfer:  181k\n```\n\nAgain, we can see that only the new column and the updated parquet metadata were uploaded. Now visualize the deduplication heatmap:\n\n```\nvisualize(table_without_text, table_with_casted_column, title=\"With Casted Column\", prefix=\"orca\")\n```\n\nThe first red region indicates the new column that was added, while the second red region indicates the updated metadata in the footer. The rest of the data remains unchanged and is not transferred again.\n\nWe are going to append new rows by concatenating another slice of the original dataset to the table.\n\n```\ntable = orca[:100_000]\nnext_10k_rows = orca[100_000:110_000]\ntable_with_appended_rows = pa.concat_tables([table, next_10k_rows])\n\nassert len(table_with_appended_rows) == 110_000\n```\n\nNow check that only the new rows are being uploaded since the original data is already known to the Xet storage layer:\n\n```\n>>> pq.write_table(table_with_appended_rows, \"hf://datasets/kszucs/pq/orca-appended-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 10.3MB / 10.3MB, 1.36MB/s  \nTotal Bytes:  106M\nTotal Transfer:  10.3M\n```\n\n```\nvisualize(table, table_with_appended_rows, title=\"With Appended Rows\", prefix=\"orca\")\n```\n\n173.1 MB / 328.8 MB = 52%\n\n106.5 MB / 201.8 MB = 52%\n\nSince each column gets new data, we can see multiple red regions. This is due to the actual parquet file specification where whole columns are laid out after each other (within each row group).\n\nHere comes the difficult part as insertions and deletions are shifting the existing rows which lead to different columns chunks or data pages in the parquet nomenclature. Since each data page is compressed separately, even a single row insertion or deletion can lead to a completely different byte-level representation starting from the edited row(s) to the end of the parquet file.\n\nThis parquet specific problem cannot be solved by the Xet storage layer alone, the parquet file itself needs to be written in a way that minimizes the data page differences even if there are inserted or deleted rows.\n\nLet's try to use the existing mechanism and see how it performs.\n\n```\ntable = orca[:100_000]\n\n# remove 4k rows from two places \ntable_with_deleted_rows = pa.concat_tables([\n    orca[:15_000], \n    orca[18_000:60_000],\n    orca[61_000:100_000]\n])\n\n# add 1k rows at the first third of the table\ntable_with_inserted_rows = pa.concat_tables([\n    orca[:10_000],\n    orca[100_000:101_000],\n    orca[10_000:50_000],\n    orca[101_000:103_000],\n    orca[50_000:100_000],\n])\n\nassert len(table) == 100_000\nassert len(table_with_deleted_rows) == 96_000\nassert len(table_with_inserted_rows) == 103_000\n```\n\n```\n>>> pq.write_table(table_with_inserted_rows, \"hf://datasets/kszucs/pq/orca-inserted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 89.8MB / 89.8MB, 42.7kB/s  \nTotal Bytes:  99.1M\nTotal Transfer:  89.8M\n```\n\n```\n>>> pq.write_table(table_with_deleted_rows, \"hf://datasets/kszucs/pq/orca-deleted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 78.2MB / 78.2MB, 46.5kB/s  \nTotal Bytes:  92.2M\nTotal Transfer:  78.2M\n```\n\nAlso visualize both cases to see the differences:\n\n```\nvisualize(table, table_with_deleted_rows, title=\"Deleted Rows\", prefix=\"orca\")\nvisualize(table, table_with_inserted_rows, title=\"Inserted Rows\", prefix=\"orca\")\n```\n\n185.3 MB / 306.8 MB = 60%\n\n174.4 MB / 188.3 MB = 92%\n\n190.1 MB / 318.0 MB = 59%\n\n186.2 MB / 195.2 MB = 95%\n\nWe can see that the deduplication performance has dropped significantly (higher ratio), and the deduplication heatmaps show that the compressed parquet files are quite different from each other. This is due to the fact that the inserted and deleted rows have shifted the existing rows, leading to different data pages starting from the edited row(s) to the end of the parquet file.\n\nWe can solve this problem by writing parquet files with a new pyarrow feature called content-defined chunking (CDC) . This feature ensures that the columns are consistently getting chunked into data pages based on their content, similarly how the Xet storage layer deduplicates data but applied to the logical values of the columns before any serialization or compression happens.\n\nThe feature can be enabled by passing use_content_defined_chunking=True to the write_parquet function:\n\n```\nimport pyarrow.parquet as pq\n\npq.write_table(table, \"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)\n```\n\nPandas also supports the new feature:\n\n```\ndf.to_parquet(\"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)\n```\n\nLet's visualize the deduplication difference before and after using the Parquet CDC feature:\n\n```\nvisualize(table, table_with_deleted_rows, title=\"With Deleted Rows\", prefix=\"orca\", with_cdc=True)\nvisualize(table, table_with_inserted_rows, title=\"With Inserted Rows\", prefix=\"orca\", with_cdc=True)\n```\n\nCompression Vanilla Parquet CDC Parquet\n\n162.9 MB / 307.2 MB = 53%\n\n104.3 MB / 188.8 MB = 55%\n\n164.1 MB / 318.4 MB = 51%\n\n102.8 MB / 195.7 MB = 52%\n\nLooks much better! Since the proof of the pudding is in the eating, let's actually upload the tables using the content-defined chunking parquet feature and see how much data is transferred.\n\nNote that we need to upload the original table first with content-defined chunking enabled:\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-cdc.parquet\", use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 94.5MB / 94.5MB, 46.5kB/s  \nTotal Bytes:  96.4M\nTotal Transfer:  94.5M\n```\n\n```\n>>> pq.write_table(\n...     table_with_inserted_rows, \n...     \"hf://datasets/kszucs/pq/orca-inserted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 6.00MB / 6.00MB, 1.00MB/s  \nTotal Bytes:  99.3M\nTotal Transfer:  6.00M\n```\n\n```\n>>> pq.write_table(\n...     table_with_deleted_rows, \n...     \"hf://datasets/kszucs/pq/orca-deleted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 7.57MB / 7.57MB, 1.35MB/s  \nTotal Bytes:  92.4M\nTotal Transfer:  7.57M\n```\n\nThe uploaded data is significantly smaller than before, showing much better deduplication performance as highlighted in the heatmaps above.\n\nImportant to note that the same performance benefits apply to downloads using the huggingface_hub.hf_hub_download() and datasets.load_dataset() functions.\n\nThere are cases depending on the reader/writer constraints where larger or smaller row-group sizes might be beneficial. The parquet writer implementations use fixed-sized row-groups by default, in the case of pyarrow the default is 1Mi rows. Dataset writers may change to reduce the row-group size in order to improve random access performance or to reduce the memory footprint of the reader application.\n\nChanging the row-group size will shift rows between row-groups, shifting values between data pages, so we have a similar problem as with inserting or deleting rows. Let's compare the deduplication performance between different row-group sizes using the parquet CDC feature:\n\n```\nfrom de import visualize\n\n# pick a larger subset of the dataset to have enough rows for the row group size tests\ntable = orca[2_000_000:3_000_000]\n\nvisualize(table, (table, {\"row_group_size\": 128 * 1024}), title=\"Small Row Groups\", with_cdc=True, prefix=\"orca\")\nvisualize(table, (table, {\"row_group_size\": 256 * 1024}), title=\"Medium Row Groups\", with_cdc=True, prefix=\"orca\")\n```\n\nDatasets are often split into multiple files to improve parallelism and random access. Parquet CDC combined with the Xet storage layer can efficiently deduplicate data across multiple files even if the data is split at different boundaries.\n\nLet's write out the dataset with three different file-level splitting then compare the deduplication performance:\n\n```\nfrom pathlib import Path\nfrom de import estimate\n\n\ndef write_dataset(table, base_dir, num_shards, **kwargs):\n    \"\"\"Simple utility to write a pyarrow table to multiple Parquet files.\"\"\"\n    # ensure that directory exists\n    base_dir = Path(base_dir)\n    base_dir.mkdir(parents=True, exist_ok=True)\n    # split and write the table into multiple files\n    rows_per_file = len(table) / num_shards\n    for i in range(num_shards):\n        start = i * rows_per_file\n        end = min((i + 1) * rows_per_file, len(table))\n        shard = table.slice(start, end - start)\n        path = base_dir / f\"part-{i}.parquet\"\n        pq.write_table(shard, path, **kwargs)\n\n\nwrite_dataset(orca, \"orca5-cdc\", num_shards=5, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca10-cdc\", num_shards=10, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca20-cdc\", num_shards=20, use_content_defined_chunking=True)\n\nestimate(\"orca5-cdc/*.parquet\", \"orca10-cdc/*.parquet\", \"orca20-cdc/*.parquet\")\n```\n\n```\nTotal size: 9.3 GB\nChunk size: 3.2 GB\n```\n\nEven though we uploaded the dataset with three different sharding configurations, the overall upload size would be barely larger than the original dataset size.\n\nSo far we've used PyArrow, let’s explore using the same CDC feature with Pandas by downloading, filtering then uploading the dataset with the content-defined chunking feature enabled:\n\n```\nimport pandas as pd\n\nsrc = \"hf://datasets/teknium/OpenHermes-2.5/openhermes2_5.json\"\ndf = pd.read_json(src)\n```\n\n```\n>>> dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc.parquet\"\n>>> df.to_parquet(dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████|  799MB /  799MB,  197kB/s  \nTotal Bytes:  799M\nTotal Transfer:  799M\n```\n\n```\n>>> short_df = df[[len(c) < 10 for c in df.conversations]]\n>>> short_dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc-short.parquet\"\n>>> short_df.to_parquet(short_dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 21.9MB / 21.9MB, 45.4kB/s  \nTotal Bytes:  801M\nTotal Transfer:  21.9M\n```\n\n```\nimport pyarrow as pa\nfrom de import visualize\n\nvisualize(\n    pa.Table.from_pandas(df), \n    pa.Table.from_pandas(short_df),\n    title=\"Hermes 2.5 Short Conversations\",\n    with_cdc=True,\n    prefix=\"hermes\"\n)\n```\n\nHermes 2.5 Short Conversations\n\nSince Parquet CDC is applied at the parquet data page level (column chunk level), the deduplication performance depends on the filter's selectivity, or rather the distribution of the changes across the dataset. If most of the data pages are affected, then the deduplication ratio will drop significantly.\n\nMore details about the feature can be found at:\n\nHugging Face's Xet announcement\n\nparquet-dedupe-estimator's readme\n\nPyArrow's documentation page\n\nPull request implementing Parquet CDC\n\nWe explored the performance benefits of the new Parquet content-defined chunking feature used alongside Hugging Face's Xet storage layer. We demonstrated how it can efficiently deduplicate data in various scenarios making parquet operations faster and more storage-efficient. Comparing to traditional cloud storage solutions, the Xet storage layer with Parquet CDC can significantly reduce data transfer times and costs.\n\nMigrate your Hugging Face repositories from Git LFS to Xet to benefit from this here: https://huggingface.co/join/xet\n\nDatasets mentioned in this article 1\n\nMore Articles from our Blog\n\nStreaming datasets: 100x More Efficient\n\nImproving Parquet Dedupe on Hugging Face Hub\n\nDoes the Hugging Face Xet Storage also work on top of (self-hosted) Minio?\n\n@ sfkeller Not today, but the underlying technology is open source and we're in the process of documenting the backend! We plan to release a Xet protocol later this year, which would open up the possibility to build for other backends as well. cc @ rajatarya\n\nThis is great! I will look forward to the release of Xet protocol.\n\nI hope it is written in Rust :)\n\nProtocol + Format will be documentation, but there is the hf-xet implementation in Rust with xet-core .\n\nThis comment has been hidden\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Reduce Parquet file upload and download times on Hugging Face Hub by leveraging the new Xet storage layer and Apache Arrow’s Parquet Content-Defined Chunking (CDC) feature enabling more efficient and scalable data workflows.\n\nTL;DR: Parquet Content-Defined Chunking (CDC) is now available in PyArrow and Pandas, enabling efficient deduplication of Parquet files on content-addressable storage systems like Hugging Face's Xet storage layer. CDC dramatically reduces data transfer and storage costs by uploading or downloading only the changed data chunks. Enable CDC by passing the use_content_defined_chunking argument:\n\n```\nimport pandas as pd\nimport pyarrow.parquet as pq\n\ndf.to_parquet(\"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)\npq.write_table(table, \"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)\n```\n\n## Table of Contents\n\n- Introduction\n\n- Data Preparation\n\nDifferent Use Cases for Parquet Deduplication\n\n- 1. Re-uploading an Exact Copies of the Table\n\n- 2. Adding and Removing Columns from the Table\n\n- 3. Changing Column Types in the Table\n\n- 4. Appending New Rows and Concatenating Tables\n\n- 5. Inserting / Deleting Rows in the Table\n\n- 6. Using Different Row-group Sizes\n\n- 7. Using Varying File-Level Splits\n\n- Using Parquet CDC feature with Pandas\n\n- References\n\n- Conclusion\n\n## Introduction\n\nApache Parquet is a columnar storage format that is widely used in the data engineering community.\n\nAs of today, Hugging Face hosts nearly 21 PB of datasets, with Parquet files alone accounting for over 4 PB of that storage. Optimizing Parquet storage is therefore a high priority. Hugging Face has introduced a new storage layer called Xet that leverages content-defined chunking to efficiently deduplicate chunks of data reducing storage costs and improving download/upload speeds.\n\nWhile Xet is format agnostic, Parquet's layout and column-chunk (data page) based compression can produce entirely different byte-level representations for data with minor changes, leading to suboptimal deduplication performance. To address this, the Parquet files should be written in a way that minimizes the byte-level differences between similar data, which is where content-defined chunking (CDC) comes into play.\n\nLet's explore the performance benefits of the new Parquet CDC feature used alongside Hugging Face's Xet storage layer.\n\n## Data Preparation\n\nFor demonstration purposes, we will use a manageable sized subset of OpenOrca dataset.\n\n```\nimport numpy as np\nimport pyarrow as pa\nimport pyarrow.compute as pc\nimport pyarrow.parquet as pq\nfrom huggingface_hub import hf_hub_download\n\n\ndef shuffle_table(table, seed=40):\n    rng = np.random.default_rng(seed)\n    indices = rng.permutation(len(table))\n    return table.take(indices)\n\n\n# download the dataset from Hugging Face Hub into local cache\npath = hf_hub_download(\n    repo_id=\"Open-Orca/OpenOrca\", \n    filename=\"3_5M-GPT3_5-Augmented.parquet\", \n    repo_type=\"dataset\"\n)\n\n# read the cached parquet file into a PyArrow table \norca = pq.read_table(path, schema=pa.schema([\n    pa.field(\"id\", pa.string()),\n    pa.field(\"system_prompt\", pa.string()),\n    pa.field(\"question\", pa.large_string()),\n    pa.field(\"response\", pa.large_string()),\n]))\n\n# augment the table with some additional columns\norca = orca.add_column(\n    orca.schema.get_field_index(\"question\"),\n    \"question_length\",\n    pc.utf8_length(orca[\"question\"])\n)\norca = orca.add_column(\n    orca.schema.get_field_index(\"response\"),\n    \"response_length\",\n    pc.utf8_length(orca[\"response\"])\n)\n\n# shuffle the table to make it unique to the Xet storage\norca = shuffle_table(orca)\n\n# limit the table to the first 100,000 rows \ntable = orca[:100_000]\n\n# take a look at the first 3 rows of the table\ntable[:3].to_pandas()\n```\n\n—\n\nid\n\nsystem_prompt\n\nquestion_length\n\nquestion\n\nresponse_length\n\nresponse\n\n0\n\ncot.64099\n\nYou are an AI assistant that helps people find...\n\n241\n\nConsider the question. What is the euphrates l...\n\n1663\n\nThe question is asking what the Euphrates Rive...\n\n1\n\nflan.1206442\n\nYou are an AI assistant. You will be given a t...\n\n230\n\nSingle/multi-select question: Is it possible t...\n\n751\n\nIt is not possible to conclude that the cowboy...\n\n2\n\nt0.1170225\n\nYou are an AI assistant. User will you give yo...\n\n1484\n\nQ:I'm taking a test and have to guess the righ...\n\n128\n\nThe passage mainly tells us what things are im...\n\n### Upload the table as a Parquet file to Hugging Face Hub\n\nSince pyarrow>=21.0.0 we can use Hugging Face URIs in the pyarrow functions to directly read and write parquet (and other file formats) files to the Hub using the hf:// URI scheme.\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 96.1MB / 96.1MB, 48.0kB/s  \nTotal Bytes:  96.1M\nTotal Transfer:  96.1M\n```\n\nWe can see that the table has been uploaded entirely (total bytes == total transfer) as new data because it is not known to the Xet storage layer yet. Now read it back as a pyarrow table:\n\n```\ndownloaded_table = pq.read_table(\"hf://datasets/kszucs/pq/orca.parquet\")\nassert downloaded_table.equals(table)\n```\n\nNote that all pyarrow functions that accept a file path also accept a Hugging Face URI, like pyarrow datasets, CSV functions, incremental Parquet writer or reading only the parquet metadata:\n\n```\npq.read_metadata(\"hf://datasets/kszucs/pq/orca.parquet\")\n```\n\n```\n<pyarrow._parquet.FileMetaData object at 0x16ebfa980>\n  created_by: parquet-cpp-arrow version 21.0.0-SNAPSHOT\n  num_columns: 6\n  num_rows: 100000\n  num_row_groups: 1\n  format_version: 2.6\n  serialized_size: 4143\n```\n\n## Different Use Cases for Parquet Deduplication\n\nTo demonstrate the effectiveness of the content-defined chunking feature, we will try out how it performs in case of:\n\n- Re-uploading exact copies of the table\n\n- Adding/removing columns from the table\n\n- Changing column types in the table\n\n- Appending new rows and concatenating tables\n\n- Inserting / deleting rows in the table\n\n- Change row-group size of the table\n\n- Using Varying File-Level Splits\n\n### 1. Re-uploading Exact Copies of the Table\n\nWhile this use case sounds trivial, traditional file systems do not deduplicate files resulting in full re-upload and re-download of the data. In contrast, a system utilizing content-defined chunking can recognize that the file content is identical and avoid unnecessary data transfer.\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-copy.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00\n```\n\nWe can see that no new data has been uploaded, and the operation was instantaneous. Now let's see what happens if we upload the same file again but to a different repository:\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq-copy/orca-copy-again.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00\n```\n\nThe upload was instantaneous again since deduplication works across repositories as well. This is a key feature of the Xet storage layer, allowing efficient data sharing and collaboration. You can read more about the details and scaling challenges in the From Chunks to Blocks: Accelerating Uploads and Downloads on the Hub blog post.\n\n### 2. Adding and Removing Columns from the Table\n\nFirst write out the original and changed tables to local parquet files to see their sizes:\n\n```\ntable_with_new_columns = table.add_column(\n    table.schema.get_field_index(\"response\"),\n    \"response_short\",\n    pc.utf8_slice_codeunits(table[\"response\"], 0, 10)\n)\ntable_with_removed_columns = table.drop([\"response\"])\n    \npq.write_table(table, \"/tmp/original.parquet\")\npq.write_table(table_with_new_columns, \"/tmp/with-new-columns.parquet\")\npq.write_table(table_with_removed_columns, \"/tmp/with-removed-columns.parquet\")\n```\n\n```\n!ls -lah /tmp/*.parquet\n```\n\n```\n-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/original.parquet\n-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/with-new-columns.parquet\n-rw-r--r--  1 kszucs  wheel    67M Jul 22 14:47 /tmp/with-removed-columns.parquet\n```\n\nNow upload them to Hugging Face to see how much data is actually transferred:\n\n```\n>>> pq.write_table(table_with_new_columns, \"hf://datasets/kszucs/pq/orca-added-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  575kB /  575kB,  288kB/s  \nTotal Bytes:  96.6M\nTotal Transfer:  575k\n```\n\nWe can see that only the new columns and the new parquet metadata placed in the file's footer were uploaded, while the original data was not transferred again. This is a huge benefit of the Xet storage layer, as it allows us to efficiently add new columns without transferring the entire dataset again.\n\nSame applies to removing columns, as we can see below:\n\n```\n>>> pq.write_table(table_with_removed_columns, \"hf://datasets/kszucs/pq/orca-removed-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 37.7kB / 37.7kB, 27.0kB/s  \nTotal Bytes:  70.6M\nTotal Transfer:  37.7k\n```\n\nTo have a better understanding of what has been uploaded, we can visualize the differences between the two parquet files using the deduplication estimation tool:\n\n```\nfrom de import visualize\n\nvisualize(table, table_with_new_columns, title=\"With New Columns\", prefix=\"orca\")\n```\n\n#### With New Columns\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n157.4 MB / 313.8 MB = 50%\n\nSnappy\n\n—\n\nDedup Stats\n\n96.7 MB / 192.7 MB = 50%\n\nAdding two new columns mean that we have unseen data pages which must be transferred (highlighted in red), but the rest of the data remains unchanged (highlighted in green), so it is not transferred again. Note the small red area in the footer metadata which almost always changes as we modify the parquet file. The dedup stats show <deduped size> / <total size> = <dedup ratio> where smaller ratios mean higher deduplication performance.\n\nAlso visualize the difference after removing a column:\n\n```\nvisualize(table, table_with_removed_columns, title=\"With Removed Columns\", prefix=\"orca\")\n```\n\n#### With Removed Columns\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n156.6 MB / 269.4 MB = 58%\n\nSnappy\n\n—\n\nDedup Stats\n\n96.1 MB / 166.7 MB = 57%\n\nSince we are removing entire columns we can only see changes in the footer metadata, all the other columns remain unchanged and already existing in the storage layer, so they are not transferred again.\n\n### 3. Changing Column Types in the Table\n\nAnother common use case is changing the column types in the table e.g. to reduce the storage size or to optimize the data for specific queries. Let's change the question_length column from int64 data type to int32 and see how much data is transferred:\n\n```\n# first make the table much smaller by removing the large string columns\n# to highlight the differences better\ntable_without_text = table_with_new_columns.drop([\"question\", \"response\"])\n\n# cast the question_length column to int64\ntable_with_casted_column = table_without_text.set_column(\n    table_without_text.schema.get_field_index(\"question_length\"),\n    \"question_length\",\n    table_without_text[\"question_length\"].cast(\"int32\")\n)\n```\n\n```\n>>> pq.write_table(table_with_casted_column, \"hf://datasets/kszucs/pq/orca-casted-column.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  181kB /  181kB,  113kB/s  \nTotal Bytes:  1.80M\nTotal Transfer:  181k\n```\n\nAgain, we can see that only the new column and the updated parquet metadata were uploaded. Now visualize the deduplication heatmap:\n\n```\nvisualize(table_without_text, table_with_casted_column, title=\"With Casted Column\", prefix=\"orca\")\n```\n\n#### With Casted Column\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n2.8 MB / 5.3 MB = 52%\n\nSnappy\n\n—\n\nDedup Stats\n\n1.9 MB / 3.6 MB = 53%\n\nThe first red region indicates the new column that was added, while the second red region indicates the updated metadata in the footer. The rest of the data remains unchanged and is not transferred again.\n\n### 4. Appending New Rows and Concatenating Tables\n\nWe are going to append new rows by concatenating another slice of the original dataset to the table.\n\n```\ntable = orca[:100_000]\nnext_10k_rows = orca[100_000:110_000]\ntable_with_appended_rows = pa.concat_tables([table, next_10k_rows])\n\nassert len(table_with_appended_rows) == 110_000\n```\n\nNow check that only the new rows are being uploaded since the original data is already known to the Xet storage layer:\n\n```\n>>> pq.write_table(table_with_appended_rows, \"hf://datasets/kszucs/pq/orca-appended-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 10.3MB / 10.3MB, 1.36MB/s  \nTotal Bytes:  106M\nTotal Transfer:  10.3M\n```\n\n```\nvisualize(table, table_with_appended_rows, title=\"With Appended Rows\", prefix=\"orca\")\n```\n\n#### With Appended Rows\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n173.1 MB / 328.8 MB = 52%\n\nSnappy\n\n—\n\nDedup Stats\n\n106.5 MB / 201.8 MB = 52%\n\nSince each column gets new data, we can see multiple red regions. This is due to the actual parquet file specification where whole columns are laid out after each other (within each row group).\n\n### 5. Inserting / Deleting Rows in the Table\n\nHere comes the difficult part as insertions and deletions are shifting the existing rows which lead to different columns chunks or data pages in the parquet nomenclature. Since each data page is compressed separately, even a single row insertion or deletion can lead to a completely different byte-level representation starting from the edited row(s) to the end of the parquet file.\n\nThis parquet specific problem cannot be solved by the Xet storage layer alone, the parquet file itself needs to be written in a way that minimizes the data page differences even if there are inserted or deleted rows.\n\nLet's try to use the existing mechanism and see how it performs.\n\n```\ntable = orca[:100_000]\n\n# remove 4k rows from two places \ntable_with_deleted_rows = pa.concat_tables([\n    orca[:15_000], \n    orca[18_000:60_000],\n    orca[61_000:100_000]\n])\n\n# add 1k rows at the first third of the table\ntable_with_inserted_rows = pa.concat_tables([\n    orca[:10_000],\n    orca[100_000:101_000],\n    orca[10_000:50_000],\n    orca[101_000:103_000],\n    orca[50_000:100_000],\n])\n\nassert len(table) == 100_000\nassert len(table_with_deleted_rows) == 96_000\nassert len(table_with_inserted_rows) == 103_000\n```\n\n```\n>>> pq.write_table(table_with_inserted_rows, \"hf://datasets/kszucs/pq/orca-inserted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 89.8MB / 89.8MB, 42.7kB/s  \nTotal Bytes:  99.1M\nTotal Transfer:  89.8M\n```\n\n```\n>>> pq.write_table(table_with_deleted_rows, \"hf://datasets/kszucs/pq/orca-deleted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 78.2MB / 78.2MB, 46.5kB/s  \nTotal Bytes:  92.2M\nTotal Transfer:  78.2M\n```\n\nAlso visualize both cases to see the differences:\n\n```\nvisualize(table, table_with_deleted_rows, title=\"Deleted Rows\", prefix=\"orca\")\nvisualize(table, table_with_inserted_rows, title=\"Inserted Rows\", prefix=\"orca\")\n```\n\n#### Deleted Rows\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n185.3 MB / 306.8 MB = 60%\n\nSnappy\n\n—\n\nDedup Stats\n\n174.4 MB / 188.3 MB = 92%\n\n#### Inserted Rows\n\nCompression\n\nVanilla Parquet\n\nNone\n\n—\n\nDedup Stats\n\n190.1 MB / 318.0 MB = 59%\n\nSnappy\n\n—\n\nDedup Stats\n\n186.2 MB / 195.2 MB = 95%\n\nWe can see that the deduplication performance has dropped significantly (higher ratio), and the deduplication heatmaps show that the compressed parquet files are quite different from each other. This is due to the fact that the inserted and deleted rows have shifted the existing rows, leading to different data pages starting from the edited row(s) to the end of the parquet file.\n\nWe can solve this problem by writing parquet files with a new pyarrow feature called content-defined chunking (CDC). This feature ensures that the columns are consistently getting chunked into data pages based on their content, similarly how the Xet storage layer deduplicates data but applied to the logical values of the columns before any serialization or compression happens.\n\nThe feature can be enabled by passing use_content_defined_chunking=True to the write_parquet function:\n\n```\nimport pyarrow.parquet as pq\n\npq.write_table(table, \"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)\n```\n\nPandas also supports the new feature:\n\n```\ndf.to_parquet(\"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)\n```\n\nLet's visualize the deduplication difference before and after using the Parquet CDC feature:\n\n```\nvisualize(table, table_with_deleted_rows, title=\"With Deleted Rows\", prefix=\"orca\", with_cdc=True)\nvisualize(table, table_with_inserted_rows, title=\"With Inserted Rows\", prefix=\"orca\", with_cdc=True)\n```\n\n#### Deleted Rows\n\nCompression\n\nVanilla Parquet\n\nCDC Parquet\n\nNone\n\n—\n\n—\n\nDedup Stats\n\n185.3 MB / 306.8 MB = 60%\n\n162.9 MB / 307.2 MB = 53%\n\nSnappy\n\n—\n\n—\n\nDedup Stats\n\n174.4 MB / 188.3 MB = 92%\n\n104.3 MB / 188.8 MB = 55%\n\n#### Inserted Rows\n\nCompression\n\nVanilla Parquet\n\nCDC Parquet\n\nNone\n\n—\n\n—\n\nDedup Stats\n\n190.1 MB / 318.0 MB = 59%\n\n164.1 MB / 318.4 MB = 51%\n\nSnappy\n\n—\n\n—\n\nDedup Stats\n\n186.2 MB / 195.2 MB = 95%\n\n102.8 MB / 195.7 MB = 52%\n\nLooks much better! Since the proof of the pudding is in the eating, let's actually upload the tables using the content-defined chunking parquet feature and see how much data is transferred.\n\nNote that we need to upload the original table first with content-defined chunking enabled:\n\n```\n>>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-cdc.parquet\", use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 94.5MB / 94.5MB, 46.5kB/s  \nTotal Bytes:  96.4M\nTotal Transfer:  94.5M\n```\n\n```\n>>> pq.write_table(\n...     table_with_inserted_rows, \n...     \"hf://datasets/kszucs/pq/orca-inserted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 6.00MB / 6.00MB, 1.00MB/s  \nTotal Bytes:  99.3M\nTotal Transfer:  6.00M\n```\n\n```\n>>> pq.write_table(\n...     table_with_deleted_rows, \n...     \"hf://datasets/kszucs/pq/orca-deleted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 7.57MB / 7.57MB, 1.35MB/s  \nTotal Bytes:  92.4M\nTotal Transfer:  7.57M\n```\n\nThe uploaded data is significantly smaller than before, showing much better deduplication performance as highlighted in the heatmaps above.\n\nImportant to note that the same performance benefits apply to downloads using the huggingface_hub.hf_hub_download() and datasets.load_dataset() functions.\n\n### 6. Using Different Row-group Sizes\n\nThere are cases depending on the reader/writer constraints where larger or smaller row-group sizes might be beneficial. The parquet writer implementations use fixed-sized row-groups by default, in the case of pyarrow the default is 1Mi rows. Dataset writers may change to reduce the row-group size in order to improve random access performance or to reduce the memory footprint of the reader application.\n\nChanging the row-group size will shift rows between row-groups, shifting values between data pages, so we have a similar problem as with inserting or deleting rows. Let's compare the deduplication performance between different row-group sizes using the parquet CDC feature:\n\n```\nfrom de import visualize\n\n# pick a larger subset of the dataset to have enough rows for the row group size tests\ntable = orca[2_000_000:3_000_000]\n\nvisualize(table, (table, {\"row_group_size\": 128 * 1024}), title=\"Small Row Groups\", with_cdc=True, prefix=\"orca\")\nvisualize(table, (table, {\"row_group_size\": 256 * 1024}), title=\"Medium Row Groups\", with_cdc=True, prefix=\"orca\")\n```\n\n#### Small Row Groups\n\nCompression\n\nVanilla Parquet\n\nCDC Parquet\n\nNone\n\n—\n\n—\n\nDedup Stats\n\n1.6 GB / 3.1 GB = 52%\n\n1.6 GB / 3.1 GB = 50%\n\nSnappy\n\n—\n\n—\n\nDedup Stats\n\n1.1 GB / 1.9 GB = 59%\n\n995.0 MB / 1.9 GB = 51%\n\n#### Medium Row Groups\n\nCompression\n\nVanilla Parquet\n\nCDC Parquet\n\nNone\n\n—\n\n—\n\nDedup Stats\n\n1.6 GB / 3.1 GB = 51%\n\n1.6 GB / 3.1 GB = 50%\n\nSnappy\n\n—\n\n—\n\nDedup Stats\n\n1.1 GB / 1.9 GB = 57%\n\n976.5 MB / 1.9 GB = 50%\n\n### 7. Using Varying File-Level Splits\n\nDatasets are often split into multiple files to improve parallelism and random access. Parquet CDC combined with the Xet storage layer can efficiently deduplicate data across multiple files even if the data is split at different boundaries.\n\nLet's write out the dataset with three different file-level splitting then compare the deduplication performance:\n\n```\nfrom pathlib import Path\nfrom de import estimate\n\n\ndef write_dataset(table, base_dir, num_shards, **kwargs):\n    \"\"\"Simple utility to write a pyarrow table to multiple Parquet files.\"\"\"\n    # ensure that directory exists\n    base_dir = Path(base_dir)\n    base_dir.mkdir(parents=True, exist_ok=True)\n    # split and write the table into multiple files\n    rows_per_file = len(table) / num_shards\n    for i in range(num_shards):\n        start = i * rows_per_file\n        end = min((i + 1) * rows_per_file, len(table))\n        shard = table.slice(start, end - start)\n        path = base_dir / f\"part-{i}.parquet\"\n        pq.write_table(shard, path, **kwargs)\n\n\nwrite_dataset(orca, \"orca5-cdc\", num_shards=5, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca10-cdc\", num_shards=10, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca20-cdc\", num_shards=20, use_content_defined_chunking=True)\n\nestimate(\"orca5-cdc/*.parquet\", \"orca10-cdc/*.parquet\", \"orca20-cdc/*.parquet\")\n```\n\n```\nTotal size: 9.3 GB\nChunk size: 3.2 GB\n```\n\nEven though we uploaded the dataset with three different sharding configurations, the overall upload size would be barely larger than the original dataset size.\n\n### Using Parquet CDC feature with Pandas\n\nSo far we've used PyArrow, let’s explore using the same CDC feature with Pandas by downloading, filtering then uploading the dataset with the content-defined chunking feature enabled:\n\n```\nimport pandas as pd\n\nsrc = \"hf://datasets/teknium/OpenHermes-2.5/openhermes2_5.json\"\ndf = pd.read_json(src)\n```\n\n```\n>>> dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc.parquet\"\n>>> df.to_parquet(dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████|  799MB /  799MB,  197kB/s  \nTotal Bytes:  799M\nTotal Transfer:  799M\n```\n\n```\n>>> short_df = df[[len(c) < 10 for c in df.conversations]]\n>>> short_dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc-short.parquet\"\n>>> short_df.to_parquet(short_dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 21.9MB / 21.9MB, 45.4kB/s  \nTotal Bytes:  801M\nTotal Transfer:  21.9M\n```\n\n```\nimport pyarrow as pa\nfrom de import visualize\n\nvisualize(\n    pa.Table.from_pandas(df), \n    pa.Table.from_pandas(short_df),\n    title=\"Hermes 2.5 Short Conversations\",\n    with_cdc=True,\n    prefix=\"hermes\"\n)\n```\n\n#### Hermes 2.5 Short Conversations\n\nCompression\n\nVanilla Parquet\n\nCDC Parquet\n\nNone\n\n—\n\n—\n\nDedup Stats\n\n1.9 GB / 3.2 GB = 58%\n\n1.6 GB / 3.2 GB = 51%\n\nSnappy\n\n—\n\n—\n\nDedup Stats\n\n1.5 GB / 1.6 GB = 94%\n\n821.1 MB / 1.6 GB = 51%\n\nSince Parquet CDC is applied at the parquet data page level (column chunk level), the deduplication performance depends on the filter's selectivity, or rather the distribution of the changes across the dataset. If most of the data pages are affected, then the deduplication ratio will drop significantly.\n\n## References\n\nMore details about the feature can be found at:\n\n- Hugging Face's Xet announcement\n\n- parquet-dedupe-estimator's readme\n\n- PyArrow's documentation page\n\n- Pull request implementing Parquet CDC\n\n## Conclusion\n\nWe explored the performance benefits of the new Parquet content-defined chunking feature used alongside Hugging Face's Xet storage layer. We demonstrated how it can efficiently deduplicate data in various scenarios making parquet operations faster and more storage-efficient. Comparing to traditional cloud storage solutions, the Xet storage layer with Parquet CDC can significantly reduce data transfer times and costs.\n\nMigrate your Hugging Face repositories from Git LFS to Xet to benefit from this here: https://huggingface.co/join/xet",
   "summaryZh": "Hugging Face 引入了基于 Apache Arrow 的 Parquet 内容定义分块（CDC）技术，并结合其 Xet 存储层，实现了对 Parquet 文件的高效去重。该方案允许用户在上传或下载时仅处理变更的数据块，从而大幅降低存储成本并提升数据传输速度。通过在 PyArrow 和 Pandas 中启用 `use_content_defined_chunking` 参数，开发者可以轻松集成此功能，解决大规模数据集（如 Hugging Face 上超过 4 PB 的 Parquet 文件）的存储优化难题，为 AI 数据流水线提供更具扩展性的基础设施支持。",
   "summaryGeneratedAt": "2026-09-01T16:55:07.984469Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -75,5 +75,3434 @@
       }
     ],
     "duplicateKey": "parquet-cdc-huggingface"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-new-columns-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-new-columns-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_c191cf47ea194a5f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-new-columns-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-new-columns-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_7f327c6997c01cf1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-removed-columns-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-removed-columns-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_d4bddd15de56ddf3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-removed-columns-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-removed-columns-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_7568e34a0c5fc02b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-casted-column-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-casted-column-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_e221c409d706abf5"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-casted-column-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-casted-column-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_460e32b87fa39398"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-appended-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-appended-rows-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_34d947a142ec2cd4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-appended-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-appended-rows-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_34918c85ba69e286"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-deleted-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-deleted-rows-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_c15317850b947141"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-deleted-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-deleted-rows-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_660a8a6d6fa369dd"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-inserted-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-inserted-rows-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_6d83f58aa4e4197d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-inserted-rows-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-inserted-rows-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_a1c87dff667c6053"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-deleted-rows-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-deleted-rows-cdc.parquet.png",
+      "alt": "Parquet none cdc",
+      "id": "image_e0b5d4d928a19973"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-deleted-rows-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-deleted-rows-cdc.parquet.png",
+      "alt": "Parquet snappy cdc",
+      "id": "image_0b76292d1302723a"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-inserted-rows-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-with-inserted-rows-cdc.parquet.png",
+      "alt": "Parquet none cdc",
+      "id": "image_0050e53b5839f01e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-inserted-rows-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-with-inserted-rows-cdc.parquet.png",
+      "alt": "Parquet snappy cdc",
+      "id": "image_a1e9f1beb60805ed"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-small-row-groups-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-small-row-groups-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_e9975bd2399691f1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-small-row-groups-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-small-row-groups-cdc.parquet.png",
+      "alt": "Parquet none cdc",
+      "id": "image_8bef90d150950976"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-small-row-groups-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-small-row-groups-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_701431add9b95e70"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-small-row-groups-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-small-row-groups-cdc.parquet.png",
+      "alt": "Parquet snappy cdc",
+      "id": "image_f5399cbcaa1b5b93"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-medium-row-groups-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-medium-row-groups-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_da7d7c7d8c71e307"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-medium-row-groups-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-none-medium-row-groups-cdc.parquet.png",
+      "alt": "Parquet none cdc",
+      "id": "image_ae1da225314c7041"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-medium-row-groups-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-medium-row-groups-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_9d69cc47c43c2dcb"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-medium-row-groups-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/orca-snappy-medium-row-groups-cdc.parquet.png",
+      "alt": "Parquet snappy cdc",
+      "id": "image_82dd06f758c62b43"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-none-hermes-2.5-short-conversations-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-none-hermes-2.5-short-conversations-nocdc.parquet.png",
+      "alt": "Parquet none nocdc",
+      "id": "image_e24b3edc166336fb"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-none-hermes-2.5-short-conversations-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-none-hermes-2.5-short-conversations-cdc.parquet.png",
+      "alt": "Parquet none cdc",
+      "id": "image_b2ff73cc81c053a4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-snappy-hermes-2.5-short-conversations-nocdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-snappy-hermes-2.5-short-conversations-nocdc.parquet.png",
+      "alt": "Parquet snappy nocdc",
+      "id": "image_9c2981c48f45ff87"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-snappy-hermes-2.5-short-conversations-cdc.parquet.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parquet-cdc/hermes-snappy-hermes-2.5-short-conversations-cdc.parquet.png",
+      "alt": "Parquet snappy cdc",
+      "id": "image_b93ee0212d6bb868"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Reduce Parquet file upload and download times on Hugging Face Hub by leveraging the new Xet storage layer and Apache Arrow’s Parquet Content-Defined Chunking (CDC) feature enabling more efficient and scalable data workflows.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "TL;DR: Parquet Content-Defined Chunking (CDC) is now available in PyArrow and Pandas, enabling efficient deduplication of Parquet files on content-addressable storage systems like Hugging Face's Xet storage layer. CDC dramatically reduces data transfer and storage costs by uploading or downloading only the changed data chunks. Enable CDC by passing the use_content_defined_chunking argument:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 355,
+          "end": 383,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Introduction",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#introduction"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Data Preparation",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#data-preparation"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Different Use Cases for Parquet Deduplication",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#different-use-cases-for-parquet-deduplication"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "1. Re-uploading an Exact Copies of the Table",
+      "spans": [
+        {
+          "start": 0,
+          "end": 44,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#1-re-uploading-an-exact-copies-of-the-table"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "2. Adding and Removing Columns from the Table",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#2-adding-and-removing-columns-from-the-table"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "3. Changing Column Types in the Table",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#3-changing-column-types-in-the-table"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "4. Appending New Rows and Concatenating Tables",
+      "spans": [
+        {
+          "start": 0,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#4-appending-new-rows-and-concatenating-tables"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "5. Inserting / Deleting Rows in the Table",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#5-inserting--deleting-rows-in-the-table"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "6. Using Different Row-group Sizes",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#6-using-different-row-group-sizes"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "7. Using Varying File-Level Splits",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#7-using-varying-file-level-splits"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Using Parquet CDC feature with Pandas",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#using-parquet-cdc-feature-with-pandas"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "References",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#references"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Conclusion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/parquet-cdc#conclusion"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Apache Parquet is a columnar storage format that is widely used in the data engineering community.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "As of today, Hugging Face hosts nearly 21 PB of datasets, with Parquet files alone accounting for over 4 PB of that storage. Optimizing Parquet storage is therefore a high priority. Hugging Face has introduced a new storage layer called Xet that leverages content-defined chunking to efficiently deduplicate chunks of data reducing storage costs and improving download/upload speeds.",
+      "spans": [
+        {
+          "start": 237,
+          "end": 240,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/xet-on-the-hub"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "While Xet is format agnostic, Parquet's layout and column-chunk (data page) based compression can produce entirely different byte-level representations for data with minor changes, leading to suboptimal deduplication performance. To address this, the Parquet files should be written in a way that minimizes the byte-level differences between similar data, which is where content-defined chunking (CDC) comes into play.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Let's explore the performance benefits of the new Parquet CDC feature used alongside Hugging Face's Xet storage layer.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Data Preparation",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "For demonstration purposes, we will use a manageable sized subset of OpenOrca dataset.",
+      "spans": [
+        {
+          "start": 69,
+          "end": 77,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/Open-Orca/OpenOrca"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "id",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "system_prompt",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "question_length",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "question",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "response_length",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "response",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "cot.64099",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "You are an AI assistant that helps people find...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "241",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "Consider the question. What is the euphrates l...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "1663",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "The question is asking what the Euphrates Rive...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "flan.1206442",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "You are an AI assistant. You will be given a t...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "230",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "Single/multi-select question: Is it possible t...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "751",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "It is not possible to conclude that the cowboy...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "2",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "t0.1170225",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "You are an AI assistant. User will you give yo...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "1484",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "Q:I'm taking a test and have to guess the righ...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "128",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "The passage mainly tells us what things are im...",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Upload the table as a Parquet file to Hugging Face Hub",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Since pyarrow>=21.0.0 we can use Hugging Face URIs in the pyarrow functions to directly read and write parquet (and other file formats) files to the Hub using the hf:// URI scheme.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 21,
+          "kind": "a",
+          "href": "https://github.com/apache/arrow/pull/45089"
+        },
+        {
+          "start": 58,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 163,
+          "end": 168,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "We can see that the table has been uploaded entirely (total bytes == total transfer) as new data because it is not known to the Xet storage layer yet. Now read it back as a pyarrow table:",
+      "spans": [
+        {
+          "start": 173,
+          "end": 180,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Note that all pyarrow functions that accept a file path also accept a Hugging Face URI, like pyarrow datasets, CSV functions, incremental Parquet writer or reading only the parquet metadata:",
+      "spans": [
+        {
+          "start": 14,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 93,
+          "end": 109,
+          "kind": "a",
+          "href": "https://arrow.apache.org/docs/python/dataset.html"
+        },
+        {
+          "start": 111,
+          "end": 124,
+          "kind": "a",
+          "href": "https://arrow.apache.org/docs/python/generated/pyarrow.csv.read_csv.html"
+        },
+        {
+          "start": 126,
+          "end": 152,
+          "kind": "a",
+          "href": "https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Different Use Cases for Parquet Deduplication",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "To demonstrate the effectiveness of the content-defined chunking feature, we will try out how it performs in case of:",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Re-uploading exact copies of the table",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Adding/removing columns from the table",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Changing column types in the table",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Appending new rows and concatenating tables",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "Inserting / deleting rows in the table",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Change row-group size of the table",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "Using Varying File-Level Splits",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "1. Re-uploading Exact Copies of the Table",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "While this use case sounds trivial, traditional file systems do not deduplicate files resulting in full re-upload and re-download of the data. In contrast, a system utilizing content-defined chunking can recognize that the file content is identical and avoid unnecessary data transfer.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "We can see that no new data has been uploaded, and the operation was instantaneous. Now let's see what happens if we upload the same file again but to a different repository:",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "The upload was instantaneous again since deduplication works across repositories as well. This is a key feature of the Xet storage layer, allowing efficient data sharing and collaboration. You can read more about the details and scaling challenges in the From Chunks to Blocks: Accelerating Uploads and Downloads on the Hub blog post.",
+      "spans": [
+        {
+          "start": 255,
+          "end": 323,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-chunks-to-blocks"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "2. Adding and Removing Columns from the Table",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "First write out the original and changed tables to local parquet files to see their sizes:",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Now upload them to Hugging Face to see how much data is actually transferred:",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "We can see that only the new columns and the new parquet metadata placed in the file's footer were uploaded, while the original data was not transferred again. This is a huge benefit of the Xet storage layer, as it allows us to efficiently add new columns without transferring the entire dataset again.",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "Same applies to removing columns, as we can see below:",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "To have a better understanding of what has been uploaded, we can visualize the differences between the two parquet files using the deduplication estimation tool:",
+      "spans": [
+        {
+          "start": 131,
+          "end": 160,
+          "kind": "a",
+          "href": "https://github.com/huggingface/dataset-dedupe-estimator"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "With New Columns",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "157.4 MB / 313.8 MB = 50%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "96.7 MB / 192.7 MB = 50%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "Adding two new columns mean that we have unseen data pages which must be transferred (highlighted in red), but the rest of the data remains unchanged (highlighted in green), so it is not transferred again. Note the small red area in the footer metadata which almost always changes as we modify the parquet file. The dedup stats show <deduped size> / <total size> = <dedup ratio> where smaller ratios mean higher deduplication performance.",
+      "spans": [
+        {
+          "start": 333,
+          "end": 378,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "Also visualize the difference after removing a column:",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "With Removed Columns",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "156.6 MB / 269.4 MB = 58%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "96.1 MB / 166.7 MB = 57%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "Since we are removing entire columns we can only see changes in the footer metadata, all the other columns remain unchanged and already existing in the storage layer, so they are not transferred again.",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "3. Changing Column Types in the Table",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "Another common use case is changing the column types in the table e.g. to reduce the storage size or to optimize the data for specific queries. Let's change the question_length column from int64 data type to int32 and see how much data is transferred:",
+      "spans": [
+        {
+          "start": 161,
+          "end": 176,
+          "kind": "code"
+        },
+        {
+          "start": 189,
+          "end": 194,
+          "kind": "code"
+        },
+        {
+          "start": 208,
+          "end": 213,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "Again, we can see that only the new column and the updated parquet metadata were uploaded. Now visualize the deduplication heatmap:",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "With Casted Column",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "2.8 MB / 5.3 MB = 52%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "1.9 MB / 3.6 MB = 53%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "The first red region indicates the new column that was added, while the second red region indicates the updated metadata in the footer. The rest of the data remains unchanged and is not transferred again.",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "4. Appending New Rows and Concatenating Tables",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "We are going to append new rows by concatenating another slice of the original dataset to the table.",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "Now check that only the new rows are being uploaded since the original data is already known to the Xet storage layer:",
+      "spans": []
+    },
+    {
+      "id": "b0118",
+      "source": "With Appended Rows",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "173.1 MB / 328.8 MB = 52%",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "106.5 MB / 201.8 MB = 52%",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "Since each column gets new data, we can see multiple red regions. This is due to the actual parquet file specification where whole columns are laid out after each other (within each row group).",
+      "spans": []
+    },
+    {
+      "id": "b0130",
+      "source": "5. Inserting / Deleting Rows in the Table",
+      "spans": []
+    },
+    {
+      "id": "b0131",
+      "source": "Here comes the difficult part as insertions and deletions are shifting the existing rows which lead to different columns chunks or data pages in the parquet nomenclature. Since each data page is compressed separately, even a single row insertion or deletion can lead to a completely different byte-level representation starting from the edited row(s) to the end of the parquet file.",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "This parquet specific problem cannot be solved by the Xet storage layer alone, the parquet file itself needs to be written in a way that minimizes the data page differences even if there are inserted or deleted rows.",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "Let's try to use the existing mechanism and see how it performs.",
+      "spans": []
+    },
+    {
+      "id": "b0134",
+      "source": "Also visualize both cases to see the differences:",
+      "spans": []
+    },
+    {
+      "id": "b0135",
+      "source": "Deleted Rows",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "185.3 MB / 306.8 MB = 60%",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "174.4 MB / 188.3 MB = 92%",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "Inserted Rows",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "190.1 MB / 318.0 MB = 59%",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "186.2 MB / 195.2 MB = 95%",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "We can see that the deduplication performance has dropped significantly (higher ratio), and the deduplication heatmaps show that the compressed parquet files are quite different from each other. This is due to the fact that the inserted and deleted rows have shifted the existing rows, leading to different data pages starting from the edited row(s) to the end of the parquet file.",
+      "spans": []
+    },
+    {
+      "id": "b0158",
+      "source": "We can solve this problem by writing parquet files with a new pyarrow feature called content-defined chunking (CDC). This feature ensures that the columns are consistently getting chunked into data pages based on their content, similarly how the Xet storage layer deduplicates data but applied to the logical values of the columns before any serialization or compression happens.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 115,
+          "kind": "a",
+          "href": "https://github.com/apache/arrow/pull/45360"
+        }
+      ]
+    },
+    {
+      "id": "b0159",
+      "source": "The feature can be enabled by passing use_content_defined_chunking=True to the write_parquet function:",
+      "spans": [
+        {
+          "start": 38,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 92,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0160",
+      "source": "Pandas also supports the new feature:",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "Let's visualize the deduplication difference before and after using the Parquet CDC feature:",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "Deleted Rows",
+      "spans": []
+    },
+    {
+      "id": "b0163",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "CDC Parquet",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "185.3 MB / 306.8 MB = 60%",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "162.9 MB / 307.2 MB = 53%",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "174.4 MB / 188.3 MB = 92%",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "104.3 MB / 188.8 MB = 55%",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "Inserted Rows",
+      "spans": []
+    },
+    {
+      "id": "b0179",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "CDC Parquet",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "190.1 MB / 318.0 MB = 59%",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "164.1 MB / 318.4 MB = 51%",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "186.2 MB / 195.2 MB = 95%",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "102.8 MB / 195.7 MB = 52%",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "Looks much better! Since the proof of the pudding is in the eating, let's actually upload the tables using the content-defined chunking parquet feature and see how much data is transferred.",
+      "spans": []
+    },
+    {
+      "id": "b0195",
+      "source": "Note that we need to upload the original table first with content-defined chunking enabled:",
+      "spans": []
+    },
+    {
+      "id": "b0196",
+      "source": "The uploaded data is significantly smaller than before, showing much better deduplication performance as highlighted in the heatmaps above.",
+      "spans": []
+    },
+    {
+      "id": "b0197",
+      "source": "Important to note that the same performance benefits apply to downloads using the huggingface_hub.hf_hub_download() and datasets.load_dataset() functions.",
+      "spans": [
+        {
+          "start": 82,
+          "end": 115,
+          "kind": "code"
+        },
+        {
+          "start": 120,
+          "end": 143,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0198",
+      "source": "6. Using Different Row-group Sizes",
+      "spans": []
+    },
+    {
+      "id": "b0199",
+      "source": "There are cases depending on the reader/writer constraints where larger or smaller row-group sizes might be beneficial. The parquet writer implementations use fixed-sized row-groups by default, in the case of pyarrow the default is 1Mi rows. Dataset writers may change to reduce the row-group size in order to improve random access performance or to reduce the memory footprint of the reader application.",
+      "spans": []
+    },
+    {
+      "id": "b0200",
+      "source": "Changing the row-group size will shift rows between row-groups, shifting values between data pages, so we have a similar problem as with inserting or deleting rows. Let's compare the deduplication performance between different row-group sizes using the parquet CDC feature:",
+      "spans": []
+    },
+    {
+      "id": "b0201",
+      "source": "Small Row Groups",
+      "spans": []
+    },
+    {
+      "id": "b0202",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "CDC Parquet",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "1.6 GB / 3.1 GB = 52%",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "1.6 GB / 3.1 GB = 50%",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0211",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "1.1 GB / 1.9 GB = 59%",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "995.0 MB / 1.9 GB = 51%",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "Medium Row Groups",
+      "spans": []
+    },
+    {
+      "id": "b0218",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0219",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0220",
+      "source": "CDC Parquet",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0221",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "1.6 GB / 3.1 GB = 51%",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "1.6 GB / 3.1 GB = 50%",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0230",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "1.1 GB / 1.9 GB = 57%",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "976.5 MB / 1.9 GB = 50%",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "7. Using Varying File-Level Splits",
+      "spans": []
+    },
+    {
+      "id": "b0234",
+      "source": "Datasets are often split into multiple files to improve parallelism and random access. Parquet CDC combined with the Xet storage layer can efficiently deduplicate data across multiple files even if the data is split at different boundaries.",
+      "spans": []
+    },
+    {
+      "id": "b0235",
+      "source": "Let's write out the dataset with three different file-level splitting then compare the deduplication performance:",
+      "spans": []
+    },
+    {
+      "id": "b0236",
+      "source": "Even though we uploaded the dataset with three different sharding configurations, the overall upload size would be barely larger than the original dataset size.",
+      "spans": []
+    },
+    {
+      "id": "b0237",
+      "source": "Using Parquet CDC feature with Pandas",
+      "spans": []
+    },
+    {
+      "id": "b0238",
+      "source": "So far we've used PyArrow, let’s explore using the same CDC feature with Pandas by downloading, filtering then uploading the dataset with the content-defined chunking feature enabled:",
+      "spans": []
+    },
+    {
+      "id": "b0239",
+      "source": "Hermes 2.5 Short Conversations",
+      "spans": []
+    },
+    {
+      "id": "b0240",
+      "source": "Compression",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "Vanilla Parquet",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0242",
+      "source": "CDC Parquet",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0243",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0244",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0245",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0246",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0247",
+      "source": "1.9 GB / 3.2 GB = 58%",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0248",
+      "source": "1.6 GB / 3.2 GB = 51%",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0249",
+      "source": "Snappy",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0250",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0251",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0252",
+      "source": "Dedup Stats",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0253",
+      "source": "1.5 GB / 1.6 GB = 94%",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0254",
+      "source": "821.1 MB / 1.6 GB = 51%",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0255",
+      "source": "Since Parquet CDC is applied at the parquet data page level (column chunk level), the deduplication performance depends on the filter's selectivity, or rather the distribution of the changes across the dataset. If most of the data pages are affected, then the deduplication ratio will drop significantly.",
+      "spans": []
+    },
+    {
+      "id": "b0256",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0257",
+      "source": "More details about the feature can be found at:",
+      "spans": []
+    },
+    {
+      "id": "b0258",
+      "source": "Hugging Face's Xet announcement",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/xet-on-the-hub"
+        }
+      ]
+    },
+    {
+      "id": "b0259",
+      "source": "parquet-dedupe-estimator's readme",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://github.com/huggingface/dataset-dedupe-estimator"
+        }
+      ]
+    },
+    {
+      "id": "b0260",
+      "source": "PyArrow's documentation page",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://arrow.apache.org/docs/python/parquet.html#content-defined-chunking"
+        }
+      ]
+    },
+    {
+      "id": "b0261",
+      "source": "Pull request implementing Parquet CDC",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "a",
+          "href": "https://github.com/apache/arrow/pull/45360"
+        }
+      ]
+    },
+    {
+      "id": "b0262",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0263",
+      "source": "We explored the performance benefits of the new Parquet content-defined chunking feature used alongside Hugging Face's Xet storage layer. We demonstrated how it can efficiently deduplicate data in various scenarios making parquet operations faster and more storage-efficient. Comparing to traditional cloud storage solutions, the Xet storage layer with Parquet CDC can significantly reduce data transfer times and costs.",
+      "spans": []
+    },
+    {
+      "id": "b0264",
+      "source": "Migrate your Hugging Face repositories from Git LFS to Xet to benefit from this here: https://huggingface.co/join/xet",
+      "spans": [
+        {
+          "start": 86,
+          "end": 117,
+          "kind": "a",
+          "href": "https://huggingface.co/join/xet"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "494d2e029c34ff6619a98aef3fa01326cdced7d7e20f5ad0955ebb1af80f6c19",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import pandas as pd\nimport pyarrow.parquet as pq\n\ndf.to_parquet(\"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)\npq.write_table(table, \"hf://datasets/{user}/{repo}/path.parquet\", use_content_defined_chunking=True)"
+    },
+    {
+      "id": "c0002",
+      "source": "import numpy as np\nimport pyarrow as pa\nimport pyarrow.compute as pc\nimport pyarrow.parquet as pq\nfrom huggingface_hub import hf_hub_download\n\n\ndef shuffle_table(table, seed=40):\n    rng = np.random.default_rng(seed)\n    indices = rng.permutation(len(table))\n    return table.take(indices)\n\n\n# download the dataset from Hugging Face Hub into local cache\npath = hf_hub_download(\n    repo_id=\"Open-Orca/OpenOrca\", \n    filename=\"3_5M-GPT3_5-Augmented.parquet\", \n    repo_type=\"dataset\"\n)\n\n# read the cached parquet file into a PyArrow table \norca = pq.read_table(path, schema=pa.schema([\n    pa.field(\"id\", pa.string()),\n    pa.field(\"system_prompt\", pa.string()),\n    pa.field(\"question\", pa.large_string()),\n    pa.field(\"response\", pa.large_string()),\n]))\n\n# augment the table with some additional columns\norca = orca.add_column(\n    orca.schema.get_field_index(\"question\"),\n    \"question_length\",\n    pc.utf8_length(orca[\"question\"])\n)\norca = orca.add_column(\n    orca.schema.get_field_index(\"response\"),\n    \"response_length\",\n    pc.utf8_length(orca[\"response\"])\n)\n\n# shuffle the table to make it unique to the Xet storage\norca = shuffle_table(orca)\n\n# limit the table to the first 100,000 rows \ntable = orca[:100_000]\n\n# take a look at the first 3 rows of the table\ntable[:3].to_pandas()"
+    },
+    {
+      "id": "c0003",
+      "source": ">>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 96.1MB / 96.1MB, 48.0kB/s  \nTotal Bytes:  96.1M\nTotal Transfer:  96.1M"
+    },
+    {
+      "id": "c0004",
+      "source": "downloaded_table = pq.read_table(\"hf://datasets/kszucs/pq/orca.parquet\")\nassert downloaded_table.equals(table)"
+    },
+    {
+      "id": "c0005",
+      "source": "pq.read_metadata(\"hf://datasets/kszucs/pq/orca.parquet\")"
+    },
+    {
+      "id": "c0006",
+      "source": "<pyarrow._parquet.FileMetaData object at 0x16ebfa980>\n  created_by: parquet-cpp-arrow version 21.0.0-SNAPSHOT\n  num_columns: 6\n  num_rows: 100000\n  num_row_groups: 1\n  format_version: 2.6\n  serialized_size: 4143"
+    },
+    {
+      "id": "c0007",
+      "source": ">>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-copy.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00"
+    },
+    {
+      "id": "c0008",
+      "source": ">>> pq.write_table(table, \"hf://datasets/kszucs/pq-copy/orca-copy-again.parquet\")\nNew Data Upload: |                                                   |  0.00B /  0.00B,  0.00B/s  \nTotal Bytes:  96.1M\nTotal Transfer:  0.00"
+    },
+    {
+      "id": "c0009",
+      "source": "table_with_new_columns = table.add_column(\n    table.schema.get_field_index(\"response\"),\n    \"response_short\",\n    pc.utf8_slice_codeunits(table[\"response\"], 0, 10)\n)\ntable_with_removed_columns = table.drop([\"response\"])\n    \npq.write_table(table, \"/tmp/original.parquet\")\npq.write_table(table_with_new_columns, \"/tmp/with-new-columns.parquet\")\npq.write_table(table_with_removed_columns, \"/tmp/with-removed-columns.parquet\")"
+    },
+    {
+      "id": "c0010",
+      "source": "!ls -lah /tmp/*.parquet"
+    },
+    {
+      "id": "c0011",
+      "source": "-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/original.parquet\n-rw-r--r--  1 kszucs  wheel    92M Jul 22 14:47 /tmp/with-new-columns.parquet\n-rw-r--r--  1 kszucs  wheel    67M Jul 22 14:47 /tmp/with-removed-columns.parquet"
+    },
+    {
+      "id": "c0012",
+      "source": ">>> pq.write_table(table_with_new_columns, \"hf://datasets/kszucs/pq/orca-added-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  575kB /  575kB,  288kB/s  \nTotal Bytes:  96.6M\nTotal Transfer:  575k"
+    },
+    {
+      "id": "c0013",
+      "source": ">>> pq.write_table(table_with_removed_columns, \"hf://datasets/kszucs/pq/orca-removed-columns.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 37.7kB / 37.7kB, 27.0kB/s  \nTotal Bytes:  70.6M\nTotal Transfer:  37.7k"
+    },
+    {
+      "id": "c0014",
+      "source": "from de import visualize\n\nvisualize(table, table_with_new_columns, title=\"With New Columns\", prefix=\"orca\")"
+    },
+    {
+      "id": "c0015",
+      "source": "visualize(table, table_with_removed_columns, title=\"With Removed Columns\", prefix=\"orca\")"
+    },
+    {
+      "id": "c0016",
+      "source": "# first make the table much smaller by removing the large string columns\n# to highlight the differences better\ntable_without_text = table_with_new_columns.drop([\"question\", \"response\"])\n\n# cast the question_length column to int64\ntable_with_casted_column = table_without_text.set_column(\n    table_without_text.schema.get_field_index(\"question_length\"),\n    \"question_length\",\n    table_without_text[\"question_length\"].cast(\"int32\")\n)"
+    },
+    {
+      "id": "c0017",
+      "source": ">>> pq.write_table(table_with_casted_column, \"hf://datasets/kszucs/pq/orca-casted-column.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████|  181kB /  181kB,  113kB/s  \nTotal Bytes:  1.80M\nTotal Transfer:  181k"
+    },
+    {
+      "id": "c0018",
+      "source": "visualize(table_without_text, table_with_casted_column, title=\"With Casted Column\", prefix=\"orca\")"
+    },
+    {
+      "id": "c0019",
+      "source": "table = orca[:100_000]\nnext_10k_rows = orca[100_000:110_000]\ntable_with_appended_rows = pa.concat_tables([table, next_10k_rows])\n\nassert len(table_with_appended_rows) == 110_000"
+    },
+    {
+      "id": "c0020",
+      "source": ">>> pq.write_table(table_with_appended_rows, \"hf://datasets/kszucs/pq/orca-appended-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 10.3MB / 10.3MB, 1.36MB/s  \nTotal Bytes:  106M\nTotal Transfer:  10.3M"
+    },
+    {
+      "id": "c0021",
+      "source": "visualize(table, table_with_appended_rows, title=\"With Appended Rows\", prefix=\"orca\")"
+    },
+    {
+      "id": "c0022",
+      "source": "table = orca[:100_000]\n\n# remove 4k rows from two places \ntable_with_deleted_rows = pa.concat_tables([\n    orca[:15_000], \n    orca[18_000:60_000],\n    orca[61_000:100_000]\n])\n\n# add 1k rows at the first third of the table\ntable_with_inserted_rows = pa.concat_tables([\n    orca[:10_000],\n    orca[100_000:101_000],\n    orca[10_000:50_000],\n    orca[101_000:103_000],\n    orca[50_000:100_000],\n])\n\nassert len(table) == 100_000\nassert len(table_with_deleted_rows) == 96_000\nassert len(table_with_inserted_rows) == 103_000"
+    },
+    {
+      "id": "c0023",
+      "source": ">>> pq.write_table(table_with_inserted_rows, \"hf://datasets/kszucs/pq/orca-inserted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 89.8MB / 89.8MB, 42.7kB/s  \nTotal Bytes:  99.1M\nTotal Transfer:  89.8M"
+    },
+    {
+      "id": "c0024",
+      "source": ">>> pq.write_table(table_with_deleted_rows, \"hf://datasets/kszucs/pq/orca-deleted-rows.parquet\")\nNew Data Upload: 100%|███████████████████████████████████████████████| 78.2MB / 78.2MB, 46.5kB/s  \nTotal Bytes:  92.2M\nTotal Transfer:  78.2M"
+    },
+    {
+      "id": "c0025",
+      "source": "visualize(table, table_with_deleted_rows, title=\"Deleted Rows\", prefix=\"orca\")\nvisualize(table, table_with_inserted_rows, title=\"Inserted Rows\", prefix=\"orca\")"
+    },
+    {
+      "id": "c0026",
+      "source": "import pyarrow.parquet as pq\n\npq.write_table(table, \"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)"
+    },
+    {
+      "id": "c0027",
+      "source": "df.to_parquet(\"hf://user/repo/filename.parquet\", use_content_defined_chunking=True)"
+    },
+    {
+      "id": "c0028",
+      "source": "visualize(table, table_with_deleted_rows, title=\"With Deleted Rows\", prefix=\"orca\", with_cdc=True)\nvisualize(table, table_with_inserted_rows, title=\"With Inserted Rows\", prefix=\"orca\", with_cdc=True)"
+    },
+    {
+      "id": "c0029",
+      "source": ">>> pq.write_table(table, \"hf://datasets/kszucs/pq/orca-cdc.parquet\", use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 94.5MB / 94.5MB, 46.5kB/s  \nTotal Bytes:  96.4M\nTotal Transfer:  94.5M"
+    },
+    {
+      "id": "c0030",
+      "source": ">>> pq.write_table(\n...     table_with_inserted_rows, \n...     \"hf://datasets/kszucs/pq/orca-inserted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 6.00MB / 6.00MB, 1.00MB/s  \nTotal Bytes:  99.3M\nTotal Transfer:  6.00M"
+    },
+    {
+      "id": "c0031",
+      "source": ">>> pq.write_table(\n...     table_with_deleted_rows, \n...     \"hf://datasets/kszucs/pq/orca-deleted-rows-cdc.parquet\", \n...     use_content_defined_chunking=True\n... )\nNew Data Upload: 100%|███████████████████████████████████████████████| 7.57MB / 7.57MB, 1.35MB/s  \nTotal Bytes:  92.4M\nTotal Transfer:  7.57M"
+    },
+    {
+      "id": "c0032",
+      "source": "from de import visualize\n\n# pick a larger subset of the dataset to have enough rows for the row group size tests\ntable = orca[2_000_000:3_000_000]\n\nvisualize(table, (table, {\"row_group_size\": 128 * 1024}), title=\"Small Row Groups\", with_cdc=True, prefix=\"orca\")\nvisualize(table, (table, {\"row_group_size\": 256 * 1024}), title=\"Medium Row Groups\", with_cdc=True, prefix=\"orca\")"
+    },
+    {
+      "id": "c0033",
+      "source": "from pathlib import Path\nfrom de import estimate\n\n\ndef write_dataset(table, base_dir, num_shards, **kwargs):\n    \"\"\"Simple utility to write a pyarrow table to multiple Parquet files.\"\"\"\n    # ensure that directory exists\n    base_dir = Path(base_dir)\n    base_dir.mkdir(parents=True, exist_ok=True)\n    # split and write the table into multiple files\n    rows_per_file = len(table) / num_shards\n    for i in range(num_shards):\n        start = i * rows_per_file\n        end = min((i + 1) * rows_per_file, len(table))\n        shard = table.slice(start, end - start)\n        path = base_dir / f\"part-{i}.parquet\"\n        pq.write_table(shard, path, **kwargs)\n\n\nwrite_dataset(orca, \"orca5-cdc\", num_shards=5, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca10-cdc\", num_shards=10, use_content_defined_chunking=True)\nwrite_dataset(orca, \"orca20-cdc\", num_shards=20, use_content_defined_chunking=True)\n\nestimate(\"orca5-cdc/*.parquet\", \"orca10-cdc/*.parquet\", \"orca20-cdc/*.parquet\")"
+    },
+    {
+      "id": "c0034",
+      "source": "Total size: 9.3 GB\nChunk size: 3.2 GB"
+    },
+    {
+      "id": "c0035",
+      "source": "import pandas as pd\n\nsrc = \"hf://datasets/teknium/OpenHermes-2.5/openhermes2_5.json\"\ndf = pd.read_json(src)"
+    },
+    {
+      "id": "c0036",
+      "source": ">>> dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc.parquet\"\n>>> df.to_parquet(dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████|  799MB /  799MB,  197kB/s  \nTotal Bytes:  799M\nTotal Transfer:  799M"
+    },
+    {
+      "id": "c0037",
+      "source": ">>> short_df = df[[len(c) < 10 for c in df.conversations]]\n>>> short_dst = \"hf://datasets/kszucs/pq/hermes-2.5-cdc-short.parquet\"\n>>> short_df.to_parquet(short_dst, use_content_defined_chunking=True)\nNew Data Upload: 100%|███████████████████████████████████████████████| 21.9MB / 21.9MB, 45.4kB/s  \nTotal Bytes:  801M\nTotal Transfer:  21.9M"
+    },
+    {
+      "id": "c0038",
+      "source": "import pyarrow as pa\nfrom de import visualize\n\nvisualize(\n    pa.Table.from_pandas(df), \n    pa.Table.from_pandas(short_df),\n    title=\"Hermes 2.5 Short Conversations\",\n    with_cdc=True,\n    prefix=\"hermes\"\n)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "494d2e029c34ff6619a98aef3fa01326cdced7d7e20f5ad0955ebb1af80f6c19",
+  "mediaLayout": [
+    {
+      "mediaId": "image_c191cf47ea194a5f",
+      "type": "image",
+      "afterBlockId": "b0079",
+      "order": 0
+    },
+    {
+      "mediaId": "image_7f327c6997c01cf1",
+      "type": "image",
+      "afterBlockId": "b0083",
+      "order": 1
+    },
+    {
+      "mediaId": "image_d4bddd15de56ddf3",
+      "type": "image",
+      "afterBlockId": "b0092",
+      "order": 2
+    },
+    {
+      "mediaId": "image_7568e34a0c5fc02b",
+      "type": "image",
+      "afterBlockId": "b0096",
+      "order": 3
+    },
+    {
+      "mediaId": "image_e221c409d706abf5",
+      "type": "image",
+      "afterBlockId": "b0107",
+      "order": 4
+    },
+    {
+      "mediaId": "image_460e32b87fa39398",
+      "type": "image",
+      "afterBlockId": "b0111",
+      "order": 5
+    },
+    {
+      "mediaId": "image_34d947a142ec2cd4",
+      "type": "image",
+      "afterBlockId": "b0122",
+      "order": 6
+    },
+    {
+      "mediaId": "image_34918c85ba69e286",
+      "type": "image",
+      "afterBlockId": "b0126",
+      "order": 7
+    },
+    {
+      "mediaId": "image_c15317850b947141",
+      "type": "image",
+      "afterBlockId": "b0139",
+      "order": 8
+    },
+    {
+      "mediaId": "image_660a8a6d6fa369dd",
+      "type": "image",
+      "afterBlockId": "b0143",
+      "order": 9
+    },
+    {
+      "mediaId": "image_6d83f58aa4e4197d",
+      "type": "image",
+      "afterBlockId": "b0150",
+      "order": 10
+    },
+    {
+      "mediaId": "image_a1c87dff667c6053",
+      "type": "image",
+      "afterBlockId": "b0154",
+      "order": 11
+    },
+    {
+      "mediaId": "image_c15317850b947141",
+      "type": "image",
+      "afterBlockId": "b0167",
+      "order": 12
+    },
+    {
+      "mediaId": "image_e0b5d4d928a19973",
+      "type": "image",
+      "afterBlockId": "b0168",
+      "order": 13
+    },
+    {
+      "mediaId": "image_660a8a6d6fa369dd",
+      "type": "image",
+      "afterBlockId": "b0173",
+      "order": 14
+    },
+    {
+      "mediaId": "image_0b76292d1302723a",
+      "type": "image",
+      "afterBlockId": "b0174",
+      "order": 15
+    },
+    {
+      "mediaId": "image_6d83f58aa4e4197d",
+      "type": "image",
+      "afterBlockId": "b0183",
+      "order": 16
+    },
+    {
+      "mediaId": "image_0050e53b5839f01e",
+      "type": "image",
+      "afterBlockId": "b0184",
+      "order": 17
+    },
+    {
+      "mediaId": "image_a1c87dff667c6053",
+      "type": "image",
+      "afterBlockId": "b0189",
+      "order": 18
+    },
+    {
+      "mediaId": "image_a1e9f1beb60805ed",
+      "type": "image",
+      "afterBlockId": "b0190",
+      "order": 19
+    },
+    {
+      "mediaId": "image_e9975bd2399691f1",
+      "type": "image",
+      "afterBlockId": "b0206",
+      "order": 20
+    },
+    {
+      "mediaId": "image_8bef90d150950976",
+      "type": "image",
+      "afterBlockId": "b0207",
+      "order": 21
+    },
+    {
+      "mediaId": "image_701431add9b95e70",
+      "type": "image",
+      "afterBlockId": "b0212",
+      "order": 22
+    },
+    {
+      "mediaId": "image_f5399cbcaa1b5b93",
+      "type": "image",
+      "afterBlockId": "b0213",
+      "order": 23
+    },
+    {
+      "mediaId": "image_da7d7c7d8c71e307",
+      "type": "image",
+      "afterBlockId": "b0222",
+      "order": 24
+    },
+    {
+      "mediaId": "image_ae1da225314c7041",
+      "type": "image",
+      "afterBlockId": "b0223",
+      "order": 25
+    },
+    {
+      "mediaId": "image_9d69cc47c43c2dcb",
+      "type": "image",
+      "afterBlockId": "b0228",
+      "order": 26
+    },
+    {
+      "mediaId": "image_82dd06f758c62b43",
+      "type": "image",
+      "afterBlockId": "b0229",
+      "order": 27
+    },
+    {
+      "mediaId": "image_e24b3edc166336fb",
+      "type": "image",
+      "afterBlockId": "b0244",
+      "order": 28
+    },
+    {
+      "mediaId": "image_b2ff73cc81c053a4",
+      "type": "image",
+      "afterBlockId": "b0245",
+      "order": 29
+    },
+    {
+      "mediaId": "image_9c2981c48f45ff87",
+      "type": "image",
+      "afterBlockId": "b0250",
+      "order": 30
+    },
+    {
+      "mediaId": "image_b93ee0212d6bb868",
+      "type": "image",
+      "afterBlockId": "b0251",
+      "order": 31
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 32,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 28,
+    "savedImages": 28,
+    "sourceImageOccurrences": 32,
+    "placedImageOccurrences": 32,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T14:40:00.446432Z",
+  "mediaLayoutCheckedAt": "2026-10-02T14:40:00.446449Z"
 }
