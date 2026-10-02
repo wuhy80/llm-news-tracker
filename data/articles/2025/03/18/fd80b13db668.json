@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/xet-on-the-hub",
   "resolvedUrl": "https://huggingface.co/blog/xet-on-the-hub",
   "fetchedAt": "2026-08-26T02:48:20.355532Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Want to skip the details and get straight to faster uploads and downloads with bigger files than ever before?\n\nClick here to read about joining the Xet waitlist (or head over to join immediately).\n\nOver the past few weeks, Hugging Face’s Xet Team took a major step forward by migrating the first Model and Dataset repositories off LFS and to Xet storage.\n\nThis marks one of many steps to fulfill Hugging Face’s vision for the Hub by empowering AI builders to build, iterate, and collaborate more effectively on massive models and datasets. If you're interested in deeper dives on the technology itself, check out the following posts:\n\n- From Files to Chunks: Improving Hugging Face Storage Efficiency\n\n- Rearchitecting Hugging Face Uploads and Downloads\n\n- From Chunks to Blocks: Accelerating Uploads and Downloads on the Hub\n\nBut this post isn't about the core technology. It's a behind-the-scenes view of getting Xet on the Hub; taking you through our proof-of-concept to the first migration of repositories.\n\nThe migration shifted ~6% of the Hub’s download traffic onto Xet infrastructure, validating several integral components and testing integrations with the myriad of ways repositories are accessed (e.g., via local development environments, different libraries, CI systems, cloud platforms, etc.). With nearly two million developers working on over two million public repositories, it’s real-world usage that’s the ultimate proving ground. Engineering a complex system like Xet storage is a balancing act. You plan for scale, performance, and reliability, but once bytes start moving, challenges emerge. The trick is knowing when to move from design and theory to practice.\n\n## The Xet Difference\n\nLFS, the storage system behind repositories today, stores large files in a separate object storage outside of the repository. LFS deduplicates at the file level. Even tiny edits create a new revision to upload in full; painful for the multi-gigabyte files found in many Hub repositories.\n\nIn contrast, Xet storage uses content-defined chunking (CDC), to deduplicate at the level of bytes (~64KB chunks of data). If you edit one row in a Parquet file or tweak a small piece of metadata in a GGUF model, only those changed chunks are sent over the wire.\n\nThis provides significant benefits to large file transfers. For example, the Xet team keeps an internal ~5 GB SQLite database that powers a metrics dashboard. With LFS, appending 1 MB (around the average update currently) requires re-uploading the entire 5 GB file. With Xet storage, we push only the new data.\n\nComparison of two recent runs with the dedupe_estimator (a tool for estimating the chunk-level deduplication available between files). Red chunks indicate what needs to be uploaded when using Xet.\n\nThis means uploads for the dashboard take a tenth of a second (at 50Mb/s) instead of the 13 minutes if the database were backed by LFS.\n\nMaking this work requires coordination between the following components:\n\nA Xet-aware client\n\n- Splits data into ~64 KB chunks.\n\n- Deduplicates identical chunks locally and aggregates them into ~64 MB blocks before upload.\n\nHugging Face Hub\n\n- Receives client requests and routes them to the correct repository.\n\n- Provides authentication and security guarantees\n\nThe content addressed store (CAS)\n\n- Enforces chunk-based deduplication for uploads and downloads.\n\n- Includes an LFS Bridge for older, non-Xet clients, acting like a traditional LFS server and providing a single URL for downloads.\n\nAmazon S3\n\n- Stores file contents (blocks) and file reconstruction metadata (shards).\n\n- Provides the final persisted layer of data referenced by the CAS\n\nBefore moving to production, the system was launched into an ephemeral environment, where we built a steel thread of functionality to enable uploading and downloading via the huggingface_hub. The video below shows our progress one month in:\n\nAfter the heady highs of a quick proof-of-concept, the team settled into battling gnarly integration points (privacy, backward compatibility, fragmentation, etc) with the complex ecosystem that is the Hub. Eventually, the infrastructure moved into production for Hugging Face team members. With real usage now rolling in, we moved forward with the first large-scale migration.\n\n## Migration Day\n\nOn February 20th at 10 a.m., it was all hands on deck. In the weeks prior the team had built the internal tooling to migrate files from LFS to Xet and, just as importantly, roll back a repository to LFS if necessary. Now it was time to put it to the test. Grafana and Kibana lit up with new logs and metrics, showing the load shift in real time.\n\nGrafana view of requests coming into Xet.\n\nThe picture is the same in Kibana, only here you can tell when we took a lunch break:\n\nKibana view of requests coming into Xet.\n\nBy the end of the day, we had successfully migrated all target repositories for a total of 4.5 TB into Xet storage. Downloads from each repository were now served by our infrastructure.\n\n## Post-Migration Challenges\n\nNo launch is without its lessons. The system handled the load smoothly and migrations went off without any major disruptions, but as the bytes flowed through various components we began to see some trends.\n\n### Download Overhead from Block Format\n\nReviewing network throughput post-migration, we saw that CAS was downloading four times more data than it was returning to clients:\n\nDownloads (rx) in yellow, amount sent to clients (tx) in green.\n\nUpon further investigation we found the vast majority of requests to CAS were for 10MB ranges of data within files. These requests come from users that are using hf_transfer to accelerate their downloads of large files. The requested ranges do not align on block boundaries and the block format doesn’t provide uncompressed chunk lengths to facilitate skipping directly to the data within the block. Instead, CAS streams the block starting at the beginning and reads until it finds the requested data.\n\nGiven a block with an average size of 60MB and multiple partial requests to ranges within that block, the overhead accumulates. CAS reads 210MB for just 60MB delivered, a ratio of 3.5 bytes downloaded : 1 byte sent to the client. At scale across blocks of irregular sizes and ranges that can span several blocks, the 4 bytes downloaded : 1 byte sent ratio is matched.\n\nAs usual, an image is worth a thousand words:\n\nRed blocks are unnecessarily streamed content while green blocks show the data CAS is actually requesting and ultimately sends.\n\nTo fix this, we updated the block format to store chunk-length metadata, enabling CAS to download only what each request actually needs. This format change required coordinated updates across:\n\n- CAS APIs\n\n- Block metadata format\n\n- 2^16 + 1 blocks on S3 (this is a coincidence I swear)\n\nAll of which were undertaken without downtime. Not only did this result in a balanced ratio in CAS downloads to returned data, but also reduced GET latency by ~35% across the board.\n\nBalanced view of downloaded and sent data with reduced throughput across the board.\n\n### Pod Load Imbalance\n\nAt the same time, we also saw an unexpected load imbalance across our CAS cluster. One pod would spike to hundreds of active uploads while other pods chugged along at single digits. Swapping the load balancer’s routing algorithm (from round-robin to least outstanding requests) and adding more nodes made little difference in the moment.\n\nDigging deeper we realized that during uploads, CAS writes to a temporary file for validation before uploading without calling fsync, allowing the OS to buffer writes in the page cache. When a spike of uploads comes in, the unflushed page cache leads to increased memory pressure.\n\nAs the OS tries to flush the page cache to disk, the pod experiences throughput throttling from block storage, causing increased latency on uploads. While uploads slowly process, new requests continue to come in, pushing more to the disk. This creates a vicious cycle, leading to a backlog of uploads and the imbalance that we saw during the migration:\n\nBalanced view of downloaded and sent data with reduced throughput across the board.\n\nTo keep a pod from getting in this state, we put a limit to the number of concurrent uploads each machine accepts before rejecting requests that, when reached, pushes requests on to other pods in the cluster. If all pods in the cluster get in this state, then our autoscaling policies kick in. Longer-term solutions might include forcing disk syncs, removing the on-disk buffering, or switching to ephemeral storage with better throughput.\n\n### Migration Takeaways\n\nThese two issues led to important architectural improvements, but they weren’t the only challenges the team tackled in the weeks following the migration. We also addressed other performance issues, a memory leak (which we fixed but still can't definitively root cause), and on advice from AWS to migrate the LFS Bridge from an Application Load Balancer (ALB) to a Network Load Balancer (NLB) to improve scalability during bursts of traffic.\n\n#### Lessons learned\n\n- There is nothing like PROD: No test environment can simulate user behavior at scale. Even after careful integration work and Hugging Face team members testing the infrastructure for months, corner cases only surfaced once we funneled real usage through the system.\n\n- Migrations simulate real traffic: By staging migrations incrementally and uncovering these issues before more traffic was on the infrastructure, we avoided downtime and disruption. Managing a fraction of traffic and storage made it relatively easy in comparison to if all the Hub was on Xet from day one.\n\n- Compound the learning: The infrastructure and system design was hardened iteratively over weeks. Every future byte and network request on Xet will receive the benefits of these lessons.\n\nIn short, real-world load was essential for exposing these challenges, and incremental migrations let us tackle them safely. That’s how we’re ensuring Xet-backed repositories scale reliably for the entire Hugging Face community with faster uploads, fewer bottlenecks, and minimal disruption all the way.\n\n## Ready. Xet. Go.\n\nWith the initial migration complete, Xet is now on the Hugging Face Hub.\n\nWe’re finalizing an official integration with the huggingface_hub that will mean you get the benefits of Xet without any significant changes to your current workflow. To get going:\n\nJoin the Waitlist\n\n- Sign up here with your user or organization account (if you have admin/write permissions).\n\n- Once accepted, your new repositories will automatically leverage Xet-backed storage.\n\n- We’ll also migrate existing repositories, so you don’t miss out on faster transfers.\n\nUse Your Usual Tools\n\n- An hf_xet Python package is coming soon to huggingface_hub. If you use the transformers or datasets libraries, it's already using huggingface_hub so you can simply install hf_xet in the same environment. Installation steps and docs are on their way.\n\n- Continue downloading and uploading large files with the same commands you already use.\n\nEnjoy the Benefits\n\n- Less waiting on uploads and downloads and faster iterations on big files.\n\n- Everyone on your team should upgrade to hf_xet to get the full benefits, but legacy clients will stay compatible via the LFS Bridge.\n\nIf you have any questions, drop us a line in the comments 👇 or open a discussion on the Xet team page. And stay tuned as we roll out more pieces (faster web uploads, faster Git workflows), bringing faster big-file collaboration to every AI builder on Hugging Face!",
   "summaryZh": "Xet工具已正式上线Hugging Face平台，为开发者提供相关支持。具体功能细节未在摘要中展开。",
   "summaryGeneratedAt": "2026-09-05T14:13:29.397544Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -51,5 +50,787 @@
     "summaryZh": "Xet工具已正式上线Hugging Face平台，为开发者提供相关支持。具体功能细节未在摘要中展开。",
     "glossary": [],
     "duplicateKey": "xet-on-hugging-face"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/sqlite-dedupe.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/sqlite-dedupe.png",
+      "alt": "SQLite Dedupe from one version to another",
+      "id": "image_696995e3839ce9bd"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/grafana-requests.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/grafana-requests.png",
+      "alt": "Grafana the day of the migration",
+      "id": "image_17bff77e7f842c83"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/kibana-requests.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/kibana-requests.png",
+      "alt": "Grafana the day of the migration",
+      "id": "image_d75b233c940635eb"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/pre-block-format-change.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/pre-block-format-change.png",
+      "alt": "Grafana throughput metrics before block format change",
+      "id": "image_69e6612eff47a6ba"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/block-format-download-problem.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/block-format-download-problem.png",
+      "alt": "Graphical representation of block format issue",
+      "id": "image_c54dda98b98bf9ec"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/post-block-format-change.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/post-block-format-change.png",
+      "alt": "Grafana throughput metrics after block format change",
+      "id": "image_f429beb765e91283"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/pod-load-imbalance.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/pod-load-imbalance.png",
+      "alt": "Pod load imbalance",
+      "id": "image_8de2a86f65d385ac"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/migration.gif",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/migration.gif",
+      "alt": "Xet speed",
+      "id": "image_62768d1d410bfe89"
+    }
+  ],
+  "videos": [
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/steel-thread.mp4",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/xet-on-the-hub/steel-thread.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/xet-on-the-hub",
+      "id": "video_bc14f66b18c21cc3"
+    }
+  ],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Want to skip the details and get straight to faster uploads and downloads with bigger files than ever before?",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Click here to read about joining the Xet waitlist (or head over to join immediately).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/xet-on-the-hub#ready-xet-go"
+        },
+        {
+          "start": 54,
+          "end": 83,
+          "kind": "a",
+          "href": "https://huggingface.co/join/xet"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Over the past few weeks, Hugging Face’s Xet Team took a major step forward by migrating the first Model and Dataset repositories off LFS and to Xet storage.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 48,
+          "kind": "a",
+          "href": "https://huggingface.co/xet-team"
+        },
+        {
+          "start": 78,
+          "end": 155,
+          "kind": "a",
+          "href": "https://huggingface.co/posts/jsulz/911431940353906"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This marks one of many steps to fulfill Hugging Face’s vision for the Hub by empowering AI builders to build, iterate, and collaborate more effectively on massive models and datasets. If you're interested in deeper dives on the technology itself, check out the following posts:",
+      "spans": [
+        {
+          "start": 32,
+          "end": 73,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/xethub-joins-hf"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "From Files to Chunks: Improving Hugging Face Storage Efficiency",
+      "spans": [
+        {
+          "start": 0,
+          "end": 63,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Rearchitecting Hugging Face Uploads and Downloads",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/rearchitecting-uploads-and-downloads"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "From Chunks to Blocks: Accelerating Uploads and Downloads on the Hub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-chunks-to-blocks"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "But this post isn't about the core technology. It's a behind-the-scenes view of getting Xet on the Hub; taking you through our proof-of-concept to the first migration of repositories.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "The migration shifted ~6% of the Hub’s download traffic onto Xet infrastructure, validating several integral components and testing integrations with the myriad of ways repositories are accessed (e.g., via local development environments, different libraries, CI systems, cloud platforms, etc.). With nearly two million developers working on over two million public repositories, it’s real-world usage that’s the ultimate proving ground. Engineering a complex system like Xet storage is a balancing act. You plan for scale, performance, and reliability, but once bytes start moving, challenges emerge. The trick is knowing when to move from design and theory to practice.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "The Xet Difference",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "LFS, the storage system behind repositories today, stores large files in a separate object storage outside of the repository. LFS deduplicates at the file level. Even tiny edits create a new revision to upload in full; painful for the multi-gigabyte files found in many Hub repositories.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/repositories-getting-started#requirements"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "In contrast, Xet storage uses content-defined chunking (CDC), to deduplicate at the level of bytes (~64KB chunks of data). If you edit one row in a Parquet file or tweak a small piece of metadata in a GGUF model, only those changed chunks are sent over the wire.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "This provides significant benefits to large file transfers. For example, the Xet team keeps an internal ~5 GB SQLite database that powers a metrics dashboard. With LFS, appending 1 MB (around the average update currently) requires re-uploading the entire 5 GB file. With Xet storage, we push only the new data.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Comparison of two recent runs with the dedupe_estimator (a tool for estimating the chunk-level deduplication available between files). Red chunks indicate what needs to be uploaded when using Xet.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 55,
+          "kind": "a",
+          "href": "https://github.com/huggingface/dedupe_estimator"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "This means uploads for the dashboard take a tenth of a second (at 50Mb/s) instead of the 13 minutes if the database were backed by LFS.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Making this work requires coordination between the following components:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "A Xet-aware client",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Splits data into ~64 KB chunks.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Deduplicates identical chunks locally and aggregates them into ~64 MB blocks before upload.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Hugging Face Hub",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Receives client requests and routes them to the correct repository.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Provides authentication and security guarantees",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "The content addressed store (CAS)",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Enforces chunk-based deduplication for uploads and downloads.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Includes an LFS Bridge for older, non-Xet clients, acting like a traditional LFS server and providing a single URL for downloads.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Amazon S3",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Stores file contents (blocks) and file reconstruction metadata (shards).",
+      "spans": [
+        {
+          "start": 22,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-chunks-to-blocks#scaling-deduplication-with-aggregation"
+        },
+        {
+          "start": 64,
+          "end": 70,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-chunks-to-blocks#scaling-deduplication-with-aggregation"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Provides the final persisted layer of data referenced by the CAS",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Before moving to production, the system was launched into an ephemeral environment, where we built a steel thread of functionality to enable uploading and downloading via the huggingface_hub. The video below shows our progress one month in:",
+      "spans": [
+        {
+          "start": 101,
+          "end": 130,
+          "kind": "a",
+          "href": "https://www.rubick.com/steel-threads/"
+        },
+        {
+          "start": 175,
+          "end": 190,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "After the heady highs of a quick proof-of-concept, the team settled into battling gnarly integration points (privacy, backward compatibility, fragmentation, etc) with the complex ecosystem that is the Hub. Eventually, the infrastructure moved into production for Hugging Face team members. With real usage now rolling in, we moved forward with the first large-scale migration.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Migration Day",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "On February 20th at 10 a.m., it was all hands on deck. In the weeks prior the team had built the internal tooling to migrate files from LFS to Xet and, just as importantly, roll back a repository to LFS if necessary. Now it was time to put it to the test. Grafana and Kibana lit up with new logs and metrics, showing the load shift in real time.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Grafana view of requests coming into Xet.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "The picture is the same in Kibana, only here you can tell when we took a lunch break:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Kibana view of requests coming into Xet.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "By the end of the day, we had successfully migrated all target repositories for a total of 4.5 TB into Xet storage. Downloads from each repository were now served by our infrastructure.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Post-Migration Challenges",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "No launch is without its lessons. The system handled the load smoothly and migrations went off without any major disruptions, but as the bytes flowed through various components we began to see some trends.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Download Overhead from Block Format",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Reviewing network throughput post-migration, we saw that CAS was downloading four times more data than it was returning to clients:",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Downloads (rx) in yellow, amount sent to clients (tx) in green.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Upon further investigation we found the vast majority of requests to CAS were for 10MB ranges of data within files. These requests come from users that are using hf_transfer to accelerate their downloads of large files. The requested ranges do not align on block boundaries and the block format doesn’t provide uncompressed chunk lengths to facilitate skipping directly to the data within the block. Instead, CAS streams the block starting at the beginning and reads until it finds the requested data.",
+      "spans": [
+        {
+          "start": 162,
+          "end": 173,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Given a block with an average size of 60MB and multiple partial requests to ranges within that block, the overhead accumulates. CAS reads 210MB for just 60MB delivered, a ratio of 3.5 bytes downloaded : 1 byte sent to the client. At scale across blocks of irregular sizes and ranges that can span several blocks, the 4 bytes downloaded : 1 byte sent ratio is matched.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "As usual, an image is worth a thousand words:",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Red blocks are unnecessarily streamed content while green blocks show the data CAS is actually requesting and ultimately sends.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "To fix this, we updated the block format to store chunk-length metadata, enabling CAS to download only what each request actually needs. This format change required coordinated updates across:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "CAS APIs",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Block metadata format",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "2^16 + 1 blocks on S3 (this is a coincidence I swear)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "All of which were undertaken without downtime. Not only did this result in a balanced ratio in CAS downloads to returned data, but also reduced GET latency by ~35% across the board.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Balanced view of downloaded and sent data with reduced throughput across the board.",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Pod Load Imbalance",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "At the same time, we also saw an unexpected load imbalance across our CAS cluster. One pod would spike to hundreds of active uploads while other pods chugged along at single digits. Swapping the load balancer’s routing algorithm (from round-robin to least outstanding requests) and adding more nodes made little difference in the moment.",
+      "spans": [
+        {
+          "start": 211,
+          "end": 228,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/how-elastic-load-balancing-works.html#routing-algorithm"
+        },
+        {
+          "start": 235,
+          "end": 276,
+          "kind": "a",
+          "href": "https://medium.com/dazn-tech/aws-application-load-balancer-algorithms-765be2eca158"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Digging deeper we realized that during uploads, CAS writes to a temporary file for validation before uploading without calling fsync, allowing the OS to buffer writes in the page cache. When a spike of uploads comes in, the unflushed page cache leads to increased memory pressure.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 132,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "As the OS tries to flush the page cache to disk, the pod experiences throughput throttling from block storage, causing increased latency on uploads. While uploads slowly process, new requests continue to come in, pushing more to the disk. This creates a vicious cycle, leading to a backlog of uploads and the imbalance that we saw during the migration:",
+      "spans": [
+        {
+          "start": 96,
+          "end": 109,
+          "kind": "a",
+          "href": "https://aws.amazon.com/ebs/"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Balanced view of downloaded and sent data with reduced throughput across the board.",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "To keep a pod from getting in this state, we put a limit to the number of concurrent uploads each machine accepts before rejecting requests that, when reached, pushes requests on to other pods in the cluster. If all pods in the cluster get in this state, then our autoscaling policies kick in. Longer-term solutions might include forcing disk syncs, removing the on-disk buffering, or switching to ephemeral storage with better throughput.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Migration Takeaways",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "These two issues led to important architectural improvements, but they weren’t the only challenges the team tackled in the weeks following the migration. We also addressed other performance issues, a memory leak (which we fixed but still can't definitively root cause), and on advice from AWS to migrate the LFS Bridge from an Application Load Balancer (ALB) to a Network Load Balancer (NLB) to improve scalability during bursts of traffic.",
+      "spans": [
+        {
+          "start": 327,
+          "end": 352,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html"
+        },
+        {
+          "start": 364,
+          "end": 385,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/elasticloadbalancing/latest/network/introduction.html"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Lessons learned",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "There is nothing like PROD: No test environment can simulate user behavior at scale. Even after careful integration work and Hugging Face team members testing the infrastructure for months, corner cases only surfaced once we funneled real usage through the system.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Migrations simulate real traffic: By staging migrations incrementally and uncovering these issues before more traffic was on the infrastructure, we avoided downtime and disruption. Managing a fraction of traffic and storage made it relatively easy in comparison to if all the Hub was on Xet from day one.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "Compound the learning: The infrastructure and system design was hardened iteratively over weeks. Every future byte and network request on Xet will receive the benefits of these lessons.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "In short, real-world load was essential for exposing these challenges, and incremental migrations let us tackle them safely. That’s how we’re ensuring Xet-backed repositories scale reliably for the entire Hugging Face community with faster uploads, fewer bottlenecks, and minimal disruption all the way.",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Ready. Xet. Go.",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "With the initial migration complete, Xet is now on the Hugging Face Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "We’re finalizing an official integration with the huggingface_hub that will mean you get the benefits of Xet without any significant changes to your current workflow. To get going:",
+      "spans": [
+        {
+          "start": 50,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Join the Waitlist",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Sign up here with your user or organization account (if you have admin/write permissions).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://huggingface.co/join/xet"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "Once accepted, your new repositories will automatically leverage Xet-backed storage.",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "We’ll also migrate existing repositories, so you don’t miss out on faster transfers.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Use Your Usual Tools",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "An hf_xet Python package is coming soon to huggingface_hub. If you use the transformers or datasets libraries, it's already using huggingface_hub so you can simply install hf_xet in the same environment. Installation steps and docs are on their way.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 87,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 99,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 145,
+          "kind": "code"
+        },
+        {
+          "start": 172,
+          "end": 178,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Continue downloading and uploading large files with the same commands you already use.",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Enjoy the Benefits",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "Less waiting on uploads and downloads and faster iterations on big files.",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Everyone on your team should upgrade to hf_xet to get the full benefits, but legacy clients will stay compatible via the LFS Bridge.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 46,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "If you have any questions, drop us a line in the comments 👇 or open a discussion on the Xet team page. And stay tuned as we roll out more pieces (faster web uploads, faster Git workflows), bringing faster big-file collaboration to every AI builder on Hugging Face!",
+      "spans": [
+        {
+          "start": 63,
+          "end": 80,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/xet-team/README/discussions/new"
+        },
+        {
+          "start": 88,
+          "end": 96,
+          "kind": "a",
+          "href": "https://huggingface.co/xet-team"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "cc585fd5557d4b539b221766f8f1a9207348b368f83a27a7b041aa7a13d00357",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "cc585fd5557d4b539b221766f8f1a9207348b368f83a27a7b041aa7a13d00357",
+  "mediaLayout": [
+    {
+      "mediaId": "image_696995e3839ce9bd",
+      "type": "image",
+      "afterBlockId": "b0013",
+      "order": 0
+    },
+    {
+      "mediaId": "video_bc14f66b18c21cc3",
+      "type": "video",
+      "afterBlockId": "b0029",
+      "order": 1
+    },
+    {
+      "mediaId": "image_17bff77e7f842c83",
+      "type": "image",
+      "afterBlockId": "b0032",
+      "order": 2
+    },
+    {
+      "mediaId": "image_d75b233c940635eb",
+      "type": "image",
+      "afterBlockId": "b0034",
+      "order": 3
+    },
+    {
+      "mediaId": "image_69e6612eff47a6ba",
+      "type": "image",
+      "afterBlockId": "b0040",
+      "order": 4
+    },
+    {
+      "mediaId": "image_c54dda98b98bf9ec",
+      "type": "image",
+      "afterBlockId": "b0044",
+      "order": 5
+    },
+    {
+      "mediaId": "image_f429beb765e91283",
+      "type": "image",
+      "afterBlockId": "b0050",
+      "order": 6
+    },
+    {
+      "mediaId": "image_8de2a86f65d385ac",
+      "type": "image",
+      "afterBlockId": "b0055",
+      "order": 7
+    },
+    {
+      "mediaId": "image_62768d1d410bfe89",
+      "type": "image",
+      "afterBlockId": "b0066",
+      "order": 8
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 9,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 8,
+    "savedImages": 8,
+    "sourceImageOccurrences": 8,
+    "placedImageOccurrences": 8,
+    "sourceVideos": 1,
+    "savedVideos": 1,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T18:46:16.749338Z",
+  "mediaLayoutCheckedAt": "2026-10-02T18:46:16.749352Z"
 }

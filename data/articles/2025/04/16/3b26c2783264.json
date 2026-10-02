@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-02T16:40:29.269180Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Prefill and Decode for Concurrent Requests - Optimizing LLM Performance\n\nPublished April 16, 2025\n\nHandling load from multiple users in parallel is crucial for the performance of LLM applications. In the previous part of our series on LLM performance, we discussed queueing strategies for the prioritization of different users. In this second part, we will now focus on the concurrent processing of requests, and how it impacts relevant metrics such as latency and throughput as well as GPU resource utilization.\n\nAt TNG, we are self-hosting numerous Large Language Models on our cluster of 24 H100 GPUs. It supports 50 different applications, handles over 5,000 inferences per hour, and generates more than ten million tokens every day.\n\n### The Two Stages of Token Generation: Prefill and Decode\n\nMost LLMs generate text token by token, which guarantees that every new token is computed based on all preceding tokens (this model property is called auto-regressive ). The first output token depends on all prompt tokens, but the second output token already depends on all prompt tokens plus the first output token, and so on. As a consequence, token generation cannot be parallelized at the level of an individual request.\n\nIn LLMs with attention mechanisms, computing a new token requires calculating key , value , and query vectors for each preceding token. Fortunately, the results of some particular calculations can be re-used for subsequent tokens. This concept is known as key-value (KV) cache. For every additional output token, only one more set of key and value vectors needs to be calculated and added to the KV cache. For the very first output token, however, we start with an initially empty KV cache and need to calculate as many sets of key and value vectors as there are tokens in the input prompt. Luckily, and in contrast to any later token generation, all input tokens are known from the beginning, and we can parallelize the calculation of their respective key and value vectors. This difference motivates the distinction between the prefill (computing the first output token) and the decode phase (computing any later output token) .\n\nIn the prefill phase, the calculations for all input tokens can be executed in parallel, while in the decode phase, no parallelization is possible on the level of individual requests.\n\nprefill: parallel processing of prompt tokens, decode: sequential processing of single output tokens.\n\nThe difference between the prefill and decode phases is also reflected in two key metrics for text generation: Time to first token and time per output token . The time to first token is given by the latency of the prefill phase, while the time per output token is the latency of a single decode step. Even though the prefill phase also generates only a single token, it takes much longer than a single decode step, because all input tokens need to be processed. On the other hand, the prefill phase is much faster with respect to the number of input tokens than a decode phase for the same number of output tokens (this difference is the reason why commercial LLM APIs charge input tokens at a much lower rate than ouput tokens).\n\nBy tracking the arrival time of requests in the inference backend and the generation time of each token in a streamed output, we can measure the prefill time (as time to first token ) and the time for each decode step (a.k.a. time per output token ).\n\nBoth latencies are relevant metrics for interactive applications like a chat bot. If users have to wait for more than 5 seconds before they see a response, they might think that the application is broken and leave. Similarly, if the text generation is as slow as 1 token per second, they would not be patient enough to wait until it is finished. Typical latency targets for interactive applications are 100-300ms per output token (i.e. a token generation speed of 3-10 tokens per second, at least as fast as reading speed, which ideally allows for skimming the output text as it is being generated), and a time to first token of 3 seconds or less. Both of these latency targets can be quite challenging to achieve, depending on the model size, hardware, prompt length, and concurrent load.\n\nOther, non-interactive use cases might not be interested in the latencies of individual requests, but only in the total token throughput (tokens per second, summed up over all concurrent requests). This could be relevant when you want to generate translations for books, or summarize code files in a large repository.\n\nAs we will see in a later section, there generally is a trade-off between maximizing the total throughput and minimizing latencies for each individual request.\n\n#### Resource Utilization\n\nBecause of the parallelized calculation for all input tokens, the prefill phase is very GPU compute-intensive. In contrast, the decode step for an individual output token utilizes very little computational power; here, the speed is typically limited by the GPU memory bandwidth, i.e. how quickly model weights and activations (including key and value vectors) can be loaded from and accessed within the GPU memory.\n\nIn general, token throughput can be increased until the GPU utilization (w.r.t. computational power) is saturated. In the prefill phase, a single request with a long prompt can already achieve maximum GPU utilization. In the decode phase, the GPU utilization can be increased by batch processing of multiple requests. As a consequence, when you plot the token throughput as a function of the number of concurrent requests, you see an almost linear increase in throughput at low concurrency, because this memory-bound regime benefits from larger batch sizes. Once the GPU utilization saturates and the compute-bound regime is entered, the throughput remains invariant to an increase in concurrency.\n\nTotal throughput increases with increasing concurrency until GPU compute power saturates. At low concurrency, throughput is limited by memory bandwidth. Shorter prompts mean lower compute utilization during prefill, thus saturation at higher request rates. (Numbers were measured for vLLM with Llama-3.1-8B on an H100 GPU, at 3000/1500 input tokens and 100 output tokens.)\n\n### Concurrent Processing\n\nWe will now consider how exactly an inference engine handles multiple requests that arrive within a short time interval.\n\nBoth the prefill and decode phases can make use of batching strategies to apply the same set of operations to different requests. But what are the consequences of running prefill and decode of different requests at the same time?\n\n#### Static Batching vs. Continuous Batching\n\nThe most naive form of batching is called static batching . (1) You start with an empty batch, (2) you fill the batch with as many items as are waiting and as fit into the batch, (3) you process the batch until all batched items are finished, and (4) you repeat the procedure with a new empty batch.\n\nAll requests start their prefill phase at the same time. Since prefill is just a single, but heavily parallelized, GPU operation (think of it as a very large matrix multiplication), the prefill phases of all concurrent requests are completed at the same time. Then, all decode phases start simultaneously. Requests with fewer output tokens would finish earlier, but because of the static batching the next waiting request can only start once the longest batched request has been completed.\n\nWith static batching, new requests have to wait until all requests of batch 1 have finished before being assembled and processed in batch 2. This may lead to a significant waste of time and resources.\n\nStatic batching optimizes the time per output token , since the decode phase is uninterrupted. The drawback is a very inefficient resource utilization. Since a single, long prompt can already saturate the compute power during prefill, handling multiple prefills in parallel does not yield a speed-up and will certainly max out GPU utilization. In contrast, the GPU will likely be underutilized during the decode phase, since even a large number of concurrent decodes is not as compute-intensive as the prefill for a long prompt.\n\nThe biggest disadvantage, however, is the potentially long time to first token . Even if some short requests finish early, the next queuing request has to wait for the longest decode in the batch to finish before its prefill can begin. Because of this flaw of static batching, inference engines typically implement continuous batching strategies. Here, any completed request is immediately removed from the batch, and the batch space is filled with the next request in line. As a consequence, every continuous batching strategy has to deal with concurrency between prefill and decode phases.\n\nIn an attempt to reduce the waiting time of requests, inference engines such as vLLM and TGI schedule the prefill phase of new requests as soon as they arrive and fit into the current batch. It is possible to run the prefill of new requests in parallel with a single decode step for each of all previous requests, but since everything is executed in the same GPU operation, its duration is dominated by the prefill, and for every request in the decode phase only a single output token can be generated in that time. Therefore, this prioritization of prefills minimizes the time to first token but interrupts the decode phase of already running requests. In a chat application, users can experience this as pausing of the streamed token generation when other users submit long prompts.\n\nIn the following measurement you can see the effect of continuous batching with a prefill-first strategy.\n\nThe time to first token is minimized because new requests are processed immediately. But during each prefill, only a single decode step can be executed for every concurrent request, despite its otherwise much shorter execution time. Therefore, prefills effectively interrupt other decodes with this strategy.\n\nOne approach to alleviate the impact of interruptive prefills on running decodes is a chunked prefill . Instead of processing the entire prompt in a single prefill step, it can be distributed over multiple chunks. Then there can be as many concurrent decode steps during prefill as there are prefill chunks (as opposed to only a single decode step per concurrent request during the entire prefill). A chunked prefill step will still take longer than an isolated decode step, but for small chunk sizes the user now experiences only a slowing-down of token generation instead of a complete pause; this reduces the average time per output token . From the perspective of the interrupting request, a chunked prefill comes with some overhead and takes a bit longer than an isolated, contiguous prefill, so there is a small increase in the time to first token . With the chunk size we now have a tuning knob for prioritizing either the time to first token or the time per output token . Typical chunk sizes are between 512 and 8192 tokens (the vLLM default was 512 when chunked prefill was first implemented, and was later updated to higher values).\n\nWhen the prefill is chunked into several steps, concurrent decodes of other requests can produce one output token for every prefill chunk instead of just one output token for the entire prefill phase. While we can't resolve individual prefill chunks in our client-side measurements, their impact is visible in concurrent decodes, which appear chunked into individual dots instead of almost continuous lines.\n\nThe biggest advantage of this strategy is, however, that chunked prefill maximizes resource efficiency . Prefill is compute-intensive, while decode is memory-bound. By running both operations in parallel, one can increase the overall throughput without being limited by GPU resources. Of course, maximum efficiency is only achieved at a certain chunk size, which in turn depends on the exact load pattern.\n\nIn a standard vLLM deployment and for evenly sized requests, we observed that chunked prefill increased the total token throughput by +50% . It is now enabled for every vLLM deployment of self-hosted LLMs at TNG. Overall, chunked prefill is a good default strategy for most use cases. Optimizing the chunk size, however, is quite difficult in environments with unpredictable load patterns (like TNG with its many diverse applications); typically, you stick with the defaults.\n\nRegardless of the exact chunk size configuration, concurrent processing with chunked prefill comes with two challenges that we will address in the next article .\n\n## Sleeper Agents and How to Tame Them\n\n## Exploring NVIDIA Nemotron 3.5 Lightning: Making it see with little resources\n\nI just wonder how chunked prefill enable sprefill and decode request be processed in a single batch.\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Handling load from multiple users in parallel is crucial for the performance of LLM applications. In the previous part of our series on LLM performance, we discussed queueing strategies for the prioritization of different users. In this second part, we will now focus on the concurrent processing of requests, and how it impacts relevant metrics such as latency and throughput as well as GPU resource utilization.\n\nAt TNG, we are self-hosting numerous Large Language Models on our cluster of 24 H100 GPUs. It supports 50 different applications, handles over 5,000 inferences per hour, and generates more than ten million tokens every day.\n\nAt TNG, we are self-hosting numerous Large Language Models on our cluster of 24 H100 GPUs. It supports 50 different applications, handles over 5,000 inferences per hour, and generates more than ten million tokens every day.\n\n### The Two Stages of Token Generation: Prefill and Decode\n\nMost LLMs generate text token by token, which guarantees that every new token is computed based on all preceding tokens (this model property is called auto-regressive). The first output token depends on all prompt tokens, but the second output token already depends on all prompt tokens plus the first output token, and so on. As a consequence, token generation cannot be parallelized at the level of an individual request.\n\nIn LLMs with attention mechanisms, computing a new token requires calculating key, value, and query vectors for each preceding token. Fortunately, the results of some particular calculations can be re-used for subsequent tokens. This concept is known as key-value (KV) cache. For every additional output token, only one more set of key and value vectors needs to be calculated and added to the KV cache. For the very first output token, however, we start with an initially empty KV cache and need to calculate as many sets of key and value vectors as there are tokens in the input prompt. Luckily, and in contrast to any later token generation, all input tokens are known from the beginning, and we can parallelize the calculation of their respective key and value vectors. This difference motivates the distinction between the prefill (computing the first output token) and the decode phase (computing any later output token).\n\nIn the prefill phase, the calculations for all input tokens can be executed in parallel, while in the decode phase, no parallelization is possible on the level of individual requests.\n\nprefill: parallel processing of prompt tokens, decode: sequential processing of single output tokens.\n\n#### Metrics\n\nThe difference between the prefill and decode phases is also reflected in two key metrics for text generation: Time to first token and time per output token. The time to first token is given by the latency of the prefill phase, while the time per output token is the latency of a single decode step. Even though the prefill phase also generates only a single token, it takes much longer than a single decode step, because all input tokens need to be processed. On the other hand, the prefill phase is much faster with respect to the number of input tokens than a decode phase for the same number of output tokens (this difference is the reason why commercial LLM APIs charge input tokens at a much lower rate than ouput tokens).\n\nBy tracking the arrival time of requests in the inference backend and the generation time of each token in a streamed output, we can measure the prefill time (as time to first token) and the time for each decode step (a.k.a. time per output token).\n\nBoth latencies are relevant metrics for interactive applications like a chat bot. If users have to wait for more than 5 seconds before they see a response, they might think that the application is broken and leave. Similarly, if the text generation is as slow as 1 token per second, they would not be patient enough to wait until it is finished. Typical latency targets for interactive applications are 100-300ms per output token (i.e. a token generation speed of 3-10 tokens per second, at least as fast as reading speed, which ideally allows for skimming the output text as it is being generated), and a time to first token of 3 seconds or less. Both of these latency targets can be quite challenging to achieve, depending on the model size, hardware, prompt length, and concurrent load.\n\nOther, non-interactive use cases might not be interested in the latencies of individual requests, but only in the total token throughput (tokens per second, summed up over all concurrent requests). This could be relevant when you want to generate translations for books, or summarize code files in a large repository.\n\nAs we will see in a later section, there generally is a trade-off between maximizing the total throughput and minimizing latencies for each individual request.\n\n#### Resource Utilization\n\nBecause of the parallelized calculation for all input tokens, the prefill phase is very GPU compute-intensive. In contrast, the decode step for an individual output token utilizes very little computational power; here, the speed is typically limited by the GPU memory bandwidth, i.e. how quickly model weights and activations (including key and value vectors) can be loaded from and accessed within the GPU memory.\n\nIn general, token throughput can be increased until the GPU utilization (w.r.t. computational power) is saturated. In the prefill phase, a single request with a long prompt can already achieve maximum GPU utilization. In the decode phase, the GPU utilization can be increased by batch processing of multiple requests. As a consequence, when you plot the token throughput as a function of the number of concurrent requests, you see an almost linear increase in throughput at low concurrency, because this memory-bound regime benefits from larger batch sizes. Once the GPU utilization saturates and the compute-bound regime is entered, the throughput remains invariant to an increase in concurrency.\n\nTotal throughput increases with increasing concurrency until GPU compute power saturates. At low concurrency, throughput is limited by memory bandwidth. Shorter prompts mean lower compute utilization during prefill, thus saturation at higher request rates. (Numbers were measured for vLLM with Llama-3.1-8B on an H100 GPU, at 3000/1500 input tokens and 100 output tokens.)\n\n### Concurrent Processing\n\nWe will now consider how exactly an inference engine handles multiple requests that arrive within a short time interval.\n\nBoth the prefill and decode phases can make use of batching strategies to apply the same set of operations to different requests. But what are the consequences of running prefill and decode of different requests at the same time?\n\n#### Static Batching vs. Continuous Batching\n\nThe most naive form of batching is called static batching. (1) You start with an empty batch, (2) you fill the batch with as many items as are waiting and as fit into the batch, (3) you process the batch until all batched items are finished, and (4) you repeat the procedure with a new empty batch.\n\nAll requests start their prefill phase at the same time. Since prefill is just a single, but heavily parallelized, GPU operation (think of it as a very large matrix multiplication), the prefill phases of all concurrent requests are completed at the same time. Then, all decode phases start simultaneously. Requests with fewer output tokens would finish earlier, but because of the static batching the next waiting request can only start once the longest batched request has been completed.\n\nWith static batching, new requests have to wait until all requests of batch 1 have finished before being assembled and processed in batch 2. This may lead to a significant waste of time and resources.\n\nStatic batching optimizes the time per output token, since the decode phase is uninterrupted. The drawback is a very inefficient resource utilization. Since a single, long prompt can already saturate the compute power during prefill, handling multiple prefills in parallel does not yield a speed-up and will certainly max out GPU utilization. In contrast, the GPU will likely be underutilized during the decode phase, since even a large number of concurrent decodes is not as compute-intensive as the prefill for a long prompt.\n\nThe biggest disadvantage, however, is the potentially long time to first token. Even if some short requests finish early, the next queuing request has to wait for the longest decode in the batch to finish before its prefill can begin. Because of this flaw of static batching, inference engines typically implement continuous batching strategies. Here, any completed request is immediately removed from the batch, and the batch space is filled with the next request in line. As a consequence, every continuous batching strategy has to deal with concurrency between prefill and decode phases.\n\n#### Prefill-First\n\nIn an attempt to reduce the waiting time of requests, inference engines such as vLLM and TGI schedule the prefill phase of new requests as soon as they arrive and fit into the current batch. It is possible to run the prefill of new requests in parallel with a single decode step for each of all previous requests, but since everything is executed in the same GPU operation, its duration is dominated by the prefill, and for every request in the decode phase only a single output token can be generated in that time. Therefore, this prioritization of prefills minimizes the time to first token but interrupts the decode phase of already running requests. In a chat application, users can experience this as pausing of the streamed token generation when other users submit long prompts.\n\nIn the following measurement you can see the effect of continuous batching with a prefill-first strategy.\n\nThe time to first token is minimized because new requests are processed immediately. But during each prefill, only a single decode step can be executed for every concurrent request, despite its otherwise much shorter execution time. Therefore, prefills effectively interrupt other decodes with this strategy.\n\n#### Chunked Prefill\n\nOne approach to alleviate the impact of interruptive prefills on running decodes is a chunked prefill. Instead of processing the entire prompt in a single prefill step, it can be distributed over multiple chunks. Then there can be as many concurrent decode steps during prefill as there are prefill chunks (as opposed to only a single decode step per concurrent request during the entire prefill). A chunked prefill step will still take longer than an isolated decode step, but for small chunk sizes the user now experiences only a slowing-down of token generation instead of a complete pause; this reduces the average time per output token. From the perspective of the interrupting request, a chunked prefill comes with some overhead and takes a bit longer than an isolated, contiguous prefill, so there is a small increase in the time to first token. With the chunk size we now have a tuning knob for prioritizing either the time to first token or the time per output token. Typical chunk sizes are between 512 and 8192 tokens (the vLLM default was 512 when chunked prefill was first implemented, and was later updated to higher values).\n\nWhen the prefill is chunked into several steps, concurrent decodes of other requests can produce one output token for every prefill chunk instead of just one output token for the entire prefill phase. While we can't resolve individual prefill chunks in our client-side measurements, their impact is visible in concurrent decodes, which appear chunked into individual dots instead of almost continuous lines.\n\nThe biggest advantage of this strategy is, however, that chunked prefill maximizes resource efficiency. Prefill is compute-intensive, while decode is memory-bound. By running both operations in parallel, one can increase the overall throughput without being limited by GPU resources. Of course, maximum efficiency is only achieved at a certain chunk size, which in turn depends on the exact load pattern.\n\nIn a standard vLLM deployment and for evenly sized requests, we observed that chunked prefill increased the total token throughput by +50%. It is now enabled for every vLLM deployment of self-hosted LLMs at TNG. Overall, chunked prefill is a good default strategy for most use cases. Optimizing the chunk size, however, is quite difficult in environments with unpredictable load patterns (like TNG with its many diverse applications); typically, you stick with the defaults.\n\nRegardless of the exact chunk size configuration, concurrent processing with chunked prefill comes with two challenges that we will address in the next article.",
   "summaryZh": "本文详细解析了LLM在处理并发请求时的性能优化策略，重点探讨了Token生成的两个阶段：Prefill（预填充）与Decode（解码）。通过分析KV Cache的机制及其对GPU资源利用率、延迟和吞吐量的影响，为大规模部署LLM提供了实用的工程优化建议。",
   "summaryGeneratedAt": "2026-09-02T21:16:42.903781Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -53,5 +53,553 @@
     "summaryZh": "本文详细解析了LLM在处理并发请求时的性能优化策略，重点探讨了Token生成的两个阶段：Prefill（预填充）与Decode（解码）。通过分析KV Cache的机制及其对GPU资源利用率、延迟和吞吐量的影响，为大规模部署LLM提供了实用的工程优化建议。",
     "glossary": [],
     "duplicateKey": "llm-performance-optimization-prefill-decode"
-  }
+  },
+  "images": [
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/OiBhSOlKQCI2LCAJkZWa1.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/OiBhSOlKQCI2LCAJkZWa1.png",
+      "alt": "",
+      "id": "image_9f0eb56bfbc78f00"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/BGKtYLqM1X9o72oc9NW8Y.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/BGKtYLqM1X9o72oc9NW8Y.png",
+      "alt": "",
+      "id": "image_c45387da7321268b"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/PEpmVaeAgdWjpYeCqhQ4E.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/PEpmVaeAgdWjpYeCqhQ4E.png",
+      "alt": "",
+      "id": "image_aaf8b4948bf6eacc"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/JcjzJAQvrwIEqSBJ0abfu.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/JcjzJAQvrwIEqSBJ0abfu.png",
+      "alt": "",
+      "id": "image_001d938dcd3a1133"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/ojRVAE65NV12cHYb2OXQm.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/ojRVAE65NV12cHYb2OXQm.png",
+      "alt": "",
+      "id": "image_252158c0b62ffa6f"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/sNrE98pgib-_yBw1b10Nw.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/sNrE98pgib-_yBw1b10Nw.png",
+      "alt": "",
+      "id": "image_3dfc0e8f1d777bfe"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/Vvy8THpBXeSvu8CN8z66t.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/65263bfb3177c2a794997821/Vvy8THpBXeSvu8CN8z66t.png",
+      "alt": "",
+      "id": "image_4d9ef198525ecdd6"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Handling load from multiple users in parallel is crucial for the performance of LLM applications. In the previous part of our series on LLM performance, we discussed queueing strategies for the prioritization of different users. In this second part, we will now focus on the concurrent processing of requests, and how it impacts relevant metrics such as latency and throughput as well as GPU resource utilization.",
+      "spans": [
+        {
+          "start": 105,
+          "end": 118,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tngtech/llm-performance-request-queueing"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "At TNG, we are self-hosting numerous Large Language Models on our cluster of 24 H100 GPUs. It supports 50 different applications, handles over 5,000 inferences per hour, and generates more than ten million tokens every day.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "At TNG, we are self-hosting numerous Large Language Models on our cluster of 24 H100 GPUs. It supports 50 different applications, handles over 5,000 inferences per hour, and generates more than ten million tokens every day.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "The Two Stages of Token Generation: Prefill and Decode",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Most LLMs generate text token by token, which guarantees that every new token is computed based on all preceding tokens (this model property is called auto-regressive). The first output token depends on all prompt tokens, but the second output token already depends on all prompt tokens plus the first output token, and so on. As a consequence, token generation cannot be parallelized at the level of an individual request.",
+      "spans": [
+        {
+          "start": 151,
+          "end": 166,
+          "kind": "em"
+        },
+        {
+          "start": 287,
+          "end": 291,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "In LLMs with attention mechanisms, computing a new token requires calculating key, value, and query vectors for each preceding token. Fortunately, the results of some particular calculations can be re-used for subsequent tokens. This concept is known as key-value (KV) cache. For every additional output token, only one more set of key and value vectors needs to be calculated and added to the KV cache. For the very first output token, however, we start with an initially empty KV cache and need to calculate as many sets of key and value vectors as there are tokens in the input prompt. Luckily, and in contrast to any later token generation, all input tokens are known from the beginning, and we can parallelize the calculation of their respective key and value vectors. This difference motivates the distinction between the prefill (computing the first output token) and the decode phase (computing any later output token).",
+      "spans": [
+        {
+          "start": 78,
+          "end": 81,
+          "kind": "em"
+        },
+        {
+          "start": 83,
+          "end": 88,
+          "kind": "em"
+        },
+        {
+          "start": 94,
+          "end": 99,
+          "kind": "em"
+        },
+        {
+          "start": 332,
+          "end": 335,
+          "kind": "em"
+        },
+        {
+          "start": 340,
+          "end": 345,
+          "kind": "em"
+        },
+        {
+          "start": 526,
+          "end": 529,
+          "kind": "em"
+        },
+        {
+          "start": 534,
+          "end": 539,
+          "kind": "em"
+        },
+        {
+          "start": 751,
+          "end": 754,
+          "kind": "em"
+        },
+        {
+          "start": 759,
+          "end": 764,
+          "kind": "em"
+        },
+        {
+          "start": 828,
+          "end": 870,
+          "kind": "strong"
+        },
+        {
+          "start": 879,
+          "end": 926,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "In the prefill phase, the calculations for all input tokens can be executed in parallel, while in the decode phase, no parallelization is possible on the level of individual requests.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "prefill: parallel processing of prompt tokens, decode: sequential processing of single output tokens.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "em"
+        },
+        {
+          "start": 47,
+          "end": 54,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Metrics",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "The difference between the prefill and decode phases is also reflected in two key metrics for text generation: Time to first token and time per output token. The time to first token is given by the latency of the prefill phase, while the time per output token is the latency of a single decode step. Even though the prefill phase also generates only a single token, it takes much longer than a single decode step, because all input tokens need to be processed. On the other hand, the prefill phase is much faster with respect to the number of input tokens than a decode phase for the same number of output tokens (this difference is the reason why commercial LLM APIs charge input tokens at a much lower rate than ouput tokens).",
+      "spans": [
+        {
+          "start": 111,
+          "end": 130,
+          "kind": "em"
+        },
+        {
+          "start": 135,
+          "end": 156,
+          "kind": "em"
+        },
+        {
+          "start": 162,
+          "end": 181,
+          "kind": "strong"
+        },
+        {
+          "start": 162,
+          "end": 181,
+          "kind": "em"
+        },
+        {
+          "start": 238,
+          "end": 259,
+          "kind": "strong"
+        },
+        {
+          "start": 238,
+          "end": 259,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "By tracking the arrival time of requests in the inference backend and the generation time of each token in a streamed output, we can measure the prefill time (as time to first token) and the time for each decode step (a.k.a. time per output token).",
+      "spans": [
+        {
+          "start": 162,
+          "end": 181,
+          "kind": "em"
+        },
+        {
+          "start": 225,
+          "end": 246,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Both latencies are relevant metrics for interactive applications like a chat bot. If users have to wait for more than 5 seconds before they see a response, they might think that the application is broken and leave. Similarly, if the text generation is as slow as 1 token per second, they would not be patient enough to wait until it is finished. Typical latency targets for interactive applications are 100-300ms per output token (i.e. a token generation speed of 3-10 tokens per second, at least as fast as reading speed, which ideally allows for skimming the output text as it is being generated), and a time to first token of 3 seconds or less. Both of these latency targets can be quite challenging to achieve, depending on the model size, hardware, prompt length, and concurrent load.",
+      "spans": [
+        {
+          "start": 606,
+          "end": 625,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Other, non-interactive use cases might not be interested in the latencies of individual requests, but only in the total token throughput (tokens per second, summed up over all concurrent requests). This could be relevant when you want to generate translations for books, or summarize code files in a large repository.",
+      "spans": [
+        {
+          "start": 120,
+          "end": 136,
+          "kind": "strong"
+        },
+        {
+          "start": 120,
+          "end": 136,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "As we will see in a later section, there generally is a trade-off between maximizing the total throughput and minimizing latencies for each individual request.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Resource Utilization",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Because of the parallelized calculation for all input tokens, the prefill phase is very GPU compute-intensive. In contrast, the decode step for an individual output token utilizes very little computational power; here, the speed is typically limited by the GPU memory bandwidth, i.e. how quickly model weights and activations (including key and value vectors) can be loaded from and accessed within the GPU memory.",
+      "spans": [
+        {
+          "start": 337,
+          "end": 340,
+          "kind": "em"
+        },
+        {
+          "start": 345,
+          "end": 350,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "In general, token throughput can be increased until the GPU utilization (w.r.t. computational power) is saturated. In the prefill phase, a single request with a long prompt can already achieve maximum GPU utilization. In the decode phase, the GPU utilization can be increased by batch processing of multiple requests. As a consequence, when you plot the token throughput as a function of the number of concurrent requests, you see an almost linear increase in throughput at low concurrency, because this memory-bound regime benefits from larger batch sizes. Once the GPU utilization saturates and the compute-bound regime is entered, the throughput remains invariant to an increase in concurrency.",
+      "spans": [
+        {
+          "start": 243,
+          "end": 295,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Total throughput increases with increasing concurrency until GPU compute power saturates. At low concurrency, throughput is limited by memory bandwidth. Shorter prompts mean lower compute utilization during prefill, thus saturation at higher request rates. (Numbers were measured for vLLM with Llama-3.1-8B on an H100 GPU, at 3000/1500 input tokens and 100 output tokens.)",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Concurrent Processing",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "We will now consider how exactly an inference engine handles multiple requests that arrive within a short time interval.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Both the prefill and decode phases can make use of batching strategies to apply the same set of operations to different requests. But what are the consequences of running prefill and decode of different requests at the same time?",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Static Batching vs. Continuous Batching",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "The most naive form of batching is called static batching. (1) You start with an empty batch, (2) you fill the batch with as many items as are waiting and as fit into the batch, (3) you process the batch until all batched items are finished, and (4) you repeat the procedure with a new empty batch.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 57,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "All requests start their prefill phase at the same time. Since prefill is just a single, but heavily parallelized, GPU operation (think of it as a very large matrix multiplication), the prefill phases of all concurrent requests are completed at the same time. Then, all decode phases start simultaneously. Requests with fewer output tokens would finish earlier, but because of the static batching the next waiting request can only start once the longest batched request has been completed.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "With static batching, new requests have to wait until all requests of batch 1 have finished before being assembled and processed in batch 2. This may lead to a significant waste of time and resources.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Static batching optimizes the time per output token, since the decode phase is uninterrupted. The drawback is a very inefficient resource utilization. Since a single, long prompt can already saturate the compute power during prefill, handling multiple prefills in parallel does not yield a speed-up and will certainly max out GPU utilization. In contrast, the GPU will likely be underutilized during the decode phase, since even a large number of concurrent decodes is not as compute-intensive as the prefill for a long prompt.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 51,
+          "kind": "em"
+        },
+        {
+          "start": 0,
+          "end": 51,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The biggest disadvantage, however, is the potentially long time to first token. Even if some short requests finish early, the next queuing request has to wait for the longest decode in the batch to finish before its prefill can begin. Because of this flaw of static batching, inference engines typically implement continuous batching strategies. Here, any completed request is immediately removed from the batch, and the batch space is filled with the next request in line. As a consequence, every continuous batching strategy has to deal with concurrency between prefill and decode phases.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 78,
+          "kind": "em"
+        },
+        {
+          "start": 314,
+          "end": 333,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Prefill-First",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "In an attempt to reduce the waiting time of requests, inference engines such as vLLM and TGI schedule the prefill phase of new requests as soon as they arrive and fit into the current batch. It is possible to run the prefill of new requests in parallel with a single decode step for each of all previous requests, but since everything is executed in the same GPU operation, its duration is dominated by the prefill, and for every request in the decode phase only a single output token can be generated in that time. Therefore, this prioritization of prefills minimizes the time to first token but interrupts the decode phase of already running requests. In a chat application, users can experience this as pausing of the streamed token generation when other users submit long prompts.",
+      "spans": [
+        {
+          "start": 573,
+          "end": 592,
+          "kind": "em"
+        },
+        {
+          "start": 532,
+          "end": 592,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "In the following measurement you can see the effect of continuous batching with a prefill-first strategy.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "The time to first token is minimized because new requests are processed immediately. But during each prefill, only a single decode step can be executed for every concurrent request, despite its otherwise much shorter execution time. Therefore, prefills effectively interrupt other decodes with this strategy.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Chunked Prefill",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "One approach to alleviate the impact of interruptive prefills on running decodes is a chunked prefill. Instead of processing the entire prompt in a single prefill step, it can be distributed over multiple chunks. Then there can be as many concurrent decode steps during prefill as there are prefill chunks (as opposed to only a single decode step per concurrent request during the entire prefill). A chunked prefill step will still take longer than an isolated decode step, but for small chunk sizes the user now experiences only a slowing-down of token generation instead of a complete pause; this reduces the average time per output token. From the perspective of the interrupting request, a chunked prefill comes with some overhead and takes a bit longer than an isolated, contiguous prefill, so there is a small increase in the time to first token. With the chunk size we now have a tuning knob for prioritizing either the time to first token or the time per output token. Typical chunk sizes are between 512 and 8192 tokens (the vLLM default was 512 when chunked prefill was first implemented, and was later updated to higher values).",
+      "spans": [
+        {
+          "start": 86,
+          "end": 101,
+          "kind": "em"
+        },
+        {
+          "start": 619,
+          "end": 640,
+          "kind": "em"
+        },
+        {
+          "start": 832,
+          "end": 851,
+          "kind": "em"
+        },
+        {
+          "start": 927,
+          "end": 946,
+          "kind": "em"
+        },
+        {
+          "start": 954,
+          "end": 975,
+          "kind": "em"
+        },
+        {
+          "start": 887,
+          "end": 975,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "When the prefill is chunked into several steps, concurrent decodes of other requests can produce one output token for every prefill chunk instead of just one output token for the entire prefill phase. While we can't resolve individual prefill chunks in our client-side measurements, their impact is visible in concurrent decodes, which appear chunked into individual dots instead of almost continuous lines.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "The biggest advantage of this strategy is, however, that chunked prefill maximizes resource efficiency. Prefill is compute-intensive, while decode is memory-bound. By running both operations in parallel, one can increase the overall throughput without being limited by GPU resources. Of course, maximum efficiency is only achieved at a certain chunk size, which in turn depends on the exact load pattern.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 102,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "In a standard vLLM deployment and for evenly sized requests, we observed that chunked prefill increased the total token throughput by +50%. It is now enabled for every vLLM deployment of self-hosted LLMs at TNG. Overall, chunked prefill is a good default strategy for most use cases. Optimizing the chunk size, however, is quite difficult in environments with unpredictable load patterns (like TNG with its many diverse applications); typically, you stick with the defaults.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 138,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Regardless of the exact chunk size configuration, concurrent processing with chunked prefill comes with two challenges that we will address in the next article.",
+      "spans": [
+        {
+          "start": 143,
+          "end": 159,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tngtech/llm-performance-blocked-by-long-prompts"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "48409136c9fb6713cfc4f3584d7bbc328d6d37e5d898bb3c18c6575925fb63b1",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "48409136c9fb6713cfc4f3584d7bbc328d6d37e5d898bb3c18c6575925fb63b1",
+  "mediaLayout": [
+    {
+      "mediaId": "image_9f0eb56bfbc78f00",
+      "type": "image",
+      "afterBlockId": "b0001",
+      "order": 0
+    },
+    {
+      "mediaId": "image_c45387da7321268b",
+      "type": "image",
+      "afterBlockId": "b0007",
+      "order": 1
+    },
+    {
+      "mediaId": "image_aaf8b4948bf6eacc",
+      "type": "image",
+      "afterBlockId": "b0010",
+      "order": 2
+    },
+    {
+      "mediaId": "image_001d938dcd3a1133",
+      "type": "image",
+      "afterBlockId": "b0017",
+      "order": 3
+    },
+    {
+      "mediaId": "image_252158c0b62ffa6f",
+      "type": "image",
+      "afterBlockId": "b0024",
+      "order": 4
+    },
+    {
+      "mediaId": "image_3dfc0e8f1d777bfe",
+      "type": "image",
+      "afterBlockId": "b0030",
+      "order": 5
+    },
+    {
+      "mediaId": "image_4d9ef198525ecdd6",
+      "type": "image",
+      "afterBlockId": "b0033",
+      "order": 6
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 7,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 7,
+    "savedImages": 7,
+    "sourceImageOccurrences": 7,
+    "placedImageOccurrences": 7,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-02T18:44:58.600894Z",
+  "mediaLayoutCheckedAt": "2026-10-02T18:44:58.600908Z"
 }
