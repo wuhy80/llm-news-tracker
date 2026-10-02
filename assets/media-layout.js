@@ -7,6 +7,23 @@
       return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url : null;
     } catch { return null; }
   }
+  const MEDIA_PREFIX = 'data/article-media/';
+  function mediaBase() {
+    /* Media bytes may live outside the repository (for example an R2/CDN
+       bucket). Snapshots keep repository-relative src values so the archive
+       stays self-describing, and the public base is applied at render time. */
+    try {
+      const meta = document.querySelector && document.querySelector('meta[name="media-base"]');
+      const base = httpUrl(String((meta && meta.content) || '').trim());
+      return base ? base.href.replace(/\/+$/, '') : '';
+    } catch { return ''; }
+  }
+  function resolveMedia(src) {
+    if (!src.startsWith(MEDIA_PREFIX)) return src;
+    const base = mediaBase();
+    // No external base configured: keep serving from the repository itself.
+    return base ? `${base}/${src.slice(MEDIA_PREFIX.length)}` : src;
+  }
   function figureFor(type, media) {
     const figure = document.createElement('figure');
     figure.className = 'reader-figure';
@@ -16,7 +33,7 @@
       if (!/^data\/article-media\/[a-zA-Z0-9_./-]+$/.test(src) && !httpUrl(src)) return null;
       if (src.split('/').includes('..')) return null;
       element = document.createElement('img');
-      element.src = src;
+      element.src = resolveMedia(src);
       element.alt = String(media.alt || '文章配图');
       element.loading = 'lazy';
       element.decoding = 'async';
