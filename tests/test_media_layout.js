@@ -9,7 +9,8 @@ class Element {
   after(n) {const p=this.parent;n.remove?.();n.parent=p;p.children.splice(p.children.indexOf(this)+1,0,n);}
   remove() {if(this.parent){const p=this.parent;p.children.splice(p.children.indexOf(this),1);this.parent=null;}}
   replaceChildren(){for(const c of this.children)c.parent=null;this.children=[];}
-  addEventListener() {}
+  addEventListener(type, handler) {(this.listeners??={})[type]??=[];this.listeners[type].push(handler);}
+  dispatch(type) {for(const handler of this.listeners?.[type]||[])handler();}
   querySelectorAll() {const all=[];function visit(n){for(const c of n.children){if(c.dataset.blockId)all.push(c);visit(c);}}visit(this);return all;}
 }
 let mediaBase='';
@@ -34,11 +35,17 @@ const item={images:[{id:'a',src:'https://example.com/a.png'}],videos:[{id:'v',ki
  mediaBase='https://pub-test.r2.dev/';root=fixture();await render(localMedia,'body',root);assert.equal(root.children[1].children[0].src,'https://pub-test.r2.dev/2026/08/23/abc/def.gif');
  mediaBase='';root=fixture();await render(localMedia,'body',root);assert.equal(root.children[1].children[0].src,'data/article-media/2026/08/23/abc/def.gif');
  mediaBase='https://pub-test.r2.dev';root=fixture();await render({...localMedia,images:[{id:'a',src:'https://example.com/a.png'}]},'body',root);assert.equal(root.children[1].children[0].src,'https://example.com/a.png');
+ mediaBase='https://pub-test.r2.dev';root=fixture();await render(localMedia,'body',root);
+ let img=root.children[1].children[0];assert.equal(img.src,'https://pub-test.r2.dev/2026/08/23/abc/def.gif');
+ img.dispatch('error');assert.equal(img.src,'data/article-media/2026/08/23/abc/def.gif');
+ img.dispatch('error');assert.equal(root.children.filter(n=>n.tagName==='FIGURE').length,0);
+ mediaBase='';root=fixture();await render(localMedia,'body',root);
+ img=root.children[1].children[0];img.dispatch('error');assert.equal(root.children.filter(n=>n.tagName==='FIGURE').length,0);
  const article=fs.readFileSync('assets/article.js','utf8');
  const fn=article.slice(article.indexOf('function renderBody(body)'),article.indexOf('function fallbackSummary'));
  Object.assign(context,{elements:{articleBody:new Element('article')},readingState:{item:{}},translatedBlocks:()=>new Map(),wordWiseEntries:()=>[],parseTags:()=>[],renderTags:()=>new Element('div'),appendReadableText:(e,text,id)=>{e.dataset.blockId=id;},renderCode:()=>new Element('pre'),normalizeBodyFences:s=>s,normalizeProseMarkup:s=>s,applyReadingPreferences:()=>{}});
  vm.runInContext(fn,context);
  context.renderBody('First paragraph\n\n## Heading\n\n- Item one\n- Item two\n\n```js\nconsole.log(1)\n```\n\n> Quote\n\nLast paragraph');
  assert.deepEqual(context.elements.articleBody.querySelectorAll().map(e=>e.dataset.blockId),['b0001','b0002','b0003','b0004','c0001','b0005','b0006']);
- console.log('Media DOM ordering, repeated media, hash guard, render race, URL safety, external media base and real reader block ids passed');
+ console.log('Media DOM ordering, repeated media, hash guard, render race, URL safety, external media base, repository fallback and real reader block ids passed');
 })().catch(error=>{console.error(error);process.exit(1);});
