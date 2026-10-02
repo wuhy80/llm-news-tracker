@@ -60,3 +60,26 @@ class HistoricalMediaTests(unittest.TestCase):
 
     def test_locally_cached_incompatible_image_not_requeued_forever(self):
         self.assertFalse(repair.has_problematic_images({'images': [{'src': 'data/article-media/pic.jpg', 'originalUrl': 'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp'}]}))
+
+    def test_unarchived_incompatible_image_still_requeued(self):
+        # Guard the other direction: the "already archived" check must not turn
+        # into a blanket skip for images that genuinely need a local copy.
+        self.assertTrue(repair.has_problematic_images({'images': [{'src': 'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp', 'originalUrl': 'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp'}]}))
+
+    def test_external_media_base_is_recognised_as_managed(self):
+        with patch.object(article_store, 'MEDIA_BASE_URL', 'https://assets.example.com'):
+            cases = {
+                'https://assets.example.com/2026/09/chart.webp': False,
+                # Query strings and fragments must not defeat the match.
+                'https://assets.example.com/2026/09/chart.webp?v=2': False,
+                'https://assets.example.com/2026/09/chart.webp#top': False,
+                # A lookalike host is not managed media.
+                'https://assets.example.com.evil.test/chart.webp': True,
+                # Nothing archived for this one yet.
+                'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp': True,
+            }
+            for src, expected in cases.items():
+                with self.subTest(src=src):
+                    self.assertEqual(
+                        repair.has_problematic_images({'images': [{'src': src, 'originalUrl': 'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp'}]}),
+                        expected)
