@@ -24,6 +24,10 @@ from article_media import MEDIA_FORMAT_VERSION, extract_media_refs
 ROOT = Path(__file__).resolve().parents[1]
 ARTICLES_DIR = ROOT / "data" / "articles"
 MEDIA_DIR = ROOT / "data" / "article-media"
+MEDIA_PATH_PREFIX = MEDIA_DIR.relative_to(ROOT).as_posix() + "/"
+# Media bytes may live outside the repository (for example an R2/CDN bucket).
+# Repair loops use this base to recognise media we already host ourselves.
+MEDIA_BASE_URL = os.getenv("ARTICLE_MEDIA_BASE_URL", "")
 USER_AGENT = "LLM-Pulse/1.0 (+https://github.com/wuhy80/llm-news-tracker)"
 IMAGE_BROWSER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
 MAX_DOWNLOAD_BYTES = 2_500_000
@@ -311,6 +315,24 @@ def is_browser_incompatible_image(url: str) -> bool:
     """Identify CDN responses that Chromium may block despite a successful CLI fetch."""
     hostname = (urllib.parse.urlparse(url).hostname or "").casefold()
     return hostname == "i.qbitai.com"
+
+
+def is_managed_media_src(value: str) -> bool:
+    """True when an image already points at media bytes we store ourselves.
+
+    Managed media lives in the repository (``data/article-media/...``) or on an
+    external origin configured through ``ARTICLE_MEDIA_BASE_URL`` (for example
+    an R2/CDN bucket). Repair loops rely on this to decide an image is already
+    archived, so it must stay the single source of truth: a stale prefix check
+    requeues every affected article on every run.
+    """
+    reference = str(value or "").strip().split("?", 1)[0].split("#", 1)[0].lstrip("/")
+    if not reference:
+        return False
+    if reference.startswith(MEDIA_PATH_PREFIX):
+        return True
+    base = str(MEDIA_BASE_URL or "").strip().rstrip("/")
+    return bool(base) and (reference == base or reference.startswith(base + "/"))
 
 
 def should_download_image(url: str) -> bool:

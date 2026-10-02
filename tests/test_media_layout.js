@@ -9,10 +9,13 @@ class Element {
   after(n) {const p=this.parent;n.remove?.();n.parent=p;p.children.splice(p.children.indexOf(this)+1,0,n);}
   remove() {if(this.parent){const p=this.parent;p.children.splice(p.children.indexOf(this),1);this.parent=null;}}
   replaceChildren(){for(const c of this.children)c.parent=null;this.children=[];}
-  addEventListener() {}
+  addEventListener(type, handler) {(this.listeners??={})[type]??=[];this.listeners[type].push(handler);}
+  dispatch(type) {for(const handler of this.listeners?.[type]||[])handler();}
   querySelectorAll() {const all=[];function visit(n){for(const c of n.children){if(c.dataset.blockId)all.push(c);visit(c);}}visit(this);return all;}
 }
-const document={createElement:t=>new Element(t),createTextNode:()=>new Element('text')};
+let mediaBase='';
+const document={createElement:t=>new Element(t),createTextNode:()=>new Element('text'),
+  querySelector:s=>s==='meta[name="media-base"]'?{content:mediaBase}:null};
 const context={document,URL,TextEncoder,Uint8Array,crypto:webcrypto,window:{}};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync('assets/media-layout.js','utf8'),context);
@@ -27,11 +30,25 @@ const item={images:[{id:'a',src:'https://example.com/a.png'}],videos:[{id:'v',ki
  root=fixture();const stale=render(item,'body',root);root.replaceChildren();await render({},'',root);await stale;assert.equal(root.children.length,0);
  root=fixture();await render({...item,mediaLayout:[{mediaId:'a',type:'image',afterBlockId:null,order:0}]},'body',root);assert.equal(root.children[0].tagName,'FIGURE');
  root=fixture();await render({images:[{src:'javascript:alert(1)'},{src:'data/article-media/../../x'}],videos:[{kind:'embed',src:'https://evil.example/embed/123'}]},'',root);assert.equal(root.children.length,3);
+ const localMedia={images:[{id:'a',src:'data/article-media/2026/08/23/abc/def.gif'}],mediaLayoutVersion:1,mediaLayoutBodyHash:digest('body'),mediaLayout:[{mediaId:'a',type:'image',afterBlockId:'b0001',order:0}]};
+ const imgOf=root=>root.children[1].children[0].children[0];
+ mediaBase='https://pub-test.r2.dev';root=fixture();await render(localMedia,'body',root);assert.equal(imgOf(root).src,'https://pub-test.r2.dev/2026/08/23/abc/def.gif');
+ mediaBase='https://pub-test.r2.dev/';root=fixture();await render(localMedia,'body',root);assert.equal(imgOf(root).src,'https://pub-test.r2.dev/2026/08/23/abc/def.gif');
+ mediaBase='';root=fixture();await render(localMedia,'body',root);assert.equal(imgOf(root).src,'data/article-media/2026/08/23/abc/def.gif');
+ mediaBase='https://pub-test.r2.dev';root=fixture();await render({...localMedia,images:[{id:'a',src:'https://example.com/a.png'}]},'body',root);assert.equal(imgOf(root).src,'https://example.com/a.png');
+ mediaBase='https://pub-test.r2.dev';root=fixture();await render(localMedia,'body',root);
+ let link=root.children[1].children[0],img=link.children[0];
+ assert.equal(link.tagName,'A');assert.equal(img.src,'https://pub-test.r2.dev/2026/08/23/abc/def.gif');
+ img.dispatch('error');assert.equal(img.src,'data/article-media/2026/08/23/abc/def.gif');
+ img.dispatch('error');assert.equal(img.parent,null);assert.equal(link.children.length,1);assert.equal(link.children[0].className,'reader-image-error');
+ mediaBase='';root=fixture();await render(localMedia,'body',root);
+ link=root.children[1].children[0];link.children[0].dispatch('error');
+ assert.equal(link.children.length,1);assert.equal(link.children[0].className,'reader-image-error');
  const article=fs.readFileSync('assets/article.js','utf8');
  const fn=article.slice(article.indexOf('function renderBody(body)'),article.indexOf('function fallbackSummary'));
  Object.assign(context,{elements:{articleBody:new Element('article')},readingState:{item:{}},translatedBlocks:()=>new Map(),wordWiseEntries:()=>[],parseTags:()=>[],renderTags:()=>new Element('div'),appendReadableText:(e,text,id)=>{e.dataset.blockId=id;},renderCode:()=>new Element('pre'),normalizeBodyFences:s=>s,normalizeProseMarkup:s=>s,applyReadingPreferences:()=>{}});
  vm.runInContext(fn,context);
  context.renderBody('First paragraph\n\n## Heading\n\n- Item one\n- Item two\n\n```js\nconsole.log(1)\n```\n\n> Quote\n\nLast paragraph');
  assert.deepEqual(context.elements.articleBody.querySelectorAll().map(e=>e.dataset.blockId),['b0001','b0002','b0003','b0004','c0001','b0005','b0006']);
- console.log('Media DOM ordering, repeated media, hash guard, render race, URL safety and real reader block ids passed');
+ console.log('Media DOM ordering, repeated media, hash guard, render race, URL safety, external media base, repository fallback and real reader block ids passed');
 })().catch(error=>{console.error(error);process.exit(1);});
