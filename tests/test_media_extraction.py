@@ -104,3 +104,27 @@ class MediaRegressionTests(unittest.TestCase):
             '<article><img src="/chosen.jpg" srcset="/small.jpg 100w, /huge.jpg 2000w"></article>',
             'https://example.com/post')
         self.assertEqual([i['url'] for i in images], ['https://example.com/chosen.jpg'])
+
+    def test_a_small_reddit_preview_is_replaced_by_the_original(self):
+        # preview.redd.it signs the size, so a 140px copy can never be asked for
+        # a bigger one; i.redd.it serves the original instead.
+        images, _ = extract_media_refs(
+            '<article><img src="https://preview.redd.it/abc.png?width=140&height=139&auto=webp&s=SIG"></article>',
+            'https://www.reddit.com/r/LocalLLaMA/comments/abc/post/')
+        self.assertEqual([i['url'] for i in images], ['https://i.redd.it/abc.png'])
+
+    def test_a_large_reddit_preview_is_left_alone(self):
+        images, _ = extract_media_refs(
+            '<article><img src="https://preview.redd.it/abc.png?width=640&crop=smart&s=SIG"></article>',
+            'https://www.reddit.com/r/LocalLLaMA/comments/abc/post/')
+        self.assertEqual([i['url'] for i in images],
+                         ['https://preview.redd.it/abc.png?width=640&crop=smart&s=SIG'])
+
+    def test_external_preview_is_left_alone(self):
+        # external-preview.redd.it proxies a third-party image; there is no
+        # original on i.redd.it to point at.
+        images, _ = extract_media_refs(
+            '<article><img src="https://external-preview.redd.it/abc.png?width=140&s=SIG"></article>',
+            'https://www.reddit.com/r/LocalLLaMA/comments/abc/post/')
+        self.assertEqual([i['url'] for i in images],
+                         ['https://external-preview.redd.it/abc.png?width=140&s=SIG'])
