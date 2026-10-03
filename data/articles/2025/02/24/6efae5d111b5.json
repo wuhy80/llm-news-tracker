@@ -17,10 +17,9 @@
   "originalUrl": "https://huggingface.co/blog/remote_vae",
   "resolvedUrl": "https://huggingface.co/blog/remote_vae",
   "fetchedAt": "2026-08-26T02:48:20.801257Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "(This post was authored by hlky and Sayak)\n\nWhen operating with latent-space diffusion models for high-resolution image and video synthesis, the VAE decoder can consume quite a bit more memory. This makes it hard for the users to run these models on consumer GPUs without going through latency sacrifices and others alike.\n\nFor example, with offloading, there is a device transfer overhead, causing delays in the overall inference latency. Tiling is another solution that lets us operate on so-called “tiles” of inputs. However, it can have a negative impact on the quality of the final image.\n\nTherefore, we want to pilot an idea with the community — delegating the decoding process to a remote endpoint.\n\nNo data is stored or tracked, and code is open source. We made some changes to huggingface-inference-toolkit and use custom handlers.\n\nThis experimental feature is developed by Diffusers 🧨\n\nTable of contents:\n\nGetting started\n\n- Code\n\n- Basic example\n\n- Options\n\n- Generation\n\n- Queueing\n\n- Available VAEs\n\n- Advantages of using a remote VAE\n\n- Provide feedback\n\n## Getting started\n\nBelow, we cover three use cases where we think this remote VAE inference would be beneficial.\n\n### Code\n\nFirst, we have created a helper method for interacting with Remote VAEs.\n\nInstall diffusers from main to run the code. pip install git+https://github.com/huggingface/diffusers@main\n\nCode\n\n```\nfrom diffusers.utils.remote_utils import remote_decode\n```\n\n### Basic example\n\nHere, we show how to use the remote VAE on random tensors.\n\nCode\n\n```\nimage = remote_decode(\n    endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 4, 64, 64], dtype=torch.float16),\n    scaling_factor=0.18215,\n)\n```\n\nUsage for Flux is slightly different. Flux latents are packed so we need to send the height and width.\n\nCode\n\n```\nimage = remote_decode(\n    endpoint=\"https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 4096, 64], dtype=torch.float16),\n    height=1024,\n    width=1024,\n    scaling_factor=0.3611,\n    shift_factor=0.1159,\n)\n```\n\nFinally, an example for HunyuanVideo.\n\nCode\n\n```\nvideo = remote_decode(\n    endpoint=\"https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 16, 3, 40, 64], dtype=torch.float16),\n    output_type=\"mp4\",\n)\nwith open(\"video.mp4\", \"wb\") as f:\n    f.write(video)\n```\n\n### Generation\n\nBut we want to use the VAE on an actual pipeline to get an actual image, not random noise. The example below shows how to do it with SD v1.5.\n\nCode\n\n```\nfrom diffusers import StableDiffusionPipeline\n\npipe = StableDiffusionPipeline.from_pretrained(\n    \"stable-diffusion-v1-5/stable-diffusion-v1-5\",\n    torch_dtype=torch.float16,\n    variant=\"fp16\",\n    vae=None,\n).to(\"cuda\")\n\nprompt = \"Strawberry ice cream, in a stylish modern glass, coconut, splashing milk cream and honey, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\"\n\nlatent = pipe(\n    prompt=prompt,\n    output_type=\"latent\",\n).images\nimage = remote_decode(\n    endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    scaling_factor=0.18215,\n)\nimage.save(\"test.jpg\")\n```\n\nHere’s another example with Flux.\n\nCode\n\n```\nfrom diffusers import FluxPipeline\n\npipe = FluxPipeline.from_pretrained(\n    \"black-forest-labs/FLUX.1-schnell\",\n    torch_dtype=torch.bfloat16,\n    vae=None,\n).to(\"cuda\")\n\nprompt = \"Strawberry ice cream, in a stylish modern glass, coconut, splashing milk cream and honey, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\"\n\nlatent = pipe(\n    prompt=prompt,\n    guidance_scale=0.0,\n    num_inference_steps=4,\n    output_type=\"latent\",\n).images\nimage = remote_decode(\n    endpoint=\"https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    height=1024,\n    width=1024,\n    scaling_factor=0.3611,\n    shift_factor=0.1159,\n)\nimage.save(\"test.jpg\")\n```\n\nHere’s an example with HunyuanVideo.\n\nCode\n\n```\nfrom diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel\n\nmodel_id = \"hunyuanvideo-community/HunyuanVideo\"\ntransformer = HunyuanVideoTransformer3DModel.from_pretrained(\n    model_id, subfolder=\"transformer\", torch_dtype=torch.bfloat16\n)\npipe = HunyuanVideoPipeline.from_pretrained(\n    model_id, transformer=transformer, vae=None, torch_dtype=torch.float16\n).to(\"cuda\")\n\nlatent = pipe(\n    prompt=\"A cat walks on the grass, realistic\",\n    height=320,\n    width=512,\n    num_frames=61,\n    num_inference_steps=30,\n    output_type=\"latent\",\n).frames\n\nvideo = remote_decode(\n    endpoint=\"https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    output_type=\"mp4\",\n)\n\nif isinstance(video, bytes):\n    with open(\"video.mp4\", \"wb\") as f:\n        f.write(video)\n```\n\n### Queueing\n\nOne of the great benefits of using a remote VAE is that we can queue multiple generation requests. While the current latent is being processed for decoding, we can already queue another one. This helps improve concurrency.\n\nCode\n\n```\nimport queue\nimport threading\nfrom IPython.display import display\nfrom diffusers import StableDiffusionPipeline\n\ndef decode_worker(q: queue.Queue):\n    while True:\n        item = q.get()\n        if item is None:\n            break\n        image = remote_decode(\n            endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n            tensor=item,\n            scaling_factor=0.18215,\n        )\n        display(image)\n        q.task_done()\n\nq = queue.Queue()\nthread = threading.Thread(target=decode_worker, args=(q,), daemon=True)\nthread.start()\n\ndef decode(latent: torch.Tensor):\n    q.put(latent)\n\nprompts = [\n    \"Blueberry ice cream, in a stylish modern glass , ice cubes, nuts, mint leaves, splashing milk cream, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\",\n    \"Lemonade in a glass, mint leaves, in an aqua and white background, flowers, ice cubes, halo, fluid motion, dynamic movement, soft lighting, digital painting, rule of thirds composition, Art by Greg rutkowski, Coby whitmore\",\n    \"Comic book art, beautiful, vintage, pastel neon colors, extremely detailed pupils, delicate features, light on face, slight smile, Artgerm, Mary Blair, Edmund Dulac, long dark locks, bangs, glowing, fashionable style, fairytale ambience, hot pink.\",\n    \"Masterpiece, vanilla cone ice cream garnished with chocolate syrup, crushed nuts, choco flakes, in a brown background, gold, cinematic lighting, Art by WLOP\",\n    \"A bowl of milk, falling cornflakes, berries, blueberries, in a white background, soft lighting, intricate details, rule of thirds, octane render, volumetric lighting\",\n    \"Cold Coffee with cream, crushed almonds, in a glass, choco flakes, ice cubes, wet, in a wooden background, cinematic lighting, hyper realistic painting, art by Carne Griffiths, octane render, volumetric lighting, fluid motion, dynamic movement, muted colors,\",\n]\n\npipe = StableDiffusionPipeline.from_pretrained(\n    \"Lykon/dreamshaper-8\",\n    torch_dtype=torch.float16,\n    vae=None,\n).to(\"cuda\")\n\npipe.unet = pipe.unet.to(memory_format=torch.channels_last)\npipe.unet = torch.compile(pipe.unet, mode=\"reduce-overhead\", fullgraph=True)\n\n_ = pipe(\n    prompt=prompts[0],\n    output_type=\"latent\",\n)\n\nfor prompt in prompts:\n    latent = pipe(\n        prompt=prompt,\n        output_type=\"latent\",\n    ).images\n    decode(latent)\n\nq.put(None)\nthread.join()\n```\n\n## Available VAEs\n\n—\n\nEndpoint\n\nModel\n\nStable Diffusion v1\n\nhttps://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud\n\nstabilityai/sd-vae-ft-mse\n\nStable Diffusion XL\n\nhttps://x2dmsqunjd6k9prw.us-east-1.aws.endpoints.huggingface.cloud\n\nmadebyollin/sdxl-vae-fp16-fix\n\nFlux\n\nhttps://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud\n\nblack-forest-labs/FLUX.1-schnell\n\nHunyuanVideo\n\nhttps://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud\n\nhunyuanvideo-community/HunyuanVideo\n\n## Advantages of using a remote VAE\n\nThese tables demonstrate the VRAM requirements with different GPUs. Memory usage % determines whether users of a certain GPU will need to offload. Offload times vary with CPU, RAM and HDD/NVMe. Tiled decoding increases inference time.\n\nSD v1.5\n\nGPU\n\nResolution\n\nTime (seconds)\n\nMemory (%)\n\nTiled Time (secs)\n\nTiled Memory (%)\n\nNVIDIA GeForce RTX 4090\n\n512x512\n\n0.031\n\n5.60%\n\n0.031 (0%)\n\n5.60%\n\nNVIDIA GeForce RTX 4090\n\n1024x1024\n\n0.148\n\n20.00%\n\n0.301 (+103%)\n\n5.60%\n\nNVIDIA GeForce RTX 4080\n\n512x512\n\n0.05\n\n8.40%\n\n0.050 (0%)\n\n8.40%\n\nNVIDIA GeForce RTX 4080\n\n1024x1024\n\n0.224\n\n30.00%\n\n0.356 (+59%)\n\n8.40%\n\nNVIDIA GeForce RTX 4070 Ti\n\n512x512\n\n0.066\n\n11.30%\n\n0.066 (0%)\n\n11.30%\n\nNVIDIA GeForce RTX 4070 Ti\n\n1024x1024\n\n0.284\n\n40.50%\n\n0.454 (+60%)\n\n11.40%\n\nNVIDIA GeForce RTX 3090\n\n512x512\n\n0.062\n\n5.20%\n\n0.062 (0%)\n\n5.20%\n\nNVIDIA GeForce RTX 3090\n\n1024x1024\n\n0.253\n\n18.50%\n\n0.464 (+83%)\n\n5.20%\n\nNVIDIA GeForce RTX 3080\n\n512x512\n\n0.07\n\n12.80%\n\n0.070 (0%)\n\n12.80%\n\nNVIDIA GeForce RTX 3080\n\n1024x1024\n\n0.286\n\n45.30%\n\n0.466 (+63%)\n\n12.90%\n\nNVIDIA GeForce RTX 3070\n\n512x512\n\n0.102\n\n15.90%\n\n0.102 (0%)\n\n15.90%\n\nNVIDIA GeForce RTX 3070\n\n1024x1024\n\n0.421\n\n56.30%\n\n0.746 (+77%)\n\n16.00%\n\nSDXL\n\nGPU\n\nResolution\n\nTime (seconds)\n\nMemory Consumed (%)\n\nTiled Time (seconds)\n\nTiled Memory (%)\n\nNVIDIA GeForce RTX 4090\n\n512x512\n\n0.057\n\n10.00%\n\n0.057 (0%)\n\n10.00%\n\nNVIDIA GeForce RTX 4090\n\n1024x1024\n\n0.256\n\n35.50%\n\n0.257 (+0.4%)\n\n35.50%\n\nNVIDIA GeForce RTX 4080\n\n512x512\n\n0.092\n\n15.00%\n\n0.092 (0%)\n\n15.00%\n\nNVIDIA GeForce RTX 4080\n\n1024x1024\n\n0.406\n\n53.30%\n\n0.406 (0%)\n\n53.30%\n\nNVIDIA GeForce RTX 4070 Ti\n\n512x512\n\n0.121\n\n20.20%\n\n0.120 (-0.8%)\n\n20.20%\n\nNVIDIA GeForce RTX 4070 Ti\n\n1024x1024\n\n0.519\n\n72.00%\n\n0.519 (0%)\n\n72.00%\n\nNVIDIA GeForce RTX 3090\n\n512x512\n\n0.107\n\n10.50%\n\n0.107 (0%)\n\n10.50%\n\nNVIDIA GeForce RTX 3090\n\n1024x1024\n\n0.459\n\n38.00%\n\n0.460 (+0.2%)\n\n38.00%\n\nNVIDIA GeForce RTX 3080\n\n512x512\n\n0.121\n\n25.60%\n\n0.121 (0%)\n\n25.60%\n\nNVIDIA GeForce RTX 3080\n\n1024x1024\n\n0.524\n\n93.00%\n\n0.524 (0%)\n\n93.00%\n\nNVIDIA GeForce RTX 3070\n\n512x512\n\n0.183\n\n31.80%\n\n0.183 (0%)\n\n31.80%\n\nNVIDIA GeForce RTX 3070\n\n1024x1024\n\n0.794\n\n96.40%\n\n0.794 (0%)\n\n96.40%\n\n## Provide feedback\n\nIf you like the idea and feature, please help us with your feedback on how we can make this better and whether you’d be interested in having this kind of feature more natively integrated into the Hugging Face ecosystem. If this pilot goes well, we plan on creating optimized VAE endpoints for more models, including the ones that can generate high-resolution videos!\n\n### Steps:\n\n- Open an issue on Diffusers through this link.\n\n- Answer the questions and provide any extra info you want.\n\n- Hit submit!",
   "summaryZh": "Hugging Face推出了支持在Inference Endpoints上进行解码的远程VAE（变分自编码器）功能，优化了多模态或生成式模型的推理架构和计算效率。原始信息显示：来自原始信息源的最新动态，点击标题查看完整内容。该消息由Hugging Face发布，主题为“Remote VAEs for decoding with Inference Endpoints 🤗”。其重要性主要体现在：文章探讨了在Hugging Face推理端点上使用远程变分自编码器进行解码的技术，对生成式AI模型的部署具有实用价值。建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响。",
   "summaryGeneratedAt": "2026-09-05T14:13:52.133129Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +53,2845 @@
     "summaryZh": "Hugging Face推出了支持在Inference Endpoints上进行解码的远程VAE（变分自编码器）功能，优化了多模态或生成式模型的推理架构和计算效率。原始信息显示：来自原始信息源的最新动态，点击标题查看完整内容。该消息由Hugging Face发布，主题为“Remote VAEs for decoding with Inference Endpoints 🤗”。其重要性主要体现在：文章探讨了在Hugging Face推理端点上使用远程变分自编码器进行解码的技术，对生成式AI模型的部署具有实用价值。建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响。",
     "glossary": [],
     "duplicateKey": "remote-vaes-inference-endpoints"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/output.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/output.png",
+      "alt": "",
+      "id": "image_1f2988531850f28a"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/flux_random_latent.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/flux_random_latent.png",
+      "alt": "",
+      "id": "image_fac3d9e9af75ff51"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/test.jpg",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/test.jpg",
+      "alt": "",
+      "id": "image_3071e6111846ddd1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/test_1.jpg",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/test_1.jpg",
+      "alt": "",
+      "id": "image_842154dd17d37abd"
+    }
+  ],
+  "videos": [
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/video_1.mp4",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/video_1.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/remote_vae",
+      "id": "video_99889f67318f4f83"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/video.mp4",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/video.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/remote_vae",
+      "id": "video_72265a71ff14915a"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/queue.mp4",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/remote_vae/queue.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/remote_vae",
+      "id": "video_d652da8177ac2183"
+    }
+  ],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "(This post was authored by hlky and Sayak)",
+      "spans": [
+        {
+          "start": 27,
+          "end": 31,
+          "kind": "a",
+          "href": "https://github.com/hlky"
+        },
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "When operating with latent-space diffusion models for high-resolution image and video synthesis, the VAE decoder can consume quite a bit more memory. This makes it hard for the users to run these models on consumer GPUs without going through latency sacrifices and others alike.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "For example, with offloading, there is a device transfer overhead, causing delays in the overall inference latency. Tiling is another solution that lets us operate on so-called “tiles” of inputs. However, it can have a negative impact on the quality of the final image.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Therefore, we want to pilot an idea with the community — delegating the decoding process to a remote endpoint.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "No data is stored or tracked, and code is open source. We made some changes to huggingface-inference-toolkit and use custom handlers.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 108,
+          "kind": "a",
+          "href": "https://github.com/hlky/huggingface-inference-toolkit/tree/fix-text-support-binary"
+        },
+        {
+          "start": 117,
+          "end": 132,
+          "kind": "a",
+          "href": "https://huggingface.co/hlky/sd-vae-ft-mse/blob/main/handler.py"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "This experimental feature is developed by Diffusers 🧨",
+      "spans": [
+        {
+          "start": 42,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/hybrid_inference/overview"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Table of contents:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Getting started",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/remote_vae#getting-started"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Basic example",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Options",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Generation",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Queueing",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Available VAEs",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/remote_vae#available-vaes"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Advantages of using a remote VAE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/remote_vae#advantages-of-using-a-remote-vae"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Provide feedback",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/remote_vae#provide-feedback"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Getting started",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Below, we cover three use cases where we think this remote VAE inference would be beneficial.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "First, we have created a helper method for interacting with Remote VAEs.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Install diffusers from main to run the code. pip install git+https://github.com/huggingface/diffusers@main",
+      "spans": [
+        {
+          "start": 8,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 23,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 106,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Basic example",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Here, we show how to use the remote VAE on random tensors.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Usage for Flux is slightly different. Flux latents are packed so we need to send the height and width.",
+      "spans": [
+        {
+          "start": 85,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 96,
+          "end": 101,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Finally, an example for HunyuanVideo.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Generation",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "But we want to use the VAE on an actual pipeline to get an actual image, not random noise. The example below shows how to do it with SD v1.5.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Here’s another example with Flux.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Here’s an example with HunyuanVideo.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Queueing",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "One of the great benefits of using a remote VAE is that we can queue multiple generation requests. While the current latent is being processed for decoding, we can already queue another one. This helps improve concurrency.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Code",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Available VAEs",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "Endpoint",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "Model",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Stable Diffusion v1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud",
+      "spans": [
+        {
+          "start": 0,
+          "end": 66,
+          "kind": "a",
+          "href": "https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "stabilityai/sd-vae-ft-mse",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "a",
+          "href": "https://hf.co/stabilityai/sd-vae-ft-mse"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "Stable Diffusion XL",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "https://x2dmsqunjd6k9prw.us-east-1.aws.endpoints.huggingface.cloud",
+      "spans": [
+        {
+          "start": 0,
+          "end": 66,
+          "kind": "a",
+          "href": "https://x2dmsqunjd6k9prw.us-east-1.aws.endpoints.huggingface.cloud"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "madebyollin/sdxl-vae-fp16-fix",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://hf.co/madebyollin/sdxl-vae-fp16-fix"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "Flux",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud",
+      "spans": [
+        {
+          "start": 0,
+          "end": 66,
+          "kind": "a",
+          "href": "https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "black-forest-labs/FLUX.1-schnell",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://hf.co/black-forest-labs/FLUX.1-schnell"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "HunyuanVideo",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud",
+      "spans": [
+        {
+          "start": 0,
+          "end": 66,
+          "kind": "a",
+          "href": "https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "hunyuanvideo-community/HunyuanVideo",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "a",
+          "href": "https://hf.co/hunyuanvideo-community/HunyuanVideo"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Advantages of using a remote VAE",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "These tables demonstrate the VRAM requirements with different GPUs. Memory usage % determines whether users of a certain GPU will need to offload. Offload times vary with CPU, RAM and HDD/NVMe. Tiled decoding increases inference time.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "SD v1.5",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "GPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "Resolution",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "Time (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "Memory (%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "Tiled Time (secs)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "Tiled Memory (%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "NVIDIA GeForce RTX 4090",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "0.031",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "5.60%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "0.031 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "5.60%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "NVIDIA GeForce RTX 4090",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "0.148",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "20.00%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "0.301 (+103%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "5.60%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "NVIDIA GeForce RTX 4080",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "0.05",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "8.40%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "0.050 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "8.40%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "NVIDIA GeForce RTX 4080",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "0.224",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "30.00%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "0.356 (+59%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "8.40%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "NVIDIA GeForce RTX 4070 Ti",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "0.066",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "11.30%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "0.066 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "11.30%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "NVIDIA GeForce RTX 4070 Ti",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "0.284",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "40.50%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "0.454 (+60%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "11.40%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "NVIDIA GeForce RTX 3090",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "0.062",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "5.20%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "0.062 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "5.20%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "NVIDIA GeForce RTX 3090",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "0.253",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "18.50%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "0.464 (+83%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "5.20%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "NVIDIA GeForce RTX 3080",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "0.07",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "12.80%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "0.070 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "12.80%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "NVIDIA GeForce RTX 3080",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "0.286",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "45.30%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "0.466 (+63%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "12.90%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "NVIDIA GeForce RTX 3070",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "0.102",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "15.90%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "0.102 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "15.90%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "NVIDIA GeForce RTX 3070",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "0.421",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "56.30%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "0.746 (+77%)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "16.00%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "SDXL",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "GPU",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "Resolution",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "Time (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "Memory Consumed (%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "Tiled Time (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "Tiled Memory (%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "NVIDIA GeForce RTX 4090",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "0.057",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "10.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "0.057 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "10.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "NVIDIA GeForce RTX 4090",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "0.256",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "35.50%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "0.257 (+0.4%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "35.50%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "NVIDIA GeForce RTX 4080",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "0.092",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "15.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "0.092 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "15.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "NVIDIA GeForce RTX 4080",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "0.406",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "53.30%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "0.406 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "53.30%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "NVIDIA GeForce RTX 4070 Ti",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "0.121",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "20.20%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "0.120 (-0.8%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "20.20%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "NVIDIA GeForce RTX 4070 Ti",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "0.519",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "72.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "0.519 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "72.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "NVIDIA GeForce RTX 3090",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "0.107",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "10.50%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "0.107 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "10.50%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "NVIDIA GeForce RTX 3090",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "0.459",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "38.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "0.460 (+0.2%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "38.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "NVIDIA GeForce RTX 3080",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "0.121",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "25.60%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "0.121 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "25.60%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0198",
+      "source": "NVIDIA GeForce RTX 3080",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0199",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0200",
+      "source": "0.524",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0201",
+      "source": "93.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0202",
+      "source": "0.524 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "93.00%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 10,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "NVIDIA GeForce RTX 3070",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "512x512",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "0.183",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "31.80%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "0.183 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "31.80%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 11,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "NVIDIA GeForce RTX 3070",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0211",
+      "source": "1024x1024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "0.794",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "96.40%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "0.794 (0%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "96.40%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 12,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "Provide feedback",
+      "spans": []
+    },
+    {
+      "id": "b0217",
+      "source": "If you like the idea and feature, please help us with your feedback on how we can make this better and whether you’d be interested in having this kind of feature more natively integrated into the Hugging Face ecosystem. If this pilot goes well, we plan on creating optimized VAE endpoints for more models, including the ones that can generate high-resolution videos!",
+      "spans": []
+    },
+    {
+      "id": "b0218",
+      "source": "Steps:",
+      "spans": []
+    },
+    {
+      "id": "b0219",
+      "source": "Open an issue on Diffusers through this link.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 44,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/issues/new?template=remote-vae-pilot-feedback.yml"
+        }
+      ]
+    },
+    {
+      "id": "b0220",
+      "source": "Answer the questions and provide any extra info you want.",
+      "spans": []
+    },
+    {
+      "id": "b0221",
+      "source": "Hit submit!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "139761460e824ef90fca6dcaf99a5ca2b4788956d23e16f4d229e898c8fd3439",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from diffusers.utils.remote_utils import remote_decode"
+    },
+    {
+      "id": "c0002",
+      "source": "image = remote_decode(\n    endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 4, 64, 64], dtype=torch.float16),\n    scaling_factor=0.18215,\n)"
+    },
+    {
+      "id": "c0003",
+      "source": "image = remote_decode(\n    endpoint=\"https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 4096, 64], dtype=torch.float16),\n    height=1024,\n    width=1024,\n    scaling_factor=0.3611,\n    shift_factor=0.1159,\n)"
+    },
+    {
+      "id": "c0004",
+      "source": "video = remote_decode(\n    endpoint=\"https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=torch.randn([1, 16, 3, 40, 64], dtype=torch.float16),\n    output_type=\"mp4\",\n)\nwith open(\"video.mp4\", \"wb\") as f:\n    f.write(video)"
+    },
+    {
+      "id": "c0005",
+      "source": "from diffusers import StableDiffusionPipeline\n\npipe = StableDiffusionPipeline.from_pretrained(\n    \"stable-diffusion-v1-5/stable-diffusion-v1-5\",\n    torch_dtype=torch.float16,\n    variant=\"fp16\",\n    vae=None,\n).to(\"cuda\")\n\nprompt = \"Strawberry ice cream, in a stylish modern glass, coconut, splashing milk cream and honey, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\"\n\nlatent = pipe(\n    prompt=prompt,\n    output_type=\"latent\",\n).images\nimage = remote_decode(\n    endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    scaling_factor=0.18215,\n)\nimage.save(\"test.jpg\")"
+    },
+    {
+      "id": "c0006",
+      "source": "from diffusers import FluxPipeline\n\npipe = FluxPipeline.from_pretrained(\n    \"black-forest-labs/FLUX.1-schnell\",\n    torch_dtype=torch.bfloat16,\n    vae=None,\n).to(\"cuda\")\n\nprompt = \"Strawberry ice cream, in a stylish modern glass, coconut, splashing milk cream and honey, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\"\n\nlatent = pipe(\n    prompt=prompt,\n    guidance_scale=0.0,\n    num_inference_steps=4,\n    output_type=\"latent\",\n).images\nimage = remote_decode(\n    endpoint=\"https://whhx50ex1aryqvw6.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    height=1024,\n    width=1024,\n    scaling_factor=0.3611,\n    shift_factor=0.1159,\n)\nimage.save(\"test.jpg\")"
+    },
+    {
+      "id": "c0007",
+      "source": "from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel\n\nmodel_id = \"hunyuanvideo-community/HunyuanVideo\"\ntransformer = HunyuanVideoTransformer3DModel.from_pretrained(\n    model_id, subfolder=\"transformer\", torch_dtype=torch.bfloat16\n)\npipe = HunyuanVideoPipeline.from_pretrained(\n    model_id, transformer=transformer, vae=None, torch_dtype=torch.float16\n).to(\"cuda\")\n\nlatent = pipe(\n    prompt=\"A cat walks on the grass, realistic\",\n    height=320,\n    width=512,\n    num_frames=61,\n    num_inference_steps=30,\n    output_type=\"latent\",\n).frames\n\nvideo = remote_decode(\n    endpoint=\"https://o7ywnmrahorts457.us-east-1.aws.endpoints.huggingface.cloud/\",\n    tensor=latent,\n    output_type=\"mp4\",\n)\n\nif isinstance(video, bytes):\n    with open(\"video.mp4\", \"wb\") as f:\n        f.write(video)"
+    },
+    {
+      "id": "c0008",
+      "source": "import queue\nimport threading\nfrom IPython.display import display\nfrom diffusers import StableDiffusionPipeline\n\ndef decode_worker(q: queue.Queue):\n    while True:\n        item = q.get()\n        if item is None:\n            break\n        image = remote_decode(\n            endpoint=\"https://q1bj3bpq6kzilnsu.us-east-1.aws.endpoints.huggingface.cloud/\",\n            tensor=item,\n            scaling_factor=0.18215,\n        )\n        display(image)\n        q.task_done()\n\nq = queue.Queue()\nthread = threading.Thread(target=decode_worker, args=(q,), daemon=True)\nthread.start()\n\ndef decode(latent: torch.Tensor):\n    q.put(latent)\n\nprompts = [\n    \"Blueberry ice cream, in a stylish modern glass , ice cubes, nuts, mint leaves, splashing milk cream, in a gradient purple background, fluid motion, dynamic movement, cinematic lighting, Mysterious\",\n    \"Lemonade in a glass, mint leaves, in an aqua and white background, flowers, ice cubes, halo, fluid motion, dynamic movement, soft lighting, digital painting, rule of thirds composition, Art by Greg rutkowski, Coby whitmore\",\n    \"Comic book art, beautiful, vintage, pastel neon colors, extremely detailed pupils, delicate features, light on face, slight smile, Artgerm, Mary Blair, Edmund Dulac, long dark locks, bangs, glowing, fashionable style, fairytale ambience, hot pink.\",\n    \"Masterpiece, vanilla cone ice cream garnished with chocolate syrup, crushed nuts, choco flakes, in a brown background, gold, cinematic lighting, Art by WLOP\",\n    \"A bowl of milk, falling cornflakes, berries, blueberries, in a white background, soft lighting, intricate details, rule of thirds, octane render, volumetric lighting\",\n    \"Cold Coffee with cream, crushed almonds, in a glass, choco flakes, ice cubes, wet, in a wooden background, cinematic lighting, hyper realistic painting, art by Carne Griffiths, octane render, volumetric lighting, fluid motion, dynamic movement, muted colors,\",\n]\n\npipe = StableDiffusionPipeline.from_pretrained(\n    \"Lykon/dreamshaper-8\",\n    torch_dtype=torch.float16,\n    vae=None,\n).to(\"cuda\")\n\npipe.unet = pipe.unet.to(memory_format=torch.channels_last)\npipe.unet = torch.compile(pipe.unet, mode=\"reduce-overhead\", fullgraph=True)\n\n_ = pipe(\n    prompt=prompts[0],\n    output_type=\"latent\",\n)\n\nfor prompt in prompts:\n    latent = pipe(\n        prompt=prompt,\n        output_type=\"latent\",\n    ).images\n    decode(latent)\n\nq.put(None)\nthread.join()"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "139761460e824ef90fca6dcaf99a5ca2b4788956d23e16f4d229e898c8fd3439",
+  "mediaLayout": [
+    {
+      "mediaId": "image_1f2988531850f28a",
+      "type": "image",
+      "afterBlockId": "c0002",
+      "order": 0
+    },
+    {
+      "mediaId": "image_fac3d9e9af75ff51",
+      "type": "image",
+      "afterBlockId": "c0003",
+      "order": 1
+    },
+    {
+      "mediaId": "video_99889f67318f4f83",
+      "type": "video",
+      "afterBlockId": "c0004",
+      "order": 2
+    },
+    {
+      "mediaId": "image_3071e6111846ddd1",
+      "type": "image",
+      "afterBlockId": "c0005",
+      "order": 3
+    },
+    {
+      "mediaId": "image_842154dd17d37abd",
+      "type": "image",
+      "afterBlockId": "c0006",
+      "order": 4
+    },
+    {
+      "mediaId": "video_72265a71ff14915a",
+      "type": "video",
+      "afterBlockId": "c0007",
+      "order": 5
+    },
+    {
+      "mediaId": "video_d652da8177ac2183",
+      "type": "video",
+      "afterBlockId": "c0008",
+      "order": 6
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 7,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 4,
+    "savedImages": 4,
+    "sourceImageOccurrences": 4,
+    "placedImageOccurrences": 4,
+    "sourceVideos": 3,
+    "savedVideos": 3,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T01:27:05.178623Z",
+  "mediaLayoutCheckedAt": "2026-10-03T01:27:05.178631Z"
 }
