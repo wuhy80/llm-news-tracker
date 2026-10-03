@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:39:59.563130Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Fixing Gradient Accumulation\n\nPublished October 16, 2024\n\nOur friends at Unsloth shared an issue regarding gradient accumulation yesterday that is affecting the transformers Trainer. The initial report comes from @bnjmn_marie (kudos to him!).\n\nGradient accumulation is supposed to be mathematically equivalent to full batch training; however, losses did not match between training runs where the setting was toggled on and off.\n\nWhere does it stem from?\n\nInside the modeling code of each model, transformers offers a \"default\" loss function that's the most typically used one for the model's task. It is determined by what the modeling class should be used for: question answering, token classification, causal LM, masked LM.\n\nThis is the default loss function and it was not meant to be customizable: it is only computed when labels and input_ids are passed as inputs to the model, so the user doesn't have to compute the loss. The default loss is useful but is limited by design : for anything different being done, we expect the labels to not be passed directly, and for users to get the logits back from the model and use them to compute the loss outside of the model.\n\nHowever, the transformers Trainer, as well as many Trainers, heavily leverage these methods because of the simplicity it offers: it is a double-edged sword. Providing a simple API that becomes different as the use-case differs is not a well-thought out API, and we've been caught by surprise ourselves.\n\nTo be precise, for gradient accumulation across token-level tasks like causal LM training, the correct loss should be computed by the total loss across all batches in a gradient accumulation step divided by the total number of all non padding tokens in those batches. This is not the same as the average of the per-batch loss values. The fix is quite simple, see the following:\n\n```\ndef ForCausalLMLoss(logits, labels, vocab_size, **kwargs):\n    # Upcast to float if we need to compute the loss to avoid potential precision issues\n    logits = logits.float()\n    # Shift so that tokens < n predict n\n    shift_logits = logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()\n\n    # Flatten the tokens\n    shift_logits = shift_logits.view(-1, vocab_size)\n    shift_labels = shift_labels.view(-1)\n    # Enable model parallelism\n    shift_labels = shift_labels.to(shift_logits.device)\n\n    num_items = kwargs.pop(\"num_items\", None)\n+        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction=\"sum\")\n+        loss = loss / num_items\n-        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)\n    return loss\n```\n\nTo address this issue, we’re changing the way our models and training work in two ways:\n\nIf users are using the “default” loss functions, we will automatically take into account the needed changes when using gradient accumulation, to make sure the proper loss is reported and utilized, fixing the core issue at hand.\n\nTo ensure that any future issues with calculating losses won’t block users, we’ll be exposing an API to let users pass in their own loss functions to the Trainer directly so they can use their own fix easily until we have fixed any issues internally and made a new transformers release.\n\nAll model that inherit from PreTrainedModel now have a loss_function property, which is determined by either:\n\nthe config.loss_type : this is to make sure anyone can use his custom loss. You can do this by modifying the LOSS_MAPPING :\n\n```\ndef my_super_loss(logits, labels):\n    return loss = nn.functional.cross_entropy(logits, labels, ignore_index=-100)\n\nLOSS_MAPPING[\"my_loss_type\"] = my_super_loss\n```\n\nWe are working to ship the first change for the most popular models in this PR: https://github.com/huggingface/transformers/pull/34191#pullrequestreview-2372725010 . Following this, a call for contributions to help propagate this to the rest of the models will be done so that the majority of models is supported by next release.\n\nWe are also actively working to ship the second change in this PR: https://github.com/huggingface/transformers/pull/34198 , which will allow users to use their own loss function and make use of the number of samples seen per-batch to help with calculating their loss (and will perform the correct loss calculation during gradient accumulation as more models are supported from the prior change)\n\nBy tomorrow, you should expect the Trainer to behave correctly with gradient accumulation. Please install from main in order to benefit from the fix then:\n\n```\npip install git+https://github.com/huggingface/transformers\n```\n\nIn general, we are very responsive to bug reports submitted to our issue tracker: https://github.com/huggingface/transformers/issues\n\nThis issue has been in Transformers for some time as it's mostly a default that should be updated by the end-user; however, when defaults become non-intuitive, they are bound to be changed. In this instance, we've updated the code and shipped a fix in less than 24 hours, which is what we aim for issues like this one in transformers. Please, come and submit your issues if you have some; this is the only way we can get transformers to improve and fit well within your different use-cases.\n\nMore Articles from our Blog\n\nannouncement multimodal transformers\n\nWelcome Inkling by Thinking Machines\n\nvllm transformers inference\n\nNative-speed vLLM transformers modeling backend\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Our friends at Unsloth shared an issue regarding gradient accumulation yesterday that is affecting the transformers Trainer. The initial report comes from @bnjmn_marie (kudos to him!).\n\nGradient accumulation is supposed to be mathematically equivalent to full batch training; however, losses did not match between training runs where the setting was toggled on and off.\n\n## Where does it stem from?\n\nInside the modeling code of each model, transformers offers a \"default\" loss function that's the most typically used one for the model's task. It is determined by what the modeling class should be used for: question answering, token classification, causal LM, masked LM.\n\nThis is the default loss function and it was not meant to be customizable: it is only computed when labels and input_ids are passed as inputs to the model, so the user doesn't have to compute the loss. The default loss is useful but is limited by design: for anything different being done, we expect the labels to not be passed directly, and for users to get the logits back from the model and use them to compute the loss outside of the model.\n\nHowever, the transformers Trainer, as well as many Trainers, heavily leverage these methods because of the simplicity it offers: it is a double-edged sword. Providing a simple API that becomes different as the use-case differs is not a well-thought out API, and we've been caught by surprise ourselves.\n\nTo be precise, for gradient accumulation across token-level tasks like causal LM training, the correct loss should be computed by the total loss across all batches in a gradient accumulation step divided by the total number of all non padding tokens in those batches. This is not the same as the average of the per-batch loss values. The fix is quite simple, see the following:\n\n```\ndef ForCausalLMLoss(logits, labels, vocab_size, **kwargs):\n    # Upcast to float if we need to compute the loss to avoid potential precision issues\n    logits = logits.float()\n    # Shift so that tokens < n predict n\n    shift_logits = logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()\n\n    # Flatten the tokens\n    shift_logits = shift_logits.view(-1, vocab_size)\n    shift_labels = shift_labels.view(-1)\n    # Enable model parallelism\n    shift_labels = shift_labels.to(shift_logits.device)\n\n    num_items = kwargs.pop(\"num_items\", None)\n+        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction=\"sum\")\n+        loss = loss / num_items\n-        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)\n    return loss\n```\n\n## How we're fixing it\n\nTo address this issue, we’re changing the way our models and training work in two ways:\n\n- If users are using the “default” loss functions, we will automatically take into account the needed changes when using gradient accumulation, to make sure the proper loss is reported and utilized, fixing the core issue at hand.\n\n- To ensure that any future issues with calculating losses won’t block users, we’ll be exposing an API to let users pass in their own loss functions to the Trainer directly so they can use their own fix easily until we have fixed any issues internally and made a new transformers release.\n\nAll model that inherit from PreTrainedModel now have a loss_function property, which is determined by either:\n\n- the config.loss_type: this is to make sure anyone can use his custom loss. You can do this by modifying the LOSS_MAPPING:\n\n```\ndef my_super_loss(logits, labels):\n    return loss = nn.functional.cross_entropy(logits, labels, ignore_index=-100)\n\nLOSS_MAPPING[\"my_loss_type\"] = my_super_loss\n```\n\nWe are working to ship the first change for the most popular models in this PR: https://github.com/huggingface/transformers/pull/34191#pullrequestreview-2372725010. Following this, a call for contributions to help propagate this to the rest of the models will be done so that the majority of models is supported by next release.\n\nWe are also actively working to ship the second change in this PR: https://github.com/huggingface/transformers/pull/34198, which will allow users to use their own loss function and make use of the number of samples seen per-batch to help with calculating their loss (and will perform the correct loss calculation during gradient accumulation as more models are supported from the prior change)\n\n—\n\nBy tomorrow, you should expect the Trainer to behave correctly with gradient accumulation. Please install from main in order to benefit from the fix then:\n\n```\npip install git+https://github.com/huggingface/transformers\n```\n\nIn general, we are very responsive to bug reports submitted to our issue tracker: https://github.com/huggingface/transformers/issues\n\nThis issue has been in Transformers for some time as it's mostly a default that should be updated by the end-user; however, when defaults become non-intuitive, they are bound to be changed. In this instance, we've updated the code and shipped a fix in less than 24 hours, which is what we aim for issues like this one in transformers. Please, come and submit your issues if you have some; this is the only way we can get transformers to improve and fit well within your different use-cases.\n\nThe Transformers team 🤗",
   "summaryZh": "文章探讨了 Unsloth 发现的关于 transformers Trainer 梯度累积与全批量训练损失不匹配的问题。由于默认损失函数设计限制，在处理 causal LM 等 token 级任务时，正确的损失应当是梯度累积步数内所有批次的损失总和除以非填充 token 的总数，而不是简单对批次损失求平均。这为微调大模型的开发者提供了重要的修正参考。",
   "summaryGeneratedAt": "2026-09-05T15:20:54.322392Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +54,240 @@
     "summaryZh": "文章探讨了 Unsloth 发现的关于 transformers Trainer 梯度累积与全批量训练损失不匹配的问题。由于默认损失函数设计限制，在处理 causal LM 等 token 级任务时，正确的损失应当是梯度累积步数内所有批次的损失总和除以非填充 token 的总数，而不是简单对批次损失求平均。这为微调大模型的开发者提供了重要的修正参考。",
     "glossary": [],
     "duplicateKey": "transformers-gradient-accumulation-fix"
-  }
+  },
+  "images": [],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Our friends at Unsloth shared an issue regarding gradient accumulation yesterday that is affecting the transformers Trainer. The initial report comes from @bnjmn_marie (kudos to him!).",
+      "spans": [
+        {
+          "start": 23,
+          "end": 38,
+          "kind": "a",
+          "href": "https://unsloth.ai/blog/gradient"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Gradient accumulation is supposed to be mathematically equivalent to full batch training; however, losses did not match between training runs where the setting was toggled on and off.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 33,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Where does it stem from?",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Inside the modeling code of each model, transformers offers a \"default\" loss function that's the most typically used one for the model's task. It is determined by what the modeling class should be used for: question answering, token classification, causal LM, masked LM.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "This is the default loss function and it was not meant to be customizable: it is only computed when labels and input_ids are passed as inputs to the model, so the user doesn't have to compute the loss. The default loss is useful but is limited by design: for anything different being done, we expect the labels to not be passed directly, and for users to get the logits back from the model and use them to compute the loss outside of the model.",
+      "spans": [
+        {
+          "start": 100,
+          "end": 106,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 244,
+          "end": 253,
+          "kind": "strong"
+        },
+        {
+          "start": 314,
+          "end": 444,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "However, the transformers Trainer, as well as many Trainers, heavily leverage these methods because of the simplicity it offers: it is a double-edged sword. Providing a simple API that becomes different as the use-case differs is not a well-thought out API, and we've been caught by surprise ourselves.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "To be precise, for gradient accumulation across token-level tasks like causal LM training, the correct loss should be computed by the total loss across all batches in a gradient accumulation step divided by the total number of all non padding tokens in those batches. This is not the same as the average of the per-batch loss values. The fix is quite simple, see the following:",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "How we're fixing it",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "To address this issue, we’re changing the way our models and training work in two ways:",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "If users are using the “default” loss functions, we will automatically take into account the needed changes when using gradient accumulation, to make sure the proper loss is reported and utilized, fixing the core issue at hand.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "To ensure that any future issues with calculating losses won’t block users, we’ll be exposing an API to let users pass in their own loss functions to the Trainer directly so they can use their own fix easily until we have fixed any issues internally and made a new transformers release.",
+      "spans": [
+        {
+          "start": 154,
+          "end": 161,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "All model that inherit from PreTrainedModel now have a loss_function property, which is determined by either:",
+      "spans": [
+        {
+          "start": 28,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 55,
+          "end": 68,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "the config.loss_type: this is to make sure anyone can use his custom loss. You can do this by modifying the LOSS_MAPPING:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 120,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "We are working to ship the first change for the most popular models in this PR: https://github.com/huggingface/transformers/pull/34191#pullrequestreview-2372725010. Following this, a call for contributions to help propagate this to the rest of the models will be done so that the majority of models is supported by next release.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 163,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/34191#pullrequestreview-2372725010"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "We are also actively working to ship the second change in this PR: https://github.com/huggingface/transformers/pull/34198, which will allow users to use their own loss function and make use of the number of samples seen per-batch to help with calculating their loss (and will perform the correct loss calculation during gradient accumulation as more models are supported from the prior change)",
+      "spans": [
+        {
+          "start": 67,
+          "end": 121,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/34198"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "—",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "By tomorrow, you should expect the Trainer to behave correctly with gradient accumulation. Please install from main in order to benefit from the fix then:",
+      "spans": [
+        {
+          "start": 111,
+          "end": 115,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "In general, we are very responsive to bug reports submitted to our issue tracker: https://github.com/huggingface/transformers/issues",
+      "spans": [
+        {
+          "start": 82,
+          "end": 132,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/issues"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "This issue has been in Transformers for some time as it's mostly a default that should be updated by the end-user; however, when defaults become non-intuitive, they are bound to be changed. In this instance, we've updated the code and shipped a fix in less than 24 hours, which is what we aim for issues like this one in transformers. Please, come and submit your issues if you have some; this is the only way we can get transformers to improve and fit well within your different use-cases.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "The Transformers team 🤗",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "29bf772a25aba7bc562cb3ea313aa4edfb911db7b3c014799722086badf27ad3",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "def ForCausalLMLoss(logits, labels, vocab_size, **kwargs):\n    # Upcast to float if we need to compute the loss to avoid potential precision issues\n    logits = logits.float()\n    # Shift so that tokens < n predict n\n    shift_logits = logits[..., :-1, :].contiguous()\n    shift_labels = labels[..., 1:].contiguous()\n\n    # Flatten the tokens\n    shift_logits = shift_logits.view(-1, vocab_size)\n    shift_labels = shift_labels.view(-1)\n    # Enable model parallelism\n    shift_labels = shift_labels.to(shift_logits.device)\n\n    num_items = kwargs.pop(\"num_items\", None)\n+        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction=\"sum\")\n+        loss = loss / num_items\n-        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)\n    return loss"
+    },
+    {
+      "id": "c0002",
+      "source": "def my_super_loss(logits, labels):\n    return loss = nn.functional.cross_entropy(logits, labels, ignore_index=-100)\n\nLOSS_MAPPING[\"my_loss_type\"] = my_super_loss"
+    },
+    {
+      "id": "c0003",
+      "source": "pip install git+https://github.com/huggingface/transformers"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "29bf772a25aba7bc562cb3ea313aa4edfb911db7b3c014799722086badf27ad3",
+  "mediaLayout": [],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 0,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T01:31:24.028768Z",
+  "mediaLayoutCheckedAt": "2026-10-03T01:31:24.028780Z"
 }

@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/from-chunks-to-blocks",
   "resolvedUrl": "https://huggingface.co/blog/from-chunks-to-blocks",
   "fetchedAt": "2026-08-26T02:48:21.129579Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Content-defined chunking (CDC) plays a central role in enabling deduplication within a Xet-backed repository. The idea is straightforward: break each file’s data into chunks, store only unique ones, reap the benefits.\n\nIn practice, it's more complex. If we focused solely on maximizing deduplication, the design would call for the smallest possible chunk size. By doing that, we’d create significant overheads for the infrastructure and the builders on the Hub.\n\nOn Hugging Face's Xet team, we're bringing CDC from theory to production to deliver faster uploads and downloads to AI builders (by a factor of 2-3x in some cases). Our guiding principle is simple: enable rapid experimentation and collaboration for teams building and iterating on models and datasets. This means focusing on more than just deduplication; we’re optimizing how data moves across the network, how it’s stored, and the entire development experience.\n\n## The Realities of Scaling Deduplication\n\nImagine uploading a 200GB repository to the Hub. Today, there are a number of ways to do this, but all use a file-centric approach. To bring faster file transfers to the Hub, we've open-sourced xet-core and hf_xet, an integration with huggingface_hub which uses a chunk-based approach written in Rust.\n\nIf you consider a 200GB repository with unique chunks, that's 3 million entries (at ~64KB per chunk) in the content-addressed store (CAS) backing all repositories. If a new version of a model is uploaded or a branch in the repository is created with different data, more unique chunks are added, driving up the entries in the CAS.\n\nWith nearly 45PB across 2 million model, dataset, and space repositories on the Hub, a purely chunk-based approach could incur 690 billion chunks. Managing this volume of content using only chunks is simply not viable due to:\n\n- Network Overheads: If each chunk is downloaded or uploaded individually, millions of requests are generated on each upload and download, overwhelming both client and server. Even batching queries simply shifts the problem to the storage layer.\n\n- Infrastructure Overheads: A naive CAS that tracks chunks individually would require billions of entries, leading to steep monthly bills on services like DynamoDB or S3. At Hugging Face’s scale, this quickly adds up.\n\nIn short, network requests balloon, databases struggle to manage the metadata, and the cost of orchestrating each chunk skyrockets all while you wait for your files to transfer.\n\n## Design Principles for Deduplication at Scale\n\nThese challenges lead to a key realization:\n\nDeduplication is a performance optimization, not the final goal.\n\nThe final goal is to improve the experience of builders iterating and collaborating on models and datasets. The system components from the client to the storage layer do not need to guarantee deduplication. Instead, they leverage deduplication as one tool among many to aid in this.\n\nBy loosening the deduplication constraint, we naturally arrive at a second design principle:\n\nAvoid communication or storage strategies that scale 1:1 with the number of chunks.\n\nWhat does this mean? We scale with aggregation.\n\n## Scaling Deduplication with Aggregation\n\nAggregation takes chunks and groups them, referencing them intelligently in ways that provide clever (and practical) benefits:\n\n- Blocks: Instead of transferring and storing chunks, we bundle data together in blocks of up to 64MB after deduplication. Blocks are still content-addressed, but this reduces CAS entries by a factor of 1,000.\n\n- Shards: Shards provide the mapping between files and chunks (referencing blocks as they do so). This allows us to identify which parts of a file have changed, referencing shards generated from past uploads. When chunks are already known to exist in the CAS, they’re skipped, slashing unnecessary transfers and queries.\n\nTogether, blocks and shards unlock significant benefits. However, when someone uploads a new file, how do we know if a chunk has been uploaded before so we can eliminate an unnecessary request? Performing a network query for every chunk is not scalable and goes against the “no 1:1” principle we mentioned above.\n\nThe solution is key chunks which are a 0.1% subset of all chunks selected with a simple modulo condition based on the chunk hash. We provide a global index over these key chunks and the shards they are found in, so that when the chunk is queried, the related shard is returned to provide local deduplication. This allows us to leverage the principles of spatial locality. If a key chunk is referenced in a shard, it’s likely that other similar chunk references are available in the same shard. This further improves deduplication and reduces network and database requests.\n\n## Aggregated Deduplication in Practice\n\nThe Hub currently stores over 3.5PB of .gguf files, most of which are quantized versions of other models on the Hub. Quantized models represent an interesting opportunity for deduplication due to the nature of quantization where values are restricted to a smaller integer range and scaled. This restricts the range of values in the weight matrices, naturally leading to more repetition. Additionally, many repositories of quantized models store multiple different variants (e.g., Q4_K, Q3_K, Q5_K) with a great deal of overlap.\n\nA good example of this in practice is bartowski/gemma-2-9b-it-GGUF which contains 29 quantizations of google/gemma-2-9b-it totalling 191GB. To upload, we use hf_xet integrated with huggingface_hub to perform chunk-level deduplication locally then aggregate and store data at the block level.\n\nOnce uploaded, we can start to see some cool patterns! We’ve included a visualization that shows the deduplication ratio for each block. The darker the block, the more frequently parts of it are referenced across model versions. If you go to the Space hosting this visualization, hovering over any heatmap cell highlights all references to the block in orange across all models while clicking on a cell will select all other files that share blocks:\n\nA single block of deduplication might only represent a few MB of savings, but as you can see there are many overlapping blocks! With this many blocks that quickly adds up. Instead of uploading 191GB, the Xet-backed version of the gemma-2-9b-it-GGUF repository stores 1515 unique blocks for a total of approximately 97GB to our test CAS environment (a savings of ~94GB).\n\nWhile the storage improvements are significant, the real benefit is what this means for contributors to the Hub. At 50MB/s, the deduplication optimizations amount to a four hour difference in upload time; a speedup of nearly 2x:\n\nRepo\n\nStored Size\n\nUpload Time @ 50MB/s\n\nOriginal\n\n191 GB\n\n509 minutes\n\nXet-backed\n\n97 GB\n\n258 minutes\n\nSimilarly, local chunk caching significantly speeds up downloads. If a file is changed or a new quantization is added that has significant overlap with the local chunk cache, you won’t have to re-download any chunks that are unchanged. This contrasts to the file-based approach where the entirety of the new or updated file must be downloaded.\n\nTaken together, this demonstrates how local chunk-level deduplication paired with block-level aggregation dramatically streamlines not just storage, but developing on the Hub. By providing this level of efficiency in file transfers, AI builders can move faster, iterate quickly, and worry less about hitting infrastructure bottlenecks. For anyone pushing large files to the Hub (whether you're pushing a new model quantization or an updated version of a training set) this helps you shift focus to building and sharing, rather than waiting and troubleshooting.\n\nWe’re fast at work, rolling out the first Xet-backed repositories in the coming weeks and months! As we do that, we will be releasing more updates to bring these speeds to every builder on the Hub to make file transfers feel invisible.\n\nFollow us on the Hub to learn more about our progress!",
   "summaryZh": "Hugging Face平台对其Hub上传和下载进行了分块与区块机制的优化，旨在加速数据传输。",
   "summaryGeneratedAt": "2026-09-05T14:14:07.160196Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -51,5 +50,537 @@
     "summaryZh": "Hugging Face平台对其Hub上传和下载进行了分块与区块机制的优化，旨在加速数据传输。",
     "glossary": [],
     "duplicateKey": "huggingface-chunks-blocks-hub"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/from-chunks-to-blocks/key-chunks.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/from-chunks-to-blocks/key-chunks.png",
+      "alt": "Key chunks",
+      "id": "image_56e3a5c1a7e30894"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/from-chunks-to-blocks/dedupe_viz.gif",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/from-chunks-to-blocks/dedupe_viz.gif",
+      "alt": "Quantization deduplication visualization",
+      "id": "image_0b8ea533e28b28dc"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Content-defined chunking (CDC) plays a central role in enabling deduplication within a Xet-backed repository. The idea is straightforward: break each file’s data into chunks, store only unique ones, reap the benefits.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 108,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/from-files-to-chunks"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "In practice, it's more complex. If we focused solely on maximizing deduplication, the design would call for the smallest possible chunk size. By doing that, we’d create significant overheads for the infrastructure and the builders on the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "On Hugging Face's Xet team, we're bringing CDC from theory to production to deliver faster uploads and downloads to AI builders (by a factor of 2-3x in some cases). Our guiding principle is simple: enable rapid experimentation and collaboration for teams building and iterating on models and datasets. This means focusing on more than just deduplication; we’re optimizing how data moves across the network, how it’s stored, and the entire development experience.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 26,
+          "kind": "a",
+          "href": "https://huggingface.co/xet-team"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "The Realities of Scaling Deduplication",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Imagine uploading a 200GB repository to the Hub. Today, there are a number of ways to do this, but all use a file-centric approach. To bring faster file transfers to the Hub, we've open-sourced xet-core and hf_xet, an integration with huggingface_hub which uses a chunk-based approach written in Rust.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 93,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/huggingface_hub/en/guides/upload"
+        },
+        {
+          "start": 194,
+          "end": 202,
+          "kind": "a",
+          "href": "https://github.com/huggingface/xet-core"
+        },
+        {
+          "start": 207,
+          "end": 213,
+          "kind": "code"
+        },
+        {
+          "start": 235,
+          "end": 250,
+          "kind": "code"
+        },
+        {
+          "start": 235,
+          "end": 250,
+          "kind": "a",
+          "href": "https://github.com/huggingface/huggingface_hub"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "If you consider a 200GB repository with unique chunks, that's 3 million entries (at ~64KB per chunk) in the content-addressed store (CAS) backing all repositories. If a new version of a model is uploaded or a branch in the repository is created with different data, more unique chunks are added, driving up the entries in the CAS.",
+      "spans": [
+        {
+          "start": 84,
+          "end": 99,
+          "kind": "a",
+          "href": "https://github.com/huggingface/xet-core/blob/v1.1.7/deduplication/src/constants.rs#L4"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "With nearly 45PB across 2 million model, dataset, and space repositories on the Hub, a purely chunk-based approach could incur 690 billion chunks. Managing this volume of content using only chunks is simply not viable due to:",
+      "spans": [
+        {
+          "start": 127,
+          "end": 145,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Network Overheads: If each chunk is downloaded or uploaded individually, millions of requests are generated on each upload and download, overwhelming both client and server. Even batching queries simply shifts the problem to the storage layer.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        },
+        {
+          "start": 179,
+          "end": 195,
+          "kind": "a",
+          "href": "https://developers.google.com/workspace/classroom/best-practices/batch"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Infrastructure Overheads: A naive CAS that tracks chunks individually would require billions of entries, leading to steep monthly bills on services like DynamoDB or S3. At Hugging Face’s scale, this quickly adds up.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        },
+        {
+          "start": 153,
+          "end": 161,
+          "kind": "a",
+          "href": "https://aws.amazon.com/pm/dynamodb/"
+        },
+        {
+          "start": 165,
+          "end": 167,
+          "kind": "a",
+          "href": "https://aws.amazon.com/s3/"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "In short, network requests balloon, databases struggle to manage the metadata, and the cost of orchestrating each chunk skyrockets all while you wait for your files to transfer.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Design Principles for Deduplication at Scale",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "These challenges lead to a key realization:",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Deduplication is a performance optimization, not the final goal.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 64,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "The final goal is to improve the experience of builders iterating and collaborating on models and datasets. The system components from the client to the storage layer do not need to guarantee deduplication. Instead, they leverage deduplication as one tool among many to aid in this.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "By loosening the deduplication constraint, we naturally arrive at a second design principle:",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Avoid communication or storage strategies that scale 1:1 with the number of chunks.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 82,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "What does this mean? We scale with aggregation.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 47,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Scaling Deduplication with Aggregation",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Aggregation takes chunks and groups them, referencing them intelligently in ways that provide clever (and practical) benefits:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Blocks: Instead of transferring and storing chunks, we bundle data together in blocks of up to 64MB after deduplication. Blocks are still content-addressed, but this reduces CAS entries by a factor of 1,000.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 89,
+          "end": 99,
+          "kind": "a",
+          "href": "https://github.com/huggingface/xet-core/blob/v1.1.7/cas_object/src/constants.rs#L12"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Shards: Shards provide the mapping between files and chunks (referencing blocks as they do so). This allows us to identify which parts of a file have changed, referencing shards generated from past uploads. When chunks are already known to exist in the CAS, they’re skipped, slashing unnecessary transfers and queries.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Together, blocks and shards unlock significant benefits. However, when someone uploads a new file, how do we know if a chunk has been uploaded before so we can eliminate an unnecessary request? Performing a network query for every chunk is not scalable and goes against the “no 1:1” principle we mentioned above.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "The solution is key chunks which are a 0.1% subset of all chunks selected with a simple modulo condition based on the chunk hash. We provide a global index over these key chunks and the shards they are found in, so that when the chunk is queried, the related shard is returned to provide local deduplication. This allows us to leverage the principles of spatial locality. If a key chunk is referenced in a shard, it’s likely that other similar chunk references are available in the same shard. This further improves deduplication and reduces network and database requests.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 26,
+          "kind": "strong"
+        },
+        {
+          "start": 354,
+          "end": 370,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Locality_of_reference"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Aggregated Deduplication in Practice",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "The Hub currently stores over 3.5PB of .gguf files, most of which are quantized versions of other models on the Hub. Quantized models represent an interesting opportunity for deduplication due to the nature of quantization where values are restricted to a smaller integer range and scaled. This restricts the range of values in the weight matrices, naturally leading to more repetition. Additionally, many repositories of quantized models store multiple different variants (e.g., Q4_K, Q3_K, Q5_K) with a great deal of overlap.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 200,
+          "end": 222,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/gguf"
+        },
+        {
+          "start": 480,
+          "end": 496,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/en/gguf#quantization-types"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "A good example of this in practice is bartowski/gemma-2-9b-it-GGUF which contains 29 quantizations of google/gemma-2-9b-it totalling 191GB. To upload, we use hf_xet integrated with huggingface_hub to perform chunk-level deduplication locally then aggregate and store data at the block level.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 66,
+          "kind": "a",
+          "href": "https://huggingface.co/bartowski/gemma-2-9b-it-GGUF"
+        },
+        {
+          "start": 102,
+          "end": 122,
+          "kind": "a",
+          "href": "https://huggingface.co/google/gemma-2-9b-it"
+        },
+        {
+          "start": 158,
+          "end": 164,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 196,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Once uploaded, we can start to see some cool patterns! We’ve included a visualization that shows the deduplication ratio for each block. The darker the block, the more frequently parts of it are referenced across model versions. If you go to the Space hosting this visualization, hovering over any heatmap cell highlights all references to the block in orange across all models while clicking on a cell will select all other files that share blocks:",
+      "spans": [
+        {
+          "start": 246,
+          "end": 278,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/xet-team/quantization-dedup"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "A single block of deduplication might only represent a few MB of savings, but as you can see there are many overlapping blocks! With this many blocks that quickly adds up. Instead of uploading 191GB, the Xet-backed version of the gemma-2-9b-it-GGUF repository stores 1515 unique blocks for a total of approximately 97GB to our test CAS environment (a savings of ~94GB).",
+      "spans": [
+        {
+          "start": 230,
+          "end": 248,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "While the storage improvements are significant, the real benefit is what this means for contributors to the Hub. At 50MB/s, the deduplication optimizations amount to a four hour difference in upload time; a speedup of nearly 2x:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Repo",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "Stored Size",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "Upload Time @ 50MB/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "Original",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "191 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "509 minutes",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "Xet-backed",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "97 GB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "258 minutes",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "Similarly, local chunk caching significantly speeds up downloads. If a file is changed or a new quantization is added that has significant overlap with the local chunk cache, you won’t have to re-download any chunks that are unchanged. This contrasts to the file-based approach where the entirety of the new or updated file must be downloaded.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Taken together, this demonstrates how local chunk-level deduplication paired with block-level aggregation dramatically streamlines not just storage, but developing on the Hub. By providing this level of efficiency in file transfers, AI builders can move faster, iterate quickly, and worry less about hitting infrastructure bottlenecks. For anyone pushing large files to the Hub (whether you're pushing a new model quantization or an updated version of a training set) this helps you shift focus to building and sharing, rather than waiting and troubleshooting.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "We’re fast at work, rolling out the first Xet-backed repositories in the coming weeks and months! As we do that, we will be releasing more updates to bring these speeds to every builder on the Hub to make file transfers feel invisible.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Follow us on the Hub to learn more about our progress!",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://huggingface.co/xet-team"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "4d95e7d0ee5757f1a3f093e0fcbf275a2c4a2cec7fda224b10f23e1025c79e5f",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "4d95e7d0ee5757f1a3f093e0fcbf275a2c4a2cec7fda224b10f23e1025c79e5f",
+  "mediaLayout": [
+    {
+      "mediaId": "image_56e3a5c1a7e30894",
+      "type": "image",
+      "afterBlockId": "b0023",
+      "order": 0
+    },
+    {
+      "mediaId": "image_0b8ea533e28b28dc",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T01:27:37.190806Z",
+  "mediaLayoutCheckedAt": "2026-10-03T01:27:37.190817Z"
 }

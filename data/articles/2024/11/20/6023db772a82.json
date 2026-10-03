@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:39:59.133753Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Faster Text Generation with Self-Speculative Decoding\n\nPublished November 20, 2024\n\nThis article is also available in Chinese 简体中文 .\n\nSelf-speculative decoding, proposed in LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding is a novel approach to text generation. It combines the strengths of speculative decoding with early exiting from a large language model (LLM). This method allows for efficient generation by using the same model's early layers for drafting tokens, and later layers for verification.\n\nThis technique not only speeds up text generation, but it also achieves significant memory savings and reduces computational latency. In order to obtain an end-to-end speedup, the output of the earlier layers need to be close enough to the last layer. This is achieved by a training recipe which, as described in the paper, can be applied during pretraining, and also while fine-tuning on a specific domain. Self-speculative decoding is especially efficient for real-world applications, enabling deployment on smaller GPUs and lowering the overall hardware footprint needed for large-scale inference .\n\nIn this blog post, we explore the concept of self-speculative decoding, its implementation, and practical applications using the 🤗 transformers library. You’ll learn about the technical underpinnings, including early exit layers , unembedding , and training modifications . To ground these concepts in practice, we offer code examples, benchmark comparisons with traditional speculative decoding, and insights into performance trade-offs.\n\nDive straight into the following Hugging Face artifacts to know more about the method and try it out yourself:\n\nHugging Face Paper Discussion Forum\n\nLayerSkip Model Collections\n\nColab Notebook showcasing the in-depth working of self-speculative decoding\n\nSpeculative Decoding and Self-Speculative Decoding\n\nIllustration of LayerSkip inference on facebook/layerskip-llama2-7B (Llama2 7B continually pretrained with the LayerSkip recipe).\n\nTraditional speculative decoding uses two models: a smaller one (draft model) to generate a sequence of draft tokens, and a larger one (verification model) to verify the draft’s accuracy. The smaller model performs a significant portion of the generation, while the larger model refines the results. This increases text generation speed since the larger model verifies full sequences at once, instead of generating one draft at a time.\n\nIn self-speculative decoding, the authors build on this concept but use the early layers of a large model to generate draft tokens that are then verified by the model's deeper layers. This \"self\" aspect of speculative decoding, which requires specific training, allows the model to perform both drafting and verification. This, in turn, improves speed and reduces computational costs compared to the traditional speculative decoding.\n\nIn order to enable early-exit self-speculative decoding in the 🤗 transformers library , we just need to add the assistant_early_exit argument to the generate() function.\n\nHere is a simple code snippet showcasing the functionality.\n\n```\npip install transformers\n```\n\n```\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\nearly_exit_layer = 4\nprompt = \"Alice and Bob\"\ncheckpoint = \"facebook/layerskip-llama2-7B\"\n\ntokenizer = AutoTokenizer.from_pretrained(checkpoint)\ninputs = tokenizer(prompt, return_tensors=\"pt\").to(\"cuda\")\n\nmodel = AutoModelForCausalLM.from_pretrained(checkpoint).to(\"cuda\")\noutputs = model.generate(**inputs, assistant_early_exit=early_exit_layer)\n```\n\nNote: While the assistant_early_exit argument can potentially enable early-exit self-speculative decoding for any decoder-only transformer, the logits from the intermediate layers cannot be unembedded (process of decoding through LM Head, described later in the blog post) unless the model is specifically trained for that. You will also only obtain speedups for a checkpoint that was trained in such a way to increase the accuracy of earlier layers. The LayerSkip paper proposes a training recipe to achieve that (namely, applying early exit loss, and progressively increasing layer dropout rates). A collection of Llama2, Llama3, and Code Llama checkpoints that have been continually pretrained with the LayerSkip training recipe are provided here .\n\nWe ran an extensive list of benchmarks to measure the speedup of LayerSkip’s self-speculative decoding with respect to autoregressive decoding on various models. We also compare self-speculative decoding (based on early exiting) with standrad speculative decoding techniques. To reproduce the results, you may find the code here and the command to run each experiment in this spreadsheet . All the experiments were ran on a single 80GB A100 GPU, except for Llama2 70B experiments that ran on a node of 8 A100 GPUs.\n\nModel Variant Layers Assistant Model Assistant Layers Task Total Layers FLOPs/Input (G) Time/Input (s) FLOPs/Output (G) Time/Output (s) Efficiency\n\nfacebook/layerskip-llama3.2-1B\n\nmeta-llama/Meta-Llama-3-8B\n\nfacebook/layerskip-llama3-8B\n\nmeta-llama/Llama-2-70b-hf\n\nmeta-llama/Llama-2-13b-hf\n\nmeta-llama/Llama-2-7b-hf\n\nTinyLlama/TinyLlama_v1.1\n\nfacebook/layerskip-llama2-70B\n\nfacebook/layerskip-llama2-13B\n\nfacebook/layerskip-llama2-7B\n\nSome observations we can make from the results:\n\nAs seen in the Total Number of Parameters column, self-speculative decoding consumes less memory because it does not require a separate draft model and weights for the draft stage layers are re-used.\n\nFor all model sizes and generations except Llama2 70B, the early-exit self-speculative decoding is faster than the regular two-model speculative decoding.\n\nThere could be different reasons for the relatively limited speedups of self-speculative decoding on Llama2 70B compared to other models, e.g., the LayerSkip checkpoint of Llama2 70B was continually pretrained with fewer tokens (328 M tokens for Llama2 70B compared to 52B tokens for Llama2 7B). But this is an area of improvement to investigate for future research. Nevertheless, self-speculative decoding for 70B is significantly faster than autoregressive decoding.\n\nEarly Exit and Unembedding\n\nOne key technique in self-speculative decoding is early exit, where the generation process can halt at a pre specified layer. To accomplish this, we unembed the logits from these layers by projecting them onto the language model (LM) head to predict the next token. This allows the model to skip subsequent layers and improve inference time.\n\nUnembedding can be performed at any transformer layer, turning early-exit into an efficient token-prediction mechanism. A natural question arises: how can the LM head be adapted to unembed logits from earlier layers when it was initially trained to work with the final layer only? This is where the training modifications come into play.\n\nTraining Modifications: Layer Dropout and Early Exit Loss\n\nIn the training phase, we introduce layer dropout , which allows the model to skip certain layers during training. The dropout rate increases progressively in deeper layers, making the model less reliant on its later layers, as well as enhancing the model's generalization and speeding up training.\n\nIn addition to layer dropout, early exit loss is applied to ensure the LM head learns to unembed different layers. The total loss function for training the model with early exits is given by a summation of normalized loss from each exit (intermediate layers). This technique enables efficient training by distributing the learning task across all layers.\n\nSelf-Drafting and Self-Verification\n\nOnce training is complete, we can apply self-speculative decoding during inference. The process begins with self-drafting , where tokens are generated by exiting early from some intermediate layer. The number of speculative tokens defines how many draft tokens are produced during this stage, and the layer we exit at defines how large and accurate is the draft stage. Both parameters can be specified at inference based on a trade-off between speed and accuracy of the draft stage .\n\nThe next stage is self-verification , where the full model is used to verify the draft tokens. The verification model reuses the portion of cache from the draft model. If the draft tokens align with the verified tokens, they are added to the final output, resulting in a better usage of the memory bandwidth in our system, because it’s much more expensive to generate a sequence of tokens with the full model than verifying a draft, as long as several of the tokens match.\n\nIn the self-verification stage, only the remaining layers are computed for verification, because the results from the early layers are cached during the drafting phase.\n\nOptimizations: Shared Weights, Shared KV Cache, and Shared Compute\n\nSelf-speculative decoding benefits significantly from cache reuse, particularly the KV cache , which stores key-value pairs computed during the drafting stage. This cache allows the model to skip redundant calculations, as both the draft and verification stages use the same early layers. Additionally, the exit query cache stores the query vector from the exit layer, allowing verification to continue seamlessly from the draft stage.\n\nCompared to traditional two-model speculative decoding, early-exit self-speculative decoding can benefit from the following savings:\n\nShared Weights : Reuses the weights from the first E E E layers for both drafting and verification.\n\nShared KV Cache : Reuses key-value pairs from the first E E E layers for both drafting and verification.\n\nShared Compute : Reuses the compute of the first E E E layers by using a Exit Query Cache that saves only the query vector of the exit layer E − 1 E-1 E − 1 so that the verification process won’t need to compute layers 0 0 0 to E − 1 E-1 E − 1 .\n\nThe combination of KV and exit query caches, known as the KVQ cache , reduces memory overhead and improves inference latency.\n\nSo far, the 🤗 transformers library has implemented the first optimization (Shared Weights) in this pull request . As the number of models that use this method increases, we'll consider the additional optimizations. Feel free to open a PR if you're interested!\n\nThe early exit layer of the draft stage is a hyperparameter that we can tune or modify during inference:\n\nThe earlier we exit, the faster the generation of draft tokens are but the less accurate they will be.\n\nThe later we exit, the more accurate the draft tokens generated are but the slower their generation will be.\n\nWe wrote a script to sweep across different early exit layers and measure the tokens per second on A100 GPUs. In the Tables below we plot the tokens per second versus the early exit layer for different Llama models for both LayerSkip and baseline checkpoints (you can view the full logs here ).\n\nWe can observe the following:\n\nFor the baseline checkpoints that have not been pretrained or continually pretrained with the LayerSkip training recipe, early exit self-speculative decoding is slower than autoregressive decoding. This is because during training of most LLMs, earlier layers are not motivated to learn to predict the output, and hence generating tokens using earlier layers will have a very low acceptance rate.\n\nOn the other hand, for the Llama checkpoints that were continually pre-trained with the LayerSkip training, early exit self-speculative decoding has higher speedup than autoregressive decoding for at least a subset of the layers.\n\nFor most models, except Llama3.2 1B, we notice a regular pattern when we traverse across layers: speedup starts low for the first few layers, increases gradually to a sweet spot, and then decreases again.\n\nThe early exit layer sweet spot is when we have the optimal tradeoff between high accuracy of predictions and low overhead of generating tokens. This sweet spot depends on each model, and may also depend on the prompt or domain of the prompt.\n\nThese observations present intriguing opportunities for further experimentation and exploration. We encourage readers to build upon these ideas, test variations, and pursue their own research. Such efforts can lead to valuable insights and contribute meaningfully to the field.\n\nLayerSkip leverages the synergy between early exit, layer dropout, and cache reuse to create a fast and efficient text generation pipeline. By training the model to unembed outputs from different layers and optimizing the verification process with caches, this approach strikes a balance between speed and accuracy. As a result, it significantly improves inference times in large language models while maintaining high-quality outputs. It also reduces memory compared to traditional speculative decoding techniques due to a single model used as both the draft and verification model.\n\nSelf-speculation is an exciting field where the same LLM can create draft tokens and fix itself. Other self-speculation approaches include:\n\nDraft & Verify : where the draft stage involves skipping pre-determined attention and feed forward layers.\n\nMagicDec : where the draft stage uses a subset of the KV cache, which is useful for long context inputs.\n\nJacobi Decoding and Lookahead Decoding : Where the draft stage are a series of “guess tokens” that could be either random or obtained from a n-gram lookup table.\n\nModels mentioned in this article 1\n\nDatasets mentioned in this article 1\n\nPapers mentioned in this article 1\n\nCollections mentioned in this article 1\n\nMore Articles from our Blog\n\nresearch nlp open-source\n\nUniversal Assisted Generation: Faster Decoding with Any Assistant Model\n\nIntroducing the Ettin Reranker Family\n\nI may be missing something, but the demo code snippet in its current form is broken.\n\nArticle author Jun 18, 2025\n\nSorry to hear that. Can you inform us what version of the transformers library you are using and what error message you got?\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Self-speculative decoding, proposed in LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding is a novel approach to text generation. It combines the strengths of speculative decoding with early exiting from a large language model (LLM). This method allows for efficient generation by using the same model's early layers for drafting tokens, and later layers for verification.\n\nThis technique not only speeds up text generation, but it also achieves significant memory savings and reduces computational latency. In order to obtain an end-to-end speedup, the output of the earlier layers need to be close enough to the last layer. This is achieved by a training recipe which, as described in the paper, can be applied during pretraining, and also while fine-tuning on a specific domain. Self-speculative decoding is especially efficient for real-world applications, enabling deployment on smaller GPUs and lowering the overall hardware footprint needed for large-scale inference.\n\nIn this blog post, we explore the concept of self-speculative decoding, its implementation, and practical applications using the 🤗 transformers library. You’ll learn about the technical underpinnings, including early exit layers, unembedding, and training modifications. To ground these concepts in practice, we offer code examples, benchmark comparisons with traditional speculative decoding, and insights into performance trade-offs.\n\nDive straight into the following Hugging Face artifacts to know more about the method and try it out yourself:\n\n- Hugging Face Paper Discussion Forum\n\n- LayerSkip Model Collections\n\n- Colab Notebook showcasing the in-depth working of self-speculative decoding\n\n## Speculative Decoding and Self-Speculative Decoding\n\nIllustration of LayerSkip inference on facebook/layerskip-llama2-7B (Llama2 7B continually pretrained with the LayerSkip recipe).\n\nTraditional speculative decoding uses two models: a smaller one (draft model) to generate a sequence of draft tokens, and a larger one (verification model) to verify the draft’s accuracy. The smaller model performs a significant portion of the generation, while the larger model refines the results. This increases text generation speed since the larger model verifies full sequences at once, instead of generating one draft at a time.\n\nIn self-speculative decoding, the authors build on this concept but use the early layers of a large model to generate draft tokens that are then verified by the model's deeper layers. This \"self\" aspect of speculative decoding, which requires specific training, allows the model to perform both drafting and verification. This, in turn, improves speed and reduces computational costs compared to the traditional speculative decoding.\n\n## Usage with transformers\n\nIn order to enable early-exit self-speculative decoding in the 🤗 transformers library, we just need to add the assistant_early_exit argument to the generate() function.\n\nHere is a simple code snippet showcasing the functionality.\n\n```\npip install transformers\n```\n\n```\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\nearly_exit_layer = 4\nprompt = \"Alice and Bob\"\ncheckpoint = \"facebook/layerskip-llama2-7B\"\n\ntokenizer = AutoTokenizer.from_pretrained(checkpoint)\ninputs = tokenizer(prompt, return_tensors=\"pt\").to(\"cuda\")\n\nmodel = AutoModelForCausalLM.from_pretrained(checkpoint).to(\"cuda\")\noutputs = model.generate(**inputs, assistant_early_exit=early_exit_layer)\n```\n\nNote: While the assistant_early_exit argument can potentially enable early-exit self-speculative decoding for any decoder-only transformer, the logits from the intermediate layers cannot be unembedded (process of decoding through LM Head, described later in the blog post) unless the model is specifically trained for that. You will also only obtain speedups for a checkpoint that was trained in such a way to increase the accuracy of earlier layers. The LayerSkip paper proposes a training recipe to achieve that (namely, applying early exit loss, and progressively increasing layer dropout rates). A collection of Llama2, Llama3, and Code Llama checkpoints that have been continually pretrained with the LayerSkip training recipe are provided here.\n\n### Benchmarking\n\nWe ran an extensive list of benchmarks to measure the speedup of LayerSkip’s self-speculative decoding with respect to autoregressive decoding on various models. We also compare self-speculative decoding (based on early exiting) with standrad speculative decoding techniques. To reproduce the results, you may find the code here and the command to run each experiment in this spreadsheet. All the experiments were ran on a single 80GB A100 GPU, except for Llama2 70B experiments that ran on a node of 8 A100 GPUs.\n\n#### Llama3.2 1B\n\nModel Variant\n\nLayers\n\nAssistant Model\n\nAssistant Layers\n\nTask\n\nTotal Layers\n\nFLOPs/Input (G)\n\nTime/Input (s)\n\nFLOPs/Output (G)\n\nTime/Output (s)\n\nEfficiency\n\nfacebook/layerskip-llama3.2-1B\n\n1\n\nEarly Exit @ Layer 4\n\n—\n\nsummarization\n\n1\n\n1195.28\n\n9.96\n\n2147.7\n\n17.9\n\n1.80\n\n#### Llama3 8B\n\nModel Variant\n\nLayers\n\nAssistant Model\n\nAssistant Layers\n\nTask\n\nTotal Layers\n\nFLOPs/Input (G)\n\nTime/Input (s)\n\nFLOPs/Output (G)\n\nTime/Output (s)\n\nEfficiency\n\nmeta-llama/Meta-Llama-3-8B\n\n8\n\nmeta-llama/Llama-3.2-1B\n\n1\n\nsummarization\n\n9\n\n1872.46\n\n19.04\n\n2859.35\n\n29.08\n\n1.53\n\nmeta-llama/Meta-Llama-3-8B\n\n8\n\nmeta-llama/Llama-3.2-3B\n\n3\n\nsummarization\n\n11\n\n2814.82\n\n28.63\n\n2825.36\n\n28.73\n\n1.00\n\nfacebook/layerskip-llama3-8B\n\n8\n\nEarly Exit @ Layer 4\n\n—\n\nsummarization\n\n8\n\n1949.02\n\n15.75\n\n3571.81\n\n28.87\n\n1.83\n\n#### Llama2 70B\n\nModel Variant\n\nLayers\n\nAssistant Model\n\nAssistant Layers\n\nTask\n\nTotal Layers\n\nFLOPs/Input (G)\n\nTime/Input (s)\n\nFLOPs/Output (G)\n\nTime/Output (s)\n\nEfficiency\n\nmeta-llama/Llama-2-70b-hf\n\n70\n\nmeta-llama/Llama-2-13b-hf\n\n13\n\nsummarization\n\n83\n\n5036.54\n\n46.3\n\n12289.01\n\n112.97\n\n2.44\n\nmeta-llama/Llama-2-70b-hf\n\n70\n\nmeta-llama/Llama-2-7b-hf\n\n7\n\nsummarization\n\n77\n\n4357.55\n\n40.06\n\n12324.19\n\n113.3\n\n2.83\n\nmeta-llama/Llama-2-70b-hf\n\n70\n\nTinyLlama/TinyLlama_v1.1\n\n1\n\nsummarization\n\n71\n\n4356.21\n\n40.05\n\n12363.22\n\n113.66\n\n2.84\n\nfacebook/layerskip-llama2-70B\n\n70\n\nEarly Exit @ Layer 10\n\n—\n\nsummarization\n\n70\n\n6012.04\n\n54.96\n\n1283.34\n\n113.2\n\n2.06\n\n#### Llama2 13B\n\nModel Variant\n\nLayers\n\nAssistant Model\n\nAssistant Layers\n\nTask\n\nTotal Layers\n\nFLOPs/Input (G)\n\nTime/Input (s)\n\nFLOPs/Output (G)\n\nTime/Output (s)\n\nEfficiency\n\nmeta-llama/Llama-2-13b-hf\n\n13\n\nmeta-llama/Llama-2-7b-hf\n\n7\n\nsummarization\n\n20\n\n3557.07\n\n27.79\n\n4088.48\n\n31.94\n\n1.15\n\nmeta-llama/Llama-2-13b-hf\n\n13\n\nTinyLlama/TinyLlama_v1.1\n\n1\n\nsummarization\n\n14\n\n2901.92\n\n22.67\n\n4190.42\n\n32.74\n\n1.44\n\nmeta-llama/Llama-2-13b-hf\n\n13\n\napple/OpenELM-270M\n\n0.27\n\nsummarization\n\n13.27\n\n2883.33\n\n22.53\n\n4521.12\n\n35.32\n\n1.57\n\nmeta-llama/Llama-2-13b-hf\n\n13\n\napple/OpenELM-450M\n\n0.45\n\nsummarization\n\n13.45\n\n3267.69\n\n25.53\n\n4321.75\n\n33.76\n\n1.32\n\nfacebook/layerskip-llama2-13B\n\n13\n\nEarly Exit @ Layer 4\n\n—\n\nsummarization\n\n13\n\n4238.45\n\n33.11\n\n4217.78\n\n32.95\n\n0.995\n\nfacebook/layerskip-llama2-13B\n\n13\n\nEarly Exit @ Layer 8\n\n—\n\nsummarization\n\n13\n\n2459.61\n\n19.22\n\n4294.98\n\n33.55\n\n1.746\n\n#### Llama2 7B\n\nModel Variant\n\nLayers\n\nAssistant Model\n\nAssistant Layers\n\nTask\n\nTotal Layers\n\nFLOPs/Input (G)\n\nTime/Input (s)\n\nFLOPs/Output (G)\n\nTime/Output (s)\n\nEfficiency\n\nmeta-llama/Llama-2-7b-hf\n\n7\n\nTinyLlama/TinyLlama_v1.1\n\n1\n\nsummarization\n\n8\n\n2771.54\n\n21.65\n\n3368.48\n\n26.32\n\n1.22\n\nmeta-llama/Llama-2-7b-hf\n\n7\n\napple/OpenELM-270M\n\n0.27\n\nsummarization\n\n7.27\n\n2607.82\n\n20.37\n\n4221.14\n\n32.98\n\n1.62\n\nmeta-llama/Llama-2-7b-hf\n\n7\n\napple/OpenELM-450M\n\n0.45\n\nsummarization\n\n7.45\n\n3324.68\n\n25.97\n\n4178.66\n\n32.65\n\n1.26\n\nfacebook/layerskip-llama2-7B\n\n7\n\nEarly Exit @ Layer 4\n\n—\n\nsummarization\n\n7\n\n2548.4\n\n19.91\n\n3306.73\n\n25.83\n\n1.297\n\nSome observations we can make from the results:\n\n- As seen in the Total Number of Parameters column, self-speculative decoding consumes less memory because it does not require a separate draft model and weights for the draft stage layers are re-used.\n\n- For all model sizes and generations except Llama2 70B, the early-exit self-speculative decoding is faster than the regular two-model speculative decoding. There could be different reasons for the relatively limited speedups of self-speculative decoding on Llama2 70B compared to other models, e.g., the LayerSkip checkpoint of Llama2 70B was continually pretrained with fewer tokens (328 M tokens for Llama2 70B compared to 52B tokens for Llama2 7B). But this is an area of improvement to investigate for future research. Nevertheless, self-speculative decoding for 70B is significantly faster than autoregressive decoding.\n\n## Early Exit and Unembedding\n\nOne key technique in self-speculative decoding is early exit, where the generation process can halt at a pre specified layer. To accomplish this, we unembed the logits from these layers by projecting them onto the language model (LM) head to predict the next token. This allows the model to skip subsequent layers and improve inference time.\n\nUnembedding can be performed at any transformer layer, turning early-exit into an efficient token-prediction mechanism. A natural question arises: how can the LM head be adapted to unembed logits from earlier layers when it was initially trained to work with the final layer only? This is where the training modifications come into play.\n\n## Training Modifications: Layer Dropout and Early Exit Loss\n\nIn the training phase, we introduce layer dropout, which allows the model to skip certain layers during training. The dropout rate increases progressively in deeper layers, making the model less reliant on its later layers, as well as enhancing the model's generalization and speeding up training.\n\nIn addition to layer dropout, early exit loss is applied to ensure the LM head learns to unembed different layers. The total loss function for training the model with early exits is given by a summation of normalized loss from each exit (intermediate layers). This technique enables efficient training by distributing the learning task across all layers.\n\n## Self-Drafting and Self-Verification\n\nOnce training is complete, we can apply self-speculative decoding during inference. The process begins with self-drafting, where tokens are generated by exiting early from some intermediate layer. The number of speculative tokens defines how many draft tokens are produced during this stage, and the layer we exit at defines how large and accurate is the draft stage. Both parameters can be specified at inference based on a trade-off between speed and accuracy of the draft stage.\n\nThe next stage is self-verification, where the full model is used to verify the draft tokens. The verification model reuses the portion of cache from the draft model. If the draft tokens align with the verified tokens, they are added to the final output, resulting in a better usage of the memory bandwidth in our system, because it’s much more expensive to generate a sequence of tokens with the full model than verifying a draft, as long as several of the tokens match.\n\nIn the self-verification stage, only the remaining layers are computed for verification, because the results from the early layers are cached during the drafting phase.\n\n## Optimizations: Shared Weights, Shared KV Cache, and Shared Compute\n\nSelf-speculative decoding benefits significantly from cache reuse, particularly the KV cache, which stores key-value pairs computed during the drafting stage. This cache allows the model to skip redundant calculations, as both the draft and verification stages use the same early layers. Additionally, the exit query cache stores the query vector from the exit layer, allowing verification to continue seamlessly from the draft stage.\n\nCompared to traditional two-model speculative decoding, early-exit self-speculative decoding can benefit from the following savings:\n\n- Shared Weights: Reuses the weights from the first E E E layers for both drafting and verification.\n\n- Shared KV Cache: Reuses key-value pairs from the first E E E layers for both drafting and verification.\n\n- Shared Compute: Reuses the compute of the first E E E layers by using a Exit Query Cache that saves only the query vector of the exit layer E−1E-1E−1 so that the verification process won’t need to compute layers 0 0 0 to E−1 E-1 E−1.\n\nThe combination of KV and exit query caches, known as the KVQ cache, reduces memory overhead and improves inference latency.\n\nSo far, the 🤗 transformers library has implemented the first optimization (Shared Weights) in this pull request. As the number of models that use this method increases, we'll consider the additional optimizations. Feel free to open a PR if you're interested!\n\n## How Early Can We Exit?\n\nThe early exit layer of the draft stage is a hyperparameter that we can tune or modify during inference:\n\n- The earlier we exit, the faster the generation of draft tokens are but the less accurate they will be.\n\n- The later we exit, the more accurate the draft tokens generated are but the slower their generation will be.\n\nWe wrote a script to sweep across different early exit layers and measure the tokens per second on A100 GPUs. In the Tables below we plot the tokens per second versus the early exit layer for different Llama models for both LayerSkip and baseline checkpoints (you can view the full logs here).\n\n#### Llama3.2 1B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Llama3 8B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Code Llama3 34B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Code Llama3 7B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Llama2 70B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Llama2 13B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\n#### Llama2 7B\n\nNormal\n\nLayerSkip\n\n—\n\n—\n\nWe can observe the following:\n\n- For the baseline checkpoints that have not been pretrained or continually pretrained with the LayerSkip training recipe, early exit self-speculative decoding is slower than autoregressive decoding. This is because during training of most LLMs, earlier layers are not motivated to learn to predict the output, and hence generating tokens using earlier layers will have a very low acceptance rate.\n\nOn the other hand, for the Llama checkpoints that were continually pre-trained with the LayerSkip training, early exit self-speculative decoding has higher speedup than autoregressive decoding for at least a subset of the layers.\n\n- For most models, except Llama3.2 1B, we notice a regular pattern when we traverse across layers: speedup starts low for the first few layers, increases gradually to a sweet spot, and then decreases again.\n\n- The early exit layer sweet spot is when we have the optimal tradeoff between high accuracy of predictions and low overhead of generating tokens. This sweet spot depends on each model, and may also depend on the prompt or domain of the prompt.\n\nThese observations present intriguing opportunities for further experimentation and exploration. We encourage readers to build upon these ideas, test variations, and pursue their own research. Such efforts can lead to valuable insights and contribute meaningfully to the field.\n\n## Conclusion\n\nLayerSkip leverages the synergy between early exit, layer dropout, and cache reuse to create a fast and efficient text generation pipeline. By training the model to unembed outputs from different layers and optimizing the verification process with caches, this approach strikes a balance between speed and accuracy. As a result, it significantly improves inference times in large language models while maintaining high-quality outputs. It also reduces memory compared to traditional speculative decoding techniques due to a single model used as both the draft and verification model.\n\nSelf-speculation is an exciting field where the same LLM can create draft tokens and fix itself. Other self-speculation approaches include:\n\n- Draft & Verify: where the draft stage involves skipping pre-determined attention and feed forward layers.\n\n- MagicDec: where the draft stage uses a subset of the KV cache, which is useful for long context inputs.\n\n- Jacobi Decoding and Lookahead Decoding: Where the draft stage are a series of “guess tokens” that could be either random or obtained from a n-gram lookup table.",
   "summaryZh": "Hugging Face推出了关于“自推测解码”（Self-Speculative Decoding）的技术博客与实践指南。该方法源于LayerSkip研究，允许大语言模型利用自身的早期层来生成草稿Token，再由后期层进行验证。这种方法结合了推测 decoding 与早期退出（early exit）机制，能显著提升推理速度、降低延迟并节省内存。文章不仅探讨了其技术原理，如早期退出层与无嵌入（unembedding），还提供了代码示例和Colab Notebook，方便开发者在实际中应用。",
   "summaryGeneratedAt": "2026-09-05T15:20:30.325428Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -71,5 +71,4870 @@
       }
     ],
     "duplicateKey": "self-speculative-decoding-huggingface"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LayerSkip-Demo.gif",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LayerSkip-Demo.gif",
+      "alt": "LayerSkip Demo GIF",
+      "id": "image_55f71dd2301d099d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-3.2-1B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-3.2-1B.png",
+      "alt": "llama 3.2 1b",
+      "id": "image_bcfc0f18ed2dad83"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama3.2-1B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama3.2-1B.png",
+      "alt": "layer skip llama 3.2 1b",
+      "id": "image_cc90652a4e264ddf"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-3-8B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-3-8B.png",
+      "alt": "llama 3 8b",
+      "id": "image_cc5678c3f5b1a826"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama3-8B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama3-8B.png",
+      "alt": "layer skip llama 3 8b",
+      "id": "image_cc99568ebea870b5"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/CodeLlama-34B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/CodeLlama-34B.png",
+      "alt": "code llama 3 34b",
+      "id": "image_36359707f216972d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-CodeLlama-34B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-CodeLlama-34B.png",
+      "alt": "code layer skip llama 3 34b",
+      "id": "image_3e099d2fb957ccf6"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/CodeLlama-7B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/CodeLlama-7B.png",
+      "alt": "code llama 3 7b",
+      "id": "image_d61986a69dda3199"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-CodeLlama-7B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-CodeLlama-7B.png",
+      "alt": "code layer skip llama 3 7b",
+      "id": "image_1f578a21823cb843"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-70B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-70B.png",
+      "alt": "llama 2 70b",
+      "id": "image_0f2e362166f7d162"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-70B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-70B.png",
+      "alt": "layer skip llama 2 70b",
+      "id": "image_7632cc7a4a551d4f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-13B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-13B.png",
+      "alt": "llama 2 13b",
+      "id": "image_c16f80ffca47b857"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-13B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-13B.png",
+      "alt": "layer skip llama 2 13b",
+      "id": "image_8131450552f1ba6a"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-7B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/Llama-2-7B.png",
+      "alt": "llama 2 7b",
+      "id": "image_2444609b15a29ecf"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-7B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/layerskip-assets/LS-Llama2-7B.png",
+      "alt": "layer skip llama 2 7b",
+      "id": "image_aec304d64b02de6e"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Self-speculative decoding, proposed in LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding is a novel approach to text generation. It combines the strengths of speculative decoding with early exiting from a large language model (LLM). This method allows for efficient generation by using the same model's early layers for drafting tokens, and later layers for verification.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 109,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2404.16710"
+        },
+        {
+          "start": 311,
+          "end": 323,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This technique not only speeds up text generation, but it also achieves significant memory savings and reduces computational latency. In order to obtain an end-to-end speedup, the output of the earlier layers need to be close enough to the last layer. This is achieved by a training recipe which, as described in the paper, can be applied during pretraining, and also while fine-tuning on a specific domain. Self-speculative decoding is especially efficient for real-world applications, enabling deployment on smaller GPUs and lowering the overall hardware footprint needed for large-scale inference.",
+      "spans": [
+        {
+          "start": 578,
+          "end": 599,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "In this blog post, we explore the concept of self-speculative decoding, its implementation, and practical applications using the 🤗 transformers library. You’ll learn about the technical underpinnings, including early exit layers, unembedding, and training modifications. To ground these concepts in practice, we offer code examples, benchmark comparisons with traditional speculative decoding, and insights into performance trade-offs.",
+      "spans": [
+        {
+          "start": 211,
+          "end": 228,
+          "kind": "strong"
+        },
+        {
+          "start": 230,
+          "end": 241,
+          "kind": "strong"
+        },
+        {
+          "start": 247,
+          "end": 269,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Dive straight into the following Hugging Face artifacts to know more about the method and try it out yourself:",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Hugging Face Paper Discussion Forum",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2404.16710"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "LayerSkip Model Collections",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/facebook/layerskip-666b25c50c8ae90e1965727a"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Colab Notebook showcasing the in-depth working of self-speculative decoding",
+      "spans": [
+        {
+          "start": 0,
+          "end": 75,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/layer-skip-assets/blob/main/early_exit_self_speculative_decoding.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Speculative Decoding and Self-Speculative Decoding",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Illustration of LayerSkip inference on facebook/layerskip-llama2-7B (Llama2 7B continually pretrained with the LayerSkip recipe).",
+      "spans": [
+        {
+          "start": 39,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 39,
+          "end": 67,
+          "kind": "a",
+          "href": "https://huggingface.co/facebook/layerskip-llama2-7B"
+        },
+        {
+          "start": 0,
+          "end": 129,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Traditional speculative decoding uses two models: a smaller one (draft model) to generate a sequence of draft tokens, and a larger one (verification model) to verify the draft’s accuracy. The smaller model performs a significant portion of the generation, while the larger model refines the results. This increases text generation speed since the larger model verifies full sequences at once, instead of generating one draft at a time.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/assisted-generation"
+        },
+        {
+          "start": 38,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "In self-speculative decoding, the authors build on this concept but use the early layers of a large model to generate draft tokens that are then verified by the model's deeper layers. This \"self\" aspect of speculative decoding, which requires specific training, allows the model to perform both drafting and verification. This, in turn, improves speed and reduces computational costs compared to the traditional speculative decoding.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Usage with transformers",
+      "spans": [
+        {
+          "start": 11,
+          "end": 23,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "In order to enable early-exit self-speculative decoding in the 🤗 transformers library, we just need to add the assistant_early_exit argument to the generate() function.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 85,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers"
+        },
+        {
+          "start": 111,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 148,
+          "end": 158,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Here is a simple code snippet showcasing the functionality.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Note: While the assistant_early_exit argument can potentially enable early-exit self-speculative decoding for any decoder-only transformer, the logits from the intermediate layers cannot be unembedded (process of decoding through LM Head, described later in the blog post) unless the model is specifically trained for that. You will also only obtain speedups for a checkpoint that was trained in such a way to increase the accuracy of earlier layers. The LayerSkip paper proposes a training recipe to achieve that (namely, applying early exit loss, and progressively increasing layer dropout rates). A collection of Llama2, Llama3, and Code Llama checkpoints that have been continually pretrained with the LayerSkip training recipe are provided here.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 16,
+          "end": 36,
+          "kind": "code"
+        },
+        {
+          "start": 190,
+          "end": 200,
+          "kind": "strong"
+        },
+        {
+          "start": 338,
+          "end": 358,
+          "kind": "strong"
+        },
+        {
+          "start": 455,
+          "end": 470,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2404.16710"
+        },
+        {
+          "start": 745,
+          "end": 749,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/facebook/layerskip-666b25c50c8ae90e1965727a"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Benchmarking",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "We ran an extensive list of benchmarks to measure the speedup of LayerSkip’s self-speculative decoding with respect to autoregressive decoding on various models. We also compare self-speculative decoding (based on early exiting) with standrad speculative decoding techniques. To reproduce the results, you may find the code here and the command to run each experiment in this spreadsheet. All the experiments were ran on a single 80GB A100 GPU, except for Llama2 70B experiments that ran on a node of 8 A100 GPUs.",
+      "spans": [
+        {
+          "start": 324,
+          "end": 328,
+          "kind": "a",
+          "href": "https://github.com/gante/huggingface-demos/pull/1"
+        },
+        {
+          "start": 376,
+          "end": 387,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ariG23498/layer-skip-assets/blob/main/LayerSkip%20HuggingFace%20Benchmarking%20-%20summarization.csv"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Llama3.2 1B",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Model Variant",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "Layers",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Assistant Model",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "Assistant Layers",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "Task",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "Total Layers",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "FLOPs/Input (G)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "Time/Input (s)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "FLOPs/Output (G)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "Time/Output (s)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "Efficiency",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "facebook/layerskip-llama3.2-1B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "Early Exit @ Layer 4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "1195.28",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "9.96",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "2147.7",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "17.9",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "1.80",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "Llama3 8B",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Model Variant",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "Layers",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Assistant Model",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "Assistant Layers",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "Task",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "Total Layers",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "FLOPs/Input (G)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "Time/Input (s)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "FLOPs/Output (G)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "Time/Output (s)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Efficiency",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "meta-llama/Meta-Llama-3-8B",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "meta-llama/Llama-3.2-1B",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "9",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "1872.46",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "19.04",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "2859.35",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "29.08",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "1.53",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "meta-llama/Meta-Llama-3-8B",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "meta-llama/Llama-3.2-3B",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "3",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "11",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "2814.82",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "28.63",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "2825.36",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "28.73",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "1.00",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "facebook/layerskip-llama3-8B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "Early Exit @ Layer 4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "1949.02",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "15.75",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "3571.81",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "28.87",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "1.83",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "Llama2 70B",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Model Variant",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "Layers",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "Assistant Model",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "Assistant Layers",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "Task",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "Total Layers",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "FLOPs/Input (G)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "Time/Input (s)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "FLOPs/Output (G)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Time/Output (s)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "Efficiency",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "meta-llama/Llama-2-70b-hf",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "70",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "meta-llama/Llama-2-13b-hf",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "83",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "5036.54",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "46.3",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "12289.01",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "112.97",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "2.44",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "meta-llama/Llama-2-70b-hf",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "70",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "meta-llama/Llama-2-7b-hf",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "7",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "77",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "4357.55",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "40.06",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "12324.19",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "113.3",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "2.83",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "meta-llama/Llama-2-70b-hf",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "70",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "TinyLlama/TinyLlama_v1.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "71",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "4356.21",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "40.05",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "12363.22",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "113.66",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "2.84",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "facebook/layerskip-llama2-70B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "70",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "Early Exit @ Layer 10",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "70",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "6012.04",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "54.96",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "1283.34",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "113.2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "2.06",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "Llama2 13B",
+      "spans": []
+    },
+    {
+      "id": "b0143",
+      "source": "Model Variant",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "Layers",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "Assistant Model",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "Assistant Layers",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "Task",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "Total Layers",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "FLOPs/Input (G)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "Time/Input (s)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "FLOPs/Output (G)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "Time/Output (s)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "Efficiency",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "meta-llama/Llama-2-13b-hf",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "meta-llama/Llama-2-7b-hf",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "7",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "20",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "3557.07",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "27.79",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "4088.48",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "31.94",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "1.15",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "meta-llama/Llama-2-13b-hf",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "TinyLlama/TinyLlama_v1.1",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "14",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "2901.92",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "22.67",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "4190.42",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "32.74",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "1.44",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "meta-llama/Llama-2-13b-hf",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "apple/OpenELM-270M",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "0.27",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "13.27",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "2883.33",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "22.53",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "4521.12",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "35.32",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "1.57",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "meta-llama/Llama-2-13b-hf",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "13",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "apple/OpenELM-450M",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "0.45",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "13.45",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "3267.69",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "25.53",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "4321.75",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "33.76",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "1.32",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0198",
+      "source": "facebook/layerskip-llama2-13B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0199",
+      "source": "13",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0200",
+      "source": "Early Exit @ Layer 4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0201",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0202",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "13",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "4238.45",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "33.11",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "4217.78",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "32.95",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "0.995",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "facebook/layerskip-llama2-13B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "13",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0211",
+      "source": "Early Exit @ Layer 8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "13",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "2459.61",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "19.22",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "4294.98",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0218",
+      "source": "33.55",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0219",
+      "source": "1.746",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 6,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0220",
+      "source": "Llama2 7B",
+      "spans": []
+    },
+    {
+      "id": "b0221",
+      "source": "Model Variant",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "Layers",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "Assistant Model",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "Assistant Layers",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "Task",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "Total Layers",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "FLOPs/Input (G)",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "Time/Input (s)",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "FLOPs/Output (G)",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0230",
+      "source": "Time/Output (s)",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "Efficiency",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "meta-llama/Llama-2-7b-hf",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "7",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0234",
+      "source": "TinyLlama/TinyLlama_v1.1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0235",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0236",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0237",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0238",
+      "source": "2771.54",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0239",
+      "source": "21.65",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0240",
+      "source": "3368.48",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "26.32",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0242",
+      "source": "1.22",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0243",
+      "source": "meta-llama/Llama-2-7b-hf",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0244",
+      "source": "7",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0245",
+      "source": "apple/OpenELM-270M",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0246",
+      "source": "0.27",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0247",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0248",
+      "source": "7.27",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0249",
+      "source": "2607.82",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0250",
+      "source": "20.37",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0251",
+      "source": "4221.14",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0252",
+      "source": "32.98",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0253",
+      "source": "1.62",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0254",
+      "source": "meta-llama/Llama-2-7b-hf",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0255",
+      "source": "7",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0256",
+      "source": "apple/OpenELM-450M",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0257",
+      "source": "0.45",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0258",
+      "source": "summarization",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0259",
+      "source": "7.45",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0260",
+      "source": "3324.68",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0261",
+      "source": "25.97",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0262",
+      "source": "4178.66",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0263",
+      "source": "32.65",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0264",
+      "source": "1.26",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0265",
+      "source": "facebook/layerskip-llama2-7B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0266",
+      "source": "7",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0267",
+      "source": "Early Exit @ Layer 4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0268",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0269",
+      "source": "summarization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0270",
+      "source": "7",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0271",
+      "source": "2548.4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0272",
+      "source": "19.91",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0273",
+      "source": "3306.73",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0274",
+      "source": "25.83",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0275",
+      "source": "1.297",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0276",
+      "source": "Some observations we can make from the results:",
+      "spans": []
+    },
+    {
+      "id": "b0277",
+      "source": "As seen in the Total Number of Parameters column, self-speculative decoding consumes less memory because it does not require a separate draft model and weights for the draft stage layers are re-used.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0278",
+      "source": "For all model sizes and generations except Llama2 70B, the early-exit self-speculative decoding is faster than the regular two-model speculative decoding. There could be different reasons for the relatively limited speedups of self-speculative decoding on Llama2 70B compared to other models, e.g., the LayerSkip checkpoint of Llama2 70B was continually pretrained with fewer tokens (328 M tokens for Llama2 70B compared to 52B tokens for Llama2 7B). But this is an area of improvement to investigate for future research. Nevertheless, self-speculative decoding for 70B is significantly faster than autoregressive decoding.",
+      "spans": []
+    },
+    {
+      "id": "b0279",
+      "source": "Early Exit and Unembedding",
+      "spans": []
+    },
+    {
+      "id": "b0280",
+      "source": "One key technique in self-speculative decoding is early exit, where the generation process can halt at a pre specified layer. To accomplish this, we unembed the logits from these layers by projecting them onto the language model (LM) head to predict the next token. This allows the model to skip subsequent layers and improve inference time.",
+      "spans": [
+        {
+          "start": 149,
+          "end": 156,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0281",
+      "source": "Unembedding can be performed at any transformer layer, turning early-exit into an efficient token-prediction mechanism. A natural question arises: how can the LM head be adapted to unembed logits from earlier layers when it was initially trained to work with the final layer only? This is where the training modifications come into play.",
+      "spans": []
+    },
+    {
+      "id": "b0282",
+      "source": "Training Modifications: Layer Dropout and Early Exit Loss",
+      "spans": [
+        {
+          "start": 24,
+          "end": 37,
+          "kind": "em"
+        },
+        {
+          "start": 42,
+          "end": 57,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0283",
+      "source": "In the training phase, we introduce layer dropout, which allows the model to skip certain layers during training. The dropout rate increases progressively in deeper layers, making the model less reliant on its later layers, as well as enhancing the model's generalization and speeding up training.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 49,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0284",
+      "source": "In addition to layer dropout, early exit loss is applied to ensure the LM head learns to unembed different layers. The total loss function for training the model with early exits is given by a summation of normalized loss from each exit (intermediate layers). This technique enables efficient training by distributing the learning task across all layers.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 45,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0285",
+      "source": "Self-Drafting and Self-Verification",
+      "spans": []
+    },
+    {
+      "id": "b0286",
+      "source": "Once training is complete, we can apply self-speculative decoding during inference. The process begins with self-drafting, where tokens are generated by exiting early from some intermediate layer. The number of speculative tokens defines how many draft tokens are produced during this stage, and the layer we exit at defines how large and accurate is the draft stage. Both parameters can be specified at inference based on a trade-off between speed and accuracy of the draft stage.",
+      "spans": [
+        {
+          "start": 84,
+          "end": 95,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/v4.46.3/en/llm_optims#speculative-decoding"
+        },
+        {
+          "start": 108,
+          "end": 121,
+          "kind": "strong"
+        },
+        {
+          "start": 425,
+          "end": 480,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/assisted-generation"
+        }
+      ]
+    },
+    {
+      "id": "b0287",
+      "source": "The next stage is self-verification, where the full model is used to verify the draft tokens. The verification model reuses the portion of cache from the draft model. If the draft tokens align with the verified tokens, they are added to the final output, resulting in a better usage of the memory bandwidth in our system, because it’s much more expensive to generate a sequence of tokens with the full model than verifying a draft, as long as several of the tokens match.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 35,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0288",
+      "source": "In the self-verification stage, only the remaining layers are computed for verification, because the results from the early layers are cached during the drafting phase.",
+      "spans": []
+    },
+    {
+      "id": "b0289",
+      "source": "Optimizations: Shared Weights, Shared KV Cache, and Shared Compute",
+      "spans": []
+    },
+    {
+      "id": "b0290",
+      "source": "Self-speculative decoding benefits significantly from cache reuse, particularly the KV cache, which stores key-value pairs computed during the drafting stage. This cache allows the model to skip redundant calculations, as both the draft and verification stages use the same early layers. Additionally, the exit query cache stores the query vector from the exit layer, allowing verification to continue seamlessly from the draft stage.",
+      "spans": [
+        {
+          "start": 84,
+          "end": 92,
+          "kind": "strong"
+        },
+        {
+          "start": 306,
+          "end": 322,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0291",
+      "source": "Compared to traditional two-model speculative decoding, early-exit self-speculative decoding can benefit from the following savings:",
+      "spans": []
+    },
+    {
+      "id": "b0292",
+      "source": "Shared Weights: Reuses the weights from the first E E E layers for both drafting and verification.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0293",
+      "source": "Shared KV Cache: Reuses key-value pairs from the first E E E layers for both drafting and verification.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0294",
+      "source": "Shared Compute: Reuses the compute of the first E E E layers by using a Exit Query Cache that saves only the query vector of the exit layer E−1E-1E−1 so that the verification process won’t need to compute layers 0 0 0 to E−1 E-1 E−1.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 72,
+          "end": 88,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0295",
+      "source": "The combination of KV and exit query caches, known as the KVQ cache, reduces memory overhead and improves inference latency.",
+      "spans": [
+        {
+          "start": 58,
+          "end": 67,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0296",
+      "source": "So far, the 🤗 transformers library has implemented the first optimization (Shared Weights) in this pull request. As the number of models that use this method increases, we'll consider the additional optimizations. Feel free to open a PR if you're interested!",
+      "spans": [
+        {
+          "start": 99,
+          "end": 111,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/34240"
+        }
+      ]
+    },
+    {
+      "id": "b0297",
+      "source": "How Early Can We Exit?",
+      "spans": []
+    },
+    {
+      "id": "b0298",
+      "source": "The early exit layer of the draft stage is a hyperparameter that we can tune or modify during inference:",
+      "spans": []
+    },
+    {
+      "id": "b0299",
+      "source": "The earlier we exit, the faster the generation of draft tokens are but the less accurate they will be.",
+      "spans": []
+    },
+    {
+      "id": "b0300",
+      "source": "The later we exit, the more accurate the draft tokens generated are but the slower their generation will be.",
+      "spans": []
+    },
+    {
+      "id": "b0301",
+      "source": "We wrote a script to sweep across different early exit layers and measure the tokens per second on A100 GPUs. In the Tables below we plot the tokens per second versus the early exit layer for different Llama models for both LayerSkip and baseline checkpoints (you can view the full logs here).",
+      "spans": [
+        {
+          "start": 9,
+          "end": 17,
+          "kind": "a",
+          "href": "https://gist.github.com/mostafaelhoushi/1dd2781b896504bf0569a3ae4b8f9ecf"
+        },
+        {
+          "start": 287,
+          "end": 291,
+          "kind": "a",
+          "href": "https://drive.google.com/drive/folders/145CUq-P_6tbPkmArL7qsjxUihjDgLnzX?usp=sharing"
+        }
+      ]
+    },
+    {
+      "id": "b0302",
+      "source": "Llama3.2 1B",
+      "spans": []
+    },
+    {
+      "id": "b0303",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0304",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0305",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0306",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0307",
+      "source": "Llama3 8B",
+      "spans": []
+    },
+    {
+      "id": "b0308",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0309",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0310",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0311",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0312",
+      "source": "Code Llama3 34B",
+      "spans": []
+    },
+    {
+      "id": "b0313",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0314",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0315",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0316",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0317",
+      "source": "Code Llama3 7B",
+      "spans": []
+    },
+    {
+      "id": "b0318",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0319",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0320",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0321",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0322",
+      "source": "Llama2 70B",
+      "spans": []
+    },
+    {
+      "id": "b0323",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0324",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0325",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0326",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0327",
+      "source": "Llama2 13B",
+      "spans": []
+    },
+    {
+      "id": "b0328",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0329",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0330",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0331",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t11",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0332",
+      "source": "Llama2 7B",
+      "spans": []
+    },
+    {
+      "id": "b0333",
+      "source": "Normal",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0334",
+      "source": "LayerSkip",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0335",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0336",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t12",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0337",
+      "source": "We can observe the following:",
+      "spans": []
+    },
+    {
+      "id": "b0338",
+      "source": "For the baseline checkpoints that have not been pretrained or continually pretrained with the LayerSkip training recipe, early exit self-speculative decoding is slower than autoregressive decoding. This is because during training of most LLMs, earlier layers are not motivated to learn to predict the output, and hence generating tokens using earlier layers will have a very low acceptance rate.",
+      "spans": []
+    },
+    {
+      "id": "b0339",
+      "source": "On the other hand, for the Llama checkpoints that were continually pre-trained with the LayerSkip training, early exit self-speculative decoding has higher speedup than autoregressive decoding for at least a subset of the layers.",
+      "spans": []
+    },
+    {
+      "id": "b0340",
+      "source": "For most models, except Llama3.2 1B, we notice a regular pattern when we traverse across layers: speedup starts low for the first few layers, increases gradually to a sweet spot, and then decreases again.",
+      "spans": []
+    },
+    {
+      "id": "b0341",
+      "source": "The early exit layer sweet spot is when we have the optimal tradeoff between high accuracy of predictions and low overhead of generating tokens. This sweet spot depends on each model, and may also depend on the prompt or domain of the prompt.",
+      "spans": []
+    },
+    {
+      "id": "b0342",
+      "source": "These observations present intriguing opportunities for further experimentation and exploration. We encourage readers to build upon these ideas, test variations, and pursue their own research. Such efforts can lead to valuable insights and contribute meaningfully to the field.",
+      "spans": []
+    },
+    {
+      "id": "b0343",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0344",
+      "source": "LayerSkip leverages the synergy between early exit, layer dropout, and cache reuse to create a fast and efficient text generation pipeline. By training the model to unembed outputs from different layers and optimizing the verification process with caches, this approach strikes a balance between speed and accuracy. As a result, it significantly improves inference times in large language models while maintaining high-quality outputs. It also reduces memory compared to traditional speculative decoding techniques due to a single model used as both the draft and verification model.",
+      "spans": []
+    },
+    {
+      "id": "b0345",
+      "source": "Self-speculation is an exciting field where the same LLM can create draft tokens and fix itself. Other self-speculation approaches include:",
+      "spans": []
+    },
+    {
+      "id": "b0346",
+      "source": "Draft & Verify: where the draft stage involves skipping pre-determined attention and feed forward layers.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://aclanthology.org/2024.acl-long.607/"
+        }
+      ]
+    },
+    {
+      "id": "b0347",
+      "source": "MagicDec: where the draft stage uses a subset of the KV cache, which is useful for long context inputs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2408.11049"
+        }
+      ]
+    },
+    {
+      "id": "b0348",
+      "source": "Jacobi Decoding and Lookahead Decoding: Where the draft stage are a series of “guess tokens” that could be either random or obtained from a n-gram lookup table.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2305.10427"
+        },
+        {
+          "start": 20,
+          "end": 38,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2402.02057"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "8fae0697505c6b9f90caad97ea9e409a313937b2fc88c1b56009ffc5a586f1e5",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install transformers"
+    },
+    {
+      "id": "c0002",
+      "source": "from transformers import AutoTokenizer, AutoModelForCausalLM\n\nearly_exit_layer = 4\nprompt = \"Alice and Bob\"\ncheckpoint = \"facebook/layerskip-llama2-7B\"\n\ntokenizer = AutoTokenizer.from_pretrained(checkpoint)\ninputs = tokenizer(prompt, return_tensors=\"pt\").to(\"cuda\")\n\nmodel = AutoModelForCausalLM.from_pretrained(checkpoint).to(\"cuda\")\noutputs = model.generate(**inputs, assistant_early_exit=early_exit_layer)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "8fae0697505c6b9f90caad97ea9e409a313937b2fc88c1b56009ffc5a586f1e5",
+  "mediaLayout": [
+    {
+      "mediaId": "image_55f71dd2301d099d",
+      "type": "image",
+      "afterBlockId": "b0009",
+      "order": 0
+    },
+    {
+      "mediaId": "image_bcfc0f18ed2dad83",
+      "type": "image",
+      "afterBlockId": "b0305",
+      "order": 1
+    },
+    {
+      "mediaId": "image_cc90652a4e264ddf",
+      "type": "image",
+      "afterBlockId": "b0306",
+      "order": 2
+    },
+    {
+      "mediaId": "image_cc5678c3f5b1a826",
+      "type": "image",
+      "afterBlockId": "b0310",
+      "order": 3
+    },
+    {
+      "mediaId": "image_cc99568ebea870b5",
+      "type": "image",
+      "afterBlockId": "b0311",
+      "order": 4
+    },
+    {
+      "mediaId": "image_36359707f216972d",
+      "type": "image",
+      "afterBlockId": "b0315",
+      "order": 5
+    },
+    {
+      "mediaId": "image_3e099d2fb957ccf6",
+      "type": "image",
+      "afterBlockId": "b0316",
+      "order": 6
+    },
+    {
+      "mediaId": "image_d61986a69dda3199",
+      "type": "image",
+      "afterBlockId": "b0320",
+      "order": 7
+    },
+    {
+      "mediaId": "image_1f578a21823cb843",
+      "type": "image",
+      "afterBlockId": "b0321",
+      "order": 8
+    },
+    {
+      "mediaId": "image_0f2e362166f7d162",
+      "type": "image",
+      "afterBlockId": "b0325",
+      "order": 9
+    },
+    {
+      "mediaId": "image_7632cc7a4a551d4f",
+      "type": "image",
+      "afterBlockId": "b0326",
+      "order": 10
+    },
+    {
+      "mediaId": "image_c16f80ffca47b857",
+      "type": "image",
+      "afterBlockId": "b0330",
+      "order": 11
+    },
+    {
+      "mediaId": "image_8131450552f1ba6a",
+      "type": "image",
+      "afterBlockId": "b0331",
+      "order": 12
+    },
+    {
+      "mediaId": "image_2444609b15a29ecf",
+      "type": "image",
+      "afterBlockId": "b0335",
+      "order": 13
+    },
+    {
+      "mediaId": "image_aec304d64b02de6e",
+      "type": "image",
+      "afterBlockId": "b0336",
+      "order": 14
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 15,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 15,
+    "savedImages": 15,
+    "sourceImageOccurrences": 15,
+    "placedImageOccurrences": 15,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T01:30:14.001920Z",
+  "mediaLayoutCheckedAt": "2026-10-03T01:30:14.001928Z"
 }
