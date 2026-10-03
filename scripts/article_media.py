@@ -55,6 +55,31 @@ def safe_url(value, base=''):
     return url if p.scheme in {'http', 'https'} and p.hostname and not p.username and not p.password else ''
 
 
+def largest_srcset_candidate(value: str) -> str:
+    """Pick the largest image out of a srcset attribute.
+
+    srcset is ordered smallest first, so taking the first entry archives the
+    thumbnail - which is how a hero image ends up 140px wide. Prefer the widest
+    ``w`` descriptor; when the entries carry density descriptors or none at all,
+    the last entry is the largest.
+    """
+    best = ''
+    best_width = -1
+    for candidate in str(value or '').split(','):
+        parts = candidate.strip().split()
+        if not parts or not parts[0]:
+            continue
+        width = 0
+        if len(parts) > 1 and parts[1][-1:].lower() == 'w':
+            try:
+                width = int(parts[1][:-1])
+            except ValueError:
+                width = 0
+        if width >= best_width:
+            best, best_width = parts[0], width
+    return best
+
+
 def video_ref(value, base='', title='', poster=''):
     url = safe_url(value, base)
     p = urlparse(url)
@@ -161,7 +186,7 @@ def extract_media_refs(value, base_url='', limit=12):
                 continue
             src = next((a.get(k) for k in ('data-src', 'data-original', 'data-lazy-src', 'data-original-src', 'data-url', 'src') if a.get(k) and not a[k].startswith(('data:', 'blob:'))), '')
             if not src:
-                src = (a.get('srcset') or a.get('data-srcset') or '').split(',')[0].strip().split(' ')[0]
+                src = largest_srcset_candidate(a.get('srcset') or a.get('data-srcset') or '')
             url = safe_url(src, base_url) if src else ''
             if not url or url in posters or re.search(r'\.(mp4|webm|ogv|ogg)$', urlparse(url).path, re.I):
                 continue
