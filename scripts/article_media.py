@@ -80,6 +80,34 @@ def largest_srcset_candidate(value: str) -> str:
     return best
 
 
+REDDIT_PREVIEW_WIDTH = 400
+
+
+def prefer_full_resolution_reddit(url: str) -> str:
+    """Prefer Reddit's original image over a size-limited signed preview.
+
+    preview.redd.it serves a resized copy behind a signature that is bound to
+    that exact size, so a 140px preview cannot be asked for a larger one - and
+    the reader then upscales it to 920px wide. i.redd.it serves the original.
+    Measured against the archive, seven of eight such previews had a reachable
+    original, one did not, so this is a preference rather than a guarantee.
+
+    Only preview.redd.it is rewritten: external-preview.redd.it proxies a
+    third-party image and has no original of ours to point at.
+    """
+    parsed = urlparse(url or '')
+    if (parsed.hostname or '').lower() != 'preview.redd.it':
+        return url
+    widths = parse_qs(parsed.query).get('width') or []
+    try:
+        width = int(widths[0]) if widths else 0
+    except ValueError:
+        width = 0
+    if not width or width >= REDDIT_PREVIEW_WIDTH:
+        return url
+    return f'https://i.redd.it{parsed.path}'
+
+
 def video_ref(value, base='', title='', poster=''):
     url = safe_url(value, base)
     p = urlparse(url)
@@ -187,7 +215,7 @@ def extract_media_refs(value, base_url='', limit=12):
             src = next((a.get(k) for k in ('data-src', 'data-original', 'data-lazy-src', 'data-original-src', 'data-url', 'src') if a.get(k) and not a[k].startswith(('data:', 'blob:'))), '')
             if not src:
                 src = largest_srcset_candidate(a.get('srcset') or a.get('data-srcset') or '')
-            url = safe_url(src, base_url) if src else ''
+            url = prefer_full_resolution_reddit(safe_url(src, base_url) if src else '')
             if not url or url in posters or re.search(r'\.(mp4|webm|ogv|ogg)$', urlparse(url).path, re.I):
                 continue
             # WordPress responsive variants represent the same asset.
