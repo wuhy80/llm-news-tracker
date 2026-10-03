@@ -77,6 +77,13 @@ def layout_backfill_item(item: dict, recheck: bool = True, path: Path | None = N
     if (snapshot.get('mediaLayoutBodyHash') == body_digest(snapshot.get('body', ''))
             and snapshot.get('mediaLayoutMatched', 0) > best['mediaLayoutMatched']):
         return 'partial:' + str(snapshot['mediaLayoutMatched'])
+    # An attempt that reproduces the stored layout would change nothing but the
+    # check timestamp, and writing that back commits a fresh blob of an
+    # otherwise identical snapshot. Keep the file and report a partial attempt
+    # so the caller still records the retry cooldown.
+    if ({key: value for key, value in snapshot.items() if key != 'mediaLayoutCheckedAt'}
+            == {key: value for key, value in best.items() if key != 'mediaLayoutCheckedAt'}):
+        return 'partial:' + str(best['mediaLayoutMatched'])
     best['mediaLayoutCheckedAt'] = utc_now()
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(best, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

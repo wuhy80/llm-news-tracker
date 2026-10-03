@@ -83,3 +83,40 @@ class HistoricalMediaTests(unittest.TestCase):
                     self.assertEqual(
                         repair.has_problematic_images({'images': [{'src': src, 'originalUrl': 'https://i.qbitai.com/wp-content/uploads/2026/09/chart.webp'}]}),
                         expected)
+
+    def test_layout_attempt_that_reproduces_the_stored_layout_does_not_rewrite(self):
+        # A no-op layout attempt used to bump mediaLayoutCheckedAt and commit a
+        # fresh blob of an otherwise identical snapshot.
+        with tempfile.TemporaryDirectory() as d:
+            path, before = self.make_snapshot(
+                Path(d), 'orphan.json',
+                images=[{'src': 'data/article-media/pic.jpg'}],
+                mediaLayoutMatched=0, mediaLayoutStatus='partial',
+                mediaLayoutCheckedAt='2020-01-01T00:00:00Z')
+            original = path.read_bytes()
+            with patch.object(repair, 'fetch_page_text', return_value=('body', before['url'])), \
+                 patch.object(repair, 'take_media_source', return_value=('html', 'text')), \
+                 patch.object(repair, 'LAYOUT_READER_REMAINING', 0), \
+                 patch.object(repair, 'build_layout',
+                              return_value={'mediaLayoutMatched': 0, 'mediaLayoutStatus': 'partial'}):
+                result = repair.layout_backfill_item(before, path=path)
+            self.assertTrue(result.startswith('partial:'), result)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_layout_attempt_that_improves_the_layout_still_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, before = self.make_snapshot(
+                Path(d), 'orphan.json',
+                images=[{'src': 'data/article-media/pic.jpg'}],
+                mediaLayoutMatched=0, mediaLayoutStatus='partial',
+                mediaLayoutCheckedAt='2020-01-01T00:00:00Z')
+            with patch.object(repair, 'fetch_page_text', return_value=('body', before['url'])), \
+                 patch.object(repair, 'take_media_source', return_value=('html', 'text')), \
+                 patch.object(repair, 'LAYOUT_READER_REMAINING', 0), \
+                 patch.object(repair, 'build_layout',
+                              return_value={'mediaLayoutMatched': 3, 'mediaLayoutStatus': 'complete'}):
+                result = repair.layout_backfill_item(before, path=path)
+            self.assertTrue(result.startswith('layout:'), result)
+            after = json.loads(path.read_text())
+            self.assertEqual(after['mediaLayoutMatched'], 3)
+            self.assertNotEqual(after['mediaLayoutCheckedAt'], '2020-01-01T00:00:00Z')
