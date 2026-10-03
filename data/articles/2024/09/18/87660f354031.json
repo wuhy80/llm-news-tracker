@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-02T16:40:36.506188Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Fine-tuning LLMs to 1.58bit: extreme quantization made easy\n\nPublished September 18, 2024\n\nThis article is also available in Chinese 简体中文 .\n\nAs Large Language Models (LLMs) grow in size and complexity, finding ways to reduce their computational and energy costs has become a critical challenge. One popular solution is quantization, where the precision of parameters is reduced from the standard 16-bit floating-point (FP16) or 32-bit floating-point (FP32) to lower-bit formats like 8-bit or 4-bit. While this approach significantly cuts down on memory usage and speeds up computation, it often comes at the expense of accuracy. Reducing the precision too much can cause models to lose crucial information, resulting in degraded performance.\n\nBitNet is a special transformers architecture that represents each parameter with only three values: (-1, 0, 1) , offering a extreme quantization of just 1.58 ( l o g 2 ( 3 ) log_2(3) l o g 2 ​ ( 3 ) ) bits per parameter. However, it requires to train a model from scratch. While the results are impressive, not everybody has the budget to pre-train an LLM. To overcome this limitation, we explored a few tricks that allow fine-tuning an existing model to 1.58 bits! Keep reading to find out how !\n\n- What is BitNet in More Depth?\n\n- Pre-training Results in 1.58b\n\n- Kernels used & Benchmarks\n\nBitNet is an architecture introduced by Microsoft Research that uses extreme quantization, representing each parameter with only three values: -1, 0, and 1. This results in a model that uses just 1.58 bits per parameter, significantly reducing computational and memory requirements.\n\nThis architecture uses INT8 addition calculations when performing matrix multiplication, in contrast to LLaMA LLM's FP16 addition and multiplication operations.\n\nThe new computation paradigm of BitNet b1.58 (source: BitNet paper https://arxiv.org/abs/2402.17764)\n\nThis results in a theoretically reduced energy consumption, with BitNet b1.58 saving 71.4 times the arithmetic operations energy for matrix multiplication compared to the Llama baseline.\n\nEnergy consumption of BitNet b1.58 compared to LLama (source: BitNet paper https://arxiv.org/abs/2402.17764)\n\nWe have successfully fine-tuned a Llama3 8B model using the BitNet architecture, achieving strong performance on downstream tasks. The 8B models we developed are released under the HF1BitLLM organization. Two of these models were fine-tuned on 10B tokens with different training setup, while the third was fine-tuned on 100B tokens. Notably, our models surpass the Llama 1 7B model in MMLU benchmarks.\n\n### How to Use with Transformers\n\nTo integrate the BitNet architecture into Transformers, we introduced a new quantization method called \"bitnet\" ( PR ). This method involves replacing the standard Linear layers with specialized BitLinear layers that are compatible with the BitNet architecture, with appropriate dynamic quantization of activations, weight unpacking, and matrix multiplication.\n\nLoading and testing the model in Transformers is incredibly straightforward, there are zero changes to the API:\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\n    \"HF1BitLLM/Llama3-8B-1.58-100B-tokens\",\n    device_map=\"cuda\",\n    torch_dtype=torch.bfloat16\n)    \ntokenizer = AutoTokenizer.from_pretrained(\"meta-llama/Meta-Llama-3-8B-Instruct\")\n\ninput_text = \"Daniel went back to the garden. Mary travelled to the kitchen. Sandra journeyed to the kitchen. Sandra went to the hallway. John went to the bedroom. Mary went back to the garden. Where is Mary?\\nAnswer:\"\n\ninput_ids = tokenizer.encode(input_text, return_tensors=\"pt\").cuda()\noutput = model.generate(input_ids, max_new_tokens=10)\ngenerated_text = tokenizer.decode(output[0], skip_special_tokens=True)\nprint(generated_text)\n```\n\nWith this code, everything is managed seamlessly behind the scenes, so there's no need to worry about additional complexities, you just need to install the latest version of transformers.\n\nFor a quick test of the model, check out this notebook\n\nBitNet replaces traditional Linear layers in Multi-Head Attention and Feed-Forward Networks with specialized layers called BitLinear that use ternary precision (or even binary, in the initial version). The BitLinear layers we use in this project quantize the weights using ternary precision (with values of -1, 0, and 1), and we quantize the activations to 8-bit precision. We use a different implementation of BitLinear for training than we do for inference, as we'll see in the next section.\n\nThe main obstacle to training in ternary precision is that the weight values are discretized (via the round() function) and thus non-differentiable. BitLinear solves this with a nice trick: STE (Straight Through Estimator) . The STE allows gradients to flow through the non-differentiable rounding operation by approximating its gradient as 1 (treating round() as equivalent to the identity function). Another way to view it is that, instead of stopping the gradient at the rounding step, the STE lets the gradient pass through as if the rounding never occurred, enabling weight updates using standard gradient-based optimization techniques.\n\nThe architecture of BitNet with BitLinear layers (source: BitNet paper https://arxiv.org/pdf/2310.11453)\n\nWe train in full precision, but quantize the weights into ternary values as we go, using symmetric per tensor quantization. First, we compute the average of the absolute values of the weight matrix and use this as a scale. We then divide the weights by the scale, round the values, constrain them between -1 and 1, and finally rescale them to continue in full precision.\n\ns c a l e w = 1 1 n m ∑ i j ∣ W i j ∣ scale_w = 1(1)/(nm) |Wij| sc a l e w ​ = nm 1 ​ ∑ ij ​ ∣ W ij ​ ∣ 1 ​\n\nW q = clamp [ − 1 , 1 ] ( round ( W ∗ s c a l e ) ) W_q = clamp[-1,1](round(W*scale)) W q ​ = clamp [ − 1 , 1 ] ​ ( round ( W ∗ sc a l e ))\n\nW d e q u a n t i z e d = W q ∗ s c a l e w Wdequantized = W_q*scale_w W d e q u an t i ze d ​ = W q ​ ∗ sc a l e w ​\n\nActivations are then quantized to a specified bit-width (8-bit, in our case) using absmax per token quantization (for a comprehensive introduction to quantization methods check out this post ). This involves scaling the activations into the range [−128, 127] for an 8-bit bit-width. The quantization formula is:\n\ns c a l e x = 127 ∣ X ∣ max , dim = − 1 scale_x = 127|X|max, dim=-1 sc a l e x ​ = ∣ X ∣ max , dim = − 1 ​ 127 ​\n\nX q = clamp [ − 128 , 127 ] ( round ( X ∗ s c a l e ) ) X_q = clamp[-128,127](round(X*scale)) X q ​ = clamp [ − 128 , 127 ] ​ ( round ( X ∗ sc a l e ))\n\nX d e q u a n t i z e d = X q ∗ s c a l e x Xdequantized = X_q * scale_x X d e q u an t i ze d ​ = X q ​ ∗ sc a l e x ​\n\nTo make the formulas clearer, here are examples of weight and activation quantization using a 3x3 matrix:\n\nExample 1: Weight Matrix Quantization\n\nLet the weight matrix ( W ) be:\n\nW = [ 0.8 − 0.5 1.2 − 1.5 0.4 − 0.9 1.3 − 0.7 0.2 ] W = 0.8 & -0.5 & 1.2 \\\\ -1.5 & 0.4 & -0.9 \\\\ 1.3 & -0.7 & 0.2 W = ​ 0.8 − 1.5 1.3 ​ − 0.5 0.4 − 0.7 ​ 1.2 − 0.9 0.2 ​ ​\n\nStep 1: Compute the Scale for Weights\n\nwe calculate the average absolute value of ( W ):\n\n1 n m ∑ i j ∣ W i j ∣ = 1 9 ( 0.8 + 0.5 + 1.2 + 1.5 + 0.4 + 0.9 + 1.3 + 0.7 + 0.2 ) = 1 9 ( 7.5 ) = 0.8333 (1)/(nm) |Wij| = (1)/(9)(0.8 + 0.5 + 1.2 + 1.5 + 0.4 + 0.9 + 1.3 + 0.7 + 0.2) = (1)/(9)(7.5) = 0.8333 nm 1 ​ ∑ ij ​ ∣ W ij ​ ∣ = 9 1 ​ ( 0.8 + 0.5 + 1.2 + 1.5 + 0.4 + 0.9 + 1.3 + 0.7 + 0.2 ) = 9 1 ​ ( 7.5 ) = 0.8333\n\nNow, the scale factor is:\n\ns c a l e w = 1 0.8333 ≈ 1.2 scale_w = (1)/(0.8333) 1.2 sc a l e w ​ = 0.8333 1 ​ ≈ 1.2\n\nStep 2: Quantize the Weight Matrix\n\nW q = clamp [ − 1 , 1 ] ( round ( W × s c a l e w ) ) W_q = clamp[-1, 1](round(W × scale_w)) W q ​ = clamp [ − 1 , 1 ] ​ ( round ( W × sc a l e w ​ ))\n\nWe first scale the weights by s c a l e w ≈ 1.2 scale_w 1.2 sc a l e w ​ ≈ 1.2 :\n\nW × s c a l e w = [ 0.8 × 1.2 − 0.5 × 1.2 1.2 × 1.2 − 1.5 × 1.2 0.4 × 1.2 − 0.9 × 1.2 1.3 × 1.2 − 0.7 × 1.2 0.2 × 1.2 ] = [ 0.96 − 0.6 1.44 − 1.8 0.48 − 1.08 1.56 − 0.84 0.24 ] W × scale_w = 0.8 × 1.2 & -0.5 × 1.2 & 1.2 × 1.2 \\\\ -1.5 × 1.2 & 0.4 × 1.2 & -0.9 × 1.2 \\\\ 1.3 × 1.2 & -0.7 × 1.2 & 0.2 × 1.2 = 0.96 & -0.6 & 1.44 \\\\ -1.8 & 0.48 & -1.08 \\\\ 1.56 & -0.84 & 0.24 W × sc a l e w ​ = ​ 0.8 × 1.2 − 1.5 × 1.2 1.3 × 1.2 ​ − 0.5 × 1.2 0.4 × 1.2 − 0.7 × 1.2 ​ 1.2 × 1.2 − 0.9 × 1.2 0.2 × 1.2 ​ ​ = ​ 0.96 − 1.8 1.56 ​ − 0.6 0.48 − 0.84 ​ 1.44 − 1.08 0.24 ​ ​\n\nNext, we round the values and clamp them to the range [ − 1 , 1 ] [-1, 1] [ − 1 , 1 ] :\n\nW q = [ 1 − 1 1 − 1 0 − 1 1 − 1 0 ] W_q = 1 & -1 & 1 \\\\ -1 & 0 & -1 \\\\ 1 & -1 & 0 W q ​ = ​ 1 − 1 1 ​ − 1 0 − 1 ​ 1 − 1 0 ​ ​\n\nStep 3: Dequantize the Weights\n\nFinally, we dequantize the weights using:\n\nW d e q u a n t i z e d = W q × s c a l e w Wdequantized = W_q × scale_w W d e q u an t i ze d ​ = W q ​ × sc a l e w ​\n\nSubstituting scale_w, we get:\n\nW d e q u a n t i z e d = [ 1 × 1.2 − 1 × 1.2 1 × 1.2 − 1 × 1.2 0 × 1.2 − 1 × 1.2 1 × 1.2 − 1 × 1.2 0 × 1.2 ] = [ 1.2 − 1.2 1.2 − 1.2 0 − 1.2 1.2 − 1.2 0 ] Wdequantized = 1 × 1.2 & -1 × 1.2 & 1 × 1.2 \\\\ -1 × 1.2 & 0 × 1.2 & -1 × 1.2 \\\\ 1 × 1.2 & -1 × 1.2 & 0 × 1.2 = 1.2 & -1.2 & 1.2 \\\\ -1.2 & 0 & -1.2 \\\\ 1.2 & -1.2 & 0 W d e q u an t i ze d ​ = ​ 1 × 1.2 − 1 × 1.2 1 × 1.2 ​ − 1 × 1.2 0 × 1.2 − 1 × 1.2 ​ 1 × 1.2 − 1 × 1.2 0 × 1.2 ​ ​ = ​ 1.2 − 1.2 1.2 ​ − 1.2 0 − 1.2 ​ 1.2 − 1.2 0 ​ ​\n\nExample 2: Activation Matrix Quantization\n\nLet the activation matrix ( X ) be:\n\nX = [ 1.0 − 0.6 0.7 − 0.9 0.4 − 1.2 0.8 − 0.5 0.3 ] X = 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 X = ​ 1.0 − 0.9 0.8 ​ − 0.6 0.4 − 0.5 ​ 0.7 − 1.2 0.3 ​ ​\n\nStep 1: Compute the Scale for Activations\n\nFor each row (or channel), compute the maximum absolute value:\n\n- Row 1 : Maximum absolute value = 1.0\n\n- Row 2 : Maximum absolute value = 1.2\n\n- Row 3 : Maximum absolute value = 0.8\n\nCompute the scale factors for each row:\n\nscale = [ 127 1.0 127 1.2 127 0.8 ] = [ 127 105.83 158.75 ] scale = (127)/(1.0) \\\\ (127)/(1.2) \\\\ (127)/(0.8) = 127 \\\\ 105.83 \\\\ 158.75 scale = ​ 1.0 127 ​ 1.2 127 ​ 0.8 127 ​ ​ ​ = ​ 127 105.83 158.75 ​ ​\n\nStep 2: Quantize the Activation Matrix\n\nX q = clamp [ − 128 , 127 ] ( round ( X × scale ) ) X_q = clamp[-128,127](round(X × scale)) X q ​ = clamp [ − 128 , 127 ] ​ ( round ( X × scale ))\n\nX × scale = [ 1.0 × 127 − 0.6 × 127 0.7 × 127 − 0.9 × 105.83 0.4 × 105.83 − 1.2 × 105.83 0.8 × 158.75 − 0.5 × 158.75 0.3 × 158.75 ] = [ 127 − 76.2 88.9 − 95.2 42.3 − 127 127 − 79.4 47.6 ] X × scale = 1.0 × 127 & -0.6 × 127 & 0.7 × 127 \\\\ -0.9 × 105.83 & 0.4 × 105.83 & -1.2 × 105.83 \\\\ 0.8 × 158.75 & -0.5 × 158.75 & 0.3 × 158.75 = 127 & -76.2 & 88.9 \\\\ -95.2 & 42.3 & -127 \\\\ 127 & -79.4 & 47.6 X × scale = ​ 1.0 × 127 − 0.9 × 105.83 0.8 × 158.75 ​ − 0.6 × 127 0.4 × 105.83 − 0.5 × 158.75 ​ 0.7 × 127 − 1.2 × 105.83 0.3 × 158.75 ​ ​ = ​ 127 − 95.2 127 ​ − 76.2 42.3 − 79.4 ​ 88.9 − 127 47.6 ​ ​\n\nRound the values and clamp them to the range [ − 128 , 127 ] [-128, 127] [ − 128 , 127 ] :\n\nX q = [ 127 − 76 89 − 95 42 − 127 127 − 79 48 ] X_q = 127 & -76 & 89 \\\\ -95 & 42 & -127 \\\\ 127 & -79 & 48 X q ​ = ​ 127 − 95 127 ​ − 76 42 − 79 ​ 89 − 127 48 ​ ​\n\nStep 3: Dequantize the Activations\n\nFinally, dequantize the activations using:\n\nX d e q u a n t i z e d = X q × 1 scale Xdequantized = X_q × (1)/(scale) X d e q u an t i ze d ​ = X q ​ × scale 1 ​\n\nSubstituting the scales:\n\nX d e q u a n t i z e d = [ 127 × 1 127 − 76 × 1 127 89 × 1 127 − 95 × 1 105.83 42 × 1 105.83 − 127 × 1 105.83 127 × 1 158.75 − 79 × 1 158.75 48 × 1 158.75 ] = [ 1.0 − 0.6 0.7 − 0.9 0.4 − 1.2 0.8 − 0.5 0.3 ] Xdequantized = 127 × (1)/(127) & -76 × (1)/(127) & 89 × (1)/(127) \\\\ -95 × (1)/(105.83) & 42 × (1)/(105.83) & -127 × (1)/(105.83) \\\\ 127 × (1)/(158.75) & -79 × (1)/(158.75) & 48 × (1)/(158.75) = 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 X d e q u an t i ze d ​ = ​ 127 × 127 1 ​ − 95 × 105.83 1 ​ 127 × 158.75 1 ​ ​ − 76 × 127 1 ​ 42 × 105.83 1 ​ − 79 × 158.75 1 ​ ​ 89 × 127 1 ​ − 127 × 105.83 1 ​ 48 × 158.75 1 ​ ​ ​ = ​ 1.0 − 0.9 0.8 ​ − 0.6 0.4 − 0.5 ​ 0.7 − 1.2 0.3 ​ ​\n\nWe apply Layer Normalization (LN) before quantizing the activations to maintain the variance of the output:\n\nLN ( x ) = x − E ( x ) Var ( x ) + ϵ LN(x) = (x - E(x))/(sqrt(Var(x) + ε)) LN ( x ) = Var ( x ) + ϵ ​ x − E ( x ) ​\n\nwhere ϵ is a small number to prevent overflow.\n\nThe round() function is not differentiable, as mentioned before. We use detach() as a trick to implement a differentiable straight-through estimator in the backward pass:\n\n```\n# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant(x):\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127) / scale\n    return y\n \ndef weight_quant(w):\n    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)\n    u = (w * scale).round().clamp_(-1, 1) / scale\n    return u\n\nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight\n        x_norm = LN(x)\n        \n        # A trick for implementing Straight−Through−Estimator (STE) using detach()\n        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()\n        w_quant = w + (weight_quant(w) - w).detach()\n        \n        # Perform quantized linear transformation\n        y = F.linear(x_quant, w_quant)\n        return y\n```\n\nDuring inference, we simply quantize the weights to ternary values without rescaling. We apply the same approach to activations using 8-bit precision, then perform a matrix multiplication with an efficient kernel, followed by dividing by both the weight and activation scales. This should significantly improve inference speed, particularly with optimized hardware. You can see that the rescaling process differs during training, as matrix multiplications are kept in fp16/bf16/fp32 for proper training.\n\n```\n# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant_inference(x):\n    x = LN(x)\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127)\n    return y, scale\n \nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight # weights here are already quantized to (-1, 0, 1)    \n        w_scale = self.w_scale  \n        x_quant, x_scale = activation_quant_inference(x)\n        y = efficient_kernel(x_quant, w) / w_scale / x_scale\n        return y\n```\n\nBefore attempting fine-tuning, we first tried to reproduce the results of the BitNet paper with pre-training. We started with a small dataset, tinystories , and a Llama3 8B model . We confirmed that adding a normalization function, like the paper does, improves performance. For example, after 2000 steps of training, we had a perplexity on the validation set equal to 6.3 without normalization, and 5.9 with normalization. Training was stable in both cases.\n\nPre-training plots without (blue) & with (orange) layer normalisation\n\nWhile this approach looks very interesting for pre-training, only a few institutions can afford doing it at the necessary scale. However, there is already a wide range of strong pretrained models, and it would be extremely useful if they could be converted to 1.58bit after pre-training. Other groups had reported that fine-tuning results were not as strong as those achieved with pre-training, so we set out on an investigation to see if we could make 1.58 fine-tuning work.\n\n## Fine-tuning in 1.58bit\n\nWhen we began fine-tuning from the pre-trained Llama3 8B weights, the model performed slightly better but not as well as we expected.\n\nNote: All our experiments were conducted using Nanotron . If you're interested in trying 1.58bit pre-training or fine-tuning, you can check out this PR .\n\nFine-tuning plot compared to pre-training plot\n\nTo understand why, we tried to inspect both the weight distributions of the randomly initialized model and the pre-trained model to identify potential issues.\n\nRandom weights distribution (2 merged stds)\n\nPre-trained Llama3 weights distribution\n\nAnd the scale values for the two distributions are, respectively :\n\nRandom weights scales distribution\n\nThe initial random weight distribution is a mix of two normal distributions:\n\n- One with a standard deviation (std) of 0.025 0.025 0.025\n\n- Another with a std of 0.025 2 ⋅ num_hidden_layers = 0.00325 (0.025)/(sqrt(2 · num_hidden_layers)) = 0.00325 2 ⋅ num_hidden_layers ​ 0.025 ​ = 0.00325\n\nThis results from using different stds for column linear and row linear weights in nanotron . In the quantized version, all matrices have only 2 weight scales (50.25 and 402), which are the inverse of the mean absolute value of the weights for each matrix: scale = 1.0 / w.abs().mean().clamp_(min=1e-5)\n\n- For scale = 50.25 scale = 50.25 scale = 50.25 , w . a b s ( ) . m e a n ( ) = 0.0199 w.abs().mean() = 0.0199 w . ab s ( ) . m e an ( ) = 0.0199 , leading to std = 0.025 std = 0.025 std = 0.025 which matches our first standard deviation. The formula used to derive the std is based on the expectation of the half-normal distribution of ∣ w ∣ |w| ∣ w ∣ :\n\nE ( ∣ w ∣ ) = std ( w ) ⋅ 2 π E(|w|) = std(w) · sqrt((2)/(π)) E ( ∣ w ∣ ) = std ( w ) ⋅ π 2 ​ ​\n\n- For scale = 402 scale = 402 scale = 402 , w . a b s ( ) . m e a n ( ) = 0.0025 w.abs().mean() = 0.0025 w . ab s ( ) . m e an ( ) = 0.0025 , leading to std = 0.00325 std = 0.00325 std = 0.00325\n\nOn the other hand, the pretrained weight's distribution looks like a normal distribution with an std = 0.013 std = 0.013 std = 0.013\n\nClearly, the pretrained model starts with more information (scales), while the randomly initialized model starts with practically no information and adds to it over time. Our conclusion was that starting with random weights gives the model minimal initial information, enabling a gradual learning process, while during fine-tuning, the introduction of BitLinear layers overwhelms the model into losing all its prior information.\n\nTo improve the fine-tuning results, we tried different techniques. For example, instead of using per-tensor quantization, we tried per-row and per-column quantization to keep more information from the Llama 3 weights. We also tried to change the way the scale is computed: instead of just taking the mean absolute value of the weights as a scale, we take the mean absolute value of the outliers as a scale (an outlier value is a value that exceeds k*mean_absolute_value, where k is a constant we tried to vary in our experiments), but we didn’t notice big improvements.\n\n```\ndef scale_outliers(tensor, threshold_factor=1):\n    mean_absolute_value = torch.mean(torch.abs(tensor))\n    threshold = threshold_factor * mean_absolute_value\n    outliers = tensor[torch.abs(tensor) > threshold]\n    mean_outlier_value = torch.mean(torch.abs(outliers))\n    return mean_outlier_value\n\ndef weight_quant_scaling(w):\n    scale = 1.0 / scale_outliers(w).clamp_(min=1e-5)\n    quantized_weights = (w * scale).round().clamp_(-1, 1) / scale\n    return quantized_weights\n```\n\nWe observed that both the random weights and the Llama 3 weights resulted in losses starting at approximately the same value of 13. This suggests that the Llama 3 model loses all of its prior information when quantization is introduced. To further investigate how much information the model loses during this process, we experimented with per-group quantization.\n\nAs a sanity check, we first set the group size to 1, which essentially means no quantization. In this scenario, the loss started at 1.45, same as we see during normal fine-tuning. However, when we increased the group size to 2, the loss jumped to around 11. This indicates that even with a minimal group size of 2, the model still loses nearly all of its information.\n\nTo address this issue, we considered the possibility of introducing quantization gradually rather than applying it abruptly to the weights and activations for each tensor. To achieve this, we implemented a lambda value to control the process :\n\n```\nlambda_ = ?\nx_quant = x + lambda_ * (activation_quant(x) - x).detach()\nw_quant = w + lambda_ * (weight_quant(w) - w).detach()\n```\n\nWhen lambda is set to 0, there is essentially no quantization occurring, while at lambda=1 , full quantization is applied.\n\nWe initially tested some discrete lambda values, such as 0.25, 0.5, 0.75, and 1. However, this approach did not lead to any significant improvement in results, mainly because lambda=0.25 is already high enough for the loss to start very high.\n\nFine-tuning plot with lambda = 0.25->0.5->0.75->1\n\nAs a result, we decided to experiment with a lambda value that adjusts dynamically based on the training step.\n\n```\nlambda_ = training_step / total_training_steps\n```\n\nUsing this dynamic lambda value led to better loss convergence, but the perplexity (ppl) results during inference, when lambda was set to 1, were still far from satisfactory. We realized this was likely because the model hadn't been trained long enough with lambda=1 . To address this, we adjusted our lambda value to improve the training process.\n\n```\nlambda_ = min(2 * training_step / total_training_steps, 1)\n```\n\nWith this configuration, after 2000 steps we have :\n\nFine-tuning plot with lambda = min(2*training_step/total_training_steps, 1)\n\nOur fine-tuning method shows better convergence overall. You can observe a slight increase in the loss curve around 1,000 steps, which corresponds to when we begin approaching lambda=1 , or full quantization. However, immediately after this point, the loss starts to converge again, leading to an improved perplexity of approximately 4.\n\nDespite this progress, when we tested the quantized model on the WikiText dataset (instead of the tinystories one we used for fine-tuning), it showed a very high perplexity. This suggests that fine-tuning the model in low-bit mode on a specific dataset causes it to lose much of its general knowledge. This issue might arise because the minimal representations we aim for with ternary weights can vary significantly from one dataset to another. To address this problem, we scaled our training process to include the larger FineWeb-edu dataset. We maintained a lambda value of:\n\n```\nlambda_ = min(training_step/1000, 1)\n```\n\nWe chose this lambda value because it seemed to be a good starting point for warming up the model. We then trained the model using a learning rate of 1e-4 for 5,000 steps on the FineWeb-edu dataset. The training involved a batch size (BS) of 2 million, totaling 10 billion tokens.\n\nFinding the right learning rate and the right decay was challenging; it seems to be a crucial factor in the model's performance.\n\nFine-tuning plot with warmup quantization on Fineweb-edu\n\nAfter the fine-tuning process on Fineweb-Edu, the perplexity on the WikiText dataset reached 12.2, which is quite impressive given that we only used 10 billion tokens. The other evaluation metrics also show strong performance considering the limited amount of data (see results).\n\nWe also tried to smooth out the sharp increase when lambda approaches 1. To do this, we considered using lambda schedulers that grow exponentially at first, then level off as they get closer to 1.\n\n```\ndef scheduler(step, total_steps, k):\n    normalized_step = step / total_steps\n    return 1 - (1 - normalized_step)**k\n```\n\nfor different k values, with a number of total warmup steps of 1, we have plots like the following :\n\nExponential scheduler for different k values\n\nWe ran 4 experiments using the best-performing learning rate of 1e-4, testing values of k in [4, 6, 8, 10].\n\nFine-tuning plots with exponential scheduler\n\nThe smoothing worked well, as there's no spike like with the linear scheduler. However, the perplexity isn't great, staying around ~15, and the performance on downstream tasks is not better.\n\nWe also noticed the spike at the beginning, which the model struggled to recover from. With lambda = 0, there's essentially no quantization, so the loss starts low, around ~2. But right after the first step, there's a spike, similar to what happened with the linear scheduler (as seen in the blue plot above). So, we tried a different scheduler—a sigmoid one—that starts slowly, rises sharply to 1, and then levels off as it approaches 1.\n\n```\ndef sigmoid_scheduler(step, total_steps, k):\n    # Sigmoid-like curve: slow start, fast middle, slow end\n    normalized_step = step / total_steps\n    return 1 / (1 + np.exp(-k * (normalized_step - 0.5)))\n```\n\nFor different k values we have the following curves :\n\nSigmoid scheduler for different k values\n\nWe ran 5 experiments this time with k in [15, 20, 25, 40, 100] :\n\nFine-tuning plots with sigmoid scheduler\n\nThe sharp increase in lambda caused instability around the 500th step and didn’t fix the first divergence issue. However, for k = 100 k = 100 k = 100 , we observed some improvement in downstream tasks (see the results table), although perplexity remained around ~13.5. Despite this, it didn’t show a clear performance boost over a linear scheduler.\n\nAdditionally, we experimented with training models from scratch using random weights and various learning rates. This allowed us to compare the effectiveness of our fine-tuning approach against traditional pre-training methods.\n\nDifferent Pre-training plots with different learning rates\n\nNone of the models trained from random weights performed better than our fine-tuned model. The best perplexity we achieved with those models was 26, which falls short compared to the results from our fine-tuning approach.\n\n### Scaling to 100B Tokens !\n\nWe scaled our experiments to 100 billion tokens to see if we could match the performance of Llama 3 8B. We conducted longer training runs, starting from our best-performing checkpoint from the shorter runs with the linear scheduler, and continued fine-tuning for 45,000 steps. We experimented with different learning rates, and while the model performed closely to the Llama 3 model in some metrics, on average, it still lagged behind.\n\nHere are some examples of the metrics we evaluated at various checkpoints during the training :\n\nMetrics evaluations during the training for different lrs\n\nand the average score looks like :\n\nAverage evaluation during the training for different lrs\n\n### Experiments on Smaller Models\n\nIn our initial experiments with smaller models like SmolLM, we observed that the warmup quantization technique didn’t yield as much improvement as it did with larger models. This suggests that the effectiveness of warmup quantization could be more closely related to model size and complexity.\n\nFor example, here are the loss curves for the SmolLM 135M model, comparing warmup quantization with full quantization from the start. Interestingly, the curves closely align, and the resulting perplexities aren't significantly different.\n\nSmoll LLm fine-tuning experiment with & without warmup quantization\n\n### Results & Comparison\n\nBitNet is effective in delivering strong performance compared to baseline methods, especially at lower bit levels. According to the paper, BitNet achieves scores that are on par with 8-bit models but with significantly lower inference costs. In the case of 4-bit models, methods that only quantize weights outperform those that quantize both weights and activations, as activations are harder to quantify. However, BitNet, which uses 1.58-bit weights, surpasses both weight-only and weight-and-activation quantization methods.\n\nThe table below presents the results for various metrics after the 10B fine-tuning process of Llama3 8B. These results are compared against those from other model architectures to provide a comprehensive overview of performance (All evaluations were conducted using Lighteval on the Nanotron format model)\n\nMetrics comparison with Llama models : Linear means Linear lambda scheduler, and Sigmoid means Sigmoid lambda scheduler (in our case k = 100)\n\nAfter fine-tuning on just 10 billion tokens using ternary weights, the model demonstrates impressive performance, especially when compared to other models that underwent much more extensive training. For instance, it outperforms the Bitnet 7B model, which was trained on a significantly larger dataset of 100 billion tokens. Additionally, it performs better than the FBI LLM (Fully Binarized LLM), a model that was distilled on an even more massive 1.26 trillion tokens. This highlights the model's efficiency and effectiveness despite the relatively smaller scale of its fine-tuning process.\n\nFor the 100B tokens experiments, the best performing checkpoint we had is the following :\n\nMetrics comparison with Llama models for the model trained on 100B tokens",
+  "bodyFormatVersion": 3,
+  "body": "As Large Language Models (LLMs) grow in size and complexity, finding ways to reduce their computational and energy costs has become a critical challenge. One popular solution is quantization, where the precision of parameters is reduced from the standard 16-bit floating-point (FP16) or 32-bit floating-point (FP32) to lower-bit formats like 8-bit or 4-bit. While this approach significantly cuts down on memory usage and speeds up computation, it often comes at the expense of accuracy. Reducing the precision too much can cause models to lose crucial information, resulting in degraded performance.\n\nBitNet is a special transformers architecture that represents each parameter with only three values: (-1, 0, 1), offering a extreme quantization of just 1.58 ( log2(3) log_2(3) log2​(3) ) bits per parameter. However, it requires to train a model from scratch. While the results are impressive, not everybody has the budget to pre-train an LLM. To overcome this limitation, we explored a few tricks that allow fine-tuning an existing model to 1.58 bits! Keep reading to find out how !\n\n## Table of Contents\n\n- TL;DR\n\n- What is BitNet in More Depth?\n\n- Pre-training Results in 1.58b\n\n- Fine-tuning in 1.58b\n\n- Kernels used & Benchmarks\n\n- Conclusion\n\n- Acknowledgements\n\n- Additional Resources\n\n## TL;DR\n\nBitNet is an architecture introduced by Microsoft Research that uses extreme quantization, representing each parameter with only three values: -1, 0, and 1. This results in a model that uses just 1.58 bits per parameter, significantly reducing computational and memory requirements.\n\nThis architecture uses INT8 addition calculations when performing matrix multiplication, in contrast to LLaMA LLM's FP16 addition and multiplication operations.\n\nThe new computation paradigm of BitNet b1.58 (source: BitNet paper https://arxiv.org/abs/2402.17764)\n\nThis results in a theoretically reduced energy consumption, with BitNet b1.58 saving 71.4 times the arithmetic operations energy for matrix multiplication compared to the Llama baseline.\n\nEnergy consumption of BitNet b1.58 compared to LLama (source: BitNet paper https://arxiv.org/abs/2402.17764)\n\nWe have successfully fine-tuned a Llama3 8B model using the BitNet architecture, achieving strong performance on downstream tasks. The 8B models we developed are released under the HF1BitLLM organization. Two of these models were fine-tuned on 10B tokens with different training setup, while the third was fine-tuned on 100B tokens. Notably, our models surpass the Llama 1 7B model in MMLU benchmarks.\n\n### How to Use with Transformers\n\nTo integrate the BitNet architecture into Transformers, we introduced a new quantization method called \"bitnet\" (PR). This method involves replacing the standard Linear layers with specialized BitLinear layers that are compatible with the BitNet architecture, with appropriate dynamic quantization of activations, weight unpacking, and matrix multiplication.\n\nLoading and testing the model in Transformers is incredibly straightforward, there are zero changes to the API:\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\n    \"HF1BitLLM/Llama3-8B-1.58-100B-tokens\",\n    device_map=\"cuda\",\n    torch_dtype=torch.bfloat16\n)    \ntokenizer = AutoTokenizer.from_pretrained(\"meta-llama/Meta-Llama-3-8B-Instruct\")\n\ninput_text = \"Daniel went back to the garden. Mary travelled to the kitchen. Sandra journeyed to the kitchen. Sandra went to the hallway. John went to the bedroom. Mary went back to the garden. Where is Mary?\\nAnswer:\"\n\ninput_ids = tokenizer.encode(input_text, return_tensors=\"pt\").cuda()\noutput = model.generate(input_ids, max_new_tokens=10)\ngenerated_text = tokenizer.decode(output[0], skip_special_tokens=True)\nprint(generated_text)\n```\n\nWith this code, everything is managed seamlessly behind the scenes, so there's no need to worry about additional complexities, you just need to install the latest version of transformers.\n\nFor a quick test of the model, check out this notebook\n\n## What is BitNet In More Depth?\n\nBitNet replaces traditional Linear layers in Multi-Head Attention and Feed-Forward Networks with specialized layers called BitLinear that use ternary precision (or even binary, in the initial version). The BitLinear layers we use in this project quantize the weights using ternary precision (with values of -1, 0, and 1), and we quantize the activations to 8-bit precision. We use a different implementation of BitLinear for training than we do for inference, as we'll see in the next section.\n\nThe main obstacle to training in ternary precision is that the weight values are discretized (via the round() function) and thus non-differentiable. BitLinear solves this with a nice trick: STE (Straight Through Estimator). The STE allows gradients to flow through the non-differentiable rounding operation by approximating its gradient as 1 (treating round() as equivalent to the identity function). Another way to view it is that, instead of stopping the gradient at the rounding step, the STE lets the gradient pass through as if the rounding never occurred, enabling weight updates using standard gradient-based optimization techniques.\n\nThe architecture of BitNet with BitLinear layers (source: BitNet paper https://arxiv.org/pdf/2310.11453)\n\n### Training\n\nWe train in full precision, but quantize the weights into ternary values as we go, using symmetric per tensor quantization. First, we compute the average of the absolute values of the weight matrix and use this as a scale. We then divide the weights by the scale, round the values, constrain them between -1 and 1, and finally rescale them to continue in full precision.\n\nscalew=11nm∑ij∣Wij∣ scale_w = \\frac{1}{\\frac{1}{nm} \\sum_{ij} |W_{ij}|} scalew​=nm1​∑ij​∣Wij​∣1​\n\nWq=clamp[−1,1](round(W∗scale)) W_q = \\text{clamp}_{[-1,1]}(\\text{round}(W*scale)) Wq​=clamp[−1,1]​(round(W∗scale))\n\nWdequantized=Wq∗scalew W_{dequantized} = W_q*scale_w Wdequantized​=Wq​∗scalew​\n\nActivations are then quantized to a specified bit-width (8-bit, in our case) using absmax per token quantization (for a comprehensive introduction to quantization methods check out this post). This involves scaling the activations into the range [−128, 127] for an 8-bit bit-width. The quantization formula is:\n\nscalex=127∣X∣max, dim=−1 scale_x = \\frac{127}{|X|_{\\text{max}, \\, \\text{dim}=-1}} scalex​=∣X∣max,dim=−1​127​\n\nXq=clamp[−128,127](round(X∗scale)) X_q = \\text{clamp}_{[-128,127]}(\\text{round}(X*scale)) Xq​=clamp[−128,127]​(round(X∗scale))\n\nXdequantized=Xq∗scalex X_{dequantized} = X_q * scale_x Xdequantized​=Xq​∗scalex​\n\nTo make the formulas clearer, here are examples of weight and activation quantization using a 3x3 matrix:\n\nExample 1: Weight Matrix Quantization\n\nLet the weight matrix ( W ) be:\n\nW=[0.8−0.51.2−1.50.4−0.91.3−0.70.2] W = \\begin{bmatrix} 0.8 & -0.5 & 1.2 \\\\ -1.5 & 0.4 & -0.9 \\\\ 1.3 & -0.7 & 0.2 \\end{bmatrix} W=​0.8−1.51.3​−0.50.4−0.7​1.2−0.90.2​​\n\nStep 1: Compute the Scale for Weights\n\nUsing the formula:\n\nscalew=11nm∑ij∣Wij∣ scale_w = \\frac{1}{\\frac{1}{nm} \\sum_{ij} |W_{ij}|} scalew​=nm1​∑ij​∣Wij​∣1​\n\nwe calculate the average absolute value of ( W ):\n\n1nm∑ij∣Wij∣=19(0.8+0.5+1.2+1.5+0.4+0.9+1.3+0.7+0.2)=19(7.5)=0.8333 \\frac{1}{nm} \\sum_{ij} |W_{ij}| = \\frac{1}{9}(0.8 + 0.5 + 1.2 + 1.5 + 0.4 + 0.9 + 1.3 + 0.7 + 0.2) = \\frac{1}{9}(7.5) = 0.8333 nm1​∑ij​∣Wij​∣=91​(0.8+0.5+1.2+1.5+0.4+0.9+1.3+0.7+0.2)=91​(7.5)=0.8333\n\nNow, the scale factor is:\n\nscalew=10.8333≈1.2 scale_w = \\frac{1}{0.8333} \\approx 1.2 scalew​=0.83331​≈1.2\n\nStep 2: Quantize the Weight Matrix\n\nUsing the formula:\n\nWq=clamp[−1,1](round(W×scalew)) W_q = \\text{clamp}_{[-1, 1]}(\\text{round}(W \\times scale_w)) Wq​=clamp[−1,1]​(round(W×scalew​))\n\nWe first scale the weights by scalew≈1.2 scale_w \\approx 1.2 scalew​≈1.2:\n\nW×scalew=[0.8×1.2−0.5×1.21.2×1.2−1.5×1.20.4×1.2−0.9×1.21.3×1.2−0.7×1.20.2×1.2]=[0.96−0.61.44−1.80.48−1.081.56−0.840.24] W \\times scale_w = \\begin{bmatrix} 0.8 \\times 1.2 & -0.5 \\times 1.2 & 1.2 \\times 1.2 \\\\ -1.5 \\times 1.2 & 0.4 \\times 1.2 & -0.9 \\times 1.2 \\\\ 1.3 \\times 1.2 & -0.7 \\times 1.2 & 0.2 \\times 1.2 \\end{bmatrix} = \\begin{bmatrix} 0.96 & -0.6 & 1.44 \\\\ -1.8 & 0.48 & -1.08 \\\\ 1.56 & -0.84 & 0.24 \\end{bmatrix} W×scalew​=​0.8×1.2−1.5×1.21.3×1.2​−0.5×1.20.4×1.2−0.7×1.2​1.2×1.2−0.9×1.20.2×1.2​​=​0.96−1.81.56​−0.60.48−0.84​1.44−1.080.24​​\n\nNext, we round the values and clamp them to the range [−1,1] [-1, 1] [−1,1]:\n\nWq=[1−11−10−11−10] W_q = \\begin{bmatrix} 1 & -1 & 1 \\\\ -1 & 0 & -1 \\\\ 1 & -1 & 0 \\end{bmatrix} Wq​=​1−11​−10−1​1−10​​\n\nStep 3: Dequantize the Weights\n\nFinally, we dequantize the weights using:\n\nWdequantized=Wq×scalew W_{dequantized} = W_q \\times scale_w Wdequantized​=Wq​×scalew​\n\nSubstituting scale_w, we get:\n\nWdequantized=[1×1.2−1×1.21×1.2−1×1.20×1.2−1×1.21×1.2−1×1.20×1.2]=[1.2−1.21.2−1.20−1.21.2−1.20] W_{dequantized} = \\begin{bmatrix} 1 \\times 1.2 & -1 \\times 1.2 & 1 \\times 1.2 \\\\ -1 \\times 1.2 & 0 \\times 1.2 & -1 \\times 1.2 \\\\ 1 \\times 1.2 & -1 \\times 1.2 & 0 \\times 1.2 \\end{bmatrix} = \\begin{bmatrix} 1.2 & -1.2 & 1.2 \\\\ -1.2 & 0 & -1.2 \\\\ 1.2 & -1.2 & 0 \\end{bmatrix} Wdequantized​=​1×1.2−1×1.21×1.2​−1×1.20×1.2−1×1.2​1×1.2−1×1.20×1.2​​=​1.2−1.21.2​−1.20−1.2​1.2−1.20​​\n\nExample 2: Activation Matrix Quantization\n\nLet the activation matrix ( X ) be:\n\nX=[1.0−0.60.7−0.90.4−1.20.8−0.50.3] X = \\begin{bmatrix} 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 \\end{bmatrix} X=​1.0−0.90.8​−0.60.4−0.5​0.7−1.20.3​​\n\nStep 1: Compute the Scale for Activations\n\nFor each row (or channel), compute the maximum absolute value:\n\n- Row 1: Maximum absolute value = 1.0\n\n- Row 2: Maximum absolute value = 1.2\n\n- Row 3: Maximum absolute value = 0.8\n\nCompute the scale factors for each row:\n\nscale=[1271.01271.21270.8]=[127105.83158.75] \\text{scale} = \\begin{bmatrix} \\frac{127}{1.0} \\\\ \\frac{127}{1.2} \\\\ \\frac{127}{0.8} \\end{bmatrix} = \\begin{bmatrix} 127 \\\\ 105.83 \\\\ 158.75 \\end{bmatrix} scale=​1.0127​1.2127​0.8127​​​=​127105.83158.75​​\n\nStep 2: Quantize the Activation Matrix\n\nUsing the formula:\n\nXq=clamp[−128,127](round(X×scale)) X_q = \\text{clamp}_{[-128,127]}(\\text{round}(X \\times \\text{scale})) Xq​=clamp[−128,127]​(round(X×scale))\n\nScale the activations:\n\nX×scale=[1.0×127−0.6×1270.7×127−0.9×105.830.4×105.83−1.2×105.830.8×158.75−0.5×158.750.3×158.75]=[127−76.288.9−95.242.3−127127−79.447.6] X \\times \\text{scale} = \\begin{bmatrix} 1.0 \\times 127 & -0.6 \\times 127 & 0.7 \\times 127 \\\\ -0.9 \\times 105.83 & 0.4 \\times 105.83 & -1.2 \\times 105.83 \\\\ 0.8 \\times 158.75 & -0.5 \\times 158.75 & 0.3 \\times 158.75 \\end{bmatrix} = \\begin{bmatrix} 127 & -76.2 & 88.9 \\\\ -95.2 & 42.3 & -127 \\\\ 127 & -79.4 & 47.6 \\end{bmatrix} X×scale=​1.0×127−0.9×105.830.8×158.75​−0.6×1270.4×105.83−0.5×158.75​0.7×127−1.2×105.830.3×158.75​​=​127−95.2127​−76.242.3−79.4​88.9−12747.6​​\n\nRound the values and clamp them to the range [−128,127][-128, 127] [−128,127]:\n\nXq=[127−7689−9542−127127−7948] X_q = \\begin{bmatrix} 127 & -76 & 89 \\\\ -95 & 42 & -127 \\\\ 127 & -79 & 48 \\end{bmatrix} Xq​=​127−95127​−7642−79​89−12748​​\n\nStep 3: Dequantize the Activations\n\nFinally, dequantize the activations using:\n\nXdequantized=Xq×1scale X_{dequantized} = X_q \\times \\frac{1}{\\text{scale}} Xdequantized​=Xq​×scale1​\n\nSubstituting the scales:\n\nXdequantized=[127×1127−76×112789×1127−95×1105.8342×1105.83−127×1105.83127×1158.75−79×1158.7548×1158.75]=[1.0−0.60.7−0.90.4−1.20.8−0.50.3] X_{dequantized} = \\begin{bmatrix} 127 \\times \\frac{1}{127} & -76 \\times \\frac{1}{127} & 89 \\times \\frac{1}{127} \\\\ -95 \\times \\frac{1}{105.83} & 42 \\times \\frac{1}{105.83} & -127 \\times \\frac{1}{105.83} \\\\ 127 \\times \\frac{1}{158.75} & -79 \\times \\frac{1}{158.75} & 48 \\times \\frac{1}{158.75} \\end{bmatrix} = \\begin{bmatrix} 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 \\end{bmatrix} Xdequantized​=​127×1271​−95×105.831​127×158.751​​−76×1271​42×105.831​−79×158.751​​89×1271​−127×105.831​48×158.751​​​=​1.0−0.90.8​−0.60.4−0.5​0.7−1.20.3​​\n\nWe apply Layer Normalization (LN) before quantizing the activations to maintain the variance of the output:\n\nLN(x)=x−E(x)Var(x)+ϵ \\text{LN}(x) = \\frac{x - E(x)}{\\sqrt{\\text{Var}(x) + \\epsilon}} LN(x)=Var(x)+ϵ​x−E(x)​\n\nwhere ϵ is a small number to prevent overflow.\n\nThe round() function is not differentiable, as mentioned before. We use detach() as a trick to implement a differentiable straight-through estimator in the backward pass:\n\n```\n# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant(x):\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127) / scale\n    return y\n \ndef weight_quant(w):\n    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)\n    u = (w * scale).round().clamp_(-1, 1) / scale\n    return u\n\nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight\n        x_norm = LN(x)\n        \n        # A trick for implementing Straight−Through−Estimator (STE) using detach()\n        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()\n        w_quant = w + (weight_quant(w) - w).detach()\n        \n        # Perform quantized linear transformation\n        y = F.linear(x_quant, w_quant)\n        return y\n```\n\n### Inference\n\nDuring inference, we simply quantize the weights to ternary values without rescaling. We apply the same approach to activations using 8-bit precision, then perform a matrix multiplication with an efficient kernel, followed by dividing by both the weight and activation scales. This should significantly improve inference speed, particularly with optimized hardware. You can see that the rescaling process differs during training, as matrix multiplications are kept in fp16/bf16/fp32 for proper training.\n\n```\n# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant_inference(x):\n    x = LN(x)\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127)\n    return y, scale\n \nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight # weights here are already quantized to (-1, 0, 1)    \n        w_scale = self.w_scale  \n        x_quant, x_scale = activation_quant_inference(x)\n        y = efficient_kernel(x_quant, w) / w_scale / x_scale\n        return y\n```\n\n## Pre-training Results in 1.58b\n\nBefore attempting fine-tuning, we first tried to reproduce the results of the BitNet paper with pre-training. We started with a small dataset, tinystories, and a Llama3 8B model. We confirmed that adding a normalization function, like the paper does, improves performance. For example, after 2000 steps of training, we had a perplexity on the validation set equal to 6.3 without normalization, and 5.9 with normalization. Training was stable in both cases.\n\nPre-training plots without (blue) & with (orange) layer normalisation\n\nWhile this approach looks very interesting for pre-training, only a few institutions can afford doing it at the necessary scale. However, there is already a wide range of strong pretrained models, and it would be extremely useful if they could be converted to 1.58bit after pre-training. Other groups had reported that fine-tuning results were not as strong as those achieved with pre-training, so we set out on an investigation to see if we could make 1.58 fine-tuning work.\n\n## Fine-tuning in 1.58bit\n\nWhen we began fine-tuning from the pre-trained Llama3 8B weights, the model performed slightly better but not as well as we expected.\n\nNote: All our experiments were conducted using Nanotron. If you're interested in trying 1.58bit pre-training or fine-tuning, you can check out this PR.\n\nFine-tuning plot compared to pre-training plot\n\nTo understand why, we tried to inspect both the weight distributions of the randomly initialized model and the pre-trained model to identify potential issues.\n\nRandom weights distribution (2 merged stds)\n\nPre-trained Llama3 weights distribution\n\nAnd the scale values for the two distributions are, respectively :\n\nRandom weights scales distribution\n\nPre-trained Llama3 weights distribution\n\nThe initial random weight distribution is a mix of two normal distributions:\n\n- One with a standard deviation (std) of 0.025 0.025 0.025\n\n- Another with a std of 0.0252⋅num_hidden_layers=0.00325 \\frac{0.025}{\\sqrt{2 \\cdot \\text{num\\_hidden\\_layers}}} = 0.00325 2⋅num_hidden_layers​0.025​=0.00325\n\nThis results from using different stds for column linear and row linear weights in nanotron. In the quantized version, all matrices have only 2 weight scales (50.25 and 402), which are the inverse of the mean absolute value of the weights for each matrix: scale = 1.0 / w.abs().mean().clamp_(min=1e-5)\n\n- For scale=50.25\\text{scale} = 50.25 scale=50.25, w.abs().mean()=0.0199 w.abs().mean() = 0.0199 w.abs().mean()=0.0199, leading to std=0.025\\text{std} = 0.025 std=0.025 which matches our first standard deviation. The formula used to derive the std is based on the expectation of the half-normal distribution of ∣w∣ |w| ∣w∣: E(∣w∣)=std(w)⋅2π \\mathbb{E}(|w|) = \\text{std}(w) \\cdot \\sqrt{\\frac{2}{\\pi}} E(∣w∣)=std(w)⋅π2​​\n\n- For scale=402 \\text{scale} = 402 scale=402, w.abs().mean()=0.0025 w.abs().mean() = 0.0025 w.abs().mean()=0.0025, leading to std=0.00325\\text{std} = 0.00325 std=0.00325\n\nOn the other hand, the pretrained weight's distribution looks like a normal distribution with an std=0.013 \\text{std} = 0.013 std=0.013\n\nClearly, the pretrained model starts with more information (scales), while the randomly initialized model starts with practically no information and adds to it over time. Our conclusion was that starting with random weights gives the model minimal initial information, enabling a gradual learning process, while during fine-tuning, the introduction of BitLinear layers overwhelms the model into losing all its prior information.\n\nTo improve the fine-tuning results, we tried different techniques. For example, instead of using per-tensor quantization, we tried per-row and per-column quantization to keep more information from the Llama 3 weights. We also tried to change the way the scale is computed: instead of just taking the mean absolute value of the weights as a scale, we take the mean absolute value of the outliers as a scale (an outlier value is a value that exceeds k*mean_absolute_value, where k is a constant we tried to vary in our experiments), but we didn’t notice big improvements.\n\n```\ndef scale_outliers(tensor, threshold_factor=1):\n    mean_absolute_value = torch.mean(torch.abs(tensor))\n    threshold = threshold_factor * mean_absolute_value\n    outliers = tensor[torch.abs(tensor) > threshold]\n    mean_outlier_value = torch.mean(torch.abs(outliers))\n    return mean_outlier_value\n\ndef weight_quant_scaling(w):\n    scale = 1.0 / scale_outliers(w).clamp_(min=1e-5)\n    quantized_weights = (w * scale).round().clamp_(-1, 1) / scale\n    return quantized_weights\n```\n\nWe observed that both the random weights and the Llama 3 weights resulted in losses starting at approximately the same value of 13. This suggests that the Llama 3 model loses all of its prior information when quantization is introduced. To further investigate how much information the model loses during this process, we experimented with per-group quantization.\n\nAs a sanity check, we first set the group size to 1, which essentially means no quantization. In this scenario, the loss started at 1.45, same as we see during normal fine-tuning. However, when we increased the group size to 2, the loss jumped to around 11. This indicates that even with a minimal group size of 2, the model still loses nearly all of its information.\n\nTo address this issue, we considered the possibility of introducing quantization gradually rather than applying it abruptly to the weights and activations for each tensor. To achieve this, we implemented a lambda value to control the process :\n\n```\nlambda_ = ?\nx_quant = x + lambda_ * (activation_quant(x) - x).detach()\nw_quant = w + lambda_ * (weight_quant(w) - w).detach()\n```\n\nWhen lambda is set to 0, there is essentially no quantization occurring, while at lambda=1, full quantization is applied.\n\nWe initially tested some discrete lambda values, such as 0.25, 0.5, 0.75, and 1. However, this approach did not lead to any significant improvement in results, mainly because lambda=0.25 is already high enough for the loss to start very high.\n\nFine-tuning plot with lambda = 0.25->0.5->0.75->1\n\nAs a result, we decided to experiment with a lambda value that adjusts dynamically based on the training step.\n\n```\nlambda_ = training_step / total_training_steps\n```\n\nUsing this dynamic lambda value led to better loss convergence, but the perplexity (ppl) results during inference, when lambda was set to 1, were still far from satisfactory. We realized this was likely because the model hadn't been trained long enough with lambda=1. To address this, we adjusted our lambda value to improve the training process.\n\n```\nlambda_ = min(2 * training_step / total_training_steps, 1)\n```\n\nWith this configuration, after 2000 steps we have :\n\nFine-tuning plot with lambda = min(2*training_step/total_training_steps, 1)\n\nOur fine-tuning method shows better convergence overall. You can observe a slight increase in the loss curve around 1,000 steps, which corresponds to when we begin approaching lambda=1, or full quantization. However, immediately after this point, the loss starts to converge again, leading to an improved perplexity of approximately 4.\n\nDespite this progress, when we tested the quantized model on the WikiText dataset (instead of the tinystories one we used for fine-tuning), it showed a very high perplexity. This suggests that fine-tuning the model in low-bit mode on a specific dataset causes it to lose much of its general knowledge. This issue might arise because the minimal representations we aim for with ternary weights can vary significantly from one dataset to another. To address this problem, we scaled our training process to include the larger FineWeb-edu dataset. We maintained a lambda value of:\n\n```\nlambda_ = min(training_step/1000, 1)\n```\n\nWe chose this lambda value because it seemed to be a good starting point for warming up the model. We then trained the model using a learning rate of 1e-4 for 5,000 steps on the FineWeb-edu dataset. The training involved a batch size (BS) of 2 million, totaling 10 billion tokens.\n\nFinding the right learning rate and the right decay was challenging; it seems to be a crucial factor in the model's performance.\n\nFine-tuning plot with warmup quantization on Fineweb-edu\n\nAfter the fine-tuning process on Fineweb-Edu, the perplexity on the WikiText dataset reached 12.2, which is quite impressive given that we only used 10 billion tokens. The other evaluation metrics also show strong performance considering the limited amount of data (see results).\n\nWe also tried to smooth out the sharp increase when lambda approaches 1. To do this, we considered using lambda schedulers that grow exponentially at first, then level off as they get closer to 1.\n\n```\ndef scheduler(step, total_steps, k):\n    normalized_step = step / total_steps\n    return 1 - (1 - normalized_step)**k\n```\n\nfor different k values, with a number of total warmup steps of 1, we have plots like the following :\n\nExponential scheduler for different k values\n\nWe ran 4 experiments using the best-performing learning rate of 1e-4, testing values of k in [4, 6, 8, 10].\n\nFine-tuning plots with exponential scheduler\n\nThe smoothing worked well, as there's no spike like with the linear scheduler. However, the perplexity isn't great, staying around ~15, and the performance on downstream tasks is not better.\n\nWe also noticed the spike at the beginning, which the model struggled to recover from. With lambda = 0, there's essentially no quantization, so the loss starts low, around ~2. But right after the first step, there's a spike, similar to what happened with the linear scheduler (as seen in the blue plot above). So, we tried a different scheduler—a sigmoid one—that starts slowly, rises sharply to 1, and then levels off as it approaches 1.\n\n```\ndef sigmoid_scheduler(step, total_steps, k):\n    # Sigmoid-like curve: slow start, fast middle, slow end\n    normalized_step = step / total_steps\n    return 1 / (1 + np.exp(-k * (normalized_step - 0.5)))\n```\n\nFor different k values we have the following curves :\n\nSigmoid scheduler for different k values\n\nWe ran 5 experiments this time with k in [15, 20, 25, 40, 100] :\n\nFine-tuning plots with sigmoid scheduler\n\nThe sharp increase in lambda caused instability around the 500th step and didn’t fix the first divergence issue. However, for k=100 k = 100 k=100, we observed some improvement in downstream tasks (see the results table), although perplexity remained around ~13.5. Despite this, it didn’t show a clear performance boost over a linear scheduler.\n\nAdditionally, we experimented with training models from scratch using random weights and various learning rates. This allowed us to compare the effectiveness of our fine-tuning approach against traditional pre-training methods.\n\nDifferent Pre-training plots with different learning rates\n\nNone of the models trained from random weights performed better than our fine-tuned model. The best perplexity we achieved with those models was 26, which falls short compared to the results from our fine-tuning approach.\n\n### Scaling to 100B Tokens !\n\nWe scaled our experiments to 100 billion tokens to see if we could match the performance of Llama 3 8B. We conducted longer training runs, starting from our best-performing checkpoint from the shorter runs with the linear scheduler, and continued fine-tuning for 45,000 steps. We experimented with different learning rates, and while the model performed closely to the Llama 3 model in some metrics, on average, it still lagged behind.\n\nHere are some examples of the metrics we evaluated at various checkpoints during the training :\n\nMetrics evaluations during the training for different lrs\n\nand the average score looks like :\n\nAverage evaluation during the training for different lrs\n\n### Experiments on Smaller Models\n\nIn our initial experiments with smaller models like SmolLM, we observed that the warmup quantization technique didn’t yield as much improvement as it did with larger models. This suggests that the effectiveness of warmup quantization could be more closely related to model size and complexity.\n\nFor example, here are the loss curves for the SmolLM 135M model, comparing warmup quantization with full quantization from the start. Interestingly, the curves closely align, and the resulting perplexities aren't significantly different.\n\nSmoll LLm fine-tuning experiment with & without warmup quantization\n\n### Results & Comparison\n\nBitNet is effective in delivering strong performance compared to baseline methods, especially at lower bit levels. According to the paper, BitNet achieves scores that are on par with 8-bit models but with significantly lower inference costs. In the case of 4-bit models, methods that only quantize weights outperform those that quantize both weights and activations, as activations are harder to quantify. However, BitNet, which uses 1.58-bit weights, surpasses both weight-only and weight-and-activation quantization methods.\n\nThe table below presents the results for various metrics after the 10B fine-tuning process of Llama3 8B. These results are compared against those from other model architectures to provide a comprehensive overview of performance (All evaluations were conducted using Lighteval on the Nanotron format model)\n\nMetrics comparison with Llama models : Linear means Linear lambda scheduler, and Sigmoid means Sigmoid lambda scheduler (in our case k = 100)\n\nAfter fine-tuning on just 10 billion tokens using ternary weights, the model demonstrates impressive performance, especially when compared to other models that underwent much more extensive training. For instance, it outperforms the Bitnet 7B model, which was trained on a significantly larger dataset of 100 billion tokens. Additionally, it performs better than the FBI LLM (Fully Binarized LLM), a model that was distilled on an even more massive 1.26 trillion tokens. This highlights the model's efficiency and effectiveness despite the relatively smaller scale of its fine-tuning process.\n\nFor the 100B tokens experiments, the best performing checkpoint we had is the following :\n\nMetrics comparison with Llama models for the model trained on 100B tokens\n\nTo replicate these results, you can check out this PR to convert models to nanotron format, unpack the weights (check the function unpack_weights), and use lighteval\n\nNote that even though the models are fine-tuned from an Instruct-tuned model, they still need to be fine-tuned using an Instruct dataset as well. These can be considered base models.\n\n## Custom Kernels & Benchmarks\n\nTo benefit from the BitNet low-precision weights, we pack them into an int8 tensor (this makes the number of parameters go from 8B to 2.8B!). During inference, these weights must be unpacked before performing matrix multiplication. We implemented custom kernels in Cuda and Triton to handle the on-the-fly unpacking during the matrix multiplication process. For the matrix multiplication itself, we employed the cached tiled matrix multiplication technique. To fully grasp this approach, let's first review some Cuda programming fundamentals.\n\n### Basic GPU Concepts: Threads, Blocks, and Shared Memory\n\nBefore diving into cached tiled matrix multiplication, it's important to understand some basic GPU concepts:\n\n- Threads and Blocks: GPUs execute thousands of threads simultaneously. These threads are grouped into blocks, and each block runs independently. The grid is made up of these blocks, and it represents the entire problem space. For example, in matrix multiplication, each thread might be responsible for computing a single element of the output matrix.\n\n- Shared Memory: Each block has access to a limited amount of shared memory, which is much faster than global memory (the main memory on the GPU). However, shared memory is limited in size and shared among all threads within a block. Using shared memory effectively is key to improving performance in GPU programs.\n\n### Challenges in Matrix Multiplication\n\nA simple implementation of matrix multiplication on a GPU might involve each thread computing a single element of the result matrix by directly reading the necessary elements from global memory. However, this approach can be inefficient for the following reasons:\n\n- Memory Bandwidth: Accessing global memory is relatively slow compared to the speed at which the GPU cores can perform computations. If each thread reads matrix elements directly from global memory, the memory access times can become a bottleneck.\n\n- Redundant Data Access: In matrix multiplication, many elements of the input matrices are used multiple times. If each thread fetches the required data from global memory independently, the same data might be loaded into the GPU multiple times, leading to inefficiency. For example, if each thread is used to compute a single element in the output matrix, the thread responsible for calculating the element at position (i, j) will need to load the i-th row of matrix A and the j-th column of matrix B from global memory. However, other threads, such as the one computing the element at position (i+1, j), cannot reuse this data and will have to reload the same j-th column from global memory again.\n\n### The Idea of Tiling\n\nTiling is a technique used to address these challenges, and it was mainly used in FlashAttention to improve the kernel's efficiency. The basic idea is to divide the matrices into smaller sub-matrices, called tiles, which can fit into the shared memory of the GPU. Instead of computing the entire output matrix in one go, the computation is broken down into smaller pieces that are processed tile by tile.\n\nIn the context of matrix multiplication, this means dividing matrices A and B into blocks (tiles), loading these tiles into shared memory, and then performing the multiplication on these smaller blocks. This approach allows the threads to reuse data stored in the fast shared memory, reducing the need to access global memory repeatedly.\n\nHere’s how it works:\n\n- Loading Tiles into Shared Memory: Each block of threads cooperatively loads a tile of matrix A and a corresponding tile of matrix B from global memory into shared memory. This operation is done once per tile, and then the tile is reused multiple times by the threads in the block.\n\n- Computing Partial Products: Once the tiles are loaded into shared memory, each thread computes a partial product. Since all threads in a block are working on the same tiles in shared memory, they can efficiently reuse the data without additional global memory accesses.\n\n- Accumulating Results: After computing the partial products for one tile, the threads load the next tiles from matrices A and B into shared memory and repeat the process. The results are accumulated in a register (or local memory), and once all tiles have been processed, the final value for the output matrix element is written back to global memory.\n\nTiled Matrix multiplication illustration (source https://cnugteren.github.io/tutorial/pages/page4.html)\n\nPractical Considerations\n\nWhen implementing cached tiled matrix multiplication, several factors are considered:\n\n- Tile Size: The size of the tiles should be chosen to balance the trade-off between the amount of data that can fit into shared memory and the number of global memory accesses.\n\n- Memory Coalescing: the global memory accesses are coalesced, which means that adjacent threads access adjacent memory locations.\n\n- Occupancy: The number of threads per block and the number of blocks in the grid should be chosen to ensure high occupancy, which means having as many active warps (a warp is a set of 32 threads) as possible on the GPU to hide memory latency.\n\n### Triton Kernel\n\nHere is the kernel in triton we benchmarked :\n\n```\n@triton.autotune(\n    configs=get_cuda_autotune_config(),\n    key=['M', 'N', 'K'],\n)\n@triton.jit\ndef matmul_kernel(\n        a_ptr, b_ptr, c_ptr,\n        M, N, K,\n        stride_am, stride_ak,\n        stride_bk, stride_bn, \n        stride_cm, stride_cn,\n        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  \n        GROUP_SIZE_M: tl.constexpr,\n):\n\n    pid = tl.program_id(axis=0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    num_pid_in_group = GROUP_SIZE_M * num_pid_n\n    group_id = pid // num_pid_in_group\n    first_pid_m = group_id * GROUP_SIZE_M\n    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)\n    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)\n    pid_n = (pid % num_pid_in_group) // group_size_m\n\n    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M\n    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n\n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)\n\n    for i in range(4) : \n        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n        for j in range(0, tl.cdiv(K // 4, BLOCK_SIZE_K) ):\n            k = i * tl.cdiv(K // 4, BLOCK_SIZE_K) + j \n\n            # BLOCK_SIZE_K must be a divisor of K / 4 \n            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)\n            b_uint8 = tl.load(b_ptrs, mask=offs_k[:, None] < K // 4 - j * BLOCK_SIZE_K, other=0)\n            mask = 3<<(2*i)\n            b = ((b_uint8 & mask) >> (2*i))\n\n            # We accumulate the tiles along the K dimension.\n            tensor_full = tl.full((1,), 1, dtype=tl.int8)\n\n            accumulator += tl.dot(a, (b.to(tl.int8) - tensor_full), out_dtype=tl.int32)\n\n            a_ptrs += BLOCK_SIZE_K * stride_ak\n            b_ptrs += BLOCK_SIZE_K * stride_bk\n\n    c = accumulator\n\n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]\n    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)\n    tl.store(c_ptrs, c, mask=c_mask)\n\n\ndef matmul(a, b):\n    assert a.shape[1] == b.shape[0] * 4, \"Incompatible dimensions, the weight matrix need to be packed\"\n    assert a.is_contiguous(), \"Matrix A must be contiguous\"\n    M, K = a.shape\n    _, N = b.shape\n    c = torch.empty((M, N), device=a.device, dtype=torch.float16)\n    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )\n    matmul_kernel[grid](\n        a, b, c,\n        M, N, K,\n        a.stride(0), a.stride(1),\n        b.stride(0), b.stride(1),\n        c.stride(0), c.stride(1),\n    )\n    return c\n```\n\n### Code Breakdown\n\n- Determining Tile Positions\n\nThe kernel first determines which tile (block) of the output matrix each thread block is responsible for:\n\n- pid is the unique identifier for each thread block, obtained using tl.program_id(axis=0).\n\n- The grid is divided into groups of thread blocks (GROUP_SIZE_M). Each group processes a portion of the output matrix.\n\n- pid_m and pid_n are the coordinates of the tile in the M and N dimensions, respectively.\n\n- Offsets (offs_am, offs_bn, offs_k) are calculated to determine which elements of matrices A and B each thread in the block will work on\n\n- Loading and Computing Tiles\n\nThe kernel uses a loop to iterate over the K dimension in chunks of BLOCK_SIZE_K. For each chunk:\n\n- Load Tiles: tiles from matrices A and B are loaded from global memory.\n\nUnpacking Matrix B: The kernel assumes that matrix B is packed with int8 values, meaning each element actually represents four smaller values packed into one byte. The unpacking happens within the loop:\n\n- b_uint8 is loaded from global memory as packed int8.\n\n- Each packed value is unpacked to obtain the actual weight values used for computation.\n\n- Dot Product: The kernel computes the dot product of the loaded tiles from A and B, accumulating the results in the accumulator. The accumulator stores the partial results for the tile of the output matrix C.\n\n- Storing Results\n\nAfter all tiles along the K dimension have been processed, the final results stored in the accumulator are converted to float16 and written back to the corresponding tile of matrix C in global memory. The writing process respects memory boundaries using a mask to ensure that only valid elements are written.\n\nFor a more detailed explanation of the code, checkout this PR\n\n### Benchmark\n\nWe benchmarked our kernel against the method of unpacking the weights using @torch.compile followed by performing the matmul in BF16 precision, and found that both approaches achieved approximately the same performance. To ensure accurate benchmarking, we performed the matmul operation over 2000 iterations and averaged the time taken during the last 1000 iterations, to eliminate any inefficiencies related to initial loading or compilation. Below is a graph showing the benchmark results. We also tested various matrix sizes, with the x-axis representing the number of multiplications on a log scale, and the y-axis showing the average time in ms.\n\nTriton kernel compared to torch.compile\n\nWe also tried using BitBlas, which is a software library designed to perform matrix operations with mixed precision. It helps optimize these operations by allowing calculations to be done in lower precision formats like INT8, INT4, or even INT2, instead of the traditional FP32 or FP16 formats.\n\nThe benchmark results are promising, as BitBlas outperforms both our custom kernel and Torch's matmul function in low precision, as shown in the graph.\n\nBitblas benchmark\n\nHowever, during model loading, BitBlas needs to compile kernels tailored to the shape of the weight matrix and store them in a local database, which can increase the initial loading time.\n\n## Conclusion\n\nIn conclusion, as LLMs continue to expand, reducing their computational demands through quantization is essential. This blog has explored the approach of 1.58-bit quantization, which uses ternary weights. While pre-training models in 1.58 bits is resource-intensive, we’ve demonstrated that, with some tricks, it’s possible to fine-tune existing models to this precision level, achieving efficient performance without sacrificing accuracy. By optimizing inference speed through specialized kernels, BitNet opens new possibilities for making LLMs more practical and scalable.\n\n## Acknowledgements\n\nWe would like to express our sincere gratitude to Leandro von Werra, Thomas Wolf, and Marc Sun for their invaluable assistance and insights throughout this project. We also extend our thanks to Omar Sanseviero and Pedro Cuenca for their contributions in refining this blog post, helping to communicate our findings clearly and effectively to the AI community. Furthermore, we want to acknowledge the GeneralAI team for their pioneering work on the BitNet project. Their research has been foundational to our efforts, and we are particularly grateful for the clear and precise figures provided in their paper.\n\n## Additional Resources\n\n- H. Wang et al., BitNet: Scaling 1-bit Transformers for Large Language Models. arxiv paper\n\n- S. Ma et al., The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits. arxiv paper\n\n- S. Ma et al., The Era of 1-bit LLMs: Training Tips, Code and FAQ. link\n\n- RJ. Honicky, Are All Large Language Models Really in 1.58 Bits?. blogpost\n\n- L. Mao, CUDA Matrix Multiplication Optimization. blogpost\n\n- Tutorial: OpenCL SGEMM tuning for Kepler. link\n\n- CUDAMODE. github, youtube\n\n- Wen-mei W. Hwu, David B. Kirk, Izzat El Hajj, Programming Massively Parallel Processors : A Hands-on Approach",
   "summaryZh": "针对大模型高昂的计算和存储成本，Hugging Face探讨了如何将现有的Transformer模型微调至采用1.58bit（三值权重-1, 0, 1）的BitNet架构，为极低比特量化提供了可行的技术途径。",
   "summaryGeneratedAt": "2026-09-05T15:33:54.898658Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +54,2150 @@
     "summaryZh": "针对大模型高昂的计算和存储成本，Hugging Face探讨了如何将现有的Transformer模型微调至采用1.58bit（三值权重-1, 0, 1）的BitNet架构，为极低比特量化提供了可行的技术途径。",
     "glossary": [],
     "duplicateKey": "huggingface-finetuning-1-58bit"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/matmulfree.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/matmulfree.png",
+      "alt": "The new computation paradigm of BitNet b1.58",
+      "id": "image_65271b5d7c70419f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/energy_consumption.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/energy_consumption.png",
+      "alt": "Energy consumption of BitNet b1.58 compared to LLaMA",
+      "id": "image_ea19d584cf4f075c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/bitlinear.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/bitlinear.png",
+      "alt": "The architecture of BitNet with BitLinear layers",
+      "id": "image_57202bd6970a1f31"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/pre-training.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/pre-training.png",
+      "alt": "Pre-training plots without (blue) & with (green) layer normalisation",
+      "id": "image_0998af0384fd9e0b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/finetuning_basic.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/finetuning_basic.png",
+      "alt": "Fine-tuning plot compared to pre-training plot",
+      "id": "image_67ee64cc09cd2d6f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/poids_aléatoires.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/poids_aléatoires.png",
+      "alt": "Random weights distribution (2 merged stds)",
+      "id": "image_5c5f1477b3492f1b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/poids_llama3.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/poids_llama3.png",
+      "alt": "Pre-trained Llama3 weights distribution",
+      "id": "image_9bad3265186b79c0"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/scales_random.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/scales_random.png",
+      "alt": "Random weights scales distribution",
+      "id": "image_8547dae8e393df1c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/scales_llama3.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/scales_llama3.png",
+      "alt": "Pre-trained Llama3 weights distribution",
+      "id": "image_13eafd1460234f84"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/lambda_0.25.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/lambda_0.25.png",
+      "alt": "Fine-tuning plot with lambda = 0.25->0.5->0.75->1",
+      "id": "image_219881bae3984a09"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/lambda_training_step.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/lambda_training_step.png",
+      "alt": "Fine-tuning plot with lambda = min(2*training_step/total_training_steps, 1)",
+      "id": "image_8a89d85666c3b3f4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/fineweb-edu.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/fineweb-edu.png",
+      "alt": "Fine-tuning plot with warmup quantization on Fineweb-edu",
+      "id": "image_9b2054fc72b9764a"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp_scheduler.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp_scheduler.png",
+      "alt": "Exponential scheduler for different k values",
+      "id": "image_4c2ddb8180e4951d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp_scheduler_results.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp_scheduler_results.png",
+      "alt": "Fine-tuning plots with exponential scheduler",
+      "id": "image_7c4fa7f68996cef5"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/sig_scheduler.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/sig_scheduler.png",
+      "alt": "Sigmoid scheduler for different k values",
+      "id": "image_160afe6ae172567b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/sig_scheduler_exps.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/sig_scheduler_exps.png",
+      "alt": "Finetuning plots with sigmoid scheduler",
+      "id": "image_ee78826df6061f1b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp-randoms.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/exp-randoms.png",
+      "alt": "Different Pre-training plots with different learning rates",
+      "id": "image_fbaafe07532e1b06"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_100B.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_100B.png",
+      "alt": "Metrics evaluations during the training for different lrs",
+      "id": "image_6e87484cbd6942dc"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metric_avg.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metric_avg.png",
+      "alt": "Average evaluation during the training for different lrs",
+      "id": "image_6df06305de8bd534"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/smol_llm_exp.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/smol_llm_exp.png",
+      "alt": "Smoll LLm fine-tuning experiment with & without warmup quantization",
+      "id": "image_ba9e4fd2fd6a2555"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_comparison_updated.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_comparison_updated.png",
+      "alt": "Metrics comparison with Llama models",
+      "id": "image_1f3842fcd464c8d7"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_100B_table.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/metrics_100B_table.png",
+      "alt": "Metrics comparison with Llama models for the model trained on 100B tokens",
+      "id": "image_9329c52626ddd299"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/illustration_tiling.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/illustration_tiling.png",
+      "alt": "Tiled Matrix multiplication illustration",
+      "id": "image_5b895e1c8423c682"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/without_bitblas.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/without_bitblas.png",
+      "alt": "Triton kernel compared to torch.compile",
+      "id": "image_c3efd7b927c8ba1b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/with_bitblas.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/1.58llm_extreme_quantization/with_bitblas.png",
+      "alt": "Bitblas benchmark",
+      "id": "image_e15ae6ee08efecf1"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "As Large Language Models (LLMs) grow in size and complexity, finding ways to reduce their computational and energy costs has become a critical challenge. One popular solution is quantization, where the precision of parameters is reduced from the standard 16-bit floating-point (FP16) or 32-bit floating-point (FP32) to lower-bit formats like 8-bit or 4-bit. While this approach significantly cuts down on memory usage and speeds up computation, it often comes at the expense of accuracy. Reducing the precision too much can cause models to lose crucial information, resulting in degraded performance.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "BitNet is a special transformers architecture that represents each parameter with only three values: (-1, 0, 1), offering a extreme quantization of just 1.58 ( log2(3) log_2(3) log2​(3) ) bits per parameter. However, it requires to train a model from scratch. While the results are impressive, not everybody has the budget to pre-train an LLM. To overcome this limitation, we explored a few tricks that allow fine-tuning an existing model to 1.58 bits! Keep reading to find out how !",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2402.17764"
+        },
+        {
+          "start": 101,
+          "end": 111,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "TL;DR",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#tldr"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "What is BitNet in More Depth?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#what-is-bitnet-in-more-depth"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Pre-training Results in 1.58b",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#pre-training-results-in-158b"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Fine-tuning in 1.58b",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#fine-tuning-in-158bit"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Kernels used & Benchmarks",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#kernels-used--benchmarks"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Conclusion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#conclusion"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Acknowledgements",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#acknowledgements"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Additional Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/1_58_llm_extreme_quantization#additional-resources"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "TL;DR",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "BitNet is an architecture introduced by Microsoft Research that uses extreme quantization, representing each parameter with only three values: -1, 0, and 1. This results in a model that uses just 1.58 bits per parameter, significantly reducing computational and memory requirements.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2402.17764"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "This architecture uses INT8 addition calculations when performing matrix multiplication, in contrast to LLaMA LLM's FP16 addition and multiplication operations.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "The new computation paradigm of BitNet b1.58 (source: BitNet paper https://arxiv.org/abs/2402.17764)",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "This results in a theoretically reduced energy consumption, with BitNet b1.58 saving 71.4 times the arithmetic operations energy for matrix multiplication compared to the Llama baseline.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Energy consumption of BitNet b1.58 compared to LLama (source: BitNet paper https://arxiv.org/abs/2402.17764)",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "We have successfully fine-tuned a Llama3 8B model using the BitNet architecture, achieving strong performance on downstream tasks. The 8B models we developed are released under the HF1BitLLM organization. Two of these models were fine-tuned on 10B tokens with different training setup, while the third was fine-tuned on 100B tokens. Notably, our models surpass the Llama 1 7B model in MMLU benchmarks.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 49,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct"
+        },
+        {
+          "start": 181,
+          "end": 190,
+          "kind": "a",
+          "href": "https://huggingface.co/HF1BitLLM"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "How to Use with Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "To integrate the BitNet architecture into Transformers, we introduced a new quantization method called \"bitnet\" (PR). This method involves replacing the standard Linear layers with specialized BitLinear layers that are compatible with the BitNet architecture, with appropriate dynamic quantization of activations, weight unpacking, and matrix multiplication.",
+      "spans": [
+        {
+          "start": 113,
+          "end": 115,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/33410"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Loading and testing the model in Transformers is incredibly straightforward, there are zero changes to the API:",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "With this code, everything is managed seamlessly behind the scenes, so there's no need to worry about additional complexities, you just need to install the latest version of transformers.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "For a quick test of the model, check out this notebook",
+      "spans": [
+        {
+          "start": 46,
+          "end": 54,
+          "kind": "a",
+          "href": "https://colab.research.google.com/drive/1ovmQUOtnYIdvcBkwEE4MzVL1HKfFHdNT?usp=sharing"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "What is BitNet In More Depth?",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "BitNet replaces traditional Linear layers in Multi-Head Attention and Feed-Forward Networks with specialized layers called BitLinear that use ternary precision (or even binary, in the initial version). The BitLinear layers we use in this project quantize the weights using ternary precision (with values of -1, 0, and 1), and we quantize the activations to 8-bit precision. We use a different implementation of BitLinear for training than we do for inference, as we'll see in the next section.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2402.17764"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "The main obstacle to training in ternary precision is that the weight values are discretized (via the round() function) and thus non-differentiable. BitLinear solves this with a nice trick: STE (Straight Through Estimator). The STE allows gradients to flow through the non-differentiable rounding operation by approximating its gradient as 1 (treating round() as equivalent to the identity function). Another way to view it is that, instead of stopping the gradient at the rounding step, the STE lets the gradient pass through as if the rounding never occurred, enabling weight updates using standard gradient-based optimization techniques.",
+      "spans": [
+        {
+          "start": 102,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 190,
+          "end": 222,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1903.05662"
+        },
+        {
+          "start": 352,
+          "end": 359,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The architecture of BitNet with BitLinear layers (source: BitNet paper https://arxiv.org/pdf/2310.11453)",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Training",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "We train in full precision, but quantize the weights into ternary values as we go, using symmetric per tensor quantization. First, we compute the average of the absolute values of the weight matrix and use this as a scale. We then divide the weights by the scale, round the values, constrain them between -1 and 1, and finally rescale them to continue in full precision.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "scalew=11nm∑ij∣Wij∣ scale_w = \\frac{1}{\\frac{1}{nm} \\sum_{ij} |W_{ij}|} scalew​=nm1​∑ij​∣Wij​∣1​",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Wq=clamp[−1,1](round(W∗scale)) W_q = \\text{clamp}_{[-1,1]}(\\text{round}(W*scale)) Wq​=clamp[−1,1]​(round(W∗scale))",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Wdequantized=Wq∗scalew W_{dequantized} = W_q*scale_w Wdequantized​=Wq​∗scalew​",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Activations are then quantized to a specified bit-width (8-bit, in our case) using absmax per token quantization (for a comprehensive introduction to quantization methods check out this post). This involves scaling the activations into the range [−128, 127] for an 8-bit bit-width. The quantization formula is:",
+      "spans": [
+        {
+          "start": 186,
+          "end": 190,
+          "kind": "a",
+          "href": "https://mlabonne.github.io/blog/posts/Introduction_to_Weight_Quantization.html"
+        },
+        {
+          "start": 246,
+          "end": 257,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "scalex=127∣X∣max, dim=−1 scale_x = \\frac{127}{|X|_{\\text{max}, \\, \\text{dim}=-1}} scalex​=∣X∣max,dim=−1​127​",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Xq=clamp[−128,127](round(X∗scale)) X_q = \\text{clamp}_{[-128,127]}(\\text{round}(X*scale)) Xq​=clamp[−128,127]​(round(X∗scale))",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Xdequantized=Xq∗scalex X_{dequantized} = X_q * scale_x Xdequantized​=Xq​∗scalex​",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "To make the formulas clearer, here are examples of weight and activation quantization using a 3x3 matrix:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Example 1: Weight Matrix Quantization",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Let the weight matrix ( W ) be:",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "W=[0.8−0.51.2−1.50.4−0.91.3−0.70.2] W = \\begin{bmatrix} 0.8 & -0.5 & 1.2 \\\\ -1.5 & 0.4 & -0.9 \\\\ 1.3 & -0.7 & 0.2 \\end{bmatrix} W=​0.8−1.51.3​−0.50.4−0.7​1.2−0.90.2​​",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Step 1: Compute the Scale for Weights",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Using the formula:",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "scalew=11nm∑ij∣Wij∣ scale_w = \\frac{1}{\\frac{1}{nm} \\sum_{ij} |W_{ij}|} scalew​=nm1​∑ij​∣Wij​∣1​",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "we calculate the average absolute value of ( W ):",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "1nm∑ij∣Wij∣=19(0.8+0.5+1.2+1.5+0.4+0.9+1.3+0.7+0.2)=19(7.5)=0.8333 \\frac{1}{nm} \\sum_{ij} |W_{ij}| = \\frac{1}{9}(0.8 + 0.5 + 1.2 + 1.5 + 0.4 + 0.9 + 1.3 + 0.7 + 0.2) = \\frac{1}{9}(7.5) = 0.8333 nm1​∑ij​∣Wij​∣=91​(0.8+0.5+1.2+1.5+0.4+0.9+1.3+0.7+0.2)=91​(7.5)=0.8333",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Now, the scale factor is:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "scalew=10.8333≈1.2 scale_w = \\frac{1}{0.8333} \\approx 1.2 scalew​=0.83331​≈1.2",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Step 2: Quantize the Weight Matrix",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Using the formula:",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Wq=clamp[−1,1](round(W×scalew)) W_q = \\text{clamp}_{[-1, 1]}(\\text{round}(W \\times scale_w)) Wq​=clamp[−1,1]​(round(W×scalew​))",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "We first scale the weights by scalew≈1.2 scale_w \\approx 1.2 scalew​≈1.2:",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "W×scalew=[0.8×1.2−0.5×1.21.2×1.2−1.5×1.20.4×1.2−0.9×1.21.3×1.2−0.7×1.20.2×1.2]=[0.96−0.61.44−1.80.48−1.081.56−0.840.24] W \\times scale_w = \\begin{bmatrix} 0.8 \\times 1.2 & -0.5 \\times 1.2 & 1.2 \\times 1.2 \\\\ -1.5 \\times 1.2 & 0.4 \\times 1.2 & -0.9 \\times 1.2 \\\\ 1.3 \\times 1.2 & -0.7 \\times 1.2 & 0.2 \\times 1.2 \\end{bmatrix} = \\begin{bmatrix} 0.96 & -0.6 & 1.44 \\\\ -1.8 & 0.48 & -1.08 \\\\ 1.56 & -0.84 & 0.24 \\end{bmatrix} W×scalew​=​0.8×1.2−1.5×1.21.3×1.2​−0.5×1.20.4×1.2−0.7×1.2​1.2×1.2−0.9×1.20.2×1.2​​=​0.96−1.81.56​−0.60.48−0.84​1.44−1.080.24​​",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Next, we round the values and clamp them to the range [−1,1] [-1, 1] [−1,1]:",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Wq=[1−11−10−11−10] W_q = \\begin{bmatrix} 1 & -1 & 1 \\\\ -1 & 0 & -1 \\\\ 1 & -1 & 0 \\end{bmatrix} Wq​=​1−11​−10−1​1−10​​",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Step 3: Dequantize the Weights",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Finally, we dequantize the weights using:",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "Wdequantized=Wq×scalew W_{dequantized} = W_q \\times scale_w Wdequantized​=Wq​×scalew​",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Substituting scale_w, we get:",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Wdequantized=[1×1.2−1×1.21×1.2−1×1.20×1.2−1×1.21×1.2−1×1.20×1.2]=[1.2−1.21.2−1.20−1.21.2−1.20] W_{dequantized} = \\begin{bmatrix} 1 \\times 1.2 & -1 \\times 1.2 & 1 \\times 1.2 \\\\ -1 \\times 1.2 & 0 \\times 1.2 & -1 \\times 1.2 \\\\ 1 \\times 1.2 & -1 \\times 1.2 & 0 \\times 1.2 \\end{bmatrix} = \\begin{bmatrix} 1.2 & -1.2 & 1.2 \\\\ -1.2 & 0 & -1.2 \\\\ 1.2 & -1.2 & 0 \\end{bmatrix} Wdequantized​=​1×1.2−1×1.21×1.2​−1×1.20×1.2−1×1.2​1×1.2−1×1.20×1.2​​=​1.2−1.21.2​−1.20−1.2​1.2−1.20​​",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Example 2: Activation Matrix Quantization",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Let the activation matrix ( X ) be:",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "X=[1.0−0.60.7−0.90.4−1.20.8−0.50.3] X = \\begin{bmatrix} 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 \\end{bmatrix} X=​1.0−0.90.8​−0.60.4−0.5​0.7−1.20.3​​",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Step 1: Compute the Scale for Activations",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "For each row (or channel), compute the maximum absolute value:",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Row 1: Maximum absolute value = 1.0",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Row 2: Maximum absolute value = 1.2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "Row 3: Maximum absolute value = 0.8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Compute the scale factors for each row:",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "scale=[1271.01271.21270.8]=[127105.83158.75] \\text{scale} = \\begin{bmatrix} \\frac{127}{1.0} \\\\ \\frac{127}{1.2} \\\\ \\frac{127}{0.8} \\end{bmatrix} = \\begin{bmatrix} 127 \\\\ 105.83 \\\\ 158.75 \\end{bmatrix} scale=​1.0127​1.2127​0.8127​​​=​127105.83158.75​​",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Step 2: Quantize the Activation Matrix",
+      "spans": [
+        {
+          "start": 0,
+          "end": 38,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "Using the formula:",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Xq=clamp[−128,127](round(X×scale)) X_q = \\text{clamp}_{[-128,127]}(\\text{round}(X \\times \\text{scale})) Xq​=clamp[−128,127]​(round(X×scale))",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "Scale the activations:",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "X×scale=[1.0×127−0.6×1270.7×127−0.9×105.830.4×105.83−1.2×105.830.8×158.75−0.5×158.750.3×158.75]=[127−76.288.9−95.242.3−127127−79.447.6] X \\times \\text{scale} = \\begin{bmatrix} 1.0 \\times 127 & -0.6 \\times 127 & 0.7 \\times 127 \\\\ -0.9 \\times 105.83 & 0.4 \\times 105.83 & -1.2 \\times 105.83 \\\\ 0.8 \\times 158.75 & -0.5 \\times 158.75 & 0.3 \\times 158.75 \\end{bmatrix} = \\begin{bmatrix} 127 & -76.2 & 88.9 \\\\ -95.2 & 42.3 & -127 \\\\ 127 & -79.4 & 47.6 \\end{bmatrix} X×scale=​1.0×127−0.9×105.830.8×158.75​−0.6×1270.4×105.83−0.5×158.75​0.7×127−1.2×105.830.3×158.75​​=​127−95.2127​−76.242.3−79.4​88.9−12747.6​​",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Round the values and clamp them to the range [−128,127][-128, 127] [−128,127]:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Xq=[127−7689−9542−127127−7948] X_q = \\begin{bmatrix} 127 & -76 & 89 \\\\ -95 & 42 & -127 \\\\ 127 & -79 & 48 \\end{bmatrix} Xq​=​127−95127​−7642−79​89−12748​​",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Step 3: Dequantize the Activations",
+      "spans": [
+        {
+          "start": 0,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "Finally, dequantize the activations using:",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "Xdequantized=Xq×1scale X_{dequantized} = X_q \\times \\frac{1}{\\text{scale}} Xdequantized​=Xq​×scale1​",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "Substituting the scales:",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "Xdequantized=[127×1127−76×112789×1127−95×1105.8342×1105.83−127×1105.83127×1158.75−79×1158.7548×1158.75]=[1.0−0.60.7−0.90.4−1.20.8−0.50.3] X_{dequantized} = \\begin{bmatrix} 127 \\times \\frac{1}{127} & -76 \\times \\frac{1}{127} & 89 \\times \\frac{1}{127} \\\\ -95 \\times \\frac{1}{105.83} & 42 \\times \\frac{1}{105.83} & -127 \\times \\frac{1}{105.83} \\\\ 127 \\times \\frac{1}{158.75} & -79 \\times \\frac{1}{158.75} & 48 \\times \\frac{1}{158.75} \\end{bmatrix} = \\begin{bmatrix} 1.0 & -0.6 & 0.7 \\\\ -0.9 & 0.4 & -1.2 \\\\ 0.8 & -0.5 & 0.3 \\end{bmatrix} Xdequantized​=​127×1271​−95×105.831​127×158.751​​−76×1271​42×105.831​−79×158.751​​89×1271​−127×105.831​48×158.751​​​=​1.0−0.90.8​−0.60.4−0.5​0.7−1.20.3​​",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "We apply Layer Normalization (LN) before quantizing the activations to maintain the variance of the output:",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "LN(x)=x−E(x)Var(x)+ϵ \\text{LN}(x) = \\frac{x - E(x)}{\\sqrt{\\text{Var}(x) + \\epsilon}} LN(x)=Var(x)+ϵ​x−E(x)​",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "where ϵ is a small number to prevent overflow.",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "The round() function is not differentiable, as mentioned before. We use detach() as a trick to implement a differentiable straight-through estimator in the backward pass:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 72,
+          "end": 80,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "During inference, we simply quantize the weights to ternary values without rescaling. We apply the same approach to activations using 8-bit precision, then perform a matrix multiplication with an efficient kernel, followed by dividing by both the weight and activation scales. This should significantly improve inference speed, particularly with optimized hardware. You can see that the rescaling process differs during training, as matrix multiplications are kept in fp16/bf16/fp32 for proper training.",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Pre-training Results in 1.58b",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Before attempting fine-tuning, we first tried to reproduce the results of the BitNet paper with pre-training. We started with a small dataset, tinystories, and a Llama3 8B model. We confirmed that adding a normalization function, like the paper does, improves performance. For example, after 2000 steps of training, we had a perplexity on the validation set equal to 6.3 without normalization, and 5.9 with normalization. Training was stable in both cases.",
+      "spans": [
+        {
+          "start": 143,
+          "end": 154,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/roneneldan/TinyStories"
+        },
+        {
+          "start": 162,
+          "end": 177,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Pre-training plots without (blue) & with (orange) layer normalisation",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "While this approach looks very interesting for pre-training, only a few institutions can afford doing it at the necessary scale. However, there is already a wide range of strong pretrained models, and it would be extremely useful if they could be converted to 1.58bit after pre-training. Other groups had reported that fine-tuning results were not as strong as those achieved with pre-training, so we set out on an investigation to see if we could make 1.58 fine-tuning work.",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "Fine-tuning in 1.58bit",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "When we began fine-tuning from the pre-trained Llama3 8B weights, the model performed slightly better but not as well as we expected.",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "Note: All our experiments were conducted using Nanotron. If you're interested in trying 1.58bit pre-training or fine-tuning, you can check out this PR.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 47,
+          "end": 55,
+          "kind": "a",
+          "href": "https://github.com/huggingface/nanotron"
+        },
+        {
+          "start": 148,
+          "end": 150,
+          "kind": "a",
+          "href": "https://github.com/huggingface/nanotron/pull/180"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "Fine-tuning plot compared to pre-training plot",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "To understand why, we tried to inspect both the weight distributions of the randomly initialized model and the pre-trained model to identify potential issues.",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "Random weights distribution (2 merged stds)",
+      "spans": []
+    },
+    {
+      "id": "b0098",
+      "source": "Pre-trained Llama3 weights distribution",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "And the scale values for the two distributions are, respectively :",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "Random weights scales distribution",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "Pre-trained Llama3 weights distribution",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "The initial random weight distribution is a mix of two normal distributions:",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "One with a standard deviation (std) of 0.025 0.025 0.025",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "Another with a std of 0.0252⋅num_hidden_layers=0.00325 \\frac{0.025}{\\sqrt{2 \\cdot \\text{num\\_hidden\\_layers}}} = 0.00325 2⋅num_hidden_layers​0.025​=0.00325",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "This results from using different stds for column linear and row linear weights in nanotron. In the quantized version, all matrices have only 2 weight scales (50.25 and 402), which are the inverse of the mean absolute value of the weights for each matrix: scale = 1.0 / w.abs().mean().clamp_(min=1e-5)",
+      "spans": [
+        {
+          "start": 83,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 256,
+          "end": 301,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0106",
+      "source": "For scale=50.25\\text{scale} = 50.25 scale=50.25, w.abs().mean()=0.0199 w.abs().mean() = 0.0199 w.abs().mean()=0.0199, leading to std=0.025\\text{std} = 0.025 std=0.025 which matches our first standard deviation. The formula used to derive the std is based on the expectation of the half-normal distribution of ∣w∣ |w| ∣w∣: E(∣w∣)=std(w)⋅2π \\mathbb{E}(|w|) = \\text{std}(w) \\cdot \\sqrt{\\frac{2}{\\pi}} E(∣w∣)=std(w)⋅π2​​",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "For scale=402 \\text{scale} = 402 scale=402, w.abs().mean()=0.0025 w.abs().mean() = 0.0025 w.abs().mean()=0.0025, leading to std=0.00325\\text{std} = 0.00325 std=0.00325",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "On the other hand, the pretrained weight's distribution looks like a normal distribution with an std=0.013 \\text{std} = 0.013 std=0.013",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "Clearly, the pretrained model starts with more information (scales), while the randomly initialized model starts with practically no information and adds to it over time. Our conclusion was that starting with random weights gives the model minimal initial information, enabling a gradual learning process, while during fine-tuning, the introduction of BitLinear layers overwhelms the model into losing all its prior information.",
+      "spans": []
+    },
+    {
+      "id": "b0110",
+      "source": "To improve the fine-tuning results, we tried different techniques. For example, instead of using per-tensor quantization, we tried per-row and per-column quantization to keep more information from the Llama 3 weights. We also tried to change the way the scale is computed: instead of just taking the mean absolute value of the weights as a scale, we take the mean absolute value of the outliers as a scale (an outlier value is a value that exceeds k*mean_absolute_value, where k is a constant we tried to vary in our experiments), but we didn’t notice big improvements.",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "We observed that both the random weights and the Llama 3 weights resulted in losses starting at approximately the same value of 13. This suggests that the Llama 3 model loses all of its prior information when quantization is introduced. To further investigate how much information the model loses during this process, we experimented with per-group quantization.",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "As a sanity check, we first set the group size to 1, which essentially means no quantization. In this scenario, the loss started at 1.45, same as we see during normal fine-tuning. However, when we increased the group size to 2, the loss jumped to around 11. This indicates that even with a minimal group size of 2, the model still loses nearly all of its information.",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "To address this issue, we considered the possibility of introducing quantization gradually rather than applying it abruptly to the weights and activations for each tensor. To achieve this, we implemented a lambda value to control the process :",
+      "spans": []
+    },
+    {
+      "id": "b0114",
+      "source": "When lambda is set to 0, there is essentially no quantization occurring, while at lambda=1, full quantization is applied.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 82,
+          "end": 90,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0115",
+      "source": "We initially tested some discrete lambda values, such as 0.25, 0.5, 0.75, and 1. However, this approach did not lead to any significant improvement in results, mainly because lambda=0.25 is already high enough for the loss to start very high.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 175,
+          "end": 186,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0116",
+      "source": "Fine-tuning plot with lambda = 0.25->0.5->0.75->1",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "As a result, we decided to experiment with a lambda value that adjusts dynamically based on the training step.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "Using this dynamic lambda value led to better loss convergence, but the perplexity (ppl) results during inference, when lambda was set to 1, were still far from satisfactory. We realized this was likely because the model hadn't been trained long enough with lambda=1. To address this, we adjusted our lambda value to improve the training process.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 120,
+          "end": 126,
+          "kind": "code"
+        },
+        {
+          "start": 258,
+          "end": 266,
+          "kind": "code"
+        },
+        {
+          "start": 301,
+          "end": 307,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0119",
+      "source": "With this configuration, after 2000 steps we have :",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Fine-tuning plot with lambda = min(2*training_step/total_training_steps, 1)",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "Our fine-tuning method shows better convergence overall. You can observe a slight increase in the loss curve around 1,000 steps, which corresponds to when we begin approaching lambda=1, or full quantization. However, immediately after this point, the loss starts to converge again, leading to an improved perplexity of approximately 4.",
+      "spans": [
+        {
+          "start": 176,
+          "end": 184,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "Despite this progress, when we tested the quantized model on the WikiText dataset (instead of the tinystories one we used for fine-tuning), it showed a very high perplexity. This suggests that fine-tuning the model in low-bit mode on a specific dataset causes it to lose much of its general knowledge. This issue might arise because the minimal representations we aim for with ternary weights can vary significantly from one dataset to another. To address this problem, we scaled our training process to include the larger FineWeb-edu dataset. We maintained a lambda value of:",
+      "spans": [
+        {
+          "start": 523,
+          "end": 534,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/HuggingFaceFW/fineweb"
+        },
+        {
+          "start": 560,
+          "end": 566,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0123",
+      "source": "We chose this lambda value because it seemed to be a good starting point for warming up the model. We then trained the model using a learning rate of 1e-4 for 5,000 steps on the FineWeb-edu dataset. The training involved a batch size (BS) of 2 million, totaling 10 billion tokens.",
+      "spans": [
+        {
+          "start": 14,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "Finding the right learning rate and the right decay was challenging; it seems to be a crucial factor in the model's performance.",
+      "spans": []
+    },
+    {
+      "id": "b0125",
+      "source": "Fine-tuning plot with warmup quantization on Fineweb-edu",
+      "spans": []
+    },
+    {
+      "id": "b0126",
+      "source": "After the fine-tuning process on Fineweb-Edu, the perplexity on the WikiText dataset reached 12.2, which is quite impressive given that we only used 10 billion tokens. The other evaluation metrics also show strong performance considering the limited amount of data (see results).",
+      "spans": []
+    },
+    {
+      "id": "b0127",
+      "source": "We also tried to smooth out the sharp increase when lambda approaches 1. To do this, we considered using lambda schedulers that grow exponentially at first, then level off as they get closer to 1.",
+      "spans": []
+    },
+    {
+      "id": "b0128",
+      "source": "for different k values, with a number of total warmup steps of 1, we have plots like the following :",
+      "spans": []
+    },
+    {
+      "id": "b0129",
+      "source": "Exponential scheduler for different k values",
+      "spans": []
+    },
+    {
+      "id": "b0130",
+      "source": "We ran 4 experiments using the best-performing learning rate of 1e-4, testing values of k in [4, 6, 8, 10].",
+      "spans": []
+    },
+    {
+      "id": "b0131",
+      "source": "Fine-tuning plots with exponential scheduler",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "The smoothing worked well, as there's no spike like with the linear scheduler. However, the perplexity isn't great, staying around ~15, and the performance on downstream tasks is not better.",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "We also noticed the spike at the beginning, which the model struggled to recover from. With lambda = 0, there's essentially no quantization, so the loss starts low, around ~2. But right after the first step, there's a spike, similar to what happened with the linear scheduler (as seen in the blue plot above). So, we tried a different scheduler—a sigmoid one—that starts slowly, rises sharply to 1, and then levels off as it approaches 1.",
+      "spans": []
+    },
+    {
+      "id": "b0134",
+      "source": "For different k values we have the following curves :",
+      "spans": []
+    },
+    {
+      "id": "b0135",
+      "source": "Sigmoid scheduler for different k values",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "We ran 5 experiments this time with k in [15, 20, 25, 40, 100] :",
+      "spans": []
+    },
+    {
+      "id": "b0137",
+      "source": "Fine-tuning plots with sigmoid scheduler",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "The sharp increase in lambda caused instability around the 500th step and didn’t fix the first divergence issue. However, for k=100 k = 100 k=100, we observed some improvement in downstream tasks (see the results table), although perplexity remained around ~13.5. Despite this, it didn’t show a clear performance boost over a linear scheduler.",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "Additionally, we experimented with training models from scratch using random weights and various learning rates. This allowed us to compare the effectiveness of our fine-tuning approach against traditional pre-training methods.",
+      "spans": []
+    },
+    {
+      "id": "b0140",
+      "source": "Different Pre-training plots with different learning rates",
+      "spans": []
+    },
+    {
+      "id": "b0141",
+      "source": "None of the models trained from random weights performed better than our fine-tuned model. The best perplexity we achieved with those models was 26, which falls short compared to the results from our fine-tuning approach.",
+      "spans": []
+    },
+    {
+      "id": "b0142",
+      "source": "Scaling to 100B Tokens !",
+      "spans": []
+    },
+    {
+      "id": "b0143",
+      "source": "We scaled our experiments to 100 billion tokens to see if we could match the performance of Llama 3 8B. We conducted longer training runs, starting from our best-performing checkpoint from the shorter runs with the linear scheduler, and continued fine-tuning for 45,000 steps. We experimented with different learning rates, and while the model performed closely to the Llama 3 model in some metrics, on average, it still lagged behind.",
+      "spans": []
+    },
+    {
+      "id": "b0144",
+      "source": "Here are some examples of the metrics we evaluated at various checkpoints during the training :",
+      "spans": []
+    },
+    {
+      "id": "b0145",
+      "source": "Metrics evaluations during the training for different lrs",
+      "spans": []
+    },
+    {
+      "id": "b0146",
+      "source": "and the average score looks like :",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "Average evaluation during the training for different lrs",
+      "spans": []
+    },
+    {
+      "id": "b0148",
+      "source": "Experiments on Smaller Models",
+      "spans": []
+    },
+    {
+      "id": "b0149",
+      "source": "In our initial experiments with smaller models like SmolLM, we observed that the warmup quantization technique didn’t yield as much improvement as it did with larger models. This suggests that the effectiveness of warmup quantization could be more closely related to model size and complexity.",
+      "spans": []
+    },
+    {
+      "id": "b0150",
+      "source": "For example, here are the loss curves for the SmolLM 135M model, comparing warmup quantization with full quantization from the start. Interestingly, the curves closely align, and the resulting perplexities aren't significantly different.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 57,
+          "kind": "a",
+          "href": "https://huggingface.co/HuggingFaceTB/SmolLM-135M"
+        }
+      ]
+    },
+    {
+      "id": "b0151",
+      "source": "Smoll LLm fine-tuning experiment with & without warmup quantization",
+      "spans": []
+    },
+    {
+      "id": "b0152",
+      "source": "Results & Comparison",
+      "spans": []
+    },
+    {
+      "id": "b0153",
+      "source": "BitNet is effective in delivering strong performance compared to baseline methods, especially at lower bit levels. According to the paper, BitNet achieves scores that are on par with 8-bit models but with significantly lower inference costs. In the case of 4-bit models, methods that only quantize weights outperform those that quantize both weights and activations, as activations are harder to quantify. However, BitNet, which uses 1.58-bit weights, surpasses both weight-only and weight-and-activation quantization methods.",
+      "spans": []
+    },
+    {
+      "id": "b0154",
+      "source": "The table below presents the results for various metrics after the 10B fine-tuning process of Llama3 8B. These results are compared against those from other model architectures to provide a comprehensive overview of performance (All evaluations were conducted using Lighteval on the Nanotron format model)",
+      "spans": [
+        {
+          "start": 266,
+          "end": 275,
+          "kind": "a",
+          "href": "https://github.com/huggingface/lighteval"
+        },
+        {
+          "start": 283,
+          "end": 291,
+          "kind": "a",
+          "href": "https://github.com/huggingface/nanotron"
+        }
+      ]
+    },
+    {
+      "id": "b0155",
+      "source": "Metrics comparison with Llama models : Linear means Linear lambda scheduler, and Sigmoid means Sigmoid lambda scheduler (in our case k = 100)",
+      "spans": []
+    },
+    {
+      "id": "b0156",
+      "source": "After fine-tuning on just 10 billion tokens using ternary weights, the model demonstrates impressive performance, especially when compared to other models that underwent much more extensive training. For instance, it outperforms the Bitnet 7B model, which was trained on a significantly larger dataset of 100 billion tokens. Additionally, it performs better than the FBI LLM (Fully Binarized LLM), a model that was distilled on an even more massive 1.26 trillion tokens. This highlights the model's efficiency and effectiveness despite the relatively smaller scale of its fine-tuning process.",
+      "spans": []
+    },
+    {
+      "id": "b0157",
+      "source": "For the 100B tokens experiments, the best performing checkpoint we had is the following :",
+      "spans": []
+    },
+    {
+      "id": "b0158",
+      "source": "Metrics comparison with Llama models for the model trained on 100B tokens",
+      "spans": []
+    },
+    {
+      "id": "b0159",
+      "source": "To replicate these results, you can check out this PR to convert models to nanotron format, unpack the weights (check the function unpack_weights), and use lighteval",
+      "spans": [
+        {
+          "start": 51,
+          "end": 53,
+          "kind": "a",
+          "href": "https://github.com/huggingface/nanotron/pull/174"
+        },
+        {
+          "start": 131,
+          "end": 145,
+          "kind": "a",
+          "href": "https://gist.github.com/MekkCyber/78c1532e8767e8da0588b778faf61866"
+        }
+      ]
+    },
+    {
+      "id": "b0160",
+      "source": "Note that even though the models are fine-tuned from an Instruct-tuned model, they still need to be fine-tuned using an Instruct dataset as well. These can be considered base models.",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "Custom Kernels & Benchmarks",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "To benefit from the BitNet low-precision weights, we pack them into an int8 tensor (this makes the number of parameters go from 8B to 2.8B!). During inference, these weights must be unpacked before performing matrix multiplication. We implemented custom kernels in Cuda and Triton to handle the on-the-fly unpacking during the matrix multiplication process. For the matrix multiplication itself, we employed the cached tiled matrix multiplication technique. To fully grasp this approach, let's first review some Cuda programming fundamentals.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 75,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0163",
+      "source": "Basic GPU Concepts: Threads, Blocks, and Shared Memory",
+      "spans": []
+    },
+    {
+      "id": "b0164",
+      "source": "Before diving into cached tiled matrix multiplication, it's important to understand some basic GPU concepts:",
+      "spans": []
+    },
+    {
+      "id": "b0165",
+      "source": "Threads and Blocks: GPUs execute thousands of threads simultaneously. These threads are grouped into blocks, and each block runs independently. The grid is made up of these blocks, and it represents the entire problem space. For example, in matrix multiplication, each thread might be responsible for computing a single element of the output matrix.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0166",
+      "source": "Shared Memory: Each block has access to a limited amount of shared memory, which is much faster than global memory (the main memory on the GPU). However, shared memory is limited in size and shared among all threads within a block. Using shared memory effectively is key to improving performance in GPU programs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0167",
+      "source": "Challenges in Matrix Multiplication",
+      "spans": []
+    },
+    {
+      "id": "b0168",
+      "source": "A simple implementation of matrix multiplication on a GPU might involve each thread computing a single element of the result matrix by directly reading the necessary elements from global memory. However, this approach can be inefficient for the following reasons:",
+      "spans": []
+    },
+    {
+      "id": "b0169",
+      "source": "Memory Bandwidth: Accessing global memory is relatively slow compared to the speed at which the GPU cores can perform computations. If each thread reads matrix elements directly from global memory, the memory access times can become a bottleneck.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0170",
+      "source": "Redundant Data Access: In matrix multiplication, many elements of the input matrices are used multiple times. If each thread fetches the required data from global memory independently, the same data might be loaded into the GPU multiple times, leading to inefficiency. For example, if each thread is used to compute a single element in the output matrix, the thread responsible for calculating the element at position (i, j) will need to load the i-th row of matrix A and the j-th column of matrix B from global memory. However, other threads, such as the one computing the element at position (i+1, j), cannot reuse this data and will have to reload the same j-th column from global memory again.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0171",
+      "source": "The Idea of Tiling",
+      "spans": []
+    },
+    {
+      "id": "b0172",
+      "source": "Tiling is a technique used to address these challenges, and it was mainly used in FlashAttention to improve the kernel's efficiency. The basic idea is to divide the matrices into smaller sub-matrices, called tiles, which can fit into the shared memory of the GPU. Instead of computing the entire output matrix in one go, the computation is broken down into smaller pieces that are processed tile by tile.",
+      "spans": []
+    },
+    {
+      "id": "b0173",
+      "source": "In the context of matrix multiplication, this means dividing matrices A and B into blocks (tiles), loading these tiles into shared memory, and then performing the multiplication on these smaller blocks. This approach allows the threads to reuse data stored in the fast shared memory, reducing the need to access global memory repeatedly.",
+      "spans": []
+    },
+    {
+      "id": "b0174",
+      "source": "Here’s how it works:",
+      "spans": []
+    },
+    {
+      "id": "b0175",
+      "source": "Loading Tiles into Shared Memory: Each block of threads cooperatively loads a tile of matrix A and a corresponding tile of matrix B from global memory into shared memory. This operation is done once per tile, and then the tile is reused multiple times by the threads in the block.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0176",
+      "source": "Computing Partial Products: Once the tiles are loaded into shared memory, each thread computes a partial product. Since all threads in a block are working on the same tiles in shared memory, they can efficiently reuse the data without additional global memory accesses.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0177",
+      "source": "Accumulating Results: After computing the partial products for one tile, the threads load the next tiles from matrices A and B into shared memory and repeat the process. The results are accumulated in a register (or local memory), and once all tiles have been processed, the final value for the output matrix element is written back to global memory.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0178",
+      "source": "Tiled Matrix multiplication illustration (source https://cnugteren.github.io/tutorial/pages/page4.html)",
+      "spans": []
+    },
+    {
+      "id": "b0179",
+      "source": "Practical Considerations",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0180",
+      "source": "When implementing cached tiled matrix multiplication, several factors are considered:",
+      "spans": []
+    },
+    {
+      "id": "b0181",
+      "source": "Tile Size: The size of the tiles should be chosen to balance the trade-off between the amount of data that can fit into shared memory and the number of global memory accesses.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0182",
+      "source": "Memory Coalescing: the global memory accesses are coalesced, which means that adjacent threads access adjacent memory locations.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0183",
+      "source": "Occupancy: The number of threads per block and the number of blocks in the grid should be chosen to ensure high occupancy, which means having as many active warps (a warp is a set of 32 threads) as possible on the GPU to hide memory latency.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0184",
+      "source": "Triton Kernel",
+      "spans": []
+    },
+    {
+      "id": "b0185",
+      "source": "Here is the kernel in triton we benchmarked :",
+      "spans": []
+    },
+    {
+      "id": "b0186",
+      "source": "Code Breakdown",
+      "spans": []
+    },
+    {
+      "id": "b0187",
+      "source": "Determining Tile Positions",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0188",
+      "source": "The kernel first determines which tile (block) of the output matrix each thread block is responsible for:",
+      "spans": []
+    },
+    {
+      "id": "b0189",
+      "source": "pid is the unique identifier for each thread block, obtained using tl.program_id(axis=0).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "code"
+        },
+        {
+          "start": 67,
+          "end": 88,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0190",
+      "source": "The grid is divided into groups of thread blocks (GROUP_SIZE_M). Each group processes a portion of the output matrix.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 62,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0191",
+      "source": "pid_m and pid_n are the coordinates of the tile in the M and N dimensions, respectively.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "code"
+        },
+        {
+          "start": 10,
+          "end": 15,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0192",
+      "source": "Offsets (offs_am, offs_bn, offs_k) are calculated to determine which elements of matrices A and B each thread in the block will work on",
+      "spans": [
+        {
+          "start": 9,
+          "end": 16,
+          "kind": "code"
+        },
+        {
+          "start": 18,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 27,
+          "end": 33,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0193",
+      "source": "Loading and Computing Tiles",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0194",
+      "source": "The kernel uses a loop to iterate over the K dimension in chunks of BLOCK_SIZE_K. For each chunk:",
+      "spans": [
+        {
+          "start": 68,
+          "end": 80,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0195",
+      "source": "Load Tiles: tiles from matrices A and B are loaded from global memory.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0196",
+      "source": "Unpacking Matrix B: The kernel assumes that matrix B is packed with int8 values, meaning each element actually represents four smaller values packed into one byte. The unpacking happens within the loop:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        },
+        {
+          "start": 68,
+          "end": 72,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0197",
+      "source": "b_uint8 is loaded from global memory as packed int8.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 47,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0198",
+      "source": "Each packed value is unpacked to obtain the actual weight values used for computation.",
+      "spans": []
+    },
+    {
+      "id": "b0199",
+      "source": "Dot Product: The kernel computes the dot product of the loaded tiles from A and B, accumulating the results in the accumulator. The accumulator stores the partial results for the tile of the output matrix C.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        },
+        {
+          "start": 115,
+          "end": 126,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 143,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0200",
+      "source": "Storing Results",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0201",
+      "source": "After all tiles along the K dimension have been processed, the final results stored in the accumulator are converted to float16 and written back to the corresponding tile of matrix C in global memory. The writing process respects memory boundaries using a mask to ensure that only valid elements are written.",
+      "spans": [
+        {
+          "start": 91,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 120,
+          "end": 127,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0202",
+      "source": "For a more detailed explanation of the code, checkout this PR",
+      "spans": [
+        {
+          "start": 59,
+          "end": 61,
+          "kind": "a",
+          "href": "https://github.com/linkedin/Liger-Kernel/pull/195/files"
+        }
+      ]
+    },
+    {
+      "id": "b0203",
+      "source": "Benchmark",
+      "spans": []
+    },
+    {
+      "id": "b0204",
+      "source": "We benchmarked our kernel against the method of unpacking the weights using @torch.compile followed by performing the matmul in BF16 precision, and found that both approaches achieved approximately the same performance. To ensure accurate benchmarking, we performed the matmul operation over 2000 iterations and averaged the time taken during the last 1000 iterations, to eliminate any inefficiencies related to initial loading or compilation. Below is a graph showing the benchmark results. We also tested various matrix sizes, with the x-axis representing the number of multiplications on a log scale, and the y-axis showing the average time in ms.",
+      "spans": [
+        {
+          "start": 76,
+          "end": 90,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0205",
+      "source": "Triton kernel compared to torch.compile",
+      "spans": []
+    },
+    {
+      "id": "b0206",
+      "source": "We also tried using BitBlas, which is a software library designed to perform matrix operations with mixed precision. It helps optimize these operations by allowing calculations to be done in lower precision formats like INT8, INT4, or even INT2, instead of the traditional FP32 or FP16 formats.",
+      "spans": []
+    },
+    {
+      "id": "b0207",
+      "source": "The benchmark results are promising, as BitBlas outperforms both our custom kernel and Torch's matmul function in low precision, as shown in the graph.",
+      "spans": [
+        {
+          "start": 95,
+          "end": 101,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0208",
+      "source": "Bitblas benchmark",
+      "spans": []
+    },
+    {
+      "id": "b0209",
+      "source": "However, during model loading, BitBlas needs to compile kernels tailored to the shape of the weight matrix and store them in a local database, which can increase the initial loading time.",
+      "spans": []
+    },
+    {
+      "id": "b0210",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0211",
+      "source": "In conclusion, as LLMs continue to expand, reducing their computational demands through quantization is essential. This blog has explored the approach of 1.58-bit quantization, which uses ternary weights. While pre-training models in 1.58 bits is resource-intensive, we’ve demonstrated that, with some tricks, it’s possible to fine-tune existing models to this precision level, achieving efficient performance without sacrificing accuracy. By optimizing inference speed through specialized kernels, BitNet opens new possibilities for making LLMs more practical and scalable.",
+      "spans": []
+    },
+    {
+      "id": "b0212",
+      "source": "Acknowledgements",
+      "spans": []
+    },
+    {
+      "id": "b0213",
+      "source": "We would like to express our sincere gratitude to Leandro von Werra, Thomas Wolf, and Marc Sun for their invaluable assistance and insights throughout this project. We also extend our thanks to Omar Sanseviero and Pedro Cuenca for their contributions in refining this blog post, helping to communicate our findings clearly and effectively to the AI community. Furthermore, we want to acknowledge the GeneralAI team for their pioneering work on the BitNet project. Their research has been foundational to our efforts, and we are particularly grateful for the clear and precise figures provided in their paper.",
+      "spans": []
+    },
+    {
+      "id": "b0214",
+      "source": "Additional Resources",
+      "spans": []
+    },
+    {
+      "id": "b0215",
+      "source": "H. Wang et al., BitNet: Scaling 1-bit Transformers for Large Language Models. arxiv paper",
+      "spans": [
+        {
+          "start": 16,
+          "end": 76,
+          "kind": "em"
+        },
+        {
+          "start": 78,
+          "end": 89,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2310.11453"
+        }
+      ]
+    },
+    {
+      "id": "b0216",
+      "source": "S. Ma et al., The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits. arxiv paper",
+      "spans": [
+        {
+          "start": 14,
+          "end": 79,
+          "kind": "em"
+        },
+        {
+          "start": 81,
+          "end": 92,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2402.17764"
+        }
+      ]
+    },
+    {
+      "id": "b0217",
+      "source": "S. Ma et al., The Era of 1-bit LLMs: Training Tips, Code and FAQ. link",
+      "spans": [
+        {
+          "start": 14,
+          "end": 64,
+          "kind": "em"
+        },
+        {
+          "start": 66,
+          "end": 70,
+          "kind": "a",
+          "href": "https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0218",
+      "source": "RJ. Honicky, Are All Large Language Models Really in 1.58 Bits?. blogpost",
+      "spans": [
+        {
+          "start": 13,
+          "end": 63,
+          "kind": "em"
+        },
+        {
+          "start": 65,
+          "end": 73,
+          "kind": "a",
+          "href": "https://learning-exhaust.hashnode.dev/are-all-large-language-models-really-in-158-bits"
+        }
+      ]
+    },
+    {
+      "id": "b0219",
+      "source": "L. Mao, CUDA Matrix Multiplication Optimization. blogpost",
+      "spans": [
+        {
+          "start": 8,
+          "end": 47,
+          "kind": "em"
+        },
+        {
+          "start": 49,
+          "end": 57,
+          "kind": "a",
+          "href": "https://leimao.github.io/article/CUDA-Matrix-Multiplication-Optimization/"
+        }
+      ]
+    },
+    {
+      "id": "b0220",
+      "source": "Tutorial: OpenCL SGEMM tuning for Kepler. link",
+      "spans": [
+        {
+          "start": 0,
+          "end": 40,
+          "kind": "em"
+        },
+        {
+          "start": 42,
+          "end": 46,
+          "kind": "a",
+          "href": "https://cnugteren.github.io/tutorial/pages/page4.html"
+        }
+      ]
+    },
+    {
+      "id": "b0221",
+      "source": "CUDAMODE. github, youtube",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "em"
+        },
+        {
+          "start": 10,
+          "end": 16,
+          "kind": "a",
+          "href": "https://github.com/cuda-mode"
+        },
+        {
+          "start": 18,
+          "end": 25,
+          "kind": "a",
+          "href": "https://www.youtube.com/channel/UCJgIbYl6C5no72a0NUAPcTA"
+        }
+      ]
+    },
+    {
+      "id": "b0222",
+      "source": "Wen-mei W. Hwu, David B. Kirk, Izzat El Hajj, Programming Massively Parallel Processors : A Hands-on Approach",
+      "spans": [
+        {
+          "start": 46,
+          "end": 109,
+          "kind": "em"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "f70eca356e8b07fe01998dd41ed18b7884515ca212f3d3ea029ed9c010bbc7fe",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "model = AutoModelForCausalLM.from_pretrained(\n    \"HF1BitLLM/Llama3-8B-1.58-100B-tokens\",\n    device_map=\"cuda\",\n    torch_dtype=torch.bfloat16\n)    \ntokenizer = AutoTokenizer.from_pretrained(\"meta-llama/Meta-Llama-3-8B-Instruct\")\n\ninput_text = \"Daniel went back to the garden. Mary travelled to the kitchen. Sandra journeyed to the kitchen. Sandra went to the hallway. John went to the bedroom. Mary went back to the garden. Where is Mary?\\nAnswer:\"\n\ninput_ids = tokenizer.encode(input_text, return_tensors=\"pt\").cuda()\noutput = model.generate(input_ids, max_new_tokens=10)\ngenerated_text = tokenizer.decode(output[0], skip_special_tokens=True)\nprint(generated_text)"
+    },
+    {
+      "id": "c0002",
+      "source": "# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant(x):\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127) / scale\n    return y\n \ndef weight_quant(w):\n    scale = 1.0 / w.abs().mean().clamp_(min=1e-5)\n    u = (w * scale).round().clamp_(-1, 1) / scale\n    return u\n\nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight\n        x_norm = LN(x)\n        \n        # A trick for implementing Straight−Through−Estimator (STE) using detach()\n        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()\n        w_quant = w + (weight_quant(w) - w).detach()\n        \n        # Perform quantized linear transformation\n        y = F.linear(x_quant, w_quant)\n        return y"
+    },
+    {
+      "id": "c0003",
+      "source": "# Adapted from https://github.com/microsoft/unilm/blob/master/bitnet/The-Era-of-1-bit-LLMs__Training_Tips_Code_FAQ.pdf\nimport torch\nimport torch.nn as nn \nimport torch.nn.functional as F\n\ndef activation_quant_inference(x):\n    x = LN(x)\n    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)\n    y = (x * scale).round().clamp_(-128, 127)\n    return y, scale\n \nclass BitLinear(nn.Linear):\n    \"\"\"\n    Only for training\n    \"\"\"\n    def forward(self, x):\n        w = self.weight # weights here are already quantized to (-1, 0, 1)    \n        w_scale = self.w_scale  \n        x_quant, x_scale = activation_quant_inference(x)\n        y = efficient_kernel(x_quant, w) / w_scale / x_scale\n        return y"
+    },
+    {
+      "id": "c0004",
+      "source": "def scale_outliers(tensor, threshold_factor=1):\n    mean_absolute_value = torch.mean(torch.abs(tensor))\n    threshold = threshold_factor * mean_absolute_value\n    outliers = tensor[torch.abs(tensor) > threshold]\n    mean_outlier_value = torch.mean(torch.abs(outliers))\n    return mean_outlier_value\n\ndef weight_quant_scaling(w):\n    scale = 1.0 / scale_outliers(w).clamp_(min=1e-5)\n    quantized_weights = (w * scale).round().clamp_(-1, 1) / scale\n    return quantized_weights"
+    },
+    {
+      "id": "c0005",
+      "source": "lambda_ = ?\nx_quant = x + lambda_ * (activation_quant(x) - x).detach()\nw_quant = w + lambda_ * (weight_quant(w) - w).detach()"
+    },
+    {
+      "id": "c0006",
+      "source": "lambda_ = training_step / total_training_steps"
+    },
+    {
+      "id": "c0007",
+      "source": "lambda_ = min(2 * training_step / total_training_steps, 1)"
+    },
+    {
+      "id": "c0008",
+      "source": "lambda_ = min(training_step/1000, 1)"
+    },
+    {
+      "id": "c0009",
+      "source": "def scheduler(step, total_steps, k):\n    normalized_step = step / total_steps\n    return 1 - (1 - normalized_step)**k"
+    },
+    {
+      "id": "c0010",
+      "source": "def sigmoid_scheduler(step, total_steps, k):\n    # Sigmoid-like curve: slow start, fast middle, slow end\n    normalized_step = step / total_steps\n    return 1 / (1 + np.exp(-k * (normalized_step - 0.5)))"
+    },
+    {
+      "id": "c0011",
+      "source": "@triton.autotune(\n    configs=get_cuda_autotune_config(),\n    key=['M', 'N', 'K'],\n)\n@triton.jit\ndef matmul_kernel(\n        a_ptr, b_ptr, c_ptr,\n        M, N, K,\n        stride_am, stride_ak,\n        stride_bk, stride_bn, \n        stride_cm, stride_cn,\n        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  \n        GROUP_SIZE_M: tl.constexpr,\n):\n\n    pid = tl.program_id(axis=0)\n    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)\n    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)\n    num_pid_in_group = GROUP_SIZE_M * num_pid_n\n    group_id = pid // num_pid_in_group\n    first_pid_m = group_id * GROUP_SIZE_M\n    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)\n    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)\n    pid_n = (pid % num_pid_in_group) // group_size_m\n\n    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M\n    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)\n    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n\n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)\n\n    for i in range(4) : \n        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)\n        for j in range(0, tl.cdiv(K // 4, BLOCK_SIZE_K) ):\n            k = i * tl.cdiv(K // 4, BLOCK_SIZE_K) + j \n\n            # BLOCK_SIZE_K must be a divisor of K / 4 \n            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)\n            b_uint8 = tl.load(b_ptrs, mask=offs_k[:, None] < K // 4 - j * BLOCK_SIZE_K, other=0)\n            mask = 3<<(2*i)\n            b = ((b_uint8 & mask) >> (2*i))\n\n            # We accumulate the tiles along the K dimension.\n            tensor_full = tl.full((1,), 1, dtype=tl.int8)\n\n            accumulator += tl.dot(a, (b.to(tl.int8) - tensor_full), out_dtype=tl.int32)\n\n            a_ptrs += BLOCK_SIZE_K * stride_ak\n            b_ptrs += BLOCK_SIZE_K * stride_bk\n\n    c = accumulator\n\n    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]\n    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)\n    tl.store(c_ptrs, c, mask=c_mask)\n\n\ndef matmul(a, b):\n    assert a.shape[1] == b.shape[0] * 4, \"Incompatible dimensions, the weight matrix need to be packed\"\n    assert a.is_contiguous(), \"Matrix A must be contiguous\"\n    M, K = a.shape\n    _, N = b.shape\n    c = torch.empty((M, N), device=a.device, dtype=torch.float16)\n    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )\n    matmul_kernel[grid](\n        a, b, c,\n        M, N, K,\n        a.stride(0), a.stride(1),\n        b.stride(0), b.stride(1),\n        c.stride(0), c.stride(1),\n    )\n    return c"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "f70eca356e8b07fe01998dd41ed18b7884515ca212f3d3ea029ed9c010bbc7fe",
+  "mediaLayout": [
+    {
+      "mediaId": "image_65271b5d7c70419f",
+      "type": "image",
+      "afterBlockId": "b0014",
+      "order": 0
+    },
+    {
+      "mediaId": "image_ea19d584cf4f075c",
+      "type": "image",
+      "afterBlockId": "b0016",
+      "order": 1
+    },
+    {
+      "mediaId": "image_57202bd6970a1f31",
+      "type": "image",
+      "afterBlockId": "b0026",
+      "order": 2
+    },
+    {
+      "mediaId": "image_0998af0384fd9e0b",
+      "type": "image",
+      "afterBlockId": "b0089",
+      "order": 3
+    },
+    {
+      "mediaId": "image_67ee64cc09cd2d6f",
+      "type": "image",
+      "afterBlockId": "b0094",
+      "order": 4
+    },
+    {
+      "mediaId": "image_5c5f1477b3492f1b",
+      "type": "image",
+      "afterBlockId": "b0096",
+      "order": 5
+    },
+    {
+      "mediaId": "image_9bad3265186b79c0",
+      "type": "image",
+      "afterBlockId": "b0097",
+      "order": 6
+    },
+    {
+      "mediaId": "image_8547dae8e393df1c",
+      "type": "image",
+      "afterBlockId": "b0099",
+      "order": 7
+    },
+    {
+      "mediaId": "image_13eafd1460234f84",
+      "type": "image",
+      "afterBlockId": "b0100",
+      "order": 8
+    },
+    {
+      "mediaId": "image_219881bae3984a09",
+      "type": "image",
+      "afterBlockId": "b0115",
+      "order": 9
+    },
+    {
+      "mediaId": "image_8a89d85666c3b3f4",
+      "type": "image",
+      "afterBlockId": "b0119",
+      "order": 10
+    },
+    {
+      "mediaId": "image_9b2054fc72b9764a",
+      "type": "image",
+      "afterBlockId": "b0124",
+      "order": 11
+    },
+    {
+      "mediaId": "image_4c2ddb8180e4951d",
+      "type": "image",
+      "afterBlockId": "b0128",
+      "order": 12
+    },
+    {
+      "mediaId": "image_7c4fa7f68996cef5",
+      "type": "image",
+      "afterBlockId": "b0130",
+      "order": 13
+    },
+    {
+      "mediaId": "image_160afe6ae172567b",
+      "type": "image",
+      "afterBlockId": "b0134",
+      "order": 14
+    },
+    {
+      "mediaId": "image_ee78826df6061f1b",
+      "type": "image",
+      "afterBlockId": "b0136",
+      "order": 15
+    },
+    {
+      "mediaId": "image_fbaafe07532e1b06",
+      "type": "image",
+      "afterBlockId": "b0139",
+      "order": 16
+    },
+    {
+      "mediaId": "image_6e87484cbd6942dc",
+      "type": "image",
+      "afterBlockId": "b0144",
+      "order": 17
+    },
+    {
+      "mediaId": "image_6df06305de8bd534",
+      "type": "image",
+      "afterBlockId": "b0146",
+      "order": 18
+    },
+    {
+      "mediaId": "image_ba9e4fd2fd6a2555",
+      "type": "image",
+      "afterBlockId": "b0150",
+      "order": 19
+    },
+    {
+      "mediaId": "image_1f3842fcd464c8d7",
+      "type": "image",
+      "afterBlockId": "b0154",
+      "order": 20
+    },
+    {
+      "mediaId": "image_9329c52626ddd299",
+      "type": "image",
+      "afterBlockId": "b0157",
+      "order": 21
+    },
+    {
+      "mediaId": "image_5b895e1c8423c682",
+      "type": "image",
+      "afterBlockId": "b0177",
+      "order": 22
+    },
+    {
+      "mediaId": "image_c3efd7b927c8ba1b",
+      "type": "image",
+      "afterBlockId": "b0204",
+      "order": 23
+    },
+    {
+      "mediaId": "image_e15ae6ee08efecf1",
+      "type": "image",
+      "afterBlockId": "b0207",
+      "order": 24
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 25,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 25,
+    "savedImages": 25,
+    "sourceImageOccurrences": 25,
+    "placedImageOccurrences": 25,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T07:05:56.172125Z",
+  "mediaLayoutCheckedAt": "2026-10-03T07:05:56.172138Z"
 }
