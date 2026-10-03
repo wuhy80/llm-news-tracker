@@ -38,28 +38,29 @@ SMALL_WIDTH = 400
 
 
 def collect_targets(data_dir: Path, media_dir: Path) -> dict[str, dict]:
-    """Smallest stored Reddit preview URL per image name, with how often it appears."""
-    referenced, documents = collect_referenced(data_dir, media_dir)
-    text = []
+    """Smallest stored Reddit preview URL per image name, and how many snapshots use it."""
+    _referenced, documents = collect_referenced(data_dir, media_dir)
+    targets: dict[str, dict] = {}
     for path in documents:
         try:
-            text.append(path.read_text(encoding="utf-8", errors="ignore"))
+            text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-    blob = "\n".join(text)
-
-    targets: dict[str, dict] = {}
-    for match in re.finditer(r"https://(preview|external-preview)\.redd\.it/([^\"\\\s]+)", blob):
-        url = "https://" + match.group(1) + ".redd.it/" + match.group(2)
-        parsed = urllib.parse.urlparse(url)
-        query = urllib.parse.parse_qs(parsed.query)
-        width = int(query.get("width", ["0"])[0] or 0)
-        name = Path(parsed.path).name
-        record = targets.setdefault(name, {"name": name, "host": parsed.hostname,
-                                           "width": width, "url": url, "uses": 0})
-        record["uses"] += 1
-        if width and width < record["width"]:
-            record.update({"width": width, "url": url})
+        seen: set[str] = set()
+        for match in re.finditer(r"https://(preview|external-preview)\.redd\.it/([^\"\\\s]+)", text):
+            url = "https://" + match.group(1) + ".redd.it/" + match.group(2)
+            parsed = urllib.parse.urlparse(url)
+            width = int(urllib.parse.parse_qs(parsed.query).get("width", ["0"])[0] or 0)
+            name = Path(parsed.path).name
+            record = targets.setdefault(name, {"name": name, "host": parsed.hostname,
+                                               "width": width, "url": url, "uses": 0})
+            # The same URL appears twice per snapshot (src and originalUrl), so
+            # count the snapshots that use it rather than raw occurrences.
+            if name not in seen:
+                record["uses"] += 1
+                seen.add(name)
+            if width and width < record["width"]:
+                record.update({"width": width, "url": url})
     return targets
 
 
