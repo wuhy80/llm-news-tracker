@@ -315,7 +315,13 @@ function appendReadableText(element, text, blockId, translations, wiseEntries, u
     const translation = document.createElement("span");
     translation.className = "reader-translation";
     translation.lang = "zh-CN";
-    translation.textContent = translated;
+    // The translation is plain text too, and the model sometimes carries the
+    // source markers through it. Nothing on this side is word-wise decorated, so
+    // the fallback only has to place the text.
+    const plain = (target, value) => { target.textContent = value; };
+    if (!window.LLMInlineMarkup?.render(translation, translated, plain)) {
+      translation.textContent = translated;
+    }
     element.append(translation);
   }
 }
