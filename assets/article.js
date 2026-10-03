@@ -302,9 +302,12 @@ function appendReadableText(element, text, blockId, translations, wiseEntries, u
   const source = document.createElement("span");
   source.className = "reader-source-text";
   const annotation = readingState.item?.inlineContent?.find(block => block.id === blockId);
-  const decorated = window.LLMInlineContent?.append(source, text, annotation,
-    (target, value) => decorateWordWise(target, value, wiseEntries, usedTerms));
-  if (!decorated) decorateWordWise(source, text, wiseEntries, usedTerms);
+  const decorate = (target, value) => decorateWordWise(target, value, wiseEntries, usedTerms);
+  const decorated = window.LLMInlineContent?.append(source, text, annotation, decorate);
+  // Validated spans win when the archive supplies them. Otherwise read the inline
+  // markers out of the plain text, which is all a source archived without spans
+  // can offer; without this they reach the reader verbatim.
+  if (!decorated && !window.LLMInlineMarkup?.render(source, text, decorate)) decorate(source, text);
   element.append(source);
   const translated = translations.get(blockId);
   if (translated) {
