@@ -1,0 +1,75 @@
+name: Deduplicate article media
+
+# Media files are named after a hash of their source URL, so identical bytes can
+# be stored several times: an image reused across articles, or one asset fetched
+# under several CDN URLs. This keeps one copy per distinct content hash and
+# repoints the other holders at it.
+#
+# Run the orphan pruner first if the archive has residue: this only ever looks at
+# files a document still references, so it is safe either way, but a smaller set
+# scans faster.
+#
+# Nothing is collapsed unless the apply input is checked. Deletion only touches
+# the working tree, so git history keeps the bytes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Collapse the duplicates (leave unchecked to report only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-writes
+  cancel-in-progress: false
+
+jobs:
+  dedupe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APPLY: ${{ inputs.apply || 'false' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the deduplication script
+        run: python -m unittest discover -s tests -p 'test_dedupe_article_media.py'
+
+      - name: Report or collapse duplicate media
+        run: |
+          if [ "$APPLY" = "true" ]; then
+            python scripts/dedupe_article_media.py --apply
+          else
+            python scripts/dedupe_article_media.py
+          fi
+
+      - name: Commit the collapsed media
+        if: ${{ inputs.apply }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "Nothing to collapse"
+            exit 0
+          fi
+          git commit -m 'chore: collapse duplicate article media'
+          # All automated archive writers share this concurrency group.
+          for attempt in 1 2 3; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+          done
+          echo "Unable to push the collapsed media" >&2
+          exit 1
