@@ -80,3 +80,27 @@ class MediaRegressionTests(unittest.TestCase):
             article_store.write_snapshot(item, 'Body', 'feed', images=[], videos=[])
             self.assertEqual(json.loads(path.read_text())['images'], [])
             self.assertEqual(json.loads(path.read_text())['videos'], [])
+
+    def test_srcset_fallback_takes_the_largest_candidate(self):
+        # srcset is ordered smallest first. Taking the first entry is how a
+        # Reddit hero image ends up archived 140px wide and then upscaled by CSS.
+        images, _ = extract_media_refs('''<article><img alt="chart"
+        srcset="https://preview.redd.it/x.png?width=140 140w, https://preview.redd.it/x.png?width=640 640w, https://preview.redd.it/x.png?width=1080 1080w"></article>''',
+                                       'https://www.reddit.com/r/LocalLLaMA/comments/abc/post/')
+        self.assertEqual([i['url'] for i in images], ['https://preview.redd.it/x.png?width=1080'])
+
+    def test_srcset_without_descriptors_takes_the_last_entry(self):
+        images, _ = extract_media_refs(
+            '<article><img srcset="/small.jpg 1x, /large.jpg 2x"></article>', 'https://example.com/post')
+        self.assertEqual([i['url'] for i in images], ['https://example.com/large.jpg'])
+
+    def test_srcset_prefers_the_widest_even_when_listed_out_of_order(self):
+        images, _ = extract_media_refs(
+            '<article><img srcset="/big.jpg 1200w, /small.jpg 200w"></article>', 'https://example.com/post')
+        self.assertEqual([i['url'] for i in images], ['https://example.com/big.jpg'])
+
+    def test_an_explicit_src_still_wins_over_srcset(self):
+        images, _ = extract_media_refs(
+            '<article><img src="/chosen.jpg" srcset="/small.jpg 100w, /huge.jpg 2000w"></article>',
+            'https://example.com/post')
+        self.assertEqual([i['url'] for i in images], ['https://example.com/chosen.jpg'])
