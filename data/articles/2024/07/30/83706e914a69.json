@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T10:57:38.803159Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Memory-efficient Diffusion Transformers with Quanto and Diffusers\n\nThis article is also available in Chinese 简体中文 .\n\nOver the past few months, we have seen an emergence in the use of Transformer-based diffusion backbones for high-resolution text-to-image (T2I) generation. These models use the transformer architecture as the building block for the diffusion process, instead of the UNet architecture that was prevalent in many of the initial diffusion models. Thanks to the nature of Transformers, these backbones show good scalability, with models ranging from 0.6B to 8B parameters.\n\nAs models become larger, memory requirements increase. The problem intensifies because a diffusion pipeline usually consists of several components: a text encoder, a diffusion backbone, and an image decoder. Furthermore, modern diffusion pipelines use multiple text encoders – for example, there are three in the case of Stable Diffusion 3. It takes 18.765 GB of GPU memory to run SD3 inference using FP16 precision.\n\nThese high memory requirements can make it difficult to use these models with consumer GPUs, slowing adoption and making experimentation harder. In this post, we show how to improve the memory efficiency of Transformer-based diffusion pipelines by leveraging Quanto's quantization utilities from the Diffusers library.\n\nQuantizing a DiffusionPipeline with Quanto\n\nGenerality of the observations\n\nbfloat16 as the main compute data-type\n\nBonus - saving and loading Diffusers models in Quanto\n\nFor a detailed introduction to Quanto, please refer to this post . In short, Quanto is a quantization toolkit built on PyTorch. It's part of Hugging Face Optimum , a set of tools for hardware optimization.\n\nModel quantization is a popular tool among LLM practitioners, but not so much with diffusion models. Quanto can help bridge this gap and provide memory savings with little or no quality degradation.\n\nFor benchmarking purposes, we use an H100 GPU with the following environment:\n\nDiffusers (installed from this commit )\n\nQuanto (installed from this commit )\n\nUnless otherwise specified, we default to performing computations in FP16. We chose not to quantize the VAE to prevent numerical instability issues. Our benchmarking code can be found here .\n\nAt the time of this writing, we have the following Transformer-based diffusion pipelines for text-to-image generation in Diffusers:\n\nPixArt-Alpha and PixArt-Sigma\n\nWe also have Latte , a Transformer-based text-to-video generation pipeline.\n\nFor brevity, we keep our study limited to the following three: PixArt-Sigma, Stable Diffusion 3, and Aura Flow. The table below shows the parameter counts of their diffusion backbones:\n\nModel Checkpoint # Params (Billion)\n\nhttps://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\n\nhttps://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers\n\nhttps://huggingface.co/fal/AuraFlow/\n\nIt’s worth keeping in mind that this post primarily focuses on memory efficiency at a slight or negligible cost of inference latency.\n\nQuantizing a model with Quanto is straightforward.\n\n```\nfrom optimum.quanto import freeze, qfloat8, quantize\nfrom diffusers import PixArtSigmaPipeline\nimport torch\n\npipeline = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", torch_dtype=torch.float16\n).to(\"cuda\")\n\nquantize(pipeline.transformer, weights=qfloat8)\nfreeze(pipeline.transformer)\n```\n\nWe call quantize() on the module to be quantized, specifying what we want to quantize. In the above case, we are just quantizing the parameters, leaving the activations as is. We’re quantizing to the FP8 data-type. We finally call freeze() to replace the original parameters with the quantized parameters.\n\nWe can then call this pipeline normally:\n\n```\nimage = pipeline(\"ghibli style, a fantasy landscape with castles\").images[0]\n```\n\nFP16 Diffusion Transformer in FP8\n\nWe notice the following memory savings when using FP8, with slightly higher latency and almost no quality degradation:\n\nBatch Size Quantization Memory (GB) Latency (Seconds)\n\nWe can quantize the text encoder in the same way:\n\n```\nquantize(pipeline.text_encoder, weights=qfloat8)\nfreeze(pipeline.text_encoder)\n```\n\nThe text encoder is also a transformer model, and we can quantize it too. Quantizing both the text encoder and the diffusion backbone leads to much larger memory improvements:\n\nBatch Size Quantization Quantize TE Memory (GB) Latency (Seconds)\n\nQuantizing the text encoder produces results very similar to the previous case:\n\nQuantizing the text encoder together with the diffusion backbone generally works for the models we tried. Stable Diffusion 3 is a special case, as it uses three different text encoders. We found that quantizing the second text encoder does not work well, so we recommend the following alternatives:\n\nOnly quantize the first text encoder ( CLIPTextModelWithProjection ) or\n\nOnly quantize the third text encoder ( T5EncoderModel ) or\n\nQuantize the first and third text encoders\n\nThe table below gives an idea about the expected memory savings for various text encoder quantization combinations (the diffusion transformer is quantized in all cases):\n\nBatch Size Quantization Quantize TE 1 Quantize TE 2 Quantize TE 3 Memory (GB) Latency (Seconds)\n\nQuantized Text Encoder: 1 Quantized Text Encoder: 3 Quantized Text Encoders: 1 and 3\n\nbfloat16 is usually better on H100\n\nUsing bfloat16 can be faster for supported GPU architectures, such as H100 or 4090. The table below presents some numbers for PixArt measured on our H100 reference hardware:\n\nBatch Size Precision Quantization Memory (GB) Latency (Seconds) Quantize TE\n\nWe found quantizing with qint8 (instead of qfloat8 ) is generally better in terms of inference latency. This effect gets more pronounced when we horizontally fuse the attention QKV projections (calling fuse_qkv_projections() in Diffusers), thereby thickening the dimensions of the int8 kernels to speed up computation. We present some evidence below for PixArt:\n\nBatch Size Quantization Memory (GB) Latency (Seconds) Quantize TE QKV Projection\n\nWe additionally experimented with qint4 when using bfloat16 . This is only applicable to bfloat16 on H100 because other configurations are not supported yet. With qint4 , we can expect to see more improvements in memory consumption at the cost of increased inference latency. Increased latency is expected, because there is no native hardware support for int4 computation – the weights are transferred using 4 bits, but computation is still done in bfloat16 . The table below shows our results for PixArt-Sigma:\n\nBatch Size Quantize TE Memory (GB) Latency (Seconds)\n\nNote, however, that due to the aggressive discretization of INT4, the end results can take a hit. This is why, for Transformer-based models in general, we usually leave the final projection layer out of quantization. In Quanto, we do this by:\n\n```\nquantize(pipeline.transformer, weights=qint4, exclude=\"proj_out\")\nfreeze(pipeline.transformer)\n```\n\n\"proj_out\" corresponds to the final layer in pipeline.transformer . The table below presents results for various settings:\n\nQuantize TE: No, Layer exclusion: None Quantize TE: No, Layer exclusion: \"proj_out\" Quantize TE: Yes, Layer exclusion: None Quantize TE: Yes, Layer exclusion: \"proj_out\"\n\nTo recover the lost image quality, a common practice is to perform quantization-aware training, which is also supported in Quanto. This technique is out of the scope of this post, feel free to contact us if you're interested!\n\nAll the results of our experiments for this post can be found here .\n\nQuantized Diffusers models can be saved and loaded:\n\n```\nfrom diffusers import PixArtTransformer2DModel\nfrom optimum.quanto import QuantizedPixArtTransformer2DModel, qfloat8\n\nmodel = PixArtTransformer2DModel.from_pretrained(\"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", subfolder=\"transformer\")\nqmodel = QuantizedPixArtTransformer2DModel.quantize(model, weights=qfloat8)\nqmodel.save_pretrained(\"pixart-sigma-fp8\")\n```\n\nThe resulting checkpoint is 587MB in size, instead of the original 2.44GB. We can then load it:\n\n```\nfrom optimum.quanto import QuantizedPixArtTransformer2DModel\nimport torch\n\ntransformer = QuantizedPixArtTransformer2DModel.from_pretrained(\"pixart-sigma-fp8\") \ntransformer.to(device=\"cuda\", dtype=torch.float16)\n```\n\nAnd use it in a DiffusionPipeline :\n\n```\nfrom diffusers import DiffusionPipeline\nimport torch\n\npipe = DiffusionPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n    transformer=None,\n    torch_dtype=torch.float16,\n).to(\"cuda\")\npipe.transformer = transformer\n\nprompt = \"A small cactus with a happy face in the Sahara desert.\"\nimage = pipe(prompt).images[0]\n```\n\nIn the future, we can expect to pass the transformer directly when initializing the pipeline so that this will work:\n\n```\npipe = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n-    transformer=None,\n+    transformer=transformer,\n    torch_dtype=torch.float16,\n).to(\"cuda\")\n```\n\nQuantizedPixArtTransformer2DModel implementation is available here for reference. If you want more models from Diffusers supported in Quanto for saving and loading, please open an issue here and mention @sayakpaul .\n\nBased on your requirements, you may want to apply different types of quantization to different pipeline modules. For example, you could use FP8 for the text encoder but INT8 for the diffusion transformer. Thanks to the flexibility of Diffusers and Quanto, this can be done seamlessly.\n\nTo optimize for your use cases, you can even combine quantization with other memory optimization techniques in Diffusers, such as enable_model_cpu_offload() .\n\nIn this post, we showed how to quantize Transformer models from Diffusers and optimize their memory consumption. The effects of quantization become more visible when we additionally quantize the text encoders involved in the mix. We hope you will apply some of the workflows to your projects and benefit from them 🤗.\n\nThanks to Pedro Cuenca for his extensive reviews on the post.\n\nModels mentioned in this article 3\n\nDatasets mentioned in this article 1\n\nMore Articles from our Blog\n\nguide diffusers quantization\n\nBringing Nunchaku 4-bit Diffusion Inference to Diffusers\n\nBeyond LoRA: Can you beat the most popular fine-tuning technique?\n\nInteresting read. Thank you for providing examples.\n\nIf you can add example for text_encoder (NOT text_encoder_2) covering different like Qwen etc,, will be helpful.\n\ne.g. Like this covers transformer\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Over the past few months, we have seen an emergence in the use of Transformer-based diffusion backbones for high-resolution text-to-image (T2I) generation. These models use the transformer architecture as the building block for the diffusion process, instead of the UNet architecture that was prevalent in many of the initial diffusion models. Thanks to the nature of Transformers, these backbones show good scalability, with models ranging from 0.6B to 8B parameters.\n\nAs models become larger, memory requirements increase. The problem intensifies because a diffusion pipeline usually consists of several components: a text encoder, a diffusion backbone, and an image decoder. Furthermore, modern diffusion pipelines use multiple text encoders – for example, there are three in the case of Stable Diffusion 3. It takes 18.765 GB of GPU memory to run SD3 inference using FP16 precision.\n\nThese high memory requirements can make it difficult to use these models with consumer GPUs, slowing adoption and making experimentation harder. In this post, we show how to improve the memory efficiency of Transformer-based diffusion pipelines by leveraging Quanto's quantization utilities from the Diffusers library.\n\n### Table of contents\n\n- Preliminaries\n\n- Quantizing a DiffusionPipeline with Quanto\n\n- Generality of the observations\n\nMisc findings\n\n- bfloat16 as the main compute data-type\n\n- The promise of qint8\n\n- INT4\n\n- Bonus - saving and loading Diffusers models in Quanto\n\n- Tips\n\n- Conclusion\n\n## Preliminaries\n\nFor a detailed introduction to Quanto, please refer to this post. In short, Quanto is a quantization toolkit built on PyTorch. It's part of Hugging Face Optimum, a set of tools for hardware optimization.\n\nModel quantization is a popular tool among LLM practitioners, but not so much with diffusion models. Quanto can help bridge this gap and provide memory savings with little or no quality degradation.\n\nFor benchmarking purposes, we use an H100 GPU with the following environment:\n\n- CUDA 12.2\n\n- PyTorch 2.4.0\n\n- Diffusers (installed from this commit)\n\n- Quanto (installed from this commit)\n\nUnless otherwise specified, we default to performing computations in FP16. We chose not to quantize the VAE to prevent numerical instability issues. Our benchmarking code can be found here.\n\nAt the time of this writing, we have the following Transformer-based diffusion pipelines for text-to-image generation in Diffusers:\n\n- PixArt-Alpha and PixArt-Sigma\n\n- Stable Diffusion 3\n\n- Hunyuan DiT\n\n- Lumina\n\n- Aura Flow\n\nWe also have Latte, a Transformer-based text-to-video generation pipeline.\n\nFor brevity, we keep our study limited to the following three: PixArt-Sigma, Stable Diffusion 3, and Aura Flow. The table below shows the parameter counts of their diffusion backbones:\n\nModel\n\nCheckpoint\n\n\\# Params (Billion)\n\nPixArt\n\nhttps://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\n\n0.611\n\nStable Diffusion 3\n\nhttps://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers\n\n2.028\n\nAura Flow\n\nhttps://huggingface.co/fal/AuraFlow/\n\n6.843\n\nIt’s worth keeping in mind that this post primarily focuses on memory efficiency at a slight or negligible cost of inference latency.\n\n## Quantizing a DiffusionPipeline with Quanto\n\nQuantizing a model with Quanto is straightforward.\n\n```\nfrom optimum.quanto import freeze, qfloat8, quantize\nfrom diffusers import PixArtSigmaPipeline\nimport torch\n\npipeline = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", torch_dtype=torch.float16\n).to(\"cuda\")\n\nquantize(pipeline.transformer, weights=qfloat8)\nfreeze(pipeline.transformer)\n```\n\nWe call quantize() on the module to be quantized, specifying what we want to quantize. In the above case, we are just quantizing the parameters, leaving the activations as is. We’re quantizing to the FP8 data-type. We finally call freeze() to replace the original parameters with the quantized parameters.\n\nWe can then call this pipeline normally:\n\n```\nimage = pipeline(\"ghibli style, a fantasy landscape with castles\").images[0]\n```\n\nFP16\n\nDiffusion Transformer in FP8\n\n—\n\n—\n\nWe notice the following memory savings when using FP8, with slightly higher latency and almost no quality degradation:\n\nBatch Size\n\nQuantization\n\nMemory (GB)\n\nLatency (Seconds)\n\n1\n\nNone\n\n12.086\n\n1.200\n\n1\n\nFP8\n\n11.547\n\n1.540\n\n4\n\nNone\n\n12.087\n\n4.482\n\n4\n\nFP8\n\n11.548\n\n5.109\n\nWe can quantize the text encoder in the same way:\n\n```\nquantize(pipeline.text_encoder, weights=qfloat8)\nfreeze(pipeline.text_encoder)\n```\n\nThe text encoder is also a transformer model, and we can quantize it too. Quantizing both the text encoder and the diffusion backbone leads to much larger memory improvements:\n\nBatch Size\n\nQuantization\n\nQuantize TE\n\nMemory (GB)\n\nLatency (Seconds)\n\n1\n\nFP8\n\nFalse\n\n11.547\n\n1.540\n\n1\n\nFP8\n\nTrue\n\n5.363\n\n1.601\n\n4\n\nFP8\n\nFalse\n\n11.548\n\n5.109\n\n4\n\nFP8\n\nTrue\n\n5.364\n\n5.141\n\nQuantizing the text encoder produces results very similar to the previous case:\n\n## Generality of the observations\n\nQuantizing the text encoder together with the diffusion backbone generally works for the models we tried. Stable Diffusion 3 is a special case, as it uses three different text encoders. We found that quantizing the second text encoder does not work well, so we recommend the following alternatives:\n\n- Only quantize the first text encoder (CLIPTextModelWithProjection) or\n\n- Only quantize the third text encoder (T5EncoderModel) or\n\n- Quantize the first and third text encoders\n\nThe table below gives an idea about the expected memory savings for various text encoder quantization combinations (the diffusion transformer is quantized in all cases):\n\nBatch Size\n\nQuantization\n\nQuantize TE 1\n\nQuantize TE 2\n\nQuantize TE 3\n\nMemory (GB)\n\nLatency (Seconds)\n\n1\n\nFP8\n\n1\n\n1\n\n1\n\n8.200\n\n2.858\n\n1 ✅\n\nFP8\n\n0\n\n0\n\n1\n\n8.294\n\n2.781\n\n1\n\nFP8\n\n1\n\n1\n\n0\n\n14.384\n\n2.833\n\n1\n\nFP8\n\n0\n\n1\n\n0\n\n14.475\n\n2.818\n\n1 ✅\n\nFP8\n\n1\n\n0\n\n0\n\n14.384\n\n2.730\n\n1\n\nFP8\n\n0\n\n1\n\n1\n\n8.325\n\n2.875\n\n1 ✅\n\nFP8\n\n1\n\n0\n\n1\n\n8.204\n\n2.789\n\n1\n\nNone\n\n\\-\n\n\\-\n\n\\-\n\n16.403\n\n2.118\n\nQuantized Text Encoder: 1\n\nQuantized Text Encoder: 3\n\nQuantized Text Encoders: 1 and 3\n\n—\n\n—\n\n—\n\n## Misc findings\n\n### bfloat16 is usually better on H100\n\nUsing bfloat16 can be faster for supported GPU architectures, such as H100 or 4090. The table below presents some numbers for PixArt measured on our H100 reference hardware:\n\nBatch Size\n\nPrecision\n\nQuantization\n\nMemory (GB)\n\nLatency (Seconds)\n\nQuantize TE\n\n1\n\nFP16\n\nINT8\n\n5.363\n\n1.538\n\nTrue\n\n1\n\nBF16\n\nINT8\n\n5.364\n\n1.454\n\nTrue\n\n1\n\nFP16\n\nFP8\n\n5.363\n\n1.601\n\nTrue\n\n1\n\nBF16\n\nFP8\n\n5.363\n\n1.495\n\nTrue\n\n### The promise of qint8\n\nWe found quantizing with qint8 (instead of qfloat8) is generally better in terms of inference latency. This effect gets more pronounced when we horizontally fuse the attention QKV projections (calling fuse_qkv_projections() in Diffusers), thereby thickening the dimensions of the int8 kernels to speed up computation. We present some evidence below for PixArt:\n\nBatch Size\n\nQuantization\n\nMemory (GB)\n\nLatency (Seconds)\n\nQuantize TE\n\nQKV Projection\n\n1\n\nINT8\n\n5.363\n\n1.538\n\nTrue\n\nFalse\n\n1\n\nINT8\n\n5.536\n\n1.504\n\nTrue\n\nTrue\n\n4\n\nINT8\n\n5.365\n\n5.129\n\nTrue\n\nFalse\n\n4\n\nINT8\n\n5.538\n\n4.989\n\nTrue\n\nTrue\n\n### How about INT4?\n\nWe additionally experimented with qint4 when using bfloat16. This is only applicable to bfloat16 on H100 because other configurations are not supported yet. With qint4, we can expect to see more improvements in memory consumption at the cost of increased inference latency. Increased latency is expected, because there is no native hardware support for int4 computation – the weights are transferred using 4 bits, but computation is still done in bfloat16. The table below shows our results for PixArt-Sigma:\n\nBatch Size\n\nQuantize TE\n\nMemory (GB)\n\nLatency (Seconds)\n\n1\n\nNo\n\n9.380\n\n7.431\n\n1\n\nYes\n\n3.058\n\n7.604\n\nNote, however, that due to the aggressive discretization of INT4, the end results can take a hit. This is why, for Transformer-based models in general, we usually leave the final projection layer out of quantization. In Quanto, we do this by:\n\n```\nquantize(pipeline.transformer, weights=qint4, exclude=\"proj_out\")\nfreeze(pipeline.transformer)\n```\n\n\"proj_out\" corresponds to the final layer in pipeline.transformer. The table below presents results for various settings:\n\nQuantize TE: No, Layer exclusion: None\n\nQuantize TE: No, Layer exclusion: \"proj_out\"\n\nQuantize TE: Yes, Layer exclusion: None\n\nQuantize TE: Yes, Layer exclusion: \"proj_out\"\n\n—\n\n—\n\n—\n\n—\n\nTo recover the lost image quality, a common practice is to perform quantization-aware training, which is also supported in Quanto. This technique is out of the scope of this post, feel free to contact us if you're interested!\n\nAll the results of our experiments for this post can be found here.\n\n## Bonus - saving and loading Diffusers models in Quanto\n\nQuantized Diffusers models can be saved and loaded:\n\n```\nfrom diffusers import PixArtTransformer2DModel\nfrom optimum.quanto import QuantizedPixArtTransformer2DModel, qfloat8\n\nmodel = PixArtTransformer2DModel.from_pretrained(\"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", subfolder=\"transformer\")\nqmodel = QuantizedPixArtTransformer2DModel.quantize(model, weights=qfloat8)\nqmodel.save_pretrained(\"pixart-sigma-fp8\")\n```\n\nThe resulting checkpoint is 587MB in size, instead of the original 2.44GB. We can then load it:\n\n```\nfrom optimum.quanto import QuantizedPixArtTransformer2DModel\nimport torch\n\ntransformer = QuantizedPixArtTransformer2DModel.from_pretrained(\"pixart-sigma-fp8\") \ntransformer.to(device=\"cuda\", dtype=torch.float16)\n```\n\nAnd use it in a DiffusionPipeline:\n\n```\nfrom diffusers import DiffusionPipeline\nimport torch\n\npipe = DiffusionPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n    transformer=None,\n    torch_dtype=torch.float16,\n).to(\"cuda\")\npipe.transformer = transformer\n\nprompt = \"A small cactus with a happy face in the Sahara desert.\"\nimage = pipe(prompt).images[0]\n```\n\nIn the future, we can expect to pass the transformer directly when initializing the pipeline so that this will work:\n\n```\npipe = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n-    transformer=None,\n+    transformer=transformer,\n    torch_dtype=torch.float16,\n).to(\"cuda\")\n```\n\nQuantizedPixArtTransformer2DModel implementation is available here for reference. If you want more models from Diffusers supported in Quanto for saving and loading, please open an issue here and mention @sayakpaul.\n\n## Tips\n\n- Based on your requirements, you may want to apply different types of quantization to different pipeline modules. For example, you could use FP8 for the text encoder but INT8 for the diffusion transformer. Thanks to the flexibility of Diffusers and Quanto, this can be done seamlessly.\n\n- To optimize for your use cases, you can even combine quantization with other memory optimization techniques in Diffusers, such as enable_model_cpu_offload().\n\n## Conclusion\n\nIn this post, we showed how to quantize Transformer models from Diffusers and optimize their memory consumption. The effects of quantization become more visible when we additionally quantize the text encoders involved in the mix. We hope you will apply some of the workflows to your projects and benefit from them 🤗.\n\nThanks to Pedro Cuenca for his extensive reviews on the post.",
   "summaryZh": "Hugging Face介绍了如何结合Quanto量化工具与Diffusers库来降低基于Transformer架构的扩散模型的显存开销。随着高分辨率文本到图像生成模型的参数量激增，该技术通过PyTorch原生量化有效地降低了多文本编码器和扩散主干网络的显存占用，从而让消费级GPU也能流畅运行先进的扩散模型。",
   "summaryGeneratedAt": "2026-09-05T15:34:44.418371Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -75,5 +75,3910 @@
       }
     ],
     "duplicateKey": "huggingface-quanto-diffusion-transformers"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypenone-qte0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypenone-qte0.png",
+      "alt": "FP16 image.",
+      "id": "image_68220ffd2b3a7a4c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypefp8-qte0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypefp8-qte0.png",
+      "alt": "FP8 quantized image.",
+      "id": "image_90043303fb15da16"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypefp8-qte1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptpixart-bs1-dtypefp16-qtypefp8-qte1.png",
+      "alt": "ckpt@pixart-bs@1-dtype@fp16-qtype@fp8-qte@1.png",
+      "id": "image_cf6ce7608c01bdf4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-first1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-first1.png",
+      "alt": "Image with quantized text encoder 1.",
+      "id": "image_358b7e6ec39da1a5"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-third1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-third1.png",
+      "alt": "Image with quantized text encoder 3.",
+      "id": "image_55fbe72fb889ea35"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-first1-third1%201.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckptsd3-bs1-dtypefp16-qtypefp8-qte1-first1-third1%201.png",
+      "alt": "Image with quantized text encoders 1 and 3.",
+      "id": "image_82b663027a382450"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%400-fuse%400.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%400-fuse%400.png",
+      "alt": "Image 1 without text encoder quantization.",
+      "id": "image_1c5f977d5fe198dd"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%400-fuse%400-exclude%40proj_out.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%400-fuse%400-exclude%40proj_out.png",
+      "alt": "Image 2 without text encoder quantization but with proj_out excluded in diffusion transformer quantization.",
+      "id": "image_f836b7f227c90fd1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%401-fuse%400.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%401-fuse%400.png",
+      "alt": "Image 3 with text encoder quantization.",
+      "id": "image_a7be478f8a409354"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%401-fuse%400-exclude%40proj_out.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/quanto-diffusers/ckpt%40pixart-bs%401-dtype%40bf16-qtype%40int4-qte%401-fuse%400-exclude%40proj_out.png",
+      "alt": "Image 3 with text encoder quantization but with proj_out excluded in diffusion transformer quantization..",
+      "id": "image_a640e251f75105ef"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Over the past few months, we have seen an emergence in the use of Transformer-based diffusion backbones for high-resolution text-to-image (T2I) generation. These models use the transformer architecture as the building block for the diffusion process, instead of the UNet architecture that was prevalent in many of the initial diffusion models. Thanks to the nature of Transformers, these backbones show good scalability, with models ranging from 0.6B to 8B parameters.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "As models become larger, memory requirements increase. The problem intensifies because a diffusion pipeline usually consists of several components: a text encoder, a diffusion backbone, and an image decoder. Furthermore, modern diffusion pipelines use multiple text encoders – for example, there are three in the case of Stable Diffusion 3. It takes 18.765 GB of GPU memory to run SD3 inference using FP16 precision.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "These high memory requirements can make it difficult to use these models with consumer GPUs, slowing adoption and making experimentation harder. In this post, we show how to improve the memory efficiency of Transformer-based diffusion pipelines by leveraging Quanto's quantization utilities from the Diffusers library.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Table of contents",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Preliminaries",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#preliminaries"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Quantizing a DiffusionPipeline with Quanto",
+      "spans": [
+        {
+          "start": 13,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#quantizing-a-diffusionpipeline-with-quanto"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Generality of the observations",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#generality-of-the-observations"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Misc findings",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#misc-findings"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "bfloat16 as the main compute data-type",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 38,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#bfloat16-is-usually-better-on-h100"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "The promise of qint8",
+      "spans": [
+        {
+          "start": 15,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#the-promise-of-qint8"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "INT4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#how-about-int4"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Bonus - saving and loading Diffusers models in Quanto",
+      "spans": [
+        {
+          "start": 0,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#bonus---saving-and-loading-diffusers-models-in-quanto"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Tips",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#tips"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Conclusion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-diffusers#conclusion"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Preliminaries",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "For a detailed introduction to Quanto, please refer to this post. In short, Quanto is a quantization toolkit built on PyTorch. It's part of Hugging Face Optimum, a set of tools for hardware optimization.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 64,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/quanto-introduction"
+        },
+        {
+          "start": 140,
+          "end": 160,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Model quantization is a popular tool among LLM practitioners, but not so much with diffusion models. Quanto can help bridge this gap and provide memory savings with little or no quality degradation.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "For benchmarking purposes, we use an H100 GPU with the following environment:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "CUDA 12.2",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "PyTorch 2.4.0",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Diffusers (installed from this commit)",
+      "spans": [
+        {
+          "start": 26,
+          "end": 37,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/commit/bce9105ac79636f68dcfdcfc9481b89533db65e5"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Quanto (installed from this commit)",
+      "spans": [
+        {
+          "start": 23,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-quanto/commit/285862b4377aa757342ed810cd60949596b4872b"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Unless otherwise specified, we default to performing computations in FP16. We chose not to quantize the VAE to prevent numerical instability issues. Our benchmarking code can be found here.",
+      "spans": [
+        {
+          "start": 184,
+          "end": 188,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/sayakpaul/sample-datasets/blob/main/quanto-exps-2/benchmark.py"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "At the time of this writing, we have the following Transformer-based diffusion pipelines for text-to-image generation in Diffusers:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "PixArt-Alpha and PixArt-Sigma",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/pixart"
+        },
+        {
+          "start": 17,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/pixart_sigma"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Stable Diffusion 3",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/stable_diffusion_3"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Hunyuan DiT",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/hunyuandit"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Lumina",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/lumina"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Aura Flow",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/aura_flow"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "We also have Latte, a Transformer-based text-to-video generation pipeline.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 18,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/latte"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "For brevity, we keep our study limited to the following three: PixArt-Sigma, Stable Diffusion 3, and Aura Flow. The table below shows the parameter counts of their diffusion backbones:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Model",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "Checkpoint",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "# Params (Billion)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "PixArt",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "https://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
+      "spans": [
+        {
+          "start": 0,
+          "end": 61,
+          "kind": "a",
+          "href": "https://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "0.611",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Stable Diffusion 3",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 70,
+          "kind": "a",
+          "href": "https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "2.028",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "Aura Flow",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "https://huggingface.co/fal/AuraFlow/",
+      "spans": [
+        {
+          "start": 0,
+          "end": 36,
+          "kind": "a",
+          "href": "https://huggingface.co/fal/AuraFlow/"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "6.843",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "It’s worth keeping in mind that this post primarily focuses on memory efficiency at a slight or negligible cost of inference latency.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Quantizing a DiffusionPipeline with Quanto",
+      "spans": [
+        {
+          "start": 13,
+          "end": 30,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Quantizing a model with Quanto is straightforward.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "We call quantize() on the module to be quantized, specifying what we want to quantize. In the above case, we are just quantizing the parameters, leaving the activations as is. We’re quantizing to the FP8 data-type. We finally call freeze() to replace the original parameters with the quantized parameters.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 18,
+          "kind": "code"
+        },
+        {
+          "start": 231,
+          "end": 239,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "We can then call this pipeline normally:",
+      "spans": [
+        {
+          "start": 22,
+          "end": 30,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "FP16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "Diffusion Transformer in FP8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "We notice the following memory savings when using FP8, with slightly higher latency and almost no quality degradation:",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "12.086",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "1.200",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "11.547",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "1.540",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "12.087",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "4.482",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "11.548",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "5.109",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "We can quantize the text encoder in the same way:",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "The text encoder is also a transformer model, and we can quantize it too. Quantizing both the text encoder and the diffusion backbone leads to much larger memory improvements:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "Quantize TE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "False",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "11.547",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "1.540",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "5.363",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "1.601",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "False",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "11.548",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "5.109",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "5.364",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "5.141",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "Quantizing the text encoder produces results very similar to the previous case:",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "Generality of the observations",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "Quantizing the text encoder together with the diffusion backbone generally works for the models we tried. Stable Diffusion 3 is a special case, as it uses three different text encoders. We found that quantizing the second text encoder does not work well, so we recommend the following alternatives:",
+      "spans": [
+        {
+          "start": 215,
+          "end": 221,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0104",
+      "source": "Only quantize the first text encoder (CLIPTextModelWithProjection) or",
+      "spans": [
+        {
+          "start": 38,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 65,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/en/model_doc/clip#transformers.CLIPTextModelWithProjection"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "Only quantize the third text encoder (T5EncoderModel) or",
+      "spans": [
+        {
+          "start": 38,
+          "end": 52,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/en/model_doc/t5#transformers.T5EncoderModel"
+        }
+      ]
+    },
+    {
+      "id": "b0106",
+      "source": "Quantize the first and third text encoders",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "The table below gives an idea about the expected memory savings for various text encoder quantization combinations (the diffusion transformer is quantized in all cases):",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "Quantize TE 1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "Quantize TE 2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "Quantize TE 3",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "8.200",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "2.858",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "1 ✅",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "8.294",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "2.781",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "14.384",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "2.833",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "14.475",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "2.818",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "1 ✅",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "14.384",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "2.730",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 5,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "8.325",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "2.875",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 6,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "1 ✅",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "8.204",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "2.789",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 7,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "None",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "16.403",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "2.118",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 8,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "Quantized Text Encoder: 1",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "Quantized Text Encoder: 3",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "Quantized Text Encoders: 1 and 3",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "Misc findings",
+      "spans": []
+    },
+    {
+      "id": "b0178",
+      "source": "bfloat16 is usually better on H100",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0179",
+      "source": "Using bfloat16 can be faster for supported GPU architectures, such as H100 or 4090. The table below presents some numbers for PixArt measured on our H100 reference hardware:",
+      "spans": [
+        {
+          "start": 6,
+          "end": 14,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0180",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "Precision",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "Quantize TE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "FP16",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "5.363",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "1.538",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "BF16",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "5.364",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "1.454",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0198",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0199",
+      "source": "FP16",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0200",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0201",
+      "source": "5.363",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0202",
+      "source": "1.601",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "BF16",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "FP8",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "5.363",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "1.495",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t7",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "The promise of qint8",
+      "spans": [
+        {
+          "start": 15,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0211",
+      "source": "We found quantizing with qint8 (instead of qfloat8) is generally better in terms of inference latency. This effect gets more pronounced when we horizontally fuse the attention QKV projections (calling fuse_qkv_projections() in Diffusers), thereby thickening the dimensions of the int8 kernels to speed up computation. We present some evidence below for PixArt:",
+      "spans": [
+        {
+          "start": 25,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 201,
+          "end": 223,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0212",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "Quantization",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "Quantize TE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "QKV Projection",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0218",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0219",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0220",
+      "source": "5.363",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0221",
+      "source": "1.538",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "False",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "5.536",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "1.504",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0230",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "5.365",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "5.129",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0234",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0235",
+      "source": "False",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0236",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0237",
+      "source": "INT8",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0238",
+      "source": "5.538",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0239",
+      "source": "4.989",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0240",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "True",
+      "spans": [],
+      "table": {
+        "id": "t8",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0242",
+      "source": "How about INT4?",
+      "spans": []
+    },
+    {
+      "id": "b0243",
+      "source": "We additionally experimented with qint4 when using bfloat16. This is only applicable to bfloat16 on H100 because other configurations are not supported yet. With qint4, we can expect to see more improvements in memory consumption at the cost of increased inference latency. Increased latency is expected, because there is no native hardware support for int4 computation – the weights are transferred using 4 bits, but computation is still done in bfloat16. The table below shows our results for PixArt-Sigma:",
+      "spans": [
+        {
+          "start": 34,
+          "end": 39,
+          "kind": "code"
+        },
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 88,
+          "end": 96,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 167,
+          "kind": "code"
+        },
+        {
+          "start": 447,
+          "end": 455,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0244",
+      "source": "Batch Size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0245",
+      "source": "Quantize TE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0246",
+      "source": "Memory (GB)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0247",
+      "source": "Latency (Seconds)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0248",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0249",
+      "source": "No",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0250",
+      "source": "9.380",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0251",
+      "source": "7.431",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0252",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0253",
+      "source": "Yes",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0254",
+      "source": "3.058",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0255",
+      "source": "7.604",
+      "spans": [],
+      "table": {
+        "id": "t9",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0256",
+      "source": "Note, however, that due to the aggressive discretization of INT4, the end results can take a hit. This is why, for Transformer-based models in general, we usually leave the final projection layer out of quantization. In Quanto, we do this by:",
+      "spans": []
+    },
+    {
+      "id": "b0257",
+      "source": "\"proj_out\" corresponds to the final layer in pipeline.transformer. The table below presents results for various settings:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0258",
+      "source": "Quantize TE: No, Layer exclusion: None",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0259",
+      "source": "Quantize TE: No, Layer exclusion: \"proj_out\"",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0260",
+      "source": "Quantize TE: Yes, Layer exclusion: None",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0261",
+      "source": "Quantize TE: Yes, Layer exclusion: \"proj_out\"",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0262",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0263",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0264",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0265",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t10",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0266",
+      "source": "To recover the lost image quality, a common practice is to perform quantization-aware training, which is also supported in Quanto. This technique is out of the scope of this post, feel free to contact us if you're interested!",
+      "spans": []
+    },
+    {
+      "id": "b0267",
+      "source": "All the results of our experiments for this post can be found here.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 66,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/sayakpaul/sample-datasets/tree/main/quanto-exps-2"
+        }
+      ]
+    },
+    {
+      "id": "b0268",
+      "source": "Bonus - saving and loading Diffusers models in Quanto",
+      "spans": []
+    },
+    {
+      "id": "b0269",
+      "source": "Quantized Diffusers models can be saved and loaded:",
+      "spans": []
+    },
+    {
+      "id": "b0270",
+      "source": "The resulting checkpoint is 587MB in size, instead of the original 2.44GB. We can then load it:",
+      "spans": [
+        {
+          "start": 28,
+          "end": 33,
+          "kind": "strong"
+        },
+        {
+          "start": 28,
+          "end": 33,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0271",
+      "source": "And use it in a DiffusionPipeline:",
+      "spans": [
+        {
+          "start": 16,
+          "end": 33,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0272",
+      "source": "In the future, we can expect to pass the transformer directly when initializing the pipeline so that this will work:",
+      "spans": [
+        {
+          "start": 41,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0273",
+      "source": "QuantizedPixArtTransformer2DModel implementation is available here for reference. If you want more models from Diffusers supported in Quanto for saving and loading, please open an issue here and mention @sayakpaul.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "code"
+        },
+        {
+          "start": 62,
+          "end": 66,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-quanto/blob/601dc193ce0ed381c479fde54a81ba546bdf64d1/optimum/quanto/models/diffusers_models.py#L184"
+        },
+        {
+          "start": 186,
+          "end": 190,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-quanto/issues/new"
+        },
+        {
+          "start": 203,
+          "end": 213,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0274",
+      "source": "Tips",
+      "spans": []
+    },
+    {
+      "id": "b0275",
+      "source": "Based on your requirements, you may want to apply different types of quantization to different pipeline modules. For example, you could use FP8 for the text encoder but INT8 for the diffusion transformer. Thanks to the flexibility of Diffusers and Quanto, this can be done seamlessly.",
+      "spans": []
+    },
+    {
+      "id": "b0276",
+      "source": "To optimize for your use cases, you can even combine quantization with other memory optimization techniques in Diffusers, such as enable_model_cpu_offload().",
+      "spans": [
+        {
+          "start": 77,
+          "end": 107,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/optimization/memory"
+        },
+        {
+          "start": 130,
+          "end": 156,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0277",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0278",
+      "source": "In this post, we showed how to quantize Transformer models from Diffusers and optimize their memory consumption. The effects of quantization become more visible when we additionally quantize the text encoders involved in the mix. We hope you will apply some of the workflows to your projects and benefit from them 🤗.",
+      "spans": []
+    },
+    {
+      "id": "b0279",
+      "source": "Thanks to Pedro Cuenca for his extensive reviews on the post.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 22,
+          "kind": "a",
+          "href": "https://github.com/pcuenca"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "a27584b8c90f89ccbd38ed0199a46f3919a90453e37710b8d1e61522aa5e2aec",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from optimum.quanto import freeze, qfloat8, quantize\nfrom diffusers import PixArtSigmaPipeline\nimport torch\n\npipeline = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", torch_dtype=torch.float16\n).to(\"cuda\")\n\nquantize(pipeline.transformer, weights=qfloat8)\nfreeze(pipeline.transformer)"
+    },
+    {
+      "id": "c0002",
+      "source": "image = pipeline(\"ghibli style, a fantasy landscape with castles\").images[0]"
+    },
+    {
+      "id": "c0003",
+      "source": "quantize(pipeline.text_encoder, weights=qfloat8)\nfreeze(pipeline.text_encoder)"
+    },
+    {
+      "id": "c0004",
+      "source": "quantize(pipeline.transformer, weights=qint4, exclude=\"proj_out\")\nfreeze(pipeline.transformer)"
+    },
+    {
+      "id": "c0005",
+      "source": "from diffusers import PixArtTransformer2DModel\nfrom optimum.quanto import QuantizedPixArtTransformer2DModel, qfloat8\n\nmodel = PixArtTransformer2DModel.from_pretrained(\"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", subfolder=\"transformer\")\nqmodel = QuantizedPixArtTransformer2DModel.quantize(model, weights=qfloat8)\nqmodel.save_pretrained(\"pixart-sigma-fp8\")"
+    },
+    {
+      "id": "c0006",
+      "source": "from optimum.quanto import QuantizedPixArtTransformer2DModel\nimport torch\n\ntransformer = QuantizedPixArtTransformer2DModel.from_pretrained(\"pixart-sigma-fp8\") \ntransformer.to(device=\"cuda\", dtype=torch.float16)"
+    },
+    {
+      "id": "c0007",
+      "source": "from diffusers import DiffusionPipeline\nimport torch\n\npipe = DiffusionPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n    transformer=None,\n    torch_dtype=torch.float16,\n).to(\"cuda\")\npipe.transformer = transformer\n\nprompt = \"A small cactus with a happy face in the Sahara desert.\"\nimage = pipe(prompt).images[0]"
+    },
+    {
+      "id": "c0008",
+      "source": "pipe = PixArtSigmaPipeline.from_pretrained(\n    \"PixArt-alpha/PixArt-Sigma-XL-2-1024-MS\", \n-    transformer=None,\n+    transformer=transformer,\n    torch_dtype=torch.float16,\n).to(\"cuda\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "a27584b8c90f89ccbd38ed0199a46f3919a90453e37710b8d1e61522aa5e2aec",
+  "mediaLayout": [
+    {
+      "mediaId": "image_68220ffd2b3a7a4c",
+      "type": "image",
+      "afterBlockId": "b0051",
+      "order": 0
+    },
+    {
+      "mediaId": "image_90043303fb15da16",
+      "type": "image",
+      "afterBlockId": "b0052",
+      "order": 1
+    },
+    {
+      "mediaId": "image_cf6ce7608c01bdf4",
+      "type": "image",
+      "afterBlockId": "b0101",
+      "order": 2
+    },
+    {
+      "mediaId": "image_358b7e6ec39da1a5",
+      "type": "image",
+      "afterBlockId": "b0174",
+      "order": 3
+    },
+    {
+      "mediaId": "image_55fbe72fb889ea35",
+      "type": "image",
+      "afterBlockId": "b0175",
+      "order": 4
+    },
+    {
+      "mediaId": "image_82b663027a382450",
+      "type": "image",
+      "afterBlockId": "b0176",
+      "order": 5
+    },
+    {
+      "mediaId": "image_1c5f977d5fe198dd",
+      "type": "image",
+      "afterBlockId": "b0262",
+      "order": 6
+    },
+    {
+      "mediaId": "image_f836b7f227c90fd1",
+      "type": "image",
+      "afterBlockId": "b0263",
+      "order": 7
+    },
+    {
+      "mediaId": "image_a7be478f8a409354",
+      "type": "image",
+      "afterBlockId": "b0264",
+      "order": 8
+    },
+    {
+      "mediaId": "image_a640e251f75105ef",
+      "type": "image",
+      "afterBlockId": "b0265",
+      "order": 9
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 10,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 10,
+    "savedImages": 10,
+    "sourceImageOccurrences": 10,
+    "placedImageOccurrences": 10,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T07:06:55.103085Z",
+  "mediaLayoutCheckedAt": "2026-10-03T07:06:55.103100Z"
 }
