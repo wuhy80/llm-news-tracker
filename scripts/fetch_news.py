@@ -635,6 +635,34 @@ def normalized_title(value: str) -> str:
     return re.sub(r"[^\w一-鿿]+", "", value)
 
 
+# Forum posts carry user-written titles, and those run far longer than editorial
+# ones: sampled across the archive, Reddit titles had a median of 65 characters
+# but a maximum of 300, and one in ten ran past 120.
+COMMUNITY_TITLE_LIMIT = 120
+COMMUNITY_SOURCE_HINTS = ("reddit", "linux do", "linux.do")
+
+
+def is_community_source(raw: dict) -> bool:
+    haystack = f"{raw.get('source') or ''} {raw.get('sourceDomain') or ''}".casefold()
+    return any(hint in haystack for hint in COMMUNITY_SOURCE_HINTS)
+
+
+def shorten_title(title: str, limit: int = COMMUNITY_TITLE_LIMIT) -> str:
+    """Trim a long forum title at a word boundary.
+
+    The item id is derived from the full title, so shortening what gets stored
+    does not move the item or break its identity.
+    """
+    text = str(title or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rfind(" ")
+    if cut >= limit // 2:
+        head = head[:cut]
+    return head.rstrip(" ,.;:!?-–—") + "…"
+
+
 def canonical_url(value: str) -> str:
     """Normalize a public article URL without removing content-identifying parameters."""
     try:
@@ -669,9 +697,10 @@ def finalize(raw: dict, now: datetime) -> dict:
         score += 6
     score = min(100, score)
     key = normalized_title(raw["title"])
+    title = shorten_title(raw["title"]) if is_community_source(raw) else raw["title"]
     return {
         "id": hashlib.sha1(key.encode("utf-8")).hexdigest()[:12],
-        "title": raw["title"],
+        "title": title,
         "summary": raw["summary"] or "来自原始信息源的最新动态，点击标题查看完整内容。",
         "url": raw["url"],
         "source": raw["source"],

@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import sys
 import unittest
 import urllib.parse
@@ -272,6 +273,52 @@ class FetchNewsTests(unittest.TestCase):
         result = fetch_news.preserve_archive_metadata(item, None)
 
         self.assertEqual(result["publishedAt"], "2026-08-23T10:06:41Z")
+
+    def forum_raw(self, title, **overrides):
+        raw = {
+            "title": title, "summary": "Numbers inside.",
+            "url": "https://www.reddit.com/r/LocalLLaMA/comments/1wwrgx1/two_local_qwen/",
+            "source": "Reddit · LocalLLaMA", "sourceDomain": "reddit.com",
+            "published": fetch_news.parse_date("2026-10-03T00:00:00Z"), "official": False,
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_a_long_forum_title_is_shortened_at_a_word_boundary(self):
+        raw = self.forum_raw(
+            "Two local Qwen models vs Claude Opus 4.6 on the same three coding tasks. "
+            "One of them tied it. Not here to start a fight, just sharing numbers")
+
+        item = fetch_news.finalize(raw, fetch_news.parse_date("2026-10-03T01:00:00Z"))
+
+        self.assertTrue(item["title"].endswith("…"))
+        self.assertLessEqual(len(item["title"]), fetch_news.COMMUNITY_TITLE_LIMIT + 1)
+        self.assertNotIn(" …", item["title"])
+        self.assertNotIn("  ", item["title"])
+
+    def test_shortening_a_title_does_not_move_the_item(self):
+        long_title = "A rather long reddit headline " * 8
+        raw = self.forum_raw(long_title)
+
+        item = fetch_news.finalize(raw, fetch_news.parse_date("2026-10-03T01:00:00Z"))
+
+        # The id comes from the full title, so a stored title change never re-keys
+        # the item or resurrects it as new.
+        expected = hashlib.sha1(fetch_news.normalized_title(long_title).encode("utf-8")).hexdigest()[:12]
+        self.assertEqual(item["id"], expected)
+
+    def test_short_forum_titles_and_long_editorial_titles_are_untouched(self):
+        short = "Qwen 3.8 ties Opus on three coding tasks"
+        long_editorial = "Introducing " + "a rather long editorial headline " * 6
+
+        short_item = fetch_news.finalize(self.forum_raw(short),
+                                        fetch_news.parse_date("2026-10-03T01:00:00Z"))
+        editorial_item = fetch_news.finalize(
+            self.forum_raw(long_editorial, source="OpenAI", sourceDomain="openai.com", official=True),
+            fetch_news.parse_date("2026-10-03T01:00:00Z"))
+
+        self.assertEqual(short_item["title"], short)
+        self.assertEqual(editorial_item["title"], long_editorial)
 
 
 if __name__ == "__main__":

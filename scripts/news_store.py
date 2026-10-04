@@ -170,6 +170,27 @@ def _remove_stale_json(directory: Path, expected: set[Path]) -> None:
             pass
 
 
+COMMUNITY_SOURCE_HINTS = ("reddit", "linux do", "linux.do")
+
+
+def is_community_item(record: dict) -> bool:
+    haystack = f"{record.get('source') or ''} {record.get('sourceDomain') or ''}".casefold()
+    return any(hint in haystack for hint in COMMUNITY_SOURCE_HINTS)
+
+
+def is_unarchived_community_item(record: dict) -> bool:
+    """A forum post that was fetched and yielded no readable body.
+
+    ``archive:not attempted`` is deliberately not treated as unarchived: it marks
+    an item still queued behind the per-run archive limit, and dropping those
+    would discard articles that were never tried. An attempt that found nothing
+    overwrites the note with its error, which is what this matches.
+    """
+    if record.get("contentKind") != "summary" or not is_community_item(record):
+        return False
+    return record.get("note") != "archive:not attempted"
+
+
 def save_news(
     data: dict,
     manifest_file: Path = MANIFEST_FILE,
@@ -190,9 +211,15 @@ def save_news(
         records.append(sync_article_record(item, articles_dir, generated_at))
     records.sort(key=lambda item: (item.get("publishedAt", ""), item.get("score", 0)), reverse=True)
 
+    # A forum post that was fetched and produced no body is not worth listing.
+    # Its snapshot stays on disk, so expected_articles below still covers it and
+    # the archive retry cooldown keeps working instead of re-fetching forever.
+    listed = [record for record in records if not is_unarchived_community_item(record)]
+    unlisted_community = len(records) - len(listed)
+
     by_day: dict[str, list[dict]] = {}
     locators: dict[str, dict[str, str]] = {}
-    for record in records:
+    for record in listed:
         year, month, day = day_parts(record.get("publishedAt"))
         date = f"{year}-{month}-{day}"
         by_day.setdefault(date, []).append(index_item(record))
@@ -221,7 +248,8 @@ def save_news(
         "generatedAt": generated_at,
         "historyPolicy": data.get("historyPolicy", "append-only"),
         "sources": data.get("sources", []),
-        "itemCount": len(records),
+        "itemCount": len(listed),
+        "unlistedCommunity": unlisted_community,
         "latestDate": max(by_day, default=None),
         "days": {date: len(by_day[date]) for date in sorted(by_day, reverse=True)},
         "articleIndexPattern": "data/article-index/{prefix}.json",
@@ -229,4 +257,5 @@ def save_news(
     if isinstance(data.get("aiReview"), dict):
         manifest["aiReview"] = data["aiReview"]
     atomic_write_json(manifest_file, manifest)
-    return {"items": len(records), "days": len(by_day), "prefixes": len(locators)}
+    return {"items": len(listed), "days": len(by_day), "prefixes": len(locators),
+            "unlistedCommunity": unlisted_community}
