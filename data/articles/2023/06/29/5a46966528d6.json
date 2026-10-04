@@ -18,8 +18,8 @@
   "fetchedAt": "2026-08-30T11:10:41.281576Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Accelerating Vision-Language Models: BridgeTower on Habana Gaudi2\n\nThis article is also available in Chinese 简体中文 .\n\nUpdate (29/08/2023): A benchmark on H100 was added to this blog post. Also, all performance numbers have been updated with newer versions of software.\n\nOptimum Habana v1.7 on Habana Gaudi2 achieves x2.5 speedups compared to A100 and x1.4 compared to H100 when fine-tuning BridgeTower, a state-of-the-art vision-language model. This performance improvement relies on hardware-accelerated data loading to make the most of your devices.\n\nThese techniques apply to any other workloads constrained by data loading, which is frequently the case for many types of vision models. This post will take you through the process and benchmark we used to compare BridgeTower fine-tuning on Habana Gaudi2, Nvidia H100 and Nvidia A100 80GB. It also demonstrates how easy it is to take advantage of these features in transformers-based models.\n\nIn the recent past, Vision-Language (VL) models have gained tremendous importance and shown dominance in a variety of VL tasks. Most common approaches leverage uni-modal encoders to extract representations from their respective modalities. Then those representations are either fused together, or fed into a cross-modal encoder. To efficiently handle some of the performance limitations and restrictions in VL representation learning, BridgeTower introduces multiple bridge layers that build a connection between the top layers of uni-modal encoders and each layer of the cross-modal encoder. This enables effective bottom-up cross-modal alignment and fusion between visual and textual representations at different semantic levels in the cross-modal encoder.\n\nPre-trained with only 4M images (see the detail below ), BridgeTower achieves state-of-the-art performance on various downstream vision-language tasks. In particular, BridgeTower achieves an accuracy of 78.73% on the VQAv2 test-std set, outperforming the previous state-of-the-art model (METER) by 1.09% using the same pre-training data and almost negligible additional parameters and computational costs. Notably, when further scaling the model, BridgeTower achieves an accuracy of 81.15%, surpassing models that are pre-trained on orders-of-magnitude larger datasets.\n\nNVIDIA H100 Tensor Core GPU is the latest and fastest generation of Nvidia GPUs. It includes a dedicated Transformer Engine that enables to perform fp8 mixed-precision runs. One device has 80GB of memory.\n\nNvidia A100 Tensor Core GPU includes the 3rd generation of the Tensor Core technology . This is still the fastest GPU that you will find at most cloud providers. We use here the 80GB-memory variant which also offers faster memory bandwidth than the 40GB one.\n\nHabana Gaudi2 is the second-generation AI hardware accelerator designed by Habana Labs. A single server contains 8 accelerator devices called HPUs with 96GB of memory each. Check out our previous blog post for a more in-depth introduction and a guide showing how to access it through the Intel Developer Cloud . Unlike many AI accelerators in the market, advanced features are very easy to apply to make the most of Gaudi2 with Optimum Habana , which enables users to port Transformers-compatible scripts to Gaudi with just a 2-line change.\n\nTo benchmark training, we are going to fine-tune a BridgeTower Large checkpoint consisting of 866M parameters. This checkpoint was pretrained on English language using masked language modeling, image-text matching and image-text contrastive loss on Conceptual Captions , SBU Captions , MSCOCO Captions and Visual Genome .\n\nWe will further fine-tune this checkpoint on the New Yorker Caption Contest dataset which consists of cartoons from The New Yorker and the most voted captions.\n\nHyperparameters are the same for all accelerators. We used a batch size of 48 samples for each device. You can check hyperparameters out here for Gaudi2 and there for A100.\n\nWhen dealing with datasets involving images, data loading is frequently a bottleneck because many costly operations are computed on CPU (image decoding, image augmentations) and then full images are sent to the training devices. Ideally, we would like to send only raw bytes to devices and then perform decoding and various image transformations on device . But let's see first how to easily allocate more resources to data loading for accelerating your runs.\n\nMaking use of dataloader_num_workers\n\nWhen image loading is done on CPU, a quick way to speed it up would be to allocate more subprocesses for data loading. This is very easy to do with Transformers' TrainingArguments (or its Optimum Habana counterpart GaudiTrainingArguments ): you can use the dataloader_num_workers=N argument to set the number of subprocesses ( N ) allocated on CPU for data loading.\n\nThe default is 0, which means that data is loaded in the main process. This may not be optimal as the main process has many things to manage. We can set it to 1 to have one fully dedicated subprocess for data loading. When several subprocesses are allocated, each one of them will be responsible for preparing a batch. This means that RAM consumption will increase with the number of workers. One recommendation would be to set it to the number of CPU cores, but those cores may not be fully free so you will have to try it out to find the best configuration.\n\nLet's run the three following experiments:\n\na mixed-precision ( bfloat16 / float32 ) run distributed across 8 devices where data loading is performed by the same process as everything else (i.e. dataloader_num_workers=0 )\n\na mixed-precision ( bfloat16 / float32 ) run distributed across 8 devices with 1 dedicated subprocess for data loading (i.e. dataloader_num_workers=1 )\n\nsame run with dataloader_num_workers=2\n\nHere are the throughputs we got on Gaudi2, H100 and A100:\n\nDevice dataloader_num_workers=0 dataloader_num_workers=1 dataloader_num_workers=2\n\nWe first see that Gaudi2 is x1.28 faster than H100 with dataloader_num_workers=2 , x1.29 faster with dataloader_num_workers=1 and x1.79 faster with dataloader_num_workers=0 . Gaudi2 is also much faster than the previous generation since it is x2.23 faster than A100 with dataloader_num_workers=2 , x2.20 faster with dataloader_num_workers=1 and x2.64 faster with dataloader_num_workers=0 , which is even better than the speedups we previously reported !\n\nSecond, we see that allocating more resources for data loading can lead to easy speedups : x1.28 on Gaudi2, x1.79 on H100 and x1.52 on A100.\n\nWe also ran experiments with several dedicated subprocesses for data loading but performance was not better than with dataloader_num_workers=2 for all accelerators. Thus, using dataloader_num_workers>0 is usually a good first way of accelerating your runs involving images!\n\nTensorboard logs can be visualized here for Gaudi2 and there for A100.\n\nHardware-accelerated data loading with Optimum Habana\n\nFor even larger speedups, we are now going to move as many data loading operations as possible from the CPU to the accelerator devices (i.e. HPUs on Gaudi2 or GPUs on A100/H100). This can be done on Gaudi2 using Habana's media pipeline .\n\nGiven a dataset, most dataloaders follow the following recipe:\n\nFetch data (e.g. where your JPEG images are stored on disk)\n\nThe CPU reads encoded images\n\nThe CPU applies image transformations to augment images\n\nFinally, images are sent to devices (although this is usually not done by the dataloader itself)\n\nInstead of doing the whole process on CPU and send ready-to-train data to devices, a more efficient workflow would be to send encoded images to devices first and then perform image decoding and augmentations:\n\nEncoded images are sent to devices\n\nDevices apply image transformations to augment images\n\nThat way we can benefit from the computing power of our devices to speed image decoding and transformations up. Note that there are two caveats to be aware of when doing this:\n\nDevice memory consumption will increase, so you may have to reduce your batch size if there is not enough free memory. This may mitigate the speedup brought by this approach.\n\nIf devices are intensively used (100% or close to it) when doing data loading on CPU, don't expect any speedup when doing it on devices as they already have their hands full.\n\nTo implement this on Gaudi2, we have got you covered: the contrastive image-text example in Optimum Habana now provides a ready-to-use media pipeline that you can use with COCO-like datasets that contain text and images! You will just have to add --mediapipe_dataloader to your command to use it.\n\nFor interested readers, a lower-level overview is given in the documentation of Gaudi here and the list of all supported operators is available there .\n\nWe are now going to re-run the previous experiments adding the mediapipe_dataloader argument since it is compatible with dataloader_num_workers :\n\nDevice dataloader_num_workers=0 dataloader_num_workers=2 dataloader_num_workers=2 + mediapipe_dataloader\n\nWe got an additional x1.10 speedup compared to the previous run with dataloader_num_workers=2 only. This final run is thus x1.41 faster than our base run on Gaudi2 simply adding 2 ready-to-use training arguments. It is also x1.41 faster than H100 and x2.45 faster than A100 with dataloader_num_workers=2 !\n\nReproducing this benchmark\n\nTo reproduce this benchmark, you first need to get access to Gaudi2 through the Intel Developer Cloud (see this guide for more information).\n\nThen, you need to install the latest version of Optimum Habana and run run_bridgetower.py which you can find here . Here is how to do it:\n\n```\npip install optimum[habana]\ngit clone https://github.com/huggingface/optimum-habana.git\ncd optimum-habana/examples/contrastive-image-text\npip install -r requirements.txt\n```\n\nThe base command line to run the script is:\n\n```\npython ../gaudi_spawn.py --use_mpi --world_size 8 run_bridgetower.py \\\n--output_dir /tmp/bridgetower-test \\\n--model_name_or_path BridgeTower/bridgetower-large-itm-mlm-itc \\\n--dataset_name jmhessel/newyorker_caption_contest --dataset_config_name matching \\\n--dataset_revision 3c6c4f6c0ff7e902833d3afa5f8f3875c2b036e6 \\\n--image_column image --caption_column image_description \\\n--remove_unused_columns=False \\\n--do_train --do_eval --do_predict \\\n--per_device_train_batch_size=\"40\" --per_device_eval_batch_size=\"16\" \\\n--num_train_epochs 5 \\\n--learning_rate=\"1e-5\" \\\n--push_to_hub --report_to tensorboard --hub_model_id bridgetower\\\n--overwrite_output_dir \\\n--use_habana --use_lazy_mode --use_hpu_graphs_for_inference --gaudi_config_name Habana/clip \\\n--throughput_warmup_steps 3 \\\n--logging_steps 10\n```\n\nwhich corresponds to the case --dataloader_num_workers 0 . You can then add --dataloader_num_workers N and --mediapipe_dataloader to test other configurations.\n\nTo push your model and Tensorboard logs to the Hugging Face Hub, you will have to log in to your account beforehand with:\n\n```\nhuggingface-cli login\n```\n\nFor A100 and H100, you can use the same run_bridgetower.py script with a few small changes:\n\nReplace GaudiTrainer and GaudiTrainingArguments with Trainer and TrainingArguments from Transformers\n\nRemove references to GaudiConfig , gaudi_config and HabanaDataloaderTrainer\n\nImport set_seed directly from Transformers: from transformers import set_seed\n\nThe results displayed in this benchmark were obtained with a Nvidia H100 Lambda instance and a Nvidia A100 80GB GCP instance both with 8 devices using Nvidia's Docker images .\n\nNote that --mediapipe_dataloader is compatible with Gaudi2 only and will not work with A100/H100.\n\nRegarding fp8 results on H100 using Transformer Engine , they are not available because the code crashes and would require modifying the modeling of BridgeTower in Transformers. We will revisit this comparison when fp8 is supported on Gaudi2.\n\nWhen dealing with images, we presented two solutions to speed up your training workflows: allocating more resources to the dataloader, and decoding and augmenting images directly on accelerator devices rather than on CPU. We showed that it leads to dramatic speedups when training a SOTA vision-language model like BridgeTower: Habana Gaudi2 with Optimum Habana is about x1.4 faster than Nvidia H100 and x2.5 faster than Nvidia A100 80GB with Transformers! And this is super easy to use as you just need to provide a few additional training arguments.\n\nTo go further, we are looking forward to using HPU graphs for training models even faster and to presenting how to use DeepSpeed ZeRO-3 on Gaudi2 to accelerate the training of your LLMs. Stay tuned!\n\nIf you are interested in accelerating your Machine Learning training and inference workflows using the latest AI hardware accelerators and software libraries, check out our Expert Acceleration Program . To learn more about Habana solutions, read about our partnership and contact them here . To learn more about Hugging Face efforts to make AI hardware accelerators easy to use, check out our Hardware Partner Program .\n\nFaster Training and Inference: Habana Gaudi-2 vs Nvidia A100 80GB\n\nFast Inference on Large Language Models: BLOOMZ on Habana Gaudi2 Accelerator\n\nModels mentioned in this article 3\n\nDatasets mentioned in this article 2\n\nPapers mentioned in this article 1\n\nMore Articles from our Blog\n\nmultimodal nlp community\n\nTraining and Finetuning Multimodal Embedding & Reranker Models with Sentence Transformers\n\nMultimodal Embedding & Reranker Models with Sentence Transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Update (29/08/2023): A benchmark on H100 was added to this blog post. Also, all performance numbers have been updated with newer versions of software.\n\nOptimum Habana v1.7 on Habana Gaudi2 achieves x2.5 speedups compared to A100 and x1.4 compared to H100 when fine-tuning BridgeTower, a state-of-the-art vision-language model. This performance improvement relies on hardware-accelerated data loading to make the most of your devices.\n\nThese techniques apply to any other workloads constrained by data loading, which is frequently the case for many types of vision models. This post will take you through the process and benchmark we used to compare BridgeTower fine-tuning on Habana Gaudi2, Nvidia H100 and Nvidia A100 80GB. It also demonstrates how easy it is to take advantage of these features in transformers-based models.\n\n## BridgeTower\n\nIn the recent past, Vision-Language (VL) models have gained tremendous importance and shown dominance in a variety of VL tasks. Most common approaches leverage uni-modal encoders to extract representations from their respective modalities. Then those representations are either fused together, or fed into a cross-modal encoder. To efficiently handle some of the performance limitations and restrictions in VL representation learning, BridgeTower introduces multiple bridge layers that build a connection between the top layers of uni-modal encoders and each layer of the cross-modal encoder. This enables effective bottom-up cross-modal alignment and fusion between visual and textual representations at different semantic levels in the cross-modal encoder.\n\nPre-trained with only 4M images (see the detail below), BridgeTower achieves state-of-the-art performance on various downstream vision-language tasks. In particular, BridgeTower achieves an accuracy of 78.73% on the VQAv2 test-std set, outperforming the previous state-of-the-art model (METER) by 1.09% using the same pre-training data and almost negligible additional parameters and computational costs. Notably, when further scaling the model, BridgeTower achieves an accuracy of 81.15%, surpassing models that are pre-trained on orders-of-magnitude larger datasets.\n\n## Hardware\n\nNVIDIA H100 Tensor Core GPU is the latest and fastest generation of Nvidia GPUs. It includes a dedicated Transformer Engine that enables to perform fp8 mixed-precision runs. One device has 80GB of memory.\n\nNvidia A100 Tensor Core GPU includes the 3rd generation of the Tensor Core technology. This is still the fastest GPU that you will find at most cloud providers. We use here the 80GB-memory variant which also offers faster memory bandwidth than the 40GB one.\n\nHabana Gaudi2 is the second-generation AI hardware accelerator designed by Habana Labs. A single server contains 8 accelerator devices called HPUs with 96GB of memory each. Check out our previous blog post for a more in-depth introduction and a guide showing how to access it through the Intel Developer Cloud. Unlike many AI accelerators in the market, advanced features are very easy to apply to make the most of Gaudi2 with Optimum Habana, which enables users to port Transformers-compatible scripts to Gaudi with just a 2-line change.\n\n## Benchmark\n\nTo benchmark training, we are going to fine-tune a BridgeTower Large checkpoint consisting of 866M parameters. This checkpoint was pretrained on English language using masked language modeling, image-text matching and image-text contrastive loss on Conceptual Captions, SBU Captions, MSCOCO Captions and Visual Genome.\n\nWe will further fine-tune this checkpoint on the New Yorker Caption Contest dataset which consists of cartoons from The New Yorker and the most voted captions.\n\nHyperparameters are the same for all accelerators. We used a batch size of 48 samples for each device. You can check hyperparameters out here for Gaudi2 and there for A100.\n\nWhen dealing with datasets involving images, data loading is frequently a bottleneck because many costly operations are computed on CPU (image decoding, image augmentations) and then full images are sent to the training devices. Ideally, we would like to send only raw bytes to devices and then perform decoding and various image transformations on device. But let's see first how to easily allocate more resources to data loading for accelerating your runs.\n\n### Making use of dataloader_num_workers\n\nWhen image loading is done on CPU, a quick way to speed it up would be to allocate more subprocesses for data loading. This is very easy to do with Transformers' TrainingArguments (or its Optimum Habana counterpart GaudiTrainingArguments): you can use the dataloader_num_workers=N argument to set the number of subprocesses (N) allocated on CPU for data loading.\n\nThe default is 0, which means that data is loaded in the main process. This may not be optimal as the main process has many things to manage. We can set it to 1 to have one fully dedicated subprocess for data loading. When several subprocesses are allocated, each one of them will be responsible for preparing a batch. This means that RAM consumption will increase with the number of workers. One recommendation would be to set it to the number of CPU cores, but those cores may not be fully free so you will have to try it out to find the best configuration.\n\nLet's run the three following experiments:\n\n- a mixed-precision (bfloat16/float32) run distributed across 8 devices where data loading is performed by the same process as everything else (i.e. dataloader_num_workers=0)\n\n- a mixed-precision (bfloat16/float32) run distributed across 8 devices with 1 dedicated subprocess for data loading (i.e. dataloader_num_workers=1)\n\n- same run with dataloader_num_workers=2\n\nHere are the throughputs we got on Gaudi2, H100 and A100:\n\nDevice\n\ndataloader_num_workers=0\n\ndataloader_num_workers=1\n\ndataloader_num_workers=2\n\nGaudi2 HPU\n\n601.5 samples/s\n\n747.4 samples/s\n\n768.7 samples/s\n\nH100 GPU\n\n336.5 samples/s\n\n580.1 samples/s\n\n602.1 samples/s\n\nA100 GPU\n\n227.5 samples/s\n\n339.7 samples/s\n\n345.4 samples/s\n\nWe first see that Gaudi2 is x1.28 faster than H100 with dataloader_num_workers=2, x1.29 faster with dataloader_num_workers=1 and x1.79 faster with dataloader_num_workers=0. Gaudi2 is also much faster than the previous generation since it is x2.23 faster than A100 with dataloader_num_workers=2, x2.20 faster with dataloader_num_workers=1 and x2.64 faster with dataloader_num_workers=0, which is even better than the speedups we previously reported!\n\nSecond, we see that allocating more resources for data loading can lead to easy speedups: x1.28 on Gaudi2, x1.79 on H100 and x1.52 on A100.\n\nWe also ran experiments with several dedicated subprocesses for data loading but performance was not better than with dataloader_num_workers=2 for all accelerators. Thus, using dataloader_num_workers>0 is usually a good first way of accelerating your runs involving images!\n\nTensorboard logs can be visualized here for Gaudi2 and there for A100.\n\n### Hardware-accelerated data loading with Optimum Habana\n\nFor even larger speedups, we are now going to move as many data loading operations as possible from the CPU to the accelerator devices (i.e. HPUs on Gaudi2 or GPUs on A100/H100). This can be done on Gaudi2 using Habana's media pipeline.\n\nGiven a dataset, most dataloaders follow the following recipe:\n\n- Fetch data (e.g. where your JPEG images are stored on disk)\n\n- The CPU reads encoded images\n\n- The CPU decodes images\n\n- The CPU applies image transformations to augment images\n\n- Finally, images are sent to devices (although this is usually not done by the dataloader itself)\n\nInstead of doing the whole process on CPU and send ready-to-train data to devices, a more efficient workflow would be to send encoded images to devices first and then perform image decoding and augmentations:\n\n- Same as before\n\n- Same as before\n\n- Encoded images are sent to devices\n\n- Devices decode images\n\n- Devices apply image transformations to augment images\n\nThat way we can benefit from the computing power of our devices to speed image decoding and transformations up. Note that there are two caveats to be aware of when doing this:\n\n- Device memory consumption will increase, so you may have to reduce your batch size if there is not enough free memory. This may mitigate the speedup brought by this approach.\n\n- If devices are intensively used (100% or close to it) when doing data loading on CPU, don't expect any speedup when doing it on devices as they already have their hands full.\n\nTo implement this on Gaudi2, we have got you covered: the contrastive image-text example in Optimum Habana now provides a ready-to-use media pipeline that you can use with COCO-like datasets that contain text and images! You will just have to add --mediapipe_dataloader to your command to use it.\n\nFor interested readers, a lower-level overview is given in the documentation of Gaudi here and the list of all supported operators is available there.\n\nWe are now going to re-run the previous experiments adding the mediapipe_dataloader argument since it is compatible with dataloader_num_workers:\n\nDevice\n\ndataloader_num_workers=0\n\ndataloader_num_workers=2\n\ndataloader_num_workers=2 + mediapipe_dataloader\n\nGaudi2 HPU\n\n601.5 samples/s\n\n768.7 samples/s\n\n847.7 samples/s\n\nH100 GPU\n\n336.5 samples/s\n\n602.1 samples/s\n\n/\n\nA100 GPU\n\n227.5 samples/s\n\n345.4 samples/s\n\n/\n\nWe got an additional x1.10 speedup compared to the previous run with dataloader_num_workers=2 only. This final run is thus x1.41 faster than our base run on Gaudi2 simply adding 2 ready-to-use training arguments. It is also x1.41 faster than H100 and x2.45 faster than A100 with dataloader_num_workers=2!\n\n### Reproducing this benchmark\n\nTo reproduce this benchmark, you first need to get access to Gaudi2 through the Intel Developer Cloud (see this guide for more information).\n\nThen, you need to install the latest version of Optimum Habana and run run_bridgetower.py which you can find here. Here is how to do it:\n\n```\npip install optimum[habana]\ngit clone https://github.com/huggingface/optimum-habana.git\ncd optimum-habana/examples/contrastive-image-text\npip install -r requirements.txt\n```\n\nThe base command line to run the script is:\n\n```\npython ../gaudi_spawn.py --use_mpi --world_size 8 run_bridgetower.py \\\n--output_dir /tmp/bridgetower-test \\\n--model_name_or_path BridgeTower/bridgetower-large-itm-mlm-itc \\\n--dataset_name jmhessel/newyorker_caption_contest --dataset_config_name matching \\\n--dataset_revision 3c6c4f6c0ff7e902833d3afa5f8f3875c2b036e6 \\\n--image_column image --caption_column image_description \\\n--remove_unused_columns=False \\\n--do_train --do_eval --do_predict \\\n--per_device_train_batch_size=\"40\" --per_device_eval_batch_size=\"16\" \\\n--num_train_epochs 5 \\\n--learning_rate=\"1e-5\" \\\n--push_to_hub --report_to tensorboard --hub_model_id bridgetower\\\n--overwrite_output_dir \\\n--use_habana --use_lazy_mode --use_hpu_graphs_for_inference --gaudi_config_name Habana/clip \\\n--throughput_warmup_steps 3 \\\n--logging_steps 10\n```\n\nwhich corresponds to the case --dataloader_num_workers 0. You can then add --dataloader_num_workers N and --mediapipe_dataloader to test other configurations.\n\nTo push your model and Tensorboard logs to the Hugging Face Hub, you will have to log in to your account beforehand with:\n\n```\nhuggingface-cli login\n```\n\nFor A100 and H100, you can use the same run_bridgetower.py script with a few small changes:\n\n- Replace GaudiTrainer and GaudiTrainingArguments with Trainer and TrainingArguments from Transformers\n\n- Remove references to GaudiConfig, gaudi_config and HabanaDataloaderTrainer\n\n- Import set_seed directly from Transformers: from transformers import set_seed\n\nThe results displayed in this benchmark were obtained with a Nvidia H100 Lambda instance and a Nvidia A100 80GB GCP instance both with 8 devices using Nvidia's Docker images.\n\nNote that --mediapipe_dataloader is compatible with Gaudi2 only and will not work with A100/H100.\n\nRegarding fp8 results on H100 using Transformer Engine, they are not available because the code crashes and would require modifying the modeling of BridgeTower in Transformers. We will revisit this comparison when fp8 is supported on Gaudi2.\n\n## Conclusion\n\nWhen dealing with images, we presented two solutions to speed up your training workflows: allocating more resources to the dataloader, and decoding and augmenting images directly on accelerator devices rather than on CPU. We showed that it leads to dramatic speedups when training a SOTA vision-language model like BridgeTower: Habana Gaudi2 with Optimum Habana is about x1.4 faster than Nvidia H100 and x2.5 faster than Nvidia A100 80GB with Transformers! And this is super easy to use as you just need to provide a few additional training arguments.\n\nTo go further, we are looking forward to using HPU graphs for training models even faster and to presenting how to use DeepSpeed ZeRO-3 on Gaudi2 to accelerate the training of your LLMs. Stay tuned!\n\nIf you are interested in accelerating your Machine Learning training and inference workflows using the latest AI hardware accelerators and software libraries, check out our Expert Acceleration Program. To learn more about Habana solutions, read about our partnership and contact them here. To learn more about Hugging Face efforts to make AI hardware accelerators easy to use, check out our Hardware Partner Program.\n\n### Related Topics\n\n- Faster Training and Inference: Habana Gaudi-2 vs Nvidia A100 80GB\n\n- Fast Inference on Large Language Models: BLOOMZ on Habana Gaudi2 Accelerator",
   "summaryZh": "本文重点介绍了视觉-语言模型 BridgeTower 在 Habana Gaudi2 硬件上的性能加速表现。通过优化数据加载瓶颈，Gaudi2在微调BridgeTower时实现了较A100和H100显著的性能提升，并提供了详细的软硬件基准对比。",
   "summaryGeneratedAt": "2026-09-06T02:30:01.981452Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -28,12 +28,12 @@
   "mediaCheckedAt": "2026-10-03T07:09:58.847948Z",
   "mediaFormatVersion": 2,
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "25007523cd9aad2a8281d6e1c6c26367c85f8b40387c114d2ab8f7f250125d25",
+  "mediaLayoutBodyHash": "e8900156969a3772c36b88aa49bd2709d5fa3561e08947d79f203742ce4e05ec",
   "mediaLayout": [],
   "mediaLayoutUnplaced": [],
   "mediaLayoutMatched": 0,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-10-03T07:09:58.954178Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:33:19.164348Z",
   "mediaRecheckedAt": "2026-10-03T07:09:58.954193Z",
   "articleKind": "page",
   "aiReview": {
@@ -66,5 +66,1363 @@
     "summaryZh": "本文重点介绍了视觉-语言模型 BridgeTower 在 Habana Gaudi2 硬件上的性能加速表现。通过优化数据加载瓶颈，Gaudi2在微调BridgeTower时实现了较A100和H100显著的性能提升，并提供了详细的软硬件基准对比。",
     "glossary": [],
     "duplicateKey": "bridgetower-habana-gaudi2-benchmark"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Update (29/08/2023): A benchmark on H100 was added to this blog post. Also, all performance numbers have been updated with newer versions of software.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 150,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Optimum Habana v1.7 on Habana Gaudi2 achieves x2.5 speedups compared to A100 and x1.4 compared to H100 when fine-tuning BridgeTower, a state-of-the-art vision-language model. This performance improvement relies on hardware-accelerated data loading to make the most of your devices.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-habana/tree/main"
+        },
+        {
+          "start": 46,
+          "end": 102,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "These techniques apply to any other workloads constrained by data loading, which is frequently the case for many types of vision models. This post will take you through the process and benchmark we used to compare BridgeTower fine-tuning on Habana Gaudi2, Nvidia H100 and Nvidia A100 80GB. It also demonstrates how easy it is to take advantage of these features in transformers-based models.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 136,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "BridgeTower",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "In the recent past, Vision-Language (VL) models have gained tremendous importance and shown dominance in a variety of VL tasks. Most common approaches leverage uni-modal encoders to extract representations from their respective modalities. Then those representations are either fused together, or fed into a cross-modal encoder. To efficiently handle some of the performance limitations and restrictions in VL representation learning, BridgeTower introduces multiple bridge layers that build a connection between the top layers of uni-modal encoders and each layer of the cross-modal encoder. This enables effective bottom-up cross-modal alignment and fusion between visual and textual representations at different semantic levels in the cross-modal encoder.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/vision_language_pretraining"
+        },
+        {
+          "start": 435,
+          "end": 446,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2206.08657"
+        },
+        {
+          "start": 467,
+          "end": 480,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Pre-trained with only 4M images (see the detail below), BridgeTower achieves state-of-the-art performance on various downstream vision-language tasks. In particular, BridgeTower achieves an accuracy of 78.73% on the VQAv2 test-std set, outperforming the previous state-of-the-art model (METER) by 1.09% using the same pre-training data and almost negligible additional parameters and computational costs. Notably, when further scaling the model, BridgeTower achieves an accuracy of 81.15%, surpassing models that are pre-trained on orders-of-magnitude larger datasets.",
+      "spans": [
+        {
+          "start": 48,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bridgetower#benchmark"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Hardware",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "NVIDIA H100 Tensor Core GPU is the latest and fastest generation of Nvidia GPUs. It includes a dedicated Transformer Engine that enables to perform fp8 mixed-precision runs. One device has 80GB of memory.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/data-center/h100/"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Nvidia A100 Tensor Core GPU includes the 3rd generation of the Tensor Core technology. This is still the fastest GPU that you will find at most cloud providers. We use here the 80GB-memory variant which also offers faster memory bandwidth than the 40GB one.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/data-center/a100/"
+        },
+        {
+          "start": 63,
+          "end": 85,
+          "kind": "a",
+          "href": "https://www.nvidia.com/en-us/data-center/tensor-cores/"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Habana Gaudi2 is the second-generation AI hardware accelerator designed by Habana Labs. A single server contains 8 accelerator devices called HPUs with 96GB of memory each. Check out our previous blog post for a more in-depth introduction and a guide showing how to access it through the Intel Developer Cloud. Unlike many AI accelerators in the market, advanced features are very easy to apply to make the most of Gaudi2 with Optimum Habana, which enables users to port Transformers-compatible scripts to Gaudi with just a 2-line change.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://habana.ai/products/gaudi2/"
+        },
+        {
+          "start": 183,
+          "end": 205,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/habana-gaudi-2-bloom#habana-gaudi2"
+        },
+        {
+          "start": 288,
+          "end": 309,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/secure/developer/devcloud/cloud-launchpad.html"
+        },
+        {
+          "start": 427,
+          "end": 441,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/habana/index"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Benchmark",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "To benchmark training, we are going to fine-tune a BridgeTower Large checkpoint consisting of 866M parameters. This checkpoint was pretrained on English language using masked language modeling, image-text matching and image-text contrastive loss on Conceptual Captions, SBU Captions, MSCOCO Captions and Visual Genome.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 79,
+          "kind": "a",
+          "href": "https://huggingface.co/BridgeTower/bridgetower-large-itm-mlm-itc"
+        },
+        {
+          "start": 249,
+          "end": 268,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/conceptual_captions"
+        },
+        {
+          "start": 270,
+          "end": 282,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/sbu_captions"
+        },
+        {
+          "start": 284,
+          "end": 299,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/HuggingFaceM4/COCO"
+        },
+        {
+          "start": 304,
+          "end": 317,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/visual_genome"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "We will further fine-tune this checkpoint on the New Yorker Caption Contest dataset which consists of cartoons from The New Yorker and the most voted captions.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 83,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/jmhessel/newyorker_caption_contest"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Hyperparameters are the same for all accelerators. We used a batch size of 48 samples for each device. You can check hyperparameters out here for Gaudi2 and there for A100.",
+      "spans": [
+        {
+          "start": 137,
+          "end": 141,
+          "kind": "a",
+          "href": "https://huggingface.co/regisss/bridgetower-newyorker-gaudi2-8x#training-hyperparameters"
+        },
+        {
+          "start": 157,
+          "end": 162,
+          "kind": "a",
+          "href": "https://huggingface.co/regisss/bridgetower-newyorker-a100-8x#training-hyperparameters"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "When dealing with datasets involving images, data loading is frequently a bottleneck because many costly operations are computed on CPU (image decoding, image augmentations) and then full images are sent to the training devices. Ideally, we would like to send only raw bytes to devices and then perform decoding and various image transformations on device. But let's see first how to easily allocate more resources to data loading for accelerating your runs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 84,
+          "kind": "strong"
+        },
+        {
+          "start": 238,
+          "end": 355,
+          "kind": "em"
+        },
+        {
+          "start": 384,
+          "end": 390,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Making use of dataloader_num_workers",
+      "spans": [
+        {
+          "start": 14,
+          "end": 36,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "When image loading is done on CPU, a quick way to speed it up would be to allocate more subprocesses for data loading. This is very easy to do with Transformers' TrainingArguments (or its Optimum Habana counterpart GaudiTrainingArguments): you can use the dataloader_num_workers=N argument to set the number of subprocesses (N) allocated on CPU for data loading.",
+      "spans": [
+        {
+          "start": 162,
+          "end": 179,
+          "kind": "code"
+        },
+        {
+          "start": 215,
+          "end": 237,
+          "kind": "code"
+        },
+        {
+          "start": 256,
+          "end": 280,
+          "kind": "code"
+        },
+        {
+          "start": 325,
+          "end": 326,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "The default is 0, which means that data is loaded in the main process. This may not be optimal as the main process has many things to manage. We can set it to 1 to have one fully dedicated subprocess for data loading. When several subprocesses are allocated, each one of them will be responsible for preparing a batch. This means that RAM consumption will increase with the number of workers. One recommendation would be to set it to the number of CPU cores, but those cores may not be fully free so you will have to try it out to find the best configuration.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Let's run the three following experiments:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "a mixed-precision (bfloat16/float32) run distributed across 8 devices where data loading is performed by the same process as everything else (i.e. dataloader_num_workers=0)",
+      "spans": [
+        {
+          "start": 19,
+          "end": 27,
+          "kind": "em"
+        },
+        {
+          "start": 28,
+          "end": 35,
+          "kind": "em"
+        },
+        {
+          "start": 147,
+          "end": 171,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "a mixed-precision (bfloat16/float32) run distributed across 8 devices with 1 dedicated subprocess for data loading (i.e. dataloader_num_workers=1)",
+      "spans": [
+        {
+          "start": 19,
+          "end": 27,
+          "kind": "em"
+        },
+        {
+          "start": 28,
+          "end": 35,
+          "kind": "em"
+        },
+        {
+          "start": 121,
+          "end": 145,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "same run with dataloader_num_workers=2",
+      "spans": [
+        {
+          "start": 14,
+          "end": 38,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Here are the throughputs we got on Gaudi2, H100 and A100:",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Device",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "dataloader_num_workers=0",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "dataloader_num_workers=1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "dataloader_num_workers=2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "Gaudi2 HPU",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "601.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "747.4 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "768.7 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "H100 GPU",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "336.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "580.1 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "602.1 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "A100 GPU",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "227.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "339.7 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "345.4 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "We first see that Gaudi2 is x1.28 faster than H100 with dataloader_num_workers=2, x1.29 faster with dataloader_num_workers=1 and x1.79 faster with dataloader_num_workers=0. Gaudi2 is also much faster than the previous generation since it is x2.23 faster than A100 with dataloader_num_workers=2, x2.20 faster with dataloader_num_workers=1 and x2.64 faster with dataloader_num_workers=0, which is even better than the speedups we previously reported!",
+      "spans": [
+        {
+          "start": 18,
+          "end": 50,
+          "kind": "strong"
+        },
+        {
+          "start": 56,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 124,
+          "kind": "code"
+        },
+        {
+          "start": 147,
+          "end": 171,
+          "kind": "code"
+        },
+        {
+          "start": 241,
+          "end": 263,
+          "kind": "strong"
+        },
+        {
+          "start": 269,
+          "end": 293,
+          "kind": "code"
+        },
+        {
+          "start": 313,
+          "end": 337,
+          "kind": "code"
+        },
+        {
+          "start": 360,
+          "end": 384,
+          "kind": "code"
+        },
+        {
+          "start": 412,
+          "end": 447,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/habana-gaudi-2-benchmark"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Second, we see that allocating more resources for data loading can lead to easy speedups: x1.28 on Gaudi2, x1.79 on H100 and x1.52 on A100.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 88,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "We also ran experiments with several dedicated subprocesses for data loading but performance was not better than with dataloader_num_workers=2 for all accelerators. Thus, using dataloader_num_workers>0 is usually a good first way of accelerating your runs involving images!",
+      "spans": [
+        {
+          "start": 118,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 201,
+          "kind": "code"
+        },
+        {
+          "start": 171,
+          "end": 273,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Tensorboard logs can be visualized here for Gaudi2 and there for A100.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 39,
+          "kind": "a",
+          "href": "https://huggingface.co/regisss/bridgetower-newyorker-gaudi2-8x/tensorboard"
+        },
+        {
+          "start": 55,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/regisss/bridgetower-newyorker-a100-8x/tensorboard"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Hardware-accelerated data loading with Optimum Habana",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "For even larger speedups, we are now going to move as many data loading operations as possible from the CPU to the accelerator devices (i.e. HPUs on Gaudi2 or GPUs on A100/H100). This can be done on Gaudi2 using Habana's media pipeline.",
+      "spans": [
+        {
+          "start": 221,
+          "end": 235,
+          "kind": "a",
+          "href": "https://docs.habana.ai/en/latest/Media_Pipeline/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Given a dataset, most dataloaders follow the following recipe:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Fetch data (e.g. where your JPEG images are stored on disk)",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "The CPU reads encoded images",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "The CPU decodes images",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "The CPU applies image transformations to augment images",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Finally, images are sent to devices (although this is usually not done by the dataloader itself)",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Instead of doing the whole process on CPU and send ready-to-train data to devices, a more efficient workflow would be to send encoded images to devices first and then perform image decoding and augmentations:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Same as before",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Same as before",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Encoded images are sent to devices",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Devices decode images",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "Devices apply image transformations to augment images",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "That way we can benefit from the computing power of our devices to speed image decoding and transformations up. Note that there are two caveats to be aware of when doing this:",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Device memory consumption will increase, so you may have to reduce your batch size if there is not enough free memory. This may mitigate the speedup brought by this approach.",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "If devices are intensively used (100% or close to it) when doing data loading on CPU, don't expect any speedup when doing it on devices as they already have their hands full.",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "To implement this on Gaudi2, we have got you covered: the contrastive image-text example in Optimum Habana now provides a ready-to-use media pipeline that you can use with COCO-like datasets that contain text and images! You will just have to add --mediapipe_dataloader to your command to use it.",
+      "spans": [
+        {
+          "start": 58,
+          "end": 88,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-habana/tree/main/examples/contrastive-image-text"
+        },
+        {
+          "start": 247,
+          "end": 269,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "For interested readers, a lower-level overview is given in the documentation of Gaudi here and the list of all supported operators is available there.",
+      "spans": [
+        {
+          "start": 86,
+          "end": 90,
+          "kind": "a",
+          "href": "https://docs.habana.ai/en/latest/Media_Pipeline/index.html"
+        },
+        {
+          "start": 144,
+          "end": 149,
+          "kind": "a",
+          "href": "https://docs.habana.ai/en/latest/Media_Pipeline/Operators.html"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "We are now going to re-run the previous experiments adding the mediapipe_dataloader argument since it is compatible with dataloader_num_workers:",
+      "spans": [
+        {
+          "start": 63,
+          "end": 83,
+          "kind": "code"
+        },
+        {
+          "start": 121,
+          "end": 143,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Device",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "dataloader_num_workers=0",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "dataloader_num_workers=2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "dataloader_num_workers=2 + mediapipe_dataloader",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 27,
+          "end": 47,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "Gaudi2 HPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "601.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "768.7 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "847.7 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "H100 GPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "336.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "602.1 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "/",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "A100 GPU",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "227.5 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "345.4 samples/s",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "/",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "We got an additional x1.10 speedup compared to the previous run with dataloader_num_workers=2 only. This final run is thus x1.41 faster than our base run on Gaudi2 simply adding 2 ready-to-use training arguments. It is also x1.41 faster than H100 and x2.45 faster than A100 with dataloader_num_workers=2!",
+      "spans": [
+        {
+          "start": 69,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 164,
+          "end": 212,
+          "kind": "strong"
+        },
+        {
+          "start": 224,
+          "end": 246,
+          "kind": "strong"
+        },
+        {
+          "start": 251,
+          "end": 273,
+          "kind": "strong"
+        },
+        {
+          "start": 279,
+          "end": 303,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Reproducing this benchmark",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "To reproduce this benchmark, you first need to get access to Gaudi2 through the Intel Developer Cloud (see this guide for more information).",
+      "spans": [
+        {
+          "start": 80,
+          "end": 101,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/secure/developer/devcloud/cloud-launchpad.html"
+        },
+        {
+          "start": 107,
+          "end": 117,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/habana-gaudi-2-benchmark#how-to-get-access-to-gaudi2"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "Then, you need to install the latest version of Optimum Habana and run run_bridgetower.py which you can find here. Here is how to do it:",
+      "spans": [
+        {
+          "start": 71,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 109,
+          "end": 113,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-habana/blob/main/examples/contrastive-image-text/run_bridgetower.py"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "The base command line to run the script is:",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "which corresponds to the case --dataloader_num_workers 0. You can then add --dataloader_num_workers N and --mediapipe_dataloader to test other configurations.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 101,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 128,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "To push your model and Tensorboard logs to the Hugging Face Hub, you will have to log in to your account beforehand with:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "For A100 and H100, you can use the same run_bridgetower.py script with a few small changes:",
+      "spans": [
+        {
+          "start": 40,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Replace GaudiTrainer and GaudiTrainingArguments with Trainer and TrainingArguments from Transformers",
+      "spans": [
+        {
+          "start": 8,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 25,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 53,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 82,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Remove references to GaudiConfig, gaudi_config and HabanaDataloaderTrainer",
+      "spans": [
+        {
+          "start": 21,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 46,
+          "kind": "code"
+        },
+        {
+          "start": 51,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Import set_seed directly from Transformers: from transformers import set_seed",
+      "spans": [
+        {
+          "start": 7,
+          "end": 15,
+          "kind": "code"
+        },
+        {
+          "start": 44,
+          "end": 77,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "The results displayed in this benchmark were obtained with a Nvidia H100 Lambda instance and a Nvidia A100 80GB GCP instance both with 8 devices using Nvidia's Docker images.",
+      "spans": [
+        {
+          "start": 151,
+          "end": 173,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "Note that --mediapipe_dataloader is compatible with Gaudi2 only and will not work with A100/H100.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 32,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "Regarding fp8 results on H100 using Transformer Engine, they are not available because the code crashes and would require modifying the modeling of BridgeTower in Transformers. We will revisit this comparison when fp8 is supported on Gaudi2.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 54,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0094",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "When dealing with images, we presented two solutions to speed up your training workflows: allocating more resources to the dataloader, and decoding and augmenting images directly on accelerator devices rather than on CPU. We showed that it leads to dramatic speedups when training a SOTA vision-language model like BridgeTower: Habana Gaudi2 with Optimum Habana is about x1.4 faster than Nvidia H100 and x2.5 faster than Nvidia A100 80GB with Transformers! And this is super easy to use as you just need to provide a few additional training arguments.",
+      "spans": [
+        {
+          "start": 328,
+          "end": 456,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "To go further, we are looking forward to using HPU graphs for training models even faster and to presenting how to use DeepSpeed ZeRO-3 on Gaudi2 to accelerate the training of your LLMs. Stay tuned!",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "If you are interested in accelerating your Machine Learning training and inference workflows using the latest AI hardware accelerators and software libraries, check out our Expert Acceleration Program. To learn more about Habana solutions, read about our partnership and contact them here. To learn more about Hugging Face efforts to make AI hardware accelerators easy to use, check out our Hardware Partner Program.",
+      "spans": [
+        {
+          "start": 173,
+          "end": 200,
+          "kind": "a",
+          "href": "https://huggingface.co/support"
+        },
+        {
+          "start": 240,
+          "end": 288,
+          "kind": "a",
+          "href": "https://huggingface.co/hardware/habana"
+        },
+        {
+          "start": 391,
+          "end": 415,
+          "kind": "a",
+          "href": "https://huggingface.co/hardware"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Related Topics",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "Faster Training and Inference: Habana Gaudi-2 vs Nvidia A100 80GB",
+      "spans": [
+        {
+          "start": 0,
+          "end": 65,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/habana-gaudi-2-benchmark"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "Fast Inference on Large Language Models: BLOOMZ on Habana Gaudi2 Accelerator",
+      "spans": [
+        {
+          "start": 0,
+          "end": 76,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/habana-gaudi-2-bloom"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "e8900156969a3772c36b88aa49bd2709d5fa3561e08947d79f203742ce4e05ec",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install optimum[habana]\ngit clone https://github.com/huggingface/optimum-habana.git\ncd optimum-habana/examples/contrastive-image-text\npip install -r requirements.txt"
+    },
+    {
+      "id": "c0002",
+      "source": "python ../gaudi_spawn.py --use_mpi --world_size 8 run_bridgetower.py \\\n--output_dir /tmp/bridgetower-test \\\n--model_name_or_path BridgeTower/bridgetower-large-itm-mlm-itc \\\n--dataset_name jmhessel/newyorker_caption_contest --dataset_config_name matching \\\n--dataset_revision 3c6c4f6c0ff7e902833d3afa5f8f3875c2b036e6 \\\n--image_column image --caption_column image_description \\\n--remove_unused_columns=False \\\n--do_train --do_eval --do_predict \\\n--per_device_train_batch_size=\"40\" --per_device_eval_batch_size=\"16\" \\\n--num_train_epochs 5 \\\n--learning_rate=\"1e-5\" \\\n--push_to_hub --report_to tensorboard --hub_model_id bridgetower\\\n--overwrite_output_dir \\\n--use_habana --use_lazy_mode --use_hpu_graphs_for_inference --gaudi_config_name Habana/clip \\\n--throughput_warmup_steps 3 \\\n--logging_steps 10"
+    },
+    {
+      "id": "c0003",
+      "source": "huggingface-cli login"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-04T15:33:19.164333Z"
 }

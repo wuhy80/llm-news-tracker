@@ -18,64 +18,64 @@
   "fetchedAt": "2026-08-30T11:10:41.023178Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Fine-tuning Stable Diffusion Models on Intel CPUs\n\nThis article is also available in Chinese 简体中文 .\n\nDiffusion models helped popularize generative AI thanks to their uncanny ability to generate photorealistic images from text prompts. These models have now found their way into enterprise use cases like synthetic data generation or content creation. The Hugging Face hub includes over 5,000 pre-trained text-to-image models . Combining them with the Diffusers library , it's never been easier to start experimenting and building image generation workflows.\n\nLike Transformer models, you can fine-tune Diffusion models to help them generate content that matches your business needs. Initially, fine-tuning was only possible on GPU infrastructure, but things are changing! A few months ago, Intel launched the fourth generation of Xeon CPUs, code-named Sapphire Rapids. Sapphire Rapids introduces the Intel Advanced Matrix Extensions (AMX), a new hardware accelerator for deep learning workloads. We've already demonstrated the benefits of AMX in several blog posts: fine-tuning NLP Transformers , inference with NLP Transformers , and inference with Stable Diffusion models .\n\nThis post will show you how to fine-tune a Stable Diffusion model on an Intel Sapphire Rapids CPU cluster. We will use textual inversion , a technique that only requires a small number of example images. We'll use only five!\n\nOur friends at Intel provided four servers hosted on the Intel Developer Cloud (IDC), a service platform for developing and running workloads in Intel®-optimized deployment environments with the latest Intel processors and performance-optimized software stacks .\n\nEach server is powered by two Intel Sapphire Rapids CPUs with 56 physical cores and 112 threads. Here's the output of lscpu :\n\n```\nArchitecture:            x86_64\n  CPU op-mode(s):        32-bit, 64-bit\n  Address sizes:         52 bits physical, 57 bits virtual\n  Byte Order:            Little Endian\nCPU(s):                  224\n  On-line CPU(s) list:   0-223\nVendor ID:               GenuineIntel\n  Model name:            Intel(R) Xeon(R) Platinum 8480+\n    CPU family:          6\n    Model:               143\n    Thread(s) per core:  2\n    Core(s) per socket:  56\n    Socket(s):           2\n    Stepping:            8\n    CPU max MHz:         3800.0000\n    CPU min MHz:         800.0000\n    BogoMIPS:            4000.00\n    Flags:               fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_per fmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cat_l2 cdp_l3 invpcid_single intel_ppin cdp_l2 ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb intel_pt avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local split_lock_detect avx_vnni avx512_bf16 wbnoinvd dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b enqcmd fsrm md_clear serialize tsxldtrk pconfig arch_lbr amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities\n```\n\nLet's first list the IP addresses of our servers in nodefile. The first line refers to the primary server.\n\n```\ncat << EOF > nodefile\n192.168.20.2\n192.168.21.2\n192.168.22.2\n192.168.23.2\nEOF\n```\n\nDistributed training requires password-less ssh between the primary and other nodes. Here's a good article on how to do this if you're unfamiliar with the process.\n\nNext, we create a new environment on each node and install the software dependencies. We notably install two Intel libraries: oneCCL , to manage distributed communication and the Intel Extension for PyTorch (IPEX) to leverage the hardware acceleration features present in Sapphire Rapids. We also add gperftools to install libtcmalloc, a high-performance memory allocation library.\n\n```\nconda create -n diffuser python==3.9\nconda activate diffuser\npip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\npip3 install transformers accelerate==0.19.0\npip3 install oneccl_bind_pt -f https://developer.intel.com/ipex-whl-stable-cpu\npip3 install intel_extension_for_pytorch\nconda install gperftools -c conda-forge -y\n```\n\nNext, we clone the diffusers repository on each node and install it from source.\n\n```\ngit clone https://github.com/huggingface/diffusers.git\ncd diffusers\npip install .\n```\n\nNext, we add IPEX to the fine-tuning script in diffusers/examples/textual_inversion . We import IPEX and optimize the U-Net and Variable Auto Encoder models. Please make sure this is applied to all nodes.\n\n```\ndiff --git a/examples/textual_inversion/textual_inversion.py b/examples/textual_inversion/textual_inversion.py\nindex 4a193abc..91c2edd1 100644\n--- a/examples/textual_inversion/textual_inversion.py\n+++ b/examples/textual_inversion/textual_inversion.py\n@@ -765,6 +765,10 @@ def main():\n     unet.to(accelerator.device, dtype=weight_dtype)\n     vae.to(accelerator.device, dtype=weight_dtype)\n\n+    import intel_extension_for_pytorch as ipex\n+    unet = ipex.optimize(unet, dtype=weight_dtype)\n+    vae = ipex.optimize(vae, dtype=weight_dtype)\n+\n     # We need to recalculate our total training steps as the size of the training dataloader may have changed.\n     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)\n     if overrode_max_train_steps:\n```\n\nThe last step is downloading the training images . Ideally, we'd use a shared NFS folder, but for the sake of simplicity, we'll download the images on each node. Please ensure they're in the same directory on all nodes ( /home/devcloud/dicoo ).\n\n```\nmkdir /home/devcloud/dicoo\ncd /home/devcloud/dicoo\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/0.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/1.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/2.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/3.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/4.jpeg\n```\n\nThe system setup is now complete. Let's configure the training job.\n\nConfiguring the fine-tuning job\n\nThe Accelerate library makes it very easy to run distributed training. We need to run it on each node and answer simple questions.\n\nHere's a screenshot for the primary node. On the other nodes, you need to set the rank to 1, 2, and 3. All other answers are identical.\n\nFinally, we need to set the environment on the primary node. It will be propagated to other nodes as the fine-tuning job starts. The first line sets the name of the network interface connected to the local network where all nodes run. You may need to adapt this using ifconfig to get the appropriate information.\n\n```\nexport I_MPI_HYDRA_IFACE=ens786f1\noneccl_bindings_for_pytorch_path=$(python -c \"from oneccl_bindings_for_pytorch import cwd; print(cwd)\")\nsource $oneccl_bindings_for_pytorch_path/env/setvars.sh\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libtcmalloc.so\nexport CCL_ATL_TRANSPORT=ofi\nexport CCL_WORKER_COUNT=1\n\nexport MODEL_NAME=\"runwayml/stable-diffusion-v1-5\"\nexport DATA_DIR=\"/home/devcloud/dicoo\"\n```\n\nWe can now launch the fine-tuning job.\n\nWe launch the fine-tuning job with mpirun , which sets up distributed communication across the nodes listed in nodefile . We'll run 16 tasks ( -n ) with four tasks per node ( -ppn ). Accelerate automatically sets up distributed training across all tasks.\n\nHere, we train for 200 steps, which should take about five minutes.\n\n```\nmpirun -f nodefile -n 16 -ppn 4                                                         \\\naccelerate launch diffusers/examples/textual_inversion/textual_inversion.py             \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline\n```\n\nHere's a screenshot of the busy cluster:\n\nDistributed training can be tricky, especially if you're new to the discipline. A minor misconfiguration on a single node is the most likely issue: missing dependency, images stored in a different location, etc.\n\nYou can quickly pinpoint the troublemaker by logging in to each node and training locally. First, set the same environment as on the primary node, then run:\n\n```\npython diffusers/examples/textual_inversion/textual_inversion.py                        \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline\n```\n\nIf training starts successfully, stop it and move to the next node. If training starts successfully on all nodes, return to the primary node and double-check the node file, the environment, and the mpirun command. Don't worry; you'll find the problem :)\n\nGenerating images with the fine-tuned model\n\nAfter 5 minutes training, the model is saved locally. We could load it with a vanilla diffusers pipeline and predict. Instead, let's use Optimum Intel and OpenVINO to optimize the model. As discussed in a previous post , this lets you generate an image on a single CPU in less than 5 seconds!\n\n```\npip install optimum[openvino]\n```\n\nHere, we load the model, optimize it for a static shape, and save it:\n\n```\nfrom optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)\nov_pipe.reshape(batch_size=5, height=512, width=512, num_images_per_prompt=1)\nov_pipe.save_pretrained(\"./textual_inversion_output_ov\")\n```\n\nThen, we load the optimized model, generate five different images and save them:\n\n```\nfrom optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output_ov\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, num_inference_steps=20)\nprompt = [\"a yellow <dicoo> robot at the beach, high quality\"]*5\nimages = ov_pipe(prompt).images\nprint(images)\nfor idx,img in enumerate(images):\n    img.save(f\"image{idx}.png\")\n```\n\nHere's a generated image. It is impressive that the model only needed five images to learn that dicoos have glasses!\n\nIf you'd like, you can fine-tune the model some more. Here's a lovely example generated by a 3,000-step model (about an hour of training).\n\nThanks to Hugging Face and Intel, you can now use Xeon CPU servers to generate high-quality images adapted to your business needs. They are generally more affordable and widely available than specialized hardware such as GPUs. Xeon CPUs can also be easily repurposed for other production tasks, from web servers to databases, making them a versatile and flexible choice for your IT infrastructure.\n\nHere are some resources to help you get started:\n\nOptimum Intel documentation\n\nDeveloper resources from Intel and Hugging Face.\n\nSapphire Rapids servers on Intel Developer Cloud , AWS and GCP .\n\nIf you have questions or feedback, we'd love to read them on the Hugging Face forum .\n\nModels mentioned in this article 1\n\nMore Articles from our Blog\n\nAccelerating PyTorch Transformers with Intel Sapphire Rapids - part 2\n\nAccelerating PyTorch Transformers with Intel Sapphire Rapids - part 1\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Diffusion models helped popularize generative AI thanks to their uncanny ability to generate photorealistic images from text prompts. These models have now found their way into enterprise use cases like synthetic data generation or content creation. The Hugging Face hub includes over 5,000 pre-trained text-to-image models. Combining them with the Diffusers library, it's never been easier to start experimenting and building image generation workflows.\n\nLike Transformer models, you can fine-tune Diffusion models to help them generate content that matches your business needs. Initially, fine-tuning was only possible on GPU infrastructure, but things are changing! A few months ago, Intel launched the fourth generation of Xeon CPUs, code-named Sapphire Rapids. Sapphire Rapids introduces the Intel Advanced Matrix Extensions (AMX), a new hardware accelerator for deep learning workloads. We've already demonstrated the benefits of AMX in several blog posts: fine-tuning NLP Transformers, inference with NLP Transformers, and inference with Stable Diffusion models.\n\nThis post will show you how to fine-tune a Stable Diffusion model on an Intel Sapphire Rapids CPU cluster. We will use textual inversion, a technique that only requires a small number of example images. We'll use only five!\n\nLet's get started.\n\n## Setting up the cluster\n\nOur friends at Intel provided four servers hosted on the Intel Developer Cloud (IDC), a service platform for developing and running workloads in Intel®-optimized deployment environments with the latest Intel processors and performance-optimized software stacks.\n\nEach server is powered by two Intel Sapphire Rapids CPUs with 56 physical cores and 112 threads. Here's the output of lscpu:\n\n```\nArchitecture:            x86_64\n  CPU op-mode(s):        32-bit, 64-bit\n  Address sizes:         52 bits physical, 57 bits virtual\n  Byte Order:            Little Endian\nCPU(s):                  224\n  On-line CPU(s) list:   0-223\nVendor ID:               GenuineIntel\n  Model name:            Intel(R) Xeon(R) Platinum 8480+\n    CPU family:          6\n    Model:               143\n    Thread(s) per core:  2\n    Core(s) per socket:  56\n    Socket(s):           2\n    Stepping:            8\n    CPU max MHz:         3800.0000\n    CPU min MHz:         800.0000\n    BogoMIPS:            4000.00\n    Flags:               fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_per fmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cat_l2 cdp_l3 invpcid_single intel_ppin cdp_l2 ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb intel_pt avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local split_lock_detect avx_vnni avx512_bf16 wbnoinvd dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b enqcmd fsrm md_clear serialize tsxldtrk pconfig arch_lbr amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities\n```\n\nLet's first list the IP addresses of our servers in nodefile. The first line refers to the primary server.\n\n```\ncat << EOF > nodefile\n192.168.20.2\n192.168.21.2\n192.168.22.2\n192.168.23.2\nEOF\n```\n\nDistributed training requires password-less ssh between the primary and other nodes. Here's a good article on how to do this if you're unfamiliar with the process.\n\nNext, we create a new environment on each node and install the software dependencies. We notably install two Intel libraries: oneCCL, to manage distributed communication and the Intel Extension for PyTorch (IPEX) to leverage the hardware acceleration features present in Sapphire Rapids. We also add gperftools to install libtcmalloc, a high-performance memory allocation library.\n\n```\nconda create -n diffuser python==3.9\nconda activate diffuser\npip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\npip3 install transformers accelerate==0.19.0\npip3 install oneccl_bind_pt -f https://developer.intel.com/ipex-whl-stable-cpu\npip3 install intel_extension_for_pytorch\nconda install gperftools -c conda-forge -y\n```\n\nNext, we clone the diffusers repository on each node and install it from source.\n\n```\ngit clone https://github.com/huggingface/diffusers.git\ncd diffusers\npip install .\n```\n\nNext, we add IPEX to the fine-tuning script in diffusers/examples/textual_inversion. We import IPEX and optimize the U-Net and Variable Auto Encoder models. Please make sure this is applied to all nodes.\n\n```\ndiff --git a/examples/textual_inversion/textual_inversion.py b/examples/textual_inversion/textual_inversion.py\nindex 4a193abc..91c2edd1 100644\n--- a/examples/textual_inversion/textual_inversion.py\n+++ b/examples/textual_inversion/textual_inversion.py\n@@ -765,6 +765,10 @@ def main():\n     unet.to(accelerator.device, dtype=weight_dtype)\n     vae.to(accelerator.device, dtype=weight_dtype)\n\n+    import intel_extension_for_pytorch as ipex\n+    unet = ipex.optimize(unet, dtype=weight_dtype)\n+    vae = ipex.optimize(vae, dtype=weight_dtype)\n+\n     # We need to recalculate our total training steps as the size of the training dataloader may have changed.\n     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)\n     if overrode_max_train_steps:\n```\n\nThe last step is downloading the training images. Ideally, we'd use a shared NFS folder, but for the sake of simplicity, we'll download the images on each node. Please ensure they're in the same directory on all nodes (/home/devcloud/dicoo).\n\n```\nmkdir /home/devcloud/dicoo\ncd /home/devcloud/dicoo\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/0.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/1.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/2.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/3.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/4.jpeg\n```\n\nHere are the images:\n\nThe system setup is now complete. Let's configure the training job.\n\n## Configuring the fine-tuning job\n\nThe Accelerate library makes it very easy to run distributed training. We need to run it on each node and answer simple questions.\n\nHere's a screenshot for the primary node. On the other nodes, you need to set the rank to 1, 2, and 3. All other answers are identical.\n\nFinally, we need to set the environment on the primary node. It will be propagated to other nodes as the fine-tuning job starts. The first line sets the name of the network interface connected to the local network where all nodes run. You may need to adapt this usingifconfig to get the appropriate information.\n\n```\nexport I_MPI_HYDRA_IFACE=ens786f1\noneccl_bindings_for_pytorch_path=$(python -c \"from oneccl_bindings_for_pytorch import cwd; print(cwd)\")\nsource $oneccl_bindings_for_pytorch_path/env/setvars.sh\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libtcmalloc.so\nexport CCL_ATL_TRANSPORT=ofi\nexport CCL_WORKER_COUNT=1\n\nexport MODEL_NAME=\"runwayml/stable-diffusion-v1-5\"\nexport DATA_DIR=\"/home/devcloud/dicoo\"\n```\n\nWe can now launch the fine-tuning job.\n\n## Fine-tuning the model\n\nWe launch the fine-tuning job with mpirun, which sets up distributed communication across the nodes listed in nodefile. We'll run 16 tasks (-n) with four tasks per node (-ppn). Accelerate automatically sets up distributed training across all tasks.\n\nHere, we train for 200 steps, which should take about five minutes.\n\n```\nmpirun -f nodefile -n 16 -ppn 4                                                         \\\naccelerate launch diffusers/examples/textual_inversion/textual_inversion.py             \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline\n```\n\nHere's a screenshot of the busy cluster:\n\n## Troubleshooting\n\nDistributed training can be tricky, especially if you're new to the discipline. A minor misconfiguration on a single node is the most likely issue: missing dependency, images stored in a different location, etc.\n\nYou can quickly pinpoint the troublemaker by logging in to each node and training locally. First, set the same environment as on the primary node, then run:\n\n```\npython diffusers/examples/textual_inversion/textual_inversion.py                        \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline\n```\n\nIf training starts successfully, stop it and move to the next node. If training starts successfully on all nodes, return to the primary node and double-check the node file, the environment, and the mpirun command. Don't worry; you'll find the problem :)\n\n## Generating images with the fine-tuned model\n\nAfter 5 minutes training, the model is saved locally. We could load it with a vanilla diffusers pipeline and predict. Instead, let's use Optimum Intel and OpenVINO to optimize the model. As discussed in a previous post, this lets you generate an image on a single CPU in less than 5 seconds!\n\n```\npip install optimum[openvino]\n```\n\nHere, we load the model, optimize it for a static shape, and save it:\n\n```\nfrom optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)\nov_pipe.reshape(batch_size=5, height=512, width=512, num_images_per_prompt=1)\nov_pipe.save_pretrained(\"./textual_inversion_output_ov\")\n```\n\nThen, we load the optimized model, generate five different images and save them:\n\n```\nfrom optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output_ov\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, num_inference_steps=20)\nprompt = [\"a yellow <dicoo> robot at the beach, high quality\"]*5\nimages = ov_pipe(prompt).images\nprint(images)\nfor idx,img in enumerate(images):\n    img.save(f\"image{idx}.png\")\n```\n\nHere's a generated image. It is impressive that the model only needed five images to learn that dicoos have glasses!\n\nIf you'd like, you can fine-tune the model some more. Here's a lovely example generated by a 3,000-step model (about an hour of training).\n\n## Conclusion\n\nThanks to Hugging Face and Intel, you can now use Xeon CPU servers to generate high-quality images adapted to your business needs. They are generally more affordable and widely available than specialized hardware such as GPUs. Xeon CPUs can also be easily repurposed for other production tasks, from web servers to databases, making them a versatile and flexible choice for your IT infrastructure.\n\nHere are some resources to help you get started:\n\n- Diffusers documentation\n\n- Optimum Intel documentation\n\n- Intel IPEX on GitHub\n\n- Developer resources from Intel and Hugging Face.\n\n- Sapphire Rapids servers on Intel Developer Cloud, AWS and GCP.\n\nIf you have questions or feedback, we'd love to read them on the Hugging Face forum.\n\nThanks for reading!",
   "summaryZh": "本文介绍了如何在英特尔第四代至强CPU（Sapphire Rapids）上使用文本反演技术微调稳定扩散模型。借助英特尔高级矩阵扩展硬件加速器，开发者无需GPU也能高效运行和定制生成式AI工作流。原始信息显示：来自原始信息源的最新动态，点击标题查看完整内容。该消息由Hugging Face发布，主题为“Fine-tuning Stable Diffusion models on Intel CPUs”。其重要性主要体现在：文章探讨了在英特尔CPU集群上对稳定扩散模型进行微调的技术方案，打破了传统上只能依赖GPU的硬件限制。建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响。",
   "summaryGeneratedAt": "2026-09-06T02:29:54.848783Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
       "src": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/0.jpeg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/0.jpeg",
+      "alt": "",
       "id": "image_f0bc23536b409fb0"
     },
     {
       "src": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/1.jpeg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/1.jpeg",
+      "alt": "",
       "id": "image_485ca23c1101d380"
     },
     {
       "src": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/2.jpeg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/2.jpeg",
+      "alt": "",
       "id": "image_465abae68b05a995"
     },
     {
       "src": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/3.jpeg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/3.jpeg",
+      "alt": "",
       "id": "image_dfb058592b6f8ceb"
     },
     {
       "src": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/4.jpeg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/4.jpeg",
+      "alt": "",
       "id": "image_683122d033b60c6f"
     },
     {
       "src": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/screen01.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/screen01.png",
+      "alt": "",
       "id": "image_86e2330426d2415c"
     },
     {
       "src": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/screen02.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/screen02.png",
+      "alt": "",
       "id": "image_feb151a9059a5bdb"
     },
     {
       "src": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/dicoo_image_200.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/dicoo_image_200.png",
+      "alt": "",
       "id": "image_70b347dd2c4cca9c"
     },
     {
       "src": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/dicoo_image.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/stable-diffusion-finetuning-intel/dicoo_image.png",
+      "alt": "",
       "id": "image_64f31d3d61510be9"
     }
   ],
@@ -83,67 +83,67 @@
   "mediaCheckedAt": "2026-10-03T07:09:59.061152Z",
   "mediaFormatVersion": 2,
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "bf579cc70abe9c0a3a6bc354235e0e4e7c0581a2e51fea63081e1dc93e6d5647",
+  "mediaLayoutBodyHash": "b4c89f1fb3385689ba8a848217edd6d76cdd4ccec6f05f0a720080092255c301",
   "mediaLayout": [
     {
       "mediaId": "image_f0bc23536b409fb0",
       "type": "image",
-      "afterBlockId": "c0006",
-      "order": 18
+      "afterBlockId": "b0014",
+      "order": 0
     },
     {
       "mediaId": "image_485ca23c1101d380",
       "type": "image",
-      "afterBlockId": "c0006",
-      "order": 19
+      "afterBlockId": "b0014",
+      "order": 1
     },
     {
       "mediaId": "image_465abae68b05a995",
       "type": "image",
-      "afterBlockId": "c0006",
-      "order": 20
+      "afterBlockId": "b0014",
+      "order": 2
     },
     {
       "mediaId": "image_dfb058592b6f8ceb",
       "type": "image",
-      "afterBlockId": "c0006",
-      "order": 21
+      "afterBlockId": "b0014",
+      "order": 3
     },
     {
       "mediaId": "image_683122d033b60c6f",
       "type": "image",
-      "afterBlockId": "c0006",
-      "order": 22
+      "afterBlockId": "b0014",
+      "order": 4
     },
     {
       "mediaId": "image_86e2330426d2415c",
       "type": "image",
-      "afterBlockId": "b0017",
-      "order": 27
+      "afterBlockId": "b0018",
+      "order": 5
     },
     {
       "mediaId": "image_feb151a9059a5bdb",
       "type": "image",
-      "afterBlockId": "b0022",
-      "order": 36
+      "afterBlockId": "b0024",
+      "order": 6
     },
     {
       "mediaId": "image_70b347dd2c4cca9c",
       "type": "image",
-      "afterBlockId": "b0030",
-      "order": 49
+      "afterBlockId": "b0033",
+      "order": 7
     },
     {
       "mediaId": "image_64f31d3d61510be9",
       "type": "image",
-      "afterBlockId": "b0031",
-      "order": 51
+      "afterBlockId": "b0034",
+      "order": 8
     }
   ],
   "mediaLayoutUnplaced": [],
   "mediaLayoutMatched": 9,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-10-03T07:09:59.112744Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:33:01.755778Z",
   "mediaRecheckedAt": "2026-10-03T07:09:59.112758Z",
   "articleKind": "page",
   "aiReview": {
@@ -176,5 +176,544 @@
     "summaryZh": "本文介绍了如何在英特尔第四代至强CPU（Sapphire Rapids）上使用文本反演技术微调稳定扩散模型。借助英特尔高级矩阵扩展硬件加速器，开发者无需GPU也能高效运行和定制生成式AI工作流。原始信息显示：来自原始信息源的最新动态，点击标题查看完整内容。该消息由Hugging Face发布，主题为“Fine-tuning Stable Diffusion models on Intel CPUs”。其重要性主要体现在：文章探讨了在英特尔CPU集群上对稳定扩散模型进行微调的技术方案，打破了传统上只能依赖GPU的硬件限制。建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响。",
     "glossary": [],
     "duplicateKey": "fine-tuning-stable-diffusion-intel-cpu"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Diffusion models helped popularize generative AI thanks to their uncanny ability to generate photorealistic images from text prompts. These models have now found their way into enterprise use cases like synthetic data generation or content creation. The Hugging Face hub includes over 5,000 pre-trained text-to-image models. Combining them with the Diffusers library, it's never been easier to start experimenting and building image generation workflows.",
+      "spans": [
+        {
+          "start": 317,
+          "end": 323,
+          "kind": "a",
+          "href": "https://huggingface.co/models?pipeline_tag=text-to-image&sort=trending"
+        },
+        {
+          "start": 349,
+          "end": 366,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/index"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Like Transformer models, you can fine-tune Diffusion models to help them generate content that matches your business needs. Initially, fine-tuning was only possible on GPU infrastructure, but things are changing! A few months ago, Intel launched the fourth generation of Xeon CPUs, code-named Sapphire Rapids. Sapphire Rapids introduces the Intel Advanced Matrix Extensions (AMX), a new hardware accelerator for deep learning workloads. We've already demonstrated the benefits of AMX in several blog posts: fine-tuning NLP Transformers, inference with NLP Transformers, and inference with Stable Diffusion models.",
+      "spans": [
+        {
+          "start": 237,
+          "end": 245,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/newsroom/news/4th-gen-xeon-scalable-processors-max-series-cpus-gpus.html#gs.2d6cd7"
+        },
+        {
+          "start": 507,
+          "end": 535,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel-sapphire-rapids"
+        },
+        {
+          "start": 537,
+          "end": 568,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel-sapphire-rapids-inference"
+        },
+        {
+          "start": 574,
+          "end": 612,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/stable-diffusion-inference-intel"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "This post will show you how to fine-tune a Stable Diffusion model on an Intel Sapphire Rapids CPU cluster. We will use textual inversion, a technique that only requires a small number of example images. We'll use only five!",
+      "spans": [
+        {
+          "start": 119,
+          "end": 136,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/training/text_inversion"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Let's get started.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Setting up the cluster",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Our friends at Intel provided four servers hosted on the Intel Developer Cloud (IDC), a service platform for developing and running workloads in Intel®-optimized deployment environments with the latest Intel processors and performance-optimized software stacks.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/intel"
+        },
+        {
+          "start": 57,
+          "end": 78,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/devcloud/services.html"
+        },
+        {
+          "start": 223,
+          "end": 260,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/topic-technology/artificial-intelligence/overview.html"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Each server is powered by two Intel Sapphire Rapids CPUs with 56 physical cores and 112 threads. Here's the output of lscpu:",
+      "spans": [
+        {
+          "start": 118,
+          "end": 123,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Let's first list the IP addresses of our servers in nodefile. The first line refers to the primary server.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 61,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Distributed training requires password-less ssh between the primary and other nodes. Here's a good article on how to do this if you're unfamiliar with the process.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 99,
+          "end": 106,
+          "kind": "a",
+          "href": "https://www.redhat.com/sysadmin/passwordless-ssh"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Next, we create a new environment on each node and install the software dependencies. We notably install two Intel libraries: oneCCL, to manage distributed communication and the Intel Extension for PyTorch (IPEX) to leverage the hardware acceleration features present in Sapphire Rapids. We also add gperftools to install libtcmalloc, a high-performance memory allocation library.",
+      "spans": [
+        {
+          "start": 126,
+          "end": 132,
+          "kind": "a",
+          "href": "https://github.com/oneapi-src/oneCCL"
+        },
+        {
+          "start": 178,
+          "end": 205,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        },
+        {
+          "start": 300,
+          "end": 310,
+          "kind": "code"
+        },
+        {
+          "start": 322,
+          "end": 334,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Next, we clone the diffusers repository on each node and install it from source.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 28,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Next, we add IPEX to the fine-tuning script in diffusers/examples/textual_inversion. We import IPEX and optimize the U-Net and Variable Auto Encoder models. Please make sure this is applied to all nodes.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 83,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "The last step is downloading the training images. Ideally, we'd use a shared NFS folder, but for the sake of simplicity, we'll download the images on each node. Please ensure they're in the same directory on all nodes (/home/devcloud/dicoo).",
+      "spans": [
+        {
+          "start": 33,
+          "end": 48,
+          "kind": "a",
+          "href": "https://huggingface.co/sd-concepts-library/dicoo"
+        },
+        {
+          "start": 219,
+          "end": 239,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Here are the images:",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "The system setup is now complete. Let's configure the training job.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Configuring the fine-tuning job",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "The Accelerate library makes it very easy to run distributed training. We need to run it on each node and answer simple questions.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/index"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Here's a screenshot for the primary node. On the other nodes, you need to set the rank to 1, 2, and 3. All other answers are identical.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Finally, we need to set the environment on the primary node. It will be propagated to other nodes as the fine-tuning job starts. The first line sets the name of the network interface connected to the local network where all nodes run. You may need to adapt this usingifconfig to get the appropriate information.",
+      "spans": [
+        {
+          "start": 267,
+          "end": 275,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "We can now launch the fine-tuning job.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Fine-tuning the model",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "We launch the fine-tuning job with mpirun, which sets up distributed communication across the nodes listed in nodefile. We'll run 16 tasks (-n) with four tasks per node (-ppn). Accelerate automatically sets up distributed training across all tasks.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 110,
+          "end": 118,
+          "kind": "code"
+        },
+        {
+          "start": 140,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 174,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 187,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Here, we train for 200 steps, which should take about five minutes.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Here's a screenshot of the busy cluster:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Troubleshooting",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Distributed training can be tricky, especially if you're new to the discipline. A minor misconfiguration on a single node is the most likely issue: missing dependency, images stored in a different location, etc.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "You can quickly pinpoint the troublemaker by logging in to each node and training locally. First, set the same environment as on the primary node, then run:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "If training starts successfully, stop it and move to the next node. If training starts successfully on all nodes, return to the primary node and double-check the node file, the environment, and the mpirun command. Don't worry; you'll find the problem :)",
+      "spans": [
+        {
+          "start": 198,
+          "end": 204,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Generating images with the fine-tuned model",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "After 5 minutes training, the model is saved locally. We could load it with a vanilla diffusers pipeline and predict. Instead, let's use Optimum Intel and OpenVINO to optimize the model. As discussed in a previous post, this lets you generate an image on a single CPU in less than 5 seconds!",
+      "spans": [
+        {
+          "start": 86,
+          "end": 95,
+          "kind": "code"
+        },
+        {
+          "start": 137,
+          "end": 163,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/intel/inference"
+        },
+        {
+          "start": 205,
+          "end": 218,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel-sapphire-rapids-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Here, we load the model, optimize it for a static shape, and save it:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Then, we load the optimized model, generate five different images and save them:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Here's a generated image. It is impressive that the model only needed five images to learn that dicoos have glasses!",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "If you'd like, you can fine-tune the model some more. Here's a lovely example generated by a 3,000-step model (about an hour of training).",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Thanks to Hugging Face and Intel, you can now use Xeon CPU servers to generate high-quality images adapted to your business needs. They are generally more affordable and widely available than specialized hardware such as GPUs. Xeon CPUs can also be easily repurposed for other production tasks, from web servers to databases, making them a versatile and flexible choice for your IT infrastructure.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Here are some resources to help you get started:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Diffusers documentation",
+      "spans": [
+        {
+          "start": 10,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Optimum Intel documentation",
+      "spans": [
+        {
+          "start": 14,
+          "end": 27,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/main/en/intel/inference"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Intel IPEX on GitHub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Developer resources from Intel and Hugging Face.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/partner/hugging-face.html"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Sapphire Rapids servers on Intel Developer Cloud, AWS and GCP.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 48,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/devcloud/services.html"
+        },
+        {
+          "start": 50,
+          "end": 53,
+          "kind": "a",
+          "href": "https://aws.amazon.com/about-aws/whats-new/2022/11/introducing-amazon-ec2-r7iz-instances/?nc1=h_ls"
+        },
+        {
+          "start": 58,
+          "end": 61,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/products/compute/c3-machine-series-on-intel-sapphire-rapids-now-ga"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "If you have questions or feedback, we'd love to read them on the Hugging Face forum.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 83,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Thanks for reading!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "b4c89f1fb3385689ba8a848217edd6d76cdd4ccec6f05f0a720080092255c301",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "Architecture:            x86_64\n  CPU op-mode(s):        32-bit, 64-bit\n  Address sizes:         52 bits physical, 57 bits virtual\n  Byte Order:            Little Endian\nCPU(s):                  224\n  On-line CPU(s) list:   0-223\nVendor ID:               GenuineIntel\n  Model name:            Intel(R) Xeon(R) Platinum 8480+\n    CPU family:          6\n    Model:               143\n    Thread(s) per core:  2\n    Core(s) per socket:  56\n    Socket(s):           2\n    Stepping:            8\n    CPU max MHz:         3800.0000\n    CPU min MHz:         800.0000\n    BogoMIPS:            4000.00\n    Flags:               fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_per fmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cat_l2 cdp_l3 invpcid_single intel_ppin cdp_l2 ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb intel_pt avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local split_lock_detect avx_vnni avx512_bf16 wbnoinvd dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b enqcmd fsrm md_clear serialize tsxldtrk pconfig arch_lbr amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities"
+    },
+    {
+      "id": "c0002",
+      "source": "cat << EOF > nodefile\n192.168.20.2\n192.168.21.2\n192.168.22.2\n192.168.23.2\nEOF"
+    },
+    {
+      "id": "c0003",
+      "source": "conda create -n diffuser python==3.9\nconda activate diffuser\npip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu\npip3 install transformers accelerate==0.19.0\npip3 install oneccl_bind_pt -f https://developer.intel.com/ipex-whl-stable-cpu\npip3 install intel_extension_for_pytorch\nconda install gperftools -c conda-forge -y"
+    },
+    {
+      "id": "c0004",
+      "source": "git clone https://github.com/huggingface/diffusers.git\ncd diffusers\npip install ."
+    },
+    {
+      "id": "c0005",
+      "source": "diff --git a/examples/textual_inversion/textual_inversion.py b/examples/textual_inversion/textual_inversion.py\nindex 4a193abc..91c2edd1 100644\n--- a/examples/textual_inversion/textual_inversion.py\n+++ b/examples/textual_inversion/textual_inversion.py\n@@ -765,6 +765,10 @@ def main():\n     unet.to(accelerator.device, dtype=weight_dtype)\n     vae.to(accelerator.device, dtype=weight_dtype)\n\n+    import intel_extension_for_pytorch as ipex\n+    unet = ipex.optimize(unet, dtype=weight_dtype)\n+    vae = ipex.optimize(vae, dtype=weight_dtype)\n+\n     # We need to recalculate our total training steps as the size of the training dataloader may have changed.\n     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)\n     if overrode_max_train_steps:"
+    },
+    {
+      "id": "c0006",
+      "source": "mkdir /home/devcloud/dicoo\ncd /home/devcloud/dicoo\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/0.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/1.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/2.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/3.jpeg\nwget https://huggingface.co/sd-concepts-library/dicoo/resolve/main/concept_images/4.jpeg"
+    },
+    {
+      "id": "c0007",
+      "source": "export I_MPI_HYDRA_IFACE=ens786f1\noneccl_bindings_for_pytorch_path=$(python -c \"from oneccl_bindings_for_pytorch import cwd; print(cwd)\")\nsource $oneccl_bindings_for_pytorch_path/env/setvars.sh\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libiomp5.so\nexport LD_PRELOAD=${LD_PRELOAD}:${CONDA_PREFIX}/lib/libtcmalloc.so\nexport CCL_ATL_TRANSPORT=ofi\nexport CCL_WORKER_COUNT=1\n\nexport MODEL_NAME=\"runwayml/stable-diffusion-v1-5\"\nexport DATA_DIR=\"/home/devcloud/dicoo\""
+    },
+    {
+      "id": "c0008",
+      "source": "mpirun -f nodefile -n 16 -ppn 4                                                         \\\naccelerate launch diffusers/examples/textual_inversion/textual_inversion.py             \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline"
+    },
+    {
+      "id": "c0009",
+      "source": "python diffusers/examples/textual_inversion/textual_inversion.py                        \\\n--pretrained_model_name_or_path=$MODEL_NAME --train_data_dir=$DATA_DIR                  \\\n--learnable_property=\"object\"   --placeholder_token=\"<dicoo>\" --initializer_token=\"toy\" \\\n--resolution=512  --train_batch_size=1  --seed=7  --gradient_accumulation_steps=1       \\\n--max_train_steps=200 --learning_rate=2.0e-03 --scale_lr --lr_scheduler=\"constant\"     \\\n--lr_warmup_steps=0 --output_dir=./textual_inversion_output --mixed_precision bf16      \\\n--save_as_full_pipeline"
+    },
+    {
+      "id": "c0010",
+      "source": "pip install optimum[openvino]"
+    },
+    {
+      "id": "c0011",
+      "source": "from optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)\nov_pipe.reshape(batch_size=5, height=512, width=512, num_images_per_prompt=1)\nov_pipe.save_pretrained(\"./textual_inversion_output_ov\")"
+    },
+    {
+      "id": "c0012",
+      "source": "from optimum.intel.openvino import OVStableDiffusionPipeline\n\nmodel_id = \"./textual_inversion_output_ov\"\n\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, num_inference_steps=20)\nprompt = [\"a yellow <dicoo> robot at the beach, high quality\"]*5\nimages = ov_pipe(prompt).images\nprint(images)\nfor idx,img in enumerate(images):\n    img.save(f\"image{idx}.png\")"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 9,
+    "savedImages": 9,
+    "sourceImageOccurrences": 9,
+    "placedImageOccurrences": 9,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-04T15:33:01.755764Z"
 }

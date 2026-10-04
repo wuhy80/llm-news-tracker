@@ -18,8 +18,8 @@
   "fetchedAt": "2026-09-05T07:37:43.576421Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Optimizing your LLM in production\n\nPublished September 15, 2023\n\nThis article is also available in Chinese 简体中文 .\n\nNote : This blog post is also available as a documentation page on Transformers .\n\nLarge Language Models (LLMs) such as GPT3/4, Falcon , and LLama are rapidly advancing in their ability to tackle human-centric tasks, establishing themselves as essential tools in modern knowledge-based industries. Deploying these models in real-world tasks remains challenging, however:\n\n- To exhibit near-human text understanding and generation capabilities, LLMs currently require to be composed of billions of parameters (see Kaplan et al , Wei et. al ). This consequently amplifies the memory demands for inference.\n\n- In many real-world tasks, LLMs need to be given extensive contextual information. This necessitates the model's capability to manage very long input sequences during inference.\n\nThe crux of these challenges lies in augmenting the computational and memory capabilities of LLMs, especially when handling expansive input sequences.\n\nIn this blog post, we will go over the most effective techniques at the time of writing this blog post to tackle these challenges for efficient LLM deployment:\n\nLower Precision : Research has shown that operating at reduced numerical precision, namely 8-bit and 4-bit, can achieve computational advantages without a considerable decline in model performance.\n\nFlash Attention: Flash Attention is a variation of the attention algorithm that not only provides a more memory-efficient approach but also realizes increased efficiency due to optimized GPU memory utilization.\n\nArchitectural Innovations: Considering that LLMs are always deployed in the same way during inference, namely autoregressive text generation with a long input context, specialized model architectures have been proposed that allow for more efficient inference. The most important advancement in model architectures hereby are Alibi , Rotary embeddings , Multi-Query Attention (MQA) and Grouped-Query-Attention (GQA) .\n\nThroughout this notebook, we will offer an analysis of auto-regressive generation from a tensor's perspective. We delve into the pros and cons of adopting lower precision, provide a comprehensive exploration of the latest attention algorithms, and discuss improved LLM architectures. While doing so, we run practical examples showcasing each of the feature improvements.\n\n### 1. Harnessing the Power of Lower Precision\n\nMemory requirements of LLMs can be best understood by seeing the LLM as a set of weight matrices and vectors and the text inputs as a sequence of vectors. In the following, the definition weights will be used to signify all model weight matrices and vectors.\n\nAt the time of writing this post, LLMs consist of at least a couple billion parameters. Each parameter thereby is made of a decimal number, e.g. 4.5689 which is usually stored in either float32 , bfloat16 , or float16 format. This allows us to easily compute the memory requirement to load the LLM into memory:\n\nLoading the weights of a model having X billion parameters requires roughly 4 * X GB of VRAM in float32 precision\n\nNowadays, models are however rarely trained in full float32 precision, but usually in bfloat16 precision or less frequently in float16 precision. Therefore the rule of thumb becomes:\n\nLoading the weights of a model having X billion parameters requires roughly 2 * X GB of VRAM in bfloat16/float16 precision\n\nFor shorter text inputs (less than 1024 tokens), the memory requirement for inference is very much dominated by the memory requirement to load the weights. Therefore, for now, let's assume that the memory requirement for inference is equal to the memory requirement to load the model into the GPU VRAM.\n\nTo give some examples of how much VRAM it roughly takes to load a model in bfloat16:\n\n- GPT3 requires 2 * 175 GB = 350 GB VRAM\n\n- Bloom requires 2 * 176 GB = 352 GB VRAM\n\n- Llama-2-70b requires 2 * 70 GB = 140 GB VRAM\n\n- Falcon-40b requires 2 * 40 GB = 80 GB VRAM\n\n- MPT-30b requires 2 * 30 GB = 60 GB VRAM\n\n- bigcode/starcoder requires 2 * 15.5 = 31 GB VRAM\n\nAs of writing this document, the largest GPU chip on the market is the A100 offering 80GB of VRAM. Most of the models listed before require more than 80GB just to be loaded and therefore necessarily require tensor parallelism and/or pipeline parallelism .\n\n🤗 Transformers does not support tensor parallelism out of the box as it requires the model architecture to be written in a specific way. If you're interested in writing models in a tensor-parallelism-friendly way, feel free to have a look at the text-generation-inference library .\n\nNaive pipeline parallelism is supported out of the box. For this, simply load the model with device=\"auto\" which will automatically place the different layers on the available GPUs as explained here . Note, however that while very effective, this naive pipeline parallelism does not tackle the issues of GPU idling. For this more advanced pipeline parallelism is required as explained here .\n\nIf you have access to an 8 x 80GB A100 node, you could load BLOOM as follows\n\n```\n!pip install transformers accelerate bitsandbytes optimum\n```\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigscience/bloom\", device_map=\"auto\", pad_token_id=0)\n```\n\nBy using device_map=\"auto\" the attention layers would be equally distributed over all available GPUs.\n\nIn this notebook, we will use bigcode/octocoder as it can be run on a single 40 GB A100 GPU device chip. Note that all memory and speed optimizations that we will apply going forward, are equally applicable to models that require model or tensor parallelism.\n\nSince the model is loaded in bfloat16 precision, using our rule of thumb above, we would expect the memory requirement to run inference with bigcode/octocoder to be around 31 GB VRAM. Let's give it a try.\n\nWe first load the model and tokenizer and then pass both to Transformers' pipeline object.\n\n```\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, pipeline\nimport torch\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\", pad_token_id=0)\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n```\n\n```\nprompt = \"Question: Please write a function in Python that transforms bytes to Giga bytes.\\n\\nAnswer:\"\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n\n```\npython bytes_to_giga_bytes(bytes):\nreturn bytes / 1024 / 1024 / 1024\n```\\n\\nThis function takes a single\n```\n\nNice, we can now directly use the result to convert bytes into Gigabytes.\n\n```\ndef bytes_to_giga_bytes(bytes):\n    return bytes / 1024 / 1024 / 1024\n```\n\nLet's call torch.cuda.max_memory_allocated to measure the peak GPU memory allocation.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\n```\n29.0260648727417\n```\n\nClose enough to our back-of-the-envelope computation! We can see the number is not exactly correct as going from bytes to kilobytes requires a multiplication of 1024 instead of 1000. Therefore the back-of-the-envelope formula can also be understood as an \"at most X GB\" computation. Note that if we had tried to run the model in full float32 precision, a whopping 64 GB of VRAM would have been required.\n\nAlmost all models are trained in bfloat16 nowadays, there is no reason to run the model in full float32 precision if your GPU supports bfloat16 . Float32 won't give better inference results than the precision that was used to train the model.\n\nIf you are unsure in which format the model weights are stored on the Hub, you can always look into the checkpoint's config under \"torch_dtype\" , e.g. here . It is recommended to set the model to the same precision type as written in the config when loading with from_pretrained(..., torch_dtype=...) except when the original type is float32 in which case one can use both float16 or bfloat16 for inference.\n\nLet's define a flush(...) function to free all allocated memory so that we can accurately measure the peak allocated GPU memory.\n\n```\ndel pipe\ndel model\n\nimport gc\nimport torch\n\ndef flush():\n  gc.collect()\n  torch.cuda.empty_cache()\n  torch.cuda.reset_peak_memory_stats()\n```\n\nLet's call it now for the next experiment.\n\n```\nflush()\n```\n\nIn the recent version of the accelerate library, you can also use an utility method called release_memory()\n\n```\nfrom accelerate.utils import release_memory\n# ...\n\nrelease_memory(model)\n```\n\nNow what if your GPU does not have 32 GB of VRAM? It has been found that model weights can be quantized to 8-bit or 4-bits without a significant loss in performance (see Dettmers et al. ). Model can be quantized to even 3 or 2 bits with an acceptable loss in performance as shown in the recent GPTQ paper 🤯.\n\nWithout going into too many details, quantization schemes aim at reducing the precision of weights while trying to keep the model's inference results as accurate as possible ( a.k.a as close as possible to bfloat16). Note that quantization works especially well for text generation since all we care about is choosing the set of most likely next tokens and don't really care about the exact values of the next token logit distribution. All that matters is that the next token logit distribution stays roughly the same so that an argmax or topk operation gives the same results.\n\nThere are various quantization techniques, which we won't discuss in detail here, but in general, all quantization techniques work as follows:\n\n- Quantize all weights to the target precision\n\n- Load the quantized weights, and pass the input sequence of vectors in bfloat16 precision\n\n- Dynamically dequantize weights to bfloat16 to perform the computation with their input vectors in bfloat16 precision\n\n- Quantize the weights again to the target precision after computation with their inputs.\n\nIn a nutshell, this means that inputs-weight matrix multiplications, with X X X being the inputs , W W W being a weight matrix and Y Y Y being the output:\n\nY = X ∗ W Y = X * W Y = X ∗ W\n\nY = X ∗ dequantize ( W ) ; quantize ( W ) Y = X * dequantize(W); quantize(W) Y = X ∗ dequantize ( W ) ; quantize ( W )\n\nfor every matrix multiplication. Dequantization and re-quantization is performed sequentially for all weight matrices as the inputs run through the network graph.\n\nTherefore, inference time is often not reduced when using quantized weights, but rather increases. Enough theory, let's give it a try! To quantize the weights with Transformers, you need to make sure that the bitsandbytes library is installed.\n\n```\n!pip install bitsandbytes\n```\n\nWe can then load models in 8-bit quantization by simply adding a load_in_8bit=True flag to from_pretrained .\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_8bit=True, pad_token_id=0)\n```\n\nNow, let's run our example again and measure the memory usage.\n\n```\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n\n```\npython bytes_to_giga_bytes(bytes):\nreturn bytes / 1024 / 1024 / 1024\n```\\n\\nThis function takes a single\n```\n\nNice, we're getting the same result as before, so no loss in accuracy! Let's look at how much memory was used this time.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\n```\n15.219234466552734\n```\n\nSignificantly less! We're down to just a bit over 15 GBs and could therefore run this model on consumer GPUs like the 4090. We're seeing a very nice gain in memory efficiency and more or less no degradation to the model's output. However, we can also notice a slight slow-down during inference.\n\nWe delete the models and flush the memory again.\n\n```\ndel model\ndel pipe\n```\n\n```\nflush()\n```\n\nLet's see what peak GPU memory consumption 4-bit quantization gives. Quantizing the model to 4-bit can be done with the same API as before - this time by passing load_in_4bit=True instead of load_in_8bit=True .\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_4bit=True, low_cpu_mem_usage=True, pad_token_id=0)\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n\n```\nbytes_to_gigabytes(bytes):\nreturn bytes / 1024 / 1024 / 1024\n```\\n\\nThis function takes a single argument\n```\n\nWe're almost seeing the same output text as before - just the python is missing just before the code snippet. Let's see how much memory was required.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\n```\n9.543574333190918\n```\n\nJust 9.5GB! That's really not a lot for a >15 billion parameter model.\n\nWhile we see very little degradation in accuracy for our model here, 4-bit quantization can in practice often lead to different results compared to 8-bit quantization or full bfloat16 inference. It is up to the user to try it out.\n\nAlso note that inference here was again a bit slower compared to 8-bit quantization which is due to the more aggressive quantization method used for 4-bit quantization leading to quantize quantize quantize and dequantize dequantize dequantize taking longer during inference.\n\n```\ndel model\ndel pipe\n```\n\n```\nflush()\n```\n\nOverall, we saw that running OctoCoder in 8-bit precision reduced the required GPU VRAM from 32G GPU VRAM to only 15GB and running the model in 4-bit precision further reduces the required GPU VRAM to just a bit over 9GB.\n\n4-bit quantization allows the model to be run on GPUs such as RTX3090, V100, and T4 which are quite accessible for most people.\n\nFor more information on quantization and to see how one can quantize models to require even less GPU VRAM memory than 4-bit, we recommend looking into the AutoGPTQ implementation.\n\nAs a conclusion, it is important to remember that model quantization trades improved memory efficiency against accuracy and in some cases inference time.\n\nIf GPU memory is not a constraint for your use case, there is often no need to look into quantization. However many GPUs simply can't run LLMs without quantization methods and in this case, 4-bit and 8-bit quantization schemes are extremely useful tools.\n\nFor more in-detail usage information, we strongly recommend taking a look at the Transformers Quantization Docs . Next, let's look into how we can improve computational and memory efficiency by using better algorithms and an improved model architecture.\n\n## 2. Flash Attention: A Leap Forward\n\nToday's top-performing LLMs share more or less the same fundamental architecture that consists of feed-forward layers, activation layers, layer normalization layers, and most crucially, self-attention layers.\n\nSelf-attention layers are central to Large Language Models (LLMs) in that they enable the model to understand the contextual relationships between input tokens. However, the peak GPU memory consumption for self-attention layers grows quadratically both in compute and memory complexity with number of input tokens (also called sequence length ) that we denote in the following by N N N . While this is not really noticeable for shorter input sequences (of up to 1000 input tokens), it becomes a serious problem for longer input sequences (at around 16000 input tokens).\n\nLet's take a closer look. The formula to compute the output O O O of a self-attention layer for an input X X X of length N N N is:\n\nO = Attn ( X ) = V × Softmax ( Q K T ) with Q = W q X , V = W v X , K = W k X O = Attn(X) = V × Softmax(QKT) with Q = W_q X, V = W_v X, K = W_k X O = Attn ( X ) = V × Softmax ( QK T ) with Q = W q ​ X , V = W v ​ X , K = W k ​ X X = ( x 1 , . . . x N ) X = (x_1, ... xN) X = ( x 1 ​ , ... x N ​ ) is thereby the input sequence to the attention layer. The projections Q Q Q and K K K will each consist of N N N vectors resulting in the Q K T QKT QK T being of size N 2 N2 N 2 .\n\nLLMs usually have multiple attention heads, thus doing multiple self-attention computations in parallel. Assuming, the LLM has 40 attention heads and runs in bfloat16 precision, we can calculate the memory requirement to store the Q K T QKT Q K T matrices to be 40 ∗ 2 ∗ N 2 40 * 2 * N2 40 ∗ 2 ∗ N 2 bytes. For N = 1000 N=1000 N = 1000 only around 50 MB of VRAM are needed, however, for N = 16000 N=16000 N = 16000 we would need 19 GB of VRAM, and for N = 100 , 000 N=100,000 N = 100 , 000 we would need almost 1TB just to store the Q K T QKT QK T matrices.\n\nLong story short, the default self-attention algorithm quickly becomes prohibitively memory-expensive for large input contexts.\n\nAs LLMs improve in text comprehension and generation, they are applied to increasingly complex tasks. While models once handled the translation or summarization of a few sentences, they now manage entire pages, demanding the capability to process extensive input lengths.\n\nHow can we get rid of the exorbitant memory requirements for large input lengths? We need a new way to compute the self-attention mechanism that gets rid of the Q K T QKT Q K T matrix. Tri Dao et al. developed exactly such a new algorithm and called it Flash Attention .\n\nIn a nutshell, Flash Attention breaks the V × Softmax ( Q K T V × Softmax(QKT V × Softmax ( QK T ) computation apart and instead computes smaller chunks of the output by iterating over multiple softmax computation steps:\n\nO i ← s i j a ∗ O i + s i j b ∗ V j × Softmax ( Q K i , j T ) for multiple i , j iterations O_i arrow saij * O_i + sbij * Vj × Softmax(QKTi,j) for multiple i, j iterations O i ​ ← s ij a ​ ∗ O i ​ + s ij b ​ ∗ V j ​ × Softmax ( QK i , j T ​ ) for multiple i , j iterations\n\nwith s i j a saij s ij a ​ and s i j b sbij s ij b ​ being some softmax normalization statistics that need to be recomputed for every i i i and j j j .\n\nPlease note that the whole Flash Attention is a bit more complex and is greatly simplified here as going in too much depth is out of scope for this notebook. The reader is invited to take a look at the well-written Flash Attention paper for more details.\n\nThe main takeaway here is:\n\nBy keeping track of softmax normalization statistics and by using some smart mathematics, Flash Attention gives numerical identical outputs compared to the default self-attention layer at a memory cost that only increases linearly with N N N .\n\nLooking at the formula, one would intuitively say that Flash Attention must be much slower compared to the default self-attention formula as more computation needs to be done. Indeed Flash Attention requires more FLOPs compared to normal attention as the softmax normalization statistics have to constantly be recomputed (see paper for more details if interested)\n\nHowever, Flash Attention is much faster in inference compared to default attention which comes from its ability to significantly reduce the demands on the slower, high-bandwidth memory of the GPU (VRAM), focusing instead on the faster on-chip memory (SRAM).\n\nEssentially, Flash Attention makes sure that all intermediate write and read operations can be done using the fast on-chip SRAM memory instead of having to access the slower VRAM memory to compute the output vector O O O .\n\nIn practice, there is currently absolutely no reason to not use Flash Attention if available. The algorithm gives mathematically the same outputs, and is both faster and more memory-efficient.\n\nLet's look at a practical example.\n\nOur OctoCoder model now gets a significantly longer input prompt which includes a so-called system prompt . System prompts are used to steer the LLM into a better assistant that is tailored to the users' task. In the following, we use a system prompt that will make OctoCoder a better coding assistant.\n\n```\nsystem_prompt = \"\"\"Below are a series of dialogues between various people and an AI technical assistant.\nThe assistant tries to be helpful, polite, honest, sophisticated, emotionally aware, and humble but knowledgeable.\nThe assistant is happy to help with code questions and will do their best to understand exactly what is needed.\nIt also tries to avoid giving false or misleading information, and it caveats when it isn't entirely sure about the right answer.\nThat said, the assistant is practical really does its best, and doesn't let caution get too much in the way of being useful.\n\nThe Starcoder models are a series of 15.5B parameter models trained on 80+ programming languages from The Stack (v1.2) (excluding opt-out requests).\nThe model uses Multi Query Attention, was trained using the Fill-in-the-Middle objective, and with 8,192 tokens context window for a trillion tokens of heavily deduplicated data.\n\n-----\n\nQuestion: Write a function that takes two lists and returns a list that has alternating elements from each input list.\n\nAnswer: Sure. Here is a function that does that.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(len(list1)):\n       results.append(list1[i])\n       results.append(list2[i])\n   return results\n\nQuestion: Can you write some test cases for this function?\n\nAnswer: Sure, here are some tests.\n\nassert alternating([10, 20, 30], [1, 2, 3]) == [10, 1, 20, 2, 30, 3]\nassert alternating([True, False], [4, 5]) == [True, 4, False, 5]\nassert alternating([], []) == []\n\nQuestion: Modify the function so that it returns all input elements when the lists have uneven length. The elements from the longer list should be at the end.\n\nAnswer: Here is the modified function.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(min(len(list1), len(list2))):\n       results.append(list1[i])\n       results.append(list2[i])\n   if len(list1) > len(list2):\n       results.extend(list1[i+1:])\n   else:\n       results.extend(list2[i+1:])\n   return results\n\n-----\n\"\"\"\n```\n\nFor demonstration purposes, we duplicate the system by ten so that the input length is long enough to observe Flash Attention's memory savings. We append the original text prompt \"Question: Please write a function in Python that transforms bytes to Giga bytes.: Here\"\n\n```\nlong_prompt = 10 * system_prompt + prompt\n```\n\nWe instantiate our model again in bfloat16 precision.\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\")\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n```\n\nLet's now run the model just like before without Flash Attention and measure the peak GPU memory requirement and inference time.\n\n```\nimport time\n\nstart_time = time.time()\nresult = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult\n```\n\n```\nGenerated in 10.96854019165039 seconds.\nSure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n\nreturn bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef\n```\n\nWe're getting the same output as before, however this time, the model repeats the answer multiple times until it's 60 tokens cut-off. This is not surprising as we've repeated the system prompt ten times for demonstration purposes and thus cued the model to repeat itself.\n\nNote that the system prompt should not be repeated ten times in real-world applications - one time is enough!\n\nLet's measure the peak GPU memory requirement.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\n```\n37.668193340301514\n```\n\nAs we can see the peak GPU memory requirement is now significantly higher than in the beginning, which is largely due to the longer input sequence. Also the generation takes a little over a minute now.\n\nWe call flush() to free GPU memory for our next experiment.\n\n```\nflush()\n```\n\nFor comparison, let's run the same function, but enable Flash Attention instead. To do so, we convert the model to BetterTransformers and by doing so enabling PyTorch's SDPA self-attention which in turn is based on Flash Attention.\n\n```\nmodel.to_bettertransformer()\n```\n\nNow we run the exact same code snippet as before and under the hood Transformers will make use of Flash Attention.\n\n```\nstart_time = time.time()\nwith torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):\n    result = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult\n```\n\n```\nGenerated in 3.0211617946624756 seconds.\n Sure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n\nreturn bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef\n```\n\nWe're getting the exact same result as before, but can observe a very significant speed-up thanks to Flash Attention.\n\nLet's measure the memory consumption one last time.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\n```\n32.617331981658936\n```\n\nAnd we're almost back to our original 29GB peak GPU memory from the beginning.\n\nWe can observe that we only use roughly 100MB more GPU memory when passing a very long input sequence with Flash Attention compared to passing a short input sequence as done in the beginning.\n\n```\nflush()\n```\n\n## 3. The Science Behind LLM Architectures: Strategic Selection for Long Text Inputs and Chat\n\nSo far we have looked into improving computational and memory efficiency by:\n\n- Casting the weights to a lower precision format\n\n- Replacing the self-attention algorithm with a more memory- and compute efficient version\n\nLet's now look into how we can change the architecture of an LLM so that it is most effective and efficient for task that require long text inputs, e.g. :\n\n- Retrieval augmented Questions Answering,\n\nNote that chat not only requires the LLM to handle long text inputs, but it also necessitates that the LLM is able to efficiently handle the back-and-forth dialogue between user and assistant (such as ChatGPT).\n\nOnce trained, the fundamental LLM architecture is difficult to change, so it is important to make considerations about the LLM's tasks beforehand and accordingly optimize the model's architecture. There are two important components of the model architecture that quickly become memory and/or performance bottlenecks for large input sequences.\n\n- The positional embeddings\n\nLet's go over each component in more detail\n\n### 3.1 Improving positional embeddings of LLMs\n\nSelf-attention puts each token in relation to each other's tokens. As an example, the Softmax ( Q K T ) Softmax(QKT) Softmax ( QK T ) matrix of the text input sequence \"Hello\", \"I\", \"love\", \"you\" could look as follows:\n\nEach word token is given a probability mass at which it attends all other word tokens and, therefore is put into relation with all other word tokens. E.g. the word \"love\" attends to the word \"Hello\" with 5%, to \"I\" with 30%, and to itself with 65%.\n\nA LLM based on self-attention, but without position embeddings would have great difficulties in understanding the positions of the text inputs to each other. This is because the probability score computed by Q K T QKT QK T relates each word token to each other word token in O ( 1 ) O(1) O ( 1 ) computations regardless of their relative positional distance to each other. Therefore, for the LLM without position embeddings each token appears to have the same distance to all other tokens, e.g. differentiating between \"Hello I love you\" and \"You love I hello\" would be very challenging.\n\nFor the LLM to understand sentence order, an additional cue is needed and is usually applied in the form of positional encodings (or also called positional embeddings ). Positional encodings, encode the position of each token into a numerical presentation that the LLM can leverage to better understand sentence order.\n\nThe authors of the Attention Is All You Need paper introduced sinusoidal positional embeddings P = p 1 , … , p N P = p_1, , p_N P = p 1 ​ , … , p N ​ . where each vector p i p_i p i ​ is computed as a sinusoidal function of its position i i i . The positional encodings are then simply added to the input sequence vectors X = x 1 , … , x N X = x_1, , x_N X = x 1 ​ , … , x N ​ = x 1 + p 1 , … , x N + p N x_1 + p_1, , x_N + p_N x 1 ​ + p 1 ​ , … , x N ​ + p N ​ thereby cueing the model to better learn sentence order.\n\nInstead of using fixed position embeddings, others (such as Devlin et al. ) used learned positional encodings for which the positional embeddings P P P are learned during training.\n\nSinusoidal and learned position embeddings used to be the predominant methods to encode sentence order into LLMs, but a couple of problems related to these positional encodings were found:",
+  "bodyFormatVersion": 3,
+  "body": "Note: This blog post is also available as a documentation page on Transformers.\n\nLarge Language Models (LLMs) such as GPT3/4, Falcon, and LLama are rapidly advancing in their ability to tackle human-centric tasks, establishing themselves as essential tools in modern knowledge-based industries. Deploying these models in real-world tasks remains challenging, however:\n\n- To exhibit near-human text understanding and generation capabilities, LLMs currently require to be composed of billions of parameters (see Kaplan et al, Wei et. al). This consequently amplifies the memory demands for inference.\n\n- In many real-world tasks, LLMs need to be given extensive contextual information. This necessitates the model's capability to manage very long input sequences during inference.\n\nThe crux of these challenges lies in augmenting the computational and memory capabilities of LLMs, especially when handling expansive input sequences.\n\nIn this blog post, we will go over the most effective techniques at the time of writing this blog post to tackle these challenges for efficient LLM deployment:\n\nLower Precision: Research has shown that operating at reduced numerical precision, namely 8-bit and 4-bit, can achieve computational advantages without a considerable decline in model performance.\n\nFlash Attention: Flash Attention is a variation of the attention algorithm that not only provides a more memory-efficient approach but also realizes increased efficiency due to optimized GPU memory utilization.\n\nArchitectural Innovations: Considering that LLMs are always deployed in the same way during inference, namely autoregressive text generation with a long input context, specialized model architectures have been proposed that allow for more efficient inference. The most important advancement in model architectures hereby are Alibi, Rotary embeddings, Multi-Query Attention (MQA) and Grouped-Query-Attention (GQA).\n\nThroughout this notebook, we will offer an analysis of auto-regressive generation from a tensor's perspective. We delve into the pros and cons of adopting lower precision, provide a comprehensive exploration of the latest attention algorithms, and discuss improved LLM architectures. While doing so, we run practical examples showcasing each of the feature improvements.\n\n### 1. Harnessing the Power of Lower Precision\n\nMemory requirements of LLMs can be best understood by seeing the LLM as a set of weight matrices and vectors and the text inputs as a sequence of vectors. In the following, the definition weights will be used to signify all model weight matrices and vectors.\n\nAt the time of writing this post, LLMs consist of at least a couple billion parameters. Each parameter thereby is made of a decimal number, e.g. 4.5689 which is usually stored in either float32, bfloat16, or float16 format. This allows us to easily compute the memory requirement to load the LLM into memory:\n\nLoading the weights of a model having X billion parameters requires roughly 4 * X GB of VRAM in float32 precision\n\nNowadays, models are however rarely trained in full float32 precision, but usually in bfloat16 precision or less frequently in float16 precision. Therefore the rule of thumb becomes:\n\nLoading the weights of a model having X billion parameters requires roughly 2 * X GB of VRAM in bfloat16/float16 precision\n\nFor shorter text inputs (less than 1024 tokens), the memory requirement for inference is very much dominated by the memory requirement to load the weights. Therefore, for now, let's assume that the memory requirement for inference is equal to the memory requirement to load the model into the GPU VRAM.\n\nTo give some examples of how much VRAM it roughly takes to load a model in bfloat16:\n\n- GPT3 requires 2 * 175 GB = 350 GB VRAM\n\n- Bloom requires 2 * 176 GB = 352 GB VRAM\n\n- Llama-2-70b requires 2 * 70 GB = 140 GB VRAM\n\n- Falcon-40b requires 2 * 40 GB = 80 GB VRAM\n\n- MPT-30b requires 2 * 30 GB = 60 GB VRAM\n\n- bigcode/starcoder requires 2 * 15.5 = 31 GB VRAM\n\nAs of writing this document, the largest GPU chip on the market is the A100 offering 80GB of VRAM. Most of the models listed before require more than 80GB just to be loaded and therefore necessarily require tensor parallelism and/or pipeline parallelism.\n\n🤗 Transformers does not support tensor parallelism out of the box as it requires the model architecture to be written in a specific way. If you're interested in writing models in a tensor-parallelism-friendly way, feel free to have a look at the text-generation-inference library.\n\nNaive pipeline parallelism is supported out of the box. For this, simply load the model with device=\"auto\" which will automatically place the different layers on the available GPUs as explained here. Note, however that while very effective, this naive pipeline parallelism does not tackle the issues of GPU idling. For this more advanced pipeline parallelism is required as explained here.\n\nIf you have access to an 8 x 80GB A100 node, you could load BLOOM as follows\n\n```\n!pip install transformers accelerate bitsandbytes optimum\n```\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigscience/bloom\", device_map=\"auto\", pad_token_id=0)\n```\n\nBy using device_map=\"auto\" the attention layers would be equally distributed over all available GPUs.\n\nIn this notebook, we will use bigcode/octocoder as it can be run on a single 40 GB A100 GPU device chip. Note that all memory and speed optimizations that we will apply going forward, are equally applicable to models that require model or tensor parallelism.\n\nSince the model is loaded in bfloat16 precision, using our rule of thumb above, we would expect the memory requirement to run inference with bigcode/octocoder to be around 31 GB VRAM. Let's give it a try.\n\nWe first load the model and tokenizer and then pass both to Transformers' pipeline object.\n\n```\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, pipeline\nimport torch\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\", pad_token_id=0)\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n```\n\n```\nprompt = \"Question: Please write a function in Python that transforms bytes to Giga bytes.\\n\\nAnswer:\"\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\nOutput:\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n``​`python\\ndef bytes_to_giga_bytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n``​`\\n\\nThis function takes a single\n```\n\nNice, we can now directly use the result to convert bytes into Gigabytes.\n\n```\ndef bytes_to_giga_bytes(bytes):\n  return bytes / 1024 / 1024 / 1024\n```\n\nLet's call torch.cuda.max_memory_allocated to measure the peak GPU memory allocation.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\nOutput:\n\n```\n29.0260648727417\n```\n\nClose enough to our back-of-the-envelope computation! We can see the number is not exactly correct as going from bytes to kilobytes requires a multiplication of 1024 instead of 1000. Therefore the back-of-the-envelope formula can also be understood as an \"at most X GB\" computation. Note that if we had tried to run the model in full float32 precision, a whopping 64 GB of VRAM would have been required.\n\nAlmost all models are trained in bfloat16 nowadays, there is no reason to run the model in full float32 precision if your GPU supports bfloat16. Float32 won't give better inference results than the precision that was used to train the model.\n\nIf you are unsure in which format the model weights are stored on the Hub, you can always look into the checkpoint's config under \"torch_dtype\", e.g. here. It is recommended to set the model to the same precision type as written in the config when loading with from_pretrained(..., torch_dtype=...) except when the original type is float32 in which case one can use both float16 or bfloat16 for inference.\n\nLet's define a flush(...) function to free all allocated memory so that we can accurately measure the peak allocated GPU memory.\n\n```\ndel pipe\ndel model\n\nimport gc\nimport torch\n\ndef flush():\n  gc.collect()\n  torch.cuda.empty_cache()\n  torch.cuda.reset_peak_memory_stats()\n```\n\nLet's call it now for the next experiment.\n\n```\nflush()\n```\n\nIn the recent version of the accelerate library, you can also use an utility method called release_memory()\n\n```\nfrom accelerate.utils import release_memory\n# ...\n\nrelease_memory(model)\n```\n\nNow what if your GPU does not have 32 GB of VRAM? It has been found that model weights can be quantized to 8-bit or 4-bits without a significant loss in performance (see Dettmers et al.). Model can be quantized to even 3 or 2 bits with an acceptable loss in performance as shown in the recent GPTQ paper 🤯.\n\nWithout going into too many details, quantization schemes aim at reducing the precision of weights while trying to keep the model's inference results as accurate as possible (a.k.a as close as possible to bfloat16). Note that quantization works especially well for text generation since all we care about is choosing the set of most likely next tokens and don't really care about the exact values of the next token logit distribution. All that matters is that the next token logit distribution stays roughly the same so that an argmax or topk operation gives the same results.\n\nThere are various quantization techniques, which we won't discuss in detail here, but in general, all quantization techniques work as follows:\n\n- Quantize all weights to the target precision\n\n- Load the quantized weights, and pass the input sequence of vectors in bfloat16 precision\n\n- Dynamically dequantize weights to bfloat16 to perform the computation with their input vectors in bfloat16 precision\n\n- Quantize the weights again to the target precision after computation with their inputs.\n\nIn a nutshell, this means that inputs-weight matrix multiplications, with X X X being the inputs, W W W being a weight matrix and Y Y Y being the output:\n\nY=X∗W Y = X * W Y=X∗W\n\nare changed to\n\nY=X∗dequantize(W);quantize(W) Y = X * \\text{dequantize}(W); \\text{quantize}(W) Y=X∗dequantize(W);quantize(W)\n\nfor every matrix multiplication. Dequantization and re-quantization is performed sequentially for all weight matrices as the inputs run through the network graph.\n\nTherefore, inference time is often not reduced when using quantized weights, but rather increases. Enough theory, let's give it a try! To quantize the weights with Transformers, you need to make sure that the bitsandbytes library is installed.\n\n```\n!pip install bitsandbytes\n```\n\nWe can then load models in 8-bit quantization by simply adding a load_in_8bit=True flag to from_pretrained.\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_8bit=True, pad_token_id=0)\n```\n\nNow, let's run our example again and measure the memory usage.\n\n```\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\nOutput:\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n``​`python\\ndef bytes_to_giga_bytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n``​`\\n\\nThis function takes a single\n```\n\nNice, we're getting the same result as before, so no loss in accuracy! Let's look at how much memory was used this time.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\nOutput:\n\n```\n15.219234466552734\n```\n\nSignificantly less! We're down to just a bit over 15 GBs and could therefore run this model on consumer GPUs like the 4090. We're seeing a very nice gain in memory efficiency and more or less no degradation to the model's output. However, we can also notice a slight slow-down during inference.\n\nWe delete the models and flush the memory again.\n\n```\ndel model\ndel pipe\n```\n\n```\nflush()\n```\n\nLet's see what peak GPU memory consumption 4-bit quantization gives. Quantizing the model to 4-bit can be done with the same API as before - this time by passing load_in_4bit=True instead of load_in_8bit=True.\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_4bit=True, low_cpu_mem_usage=True, pad_token_id=0)\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult\n```\n\nOutput:\n\n```\nHere is a Python function that transforms bytes to Giga bytes:\\n\\n``​`\\ndef bytes_to_gigabytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n``​`\\n\\nThis function takes a single argument\n```\n\nWe're almost seeing the same output text as before - just the python is missing just before the code snippet. Let's see how much memory was required.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\nOutput:\n\n```\n9.543574333190918\n```\n\nJust 9.5GB! That's really not a lot for a >15 billion parameter model.\n\nWhile we see very little degradation in accuracy for our model here, 4-bit quantization can in practice often lead to different results compared to 8-bit quantization or full bfloat16 inference. It is up to the user to try it out.\n\nAlso note that inference here was again a bit slower compared to 8-bit quantization which is due to the more aggressive quantization method used for 4-bit quantization leading to quantize \\text{quantize} quantize and dequantize \\text{dequantize} dequantize taking longer during inference.\n\n```\ndel model\ndel pipe\n```\n\n```\nflush()\n```\n\nOverall, we saw that running OctoCoder in 8-bit precision reduced the required GPU VRAM from 32G GPU VRAM to only 15GB and running the model in 4-bit precision further reduces the required GPU VRAM to just a bit over 9GB.\n\n4-bit quantization allows the model to be run on GPUs such as RTX3090, V100, and T4 which are quite accessible for most people.\n\nFor more information on quantization and to see how one can quantize models to require even less GPU VRAM memory than 4-bit, we recommend looking into the AutoGPTQ implementation.\n\nAs a conclusion, it is important to remember that model quantization trades improved memory efficiency against accuracy and in some cases inference time.\n\nIf GPU memory is not a constraint for your use case, there is often no need to look into quantization. However many GPUs simply can't run LLMs without quantization methods and in this case, 4-bit and 8-bit quantization schemes are extremely useful tools.\n\nFor more in-detail usage information, we strongly recommend taking a look at the Transformers Quantization Docs. Next, let's look into how we can improve computational and memory efficiency by using better algorithms and an improved model architecture.\n\n## 2. Flash Attention: A Leap Forward\n\nToday's top-performing LLMs share more or less the same fundamental architecture that consists of feed-forward layers, activation layers, layer normalization layers, and most crucially, self-attention layers.\n\nSelf-attention layers are central to Large Language Models (LLMs) in that they enable the model to understand the contextual relationships between input tokens. However, the peak GPU memory consumption for self-attention layers grows quadratically both in compute and memory complexity with number of input tokens (also called sequence length) that we denote in the following by N N N . While this is not really noticeable for shorter input sequences (of up to 1000 input tokens), it becomes a serious problem for longer input sequences (at around 16000 input tokens).\n\nLet's take a closer look. The formula to compute the output O \\mathbf{O} O of a self-attention layer for an input X \\mathbf{X} X of length N N N is:\n\nO=Attn(X)=V×Softmax(QKT) with Q=WqX,V=WvX,K=WkX \\textbf{O} = \\text{Attn}(\\mathbf{X}) = \\mathbf{V} \\times \\text{Softmax}(\\mathbf{QK}^T) \\text{ with } \\mathbf{Q} = \\mathbf{W}_q \\mathbf{X}, \\mathbf{V} = \\mathbf{W}_v \\mathbf{X}, \\mathbf{K} = \\mathbf{W}_k \\mathbf{X} O=Attn(X)=V×Softmax(QKT) with Q=Wq​X,V=Wv​X,K=Wk​X X=(x1,...xN) \\mathbf{X} = (\\mathbf{x}_1, ... \\mathbf{x}_{N}) X=(x1​,...xN​) is thereby the input sequence to the attention layer. The projections Q \\mathbf{Q} Q and K \\mathbf{K} K will each consist of N N N vectors resulting in the QKT \\mathbf{QK}^T QKT being of size N2 N^2 N2 .\n\nLLMs usually have multiple attention heads, thus doing multiple self-attention computations in parallel. Assuming, the LLM has 40 attention heads and runs in bfloat16 precision, we can calculate the memory requirement to store the QKT \\mathbf{QK^T} QKT matrices to be 40∗2∗N2 40 * 2 * N^2 40∗2∗N2 bytes. For N=1000 N=1000 N=1000 only around 50 MB of VRAM are needed, however, for N=16000 N=16000 N=16000 we would need 19 GB of VRAM, and for N=100,000 N=100,000 N=100,000 we would need almost 1TB just to store the QKT \\mathbf{QK}^T QKT matrices.\n\nLong story short, the default self-attention algorithm quickly becomes prohibitively memory-expensive for large input contexts.\n\nAs LLMs improve in text comprehension and generation, they are applied to increasingly complex tasks. While models once handled the translation or summarization of a few sentences, they now manage entire pages, demanding the capability to process extensive input lengths.\n\nHow can we get rid of the exorbitant memory requirements for large input lengths? We need a new way to compute the self-attention mechanism that gets rid of the QKT QK^T QKT matrix. Tri Dao et al. developed exactly such a new algorithm and called it Flash Attention.\n\nIn a nutshell, Flash Attention breaks the V×Softmax(QKT\\mathbf{V} \\times \\text{Softmax}(\\mathbf{QK}^TV×Softmax(QKT) computation apart and instead computes smaller chunks of the output by iterating over multiple softmax computation steps:\n\nOi←sija∗Oi+sijb∗Vj×Softmax(QKi,jT) for multiple i,j iterations \\textbf{O}_i \\leftarrow s^a_{ij} * \\textbf{O}_i + s^b_{ij} * \\mathbf{V}_{j} \\times \\text{Softmax}(\\mathbf{QK}^T_{i,j}) \\text{ for multiple } i, j \\text{ iterations} Oi​←sija​∗Oi​+sijb​∗Vj​×Softmax(QKi,jT​) for multiple i,j iterations\n\nwith sija s^a_{ij} sija​ and sijb s^b_{ij} sijb​ being some softmax normalization statistics that need to be recomputed for every i i i and j j j .\n\nPlease note that the whole Flash Attention is a bit more complex and is greatly simplified here as going in too much depth is out of scope for this notebook. The reader is invited to take a look at the well-written Flash Attention paper for more details.\n\nThe main takeaway here is:\n\nBy keeping track of softmax normalization statistics and by using some smart mathematics, Flash Attention gives numerical identical outputs compared to the default self-attention layer at a memory cost that only increases linearly with N N N .\n\nLooking at the formula, one would intuitively say that Flash Attention must be much slower compared to the default self-attention formula as more computation needs to be done. Indeed Flash Attention requires more FLOPs compared to normal attention as the softmax normalization statistics have to constantly be recomputed (see paper for more details if interested)\n\nHowever, Flash Attention is much faster in inference compared to default attention which comes from its ability to significantly reduce the demands on the slower, high-bandwidth memory of the GPU (VRAM), focusing instead on the faster on-chip memory (SRAM).\n\nEssentially, Flash Attention makes sure that all intermediate write and read operations can be done using the fast on-chip SRAM memory instead of having to access the slower VRAM memory to compute the output vector O \\mathbf{O} O .\n\nIn practice, there is currently absolutely no reason to not use Flash Attention if available. The algorithm gives mathematically the same outputs, and is both faster and more memory-efficient.\n\nLet's look at a practical example.\n\nOur OctoCoder model now gets a significantly longer input prompt which includes a so-called system prompt. System prompts are used to steer the LLM into a better assistant that is tailored to the users' task. In the following, we use a system prompt that will make OctoCoder a better coding assistant.\n\n```\nsystem_prompt = \"\"\"Below are a series of dialogues between various people and an AI technical assistant.\nThe assistant tries to be helpful, polite, honest, sophisticated, emotionally aware, and humble but knowledgeable.\nThe assistant is happy to help with code questions and will do their best to understand exactly what is needed.\nIt also tries to avoid giving false or misleading information, and it caveats when it isn't entirely sure about the right answer.\nThat said, the assistant is practical really does its best, and doesn't let caution get too much in the way of being useful.\n\nThe Starcoder models are a series of 15.5B parameter models trained on 80+ programming languages from The Stack (v1.2) (excluding opt-out requests).\nThe model uses Multi Query Attention, was trained using the Fill-in-the-Middle objective, and with 8,192 tokens context window for a trillion tokens of heavily deduplicated data.\n\n-----\n\nQuestion: Write a function that takes two lists and returns a list that has alternating elements from each input list.\n\nAnswer: Sure. Here is a function that does that.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(len(list1)):\n       results.append(list1[i])\n       results.append(list2[i])\n   return results\n\nQuestion: Can you write some test cases for this function?\n\nAnswer: Sure, here are some tests.\n\nassert alternating([10, 20, 30], [1, 2, 3]) == [10, 1, 20, 2, 30, 3]\nassert alternating([True, False], [4, 5]) == [True, 4, False, 5]\nassert alternating([], []) == []\n\nQuestion: Modify the function so that it returns all input elements when the lists have uneven length. The elements from the longer list should be at the end.\n\nAnswer: Here is the modified function.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(min(len(list1), len(list2))):\n       results.append(list1[i])\n       results.append(list2[i])\n   if len(list1) > len(list2):\n       results.extend(list1[i+1:])\n   else:\n       results.extend(list2[i+1:])\n   return results\n\n-----\n\"\"\"\n```\n\nFor demonstration purposes, we duplicate the system by ten so that the input length is long enough to observe Flash Attention's memory savings. We append the original text prompt \"Question: Please write a function in Python that transforms bytes to Giga bytes.\\n\\nAnswer: Here\"\n\n```\nlong_prompt = 10 * system_prompt + prompt\n```\n\nWe instantiate our model again in bfloat16 precision.\n\n```\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\")\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n```\n\nLet's now run the model just like before without Flash Attention and measure the peak GPU memory requirement and inference time.\n\n```\nimport time\n\nstart_time = time.time()\nresult = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult\n```\n\nOutput:\n\n```\nGenerated in 10.96854019165039 seconds.\nSure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n   return bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef\n```\n\nWe're getting the same output as before, however this time, the model repeats the answer multiple times until it's 60 tokens cut-off. This is not surprising as we've repeated the system prompt ten times for demonstration purposes and thus cued the model to repeat itself.\n\nNote that the system prompt should not be repeated ten times in real-world applications - one time is enough!\n\nLet's measure the peak GPU memory requirement.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\nOutput:\n\n```\n37.668193340301514\n```\n\nAs we can see the peak GPU memory requirement is now significantly higher than in the beginning, which is largely due to the longer input sequence. Also the generation takes a little over a minute now.\n\nWe call flush() to free GPU memory for our next experiment.\n\n```\nflush()\n```\n\nFor comparison, let's run the same function, but enable Flash Attention instead. To do so, we convert the model to BetterTransformers and by doing so enabling PyTorch's SDPA self-attention which in turn is based on Flash Attention.\n\n```\nmodel.to_bettertransformer()\n```\n\nNow we run the exact same code snippet as before and under the hood Transformers will make use of Flash Attention.\n\n```\nstart_time = time.time()\nwith torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):\n    result = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult\n```\n\nOutput:\n\n```\nGenerated in 3.0211617946624756 seconds.\n Sure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n   return bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef\n```\n\nWe're getting the exact same result as before, but can observe a very significant speed-up thanks to Flash Attention.\n\nLet's measure the memory consumption one last time.\n\n```\nbytes_to_giga_bytes(torch.cuda.max_memory_allocated())\n```\n\nOutput:\n\n```\n32.617331981658936\n```\n\nAnd we're almost back to our original 29GB peak GPU memory from the beginning.\n\nWe can observe that we only use roughly 100MB more GPU memory when passing a very long input sequence with Flash Attention compared to passing a short input sequence as done in the beginning.\n\n```\nflush()\n```\n\n## 3. The Science Behind LLM Architectures: Strategic Selection for Long Text Inputs and Chat\n\nSo far we have looked into improving computational and memory efficiency by:\n\n- Casting the weights to a lower precision format\n\n- Replacing the self-attention algorithm with a more memory- and compute efficient version\n\nLet's now look into how we can change the architecture of an LLM so that it is most effective and efficient for task that require long text inputs, e.g.:\n\n- Retrieval augmented Questions Answering,\n\n- Summarization,\n\n- Chat\n\nNote that chat not only requires the LLM to handle long text inputs, but it also necessitates that the LLM is able to efficiently handle the back-and-forth dialogue between user and assistant (such as ChatGPT).\n\nOnce trained, the fundamental LLM architecture is difficult to change, so it is important to make considerations about the LLM's tasks beforehand and accordingly optimize the model's architecture. There are two important components of the model architecture that quickly become memory and/or performance bottlenecks for large input sequences.\n\n- The positional embeddings\n\n- The key-value cache\n\nLet's go over each component in more detail\n\n### 3.1 Improving positional embeddings of LLMs\n\nSelf-attention puts each token in relation to each other's tokens. As an example, the Softmax(QKT) \\text{Softmax}(\\mathbf{QK}^T) Softmax(QKT) matrix of the text input sequence \"Hello\", \"I\", \"love\", \"you\" could look as follows:\n\nEach word token is given a probability mass at which it attends all other word tokens and, therefore is put into relation with all other word tokens. E.g. the word \"love\" attends to the word \"Hello\" with 5%, to \"I\" with 30%, and to itself with 65%.\n\nA LLM based on self-attention, but without position embeddings would have great difficulties in understanding the positions of the text inputs to each other. This is because the probability score computed by QKT \\mathbf{QK}^T QKT relates each word token to each other word token in O(1) O(1) O(1) computations regardless of their relative positional distance to each other. Therefore, for the LLM without position embeddings each token appears to have the same distance to all other tokens, e.g. differentiating between \"Hello I love you\" and \"You love I hello\" would be very challenging.\n\nFor the LLM to understand sentence order, an additional cue is needed and is usually applied in the form of positional encodings (or also called positional embeddings). Positional encodings, encode the position of each token into a numerical presentation that the LLM can leverage to better understand sentence order.\n\nThe authors of the Attention Is All You Need paper introduced sinusoidal positional embeddings P=p1,…,pN \\mathbf{P} = \\mathbf{p}_1, \\ldots, \\mathbf{p}_N P=p1​,…,pN​ . where each vector pi \\mathbf{p}_i pi​ is computed as a sinusoidal function of its position i i i . The positional encodings are then simply added to the input sequence vectors X^=x^1,…,x^N \\mathbf{\\hat{X}} = \\mathbf{\\hat{x}}_1, \\ldots, \\mathbf{\\hat{x}}_N X^=x^1​,…,x^N​ = x1+p1,…,xN+pN \\mathbf{x}_1 + \\mathbf{p}_1, \\ldots, \\mathbf{x}_N + \\mathbf{p}_N x1​+p1​,…,xN​+pN​ thereby cueing the model to better learn sentence order.\n\nInstead of using fixed position embeddings, others (such as Devlin et al.) used learned positional encodings for which the positional embeddings P \\mathbf{P} P are learned during training.\n\nSinusoidal and learned position embeddings used to be the predominant methods to encode sentence order into LLMs, but a couple of problems related to these positional encodings were found:\n\n- Sinusoidal and learned position embeddings are both absolute positional embeddings, i.e. encoding a unique embedding for each position id: 0,…,N 0, \\ldots, N 0,…,N . As shown by Huang et al. and Su et al., absolute positional embeddings lead to poor LLM performance for long text inputs. For long text inputs, it is advantageous if the model learns the relative positional distance input tokens have to each other instead of their absolute position.\n\n- When using learned position embeddings, the LLM has to be trained on a fixed input length N N N, which makes it difficult to extrapolate to an input length longer than what it was trained on.\n\nRecently, relative positional embeddings that can tackle the above mentioned problems have become more popular, most notably:\n\n- Rotary Position Embedding (RoPE)\n\n- ALiBi\n\nBoth RoPE and ALiBi argue that it's best to cue the LLM about sentence order directly in the self-attention algorithm as it's there that word tokens are put into relation with each other. More specifically, sentence order should be cued by modifying the QKT \\mathbf{QK}^T QKT computation.\n\nWithout going into too many details, RoPE notes that positional information can be encoded into query-key pairs, e.g. qi \\mathbf{q}_i qi​ and xj \\mathbf{x}_j xj​ by rotating each vector by an angle θ∗i \\theta * i θ∗i and θ∗j \\theta * j θ∗j respectively with i,j i, j i,j describing each vectors sentence position:\n\nq^iTx^j=qiTRθ,i−jxj. \\mathbf{\\hat{q}}_i^T \\mathbf{\\hat{x}}_j = \\mathbf{{q}}_i^T \\mathbf{R}_{\\theta, i -j} \\mathbf{{x}}_j. q^​iT​x^j​=qiT​Rθ,i−j​xj​. Rθ,i−j \\mathbf{R}_{\\theta, i - j} Rθ,i−j​ thereby represents a rotational matrix. θ \\theta θ is not learned during training, but instead set to a pre-defined value that depends on the maximum input sequence length during training.\n\nBy doing so, the propability score between qi \\mathbf{q}_i qi​ and qj \\mathbf{q}_j qj​ is only affected if i≠j i \\ne j i=j and solely depends on the relative distance i−j i - j i−j regardless of each vector's specific positions i i i and j j j .\n\nRoPE is used in multiple of today's most important LLMs, such as:\n\n- Falcon\n\n- Llama\n\n- PaLM\n\nAs an alternative, ALiBi proposes a much simpler relative position encoding scheme. The relative distance that input tokens have to each other is added as a negative integer scaled by a pre-defined value m to each query-key entry of the QKT \\mathbf{QK}^T QKT matrix right before the softmax computation.\n\nAs shown in the ALiBi paper, this simple relative positional encoding allows the model to retain a high performance even at very long text input sequences.\n\nALiBi is used in multiple of today's most important LLMs, such as:\n\n- MPT\n\n- BLOOM\n\nBoth RoPE and ALiBi position encodings can extrapolate to input lengths not seen during training whereas it has been shown that extrapolation works much better out-of-the-box for ALiBi as compared to RoPE. For ALiBi, one simply increases the values of the lower triangular position matrix to match the length of the input sequence. For RoPE, keeping the same θ \\theta θ that was used during training leads to poor results when passing text inputs much longer than those seen during training, c.f Press et al.. However, the community has found a couple of effective tricks that adapt θ \\theta θ, thereby allowing RoPE position embeddings to work well for extrapolated text input sequences (see here).\n\nBoth RoPE and ALiBi are relative positional embeddings that are not learned during training, but instead are based on the following intuitions:\n\n- Positional cues about the text inputs should be given directly to the QKT QK^T QKT matrix of the self-attention layer\n\n- The LLM should be incentivized to learn a constant relative distance positional encodings have to each other\n\n- The further text input tokens are from each other, the lower the probability of their query-value probability. Both RoPE and ALiBi lower the query-key probability of tokens far away from each other. RoPE by decreasing their vector product by increasing the angle between the query-key vectors. ALiBi by adding large negative numbers to the vector product\n\nIn conclusion, LLMs that are intended to be deployed in tasks that require handling large text inputs are better trained with relative positional embeddings, such as RoPE and ALiBi. Also note that even if an LLM with RoPE and ALiBi has been trained only on a fixed length of say N1=2048 N_1 = 2048 N1​=2048 it can still be used in practice with text inputs much larger than N1 N_1 N1​, like N2=8192>N1 N_2 = 8192 > N_1 N2​=8192>N1​ by extrapolating the positional embeddings.\n\n### 3.2 The key-value cache\n\nAuto-regressive text generation with LLMs works by iteratively putting in an input sequence, sampling the next token, appending the next token to the input sequence, and continuing to do so until the LLM produces a token that signifies that the generation has finished.\n\nPlease have a look at Transformer's Generate Text Tutorial to get a more visual explanation of how auto-regressive generation works.\n\nLet's run a quick code snippet to show how auto-regressive works in practice. We will simply take the most likely next token via torch.argmax.\n\n```\ninput_ids = tokenizer(prompt, return_tensors=\"pt\")[\"input_ids\"].to(\"cuda\")\n\nfor _ in range(5):\n  next_logits = model(input_ids)[\"logits\"][:, -1:]\n  next_token_id = torch.argmax(next_logits,dim=-1)\n\n  input_ids = torch.cat([input_ids, next_token_id], dim=-1)\n  print(\"shape of input_ids\", input_ids.shape)\n\ngenerated_text = tokenizer.batch_decode(input_ids[:, -5:])\ngenerated_text\n```\n\nOutput:\n\n```\nshape of input_ids torch.Size([1, 21])\nshape of input_ids torch.Size([1, 22])\nshape of input_ids torch.Size([1, 23])\nshape of input_ids torch.Size([1, 24])\nshape of input_ids torch.Size([1, 25])\n[' Here is a Python function']\n```\n\nAs we can see every time we increase the text input tokens by the just sampled token.\n\nWith very few exceptions, LLMs are trained using the causal language modeling objective and therefore mask the upper triangle matrix of the attention score - this is why in the two diagrams above the attention scores are left blank (a.k.a have 0 probability). For a quick recap on causal language modeling you can refer to the Illustrated Self Attention blog.\n\nAs a consequence, tokens never depend on future tokens, more specifically the qi \\mathbf{q}_i qi​ vector is never put in relation with any key, values vectors kj,vj \\mathbf{k}_j, \\mathbf{v}_j kj​,vj​ if j>i j > i j>i . Instead qi \\mathbf{q}_i qi​ only attends to previous key-value vectors km<i,vm<i , for m∈{0,…i−1} \\mathbf{k}_{m < i}, \\mathbf{v}_{m < i} \\text{ , for } m \\in \\{0, \\ldots i - 1\\} km<i​,vm<i​ , for m∈{0,…i−1}. In order to reduce unnecessary computation, one can therefore cache each layer's key-value vectors for all previous timesteps.\n\nIn the following, we will tell the LLM to make use of the key-value cache by retrieving and forwarding it for each forward pass. In Transformers, we can retrieve the key-value cache by passing the use_cache flag to the forward call and can then pass it with the current token.\n\n```\npast_key_values = None # past_key_values is the key-value cache\ngenerated_tokens = []\nnext_token_id = tokenizer(prompt, return_tensors=\"pt\")[\"input_ids\"].to(\"cuda\")\n\nfor _ in range(5):\n  next_logits, past_key_values = model(next_token_id, past_key_values=past_key_values, use_cache=True).to_tuple()\n  next_logits = next_logits[:, -1:]\n  next_token_id = torch.argmax(next_logits, dim=-1)\n\n  print(\"shape of input_ids\", next_token_id.shape)\n  # past_key_values are a tuple (one for each Transformer layer) of tuples (one for the keys, one for the values)\n  # cached keys and values each are of shape (batch_size, num_heads, sequence_length, embed_size_per_head)\n  # hence let's print how many cached keys and values we have for the first Transformer layer\n  print(\"number of cached keys of the first Transformer layer\", len(past_key_values[0][0][0,0,:,:]))\n  print(\"number of cached values of the first Transformer layer\", len(past_key_values[0][1][0,0,:,:]))\n  \n  generated_tokens.append(next_token_id.item())\n\ngenerated_text = tokenizer.batch_decode(generated_tokens)\ngenerated_text\n```\n\nOutput:\n\n```\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 20\nnumber of cached values of the first Transformer layer: 20\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 21\nnumber of cached values of the first Transformer layer: 21\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 22\nnumber of cached values of the first Transformer layer: 22\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 23\nnumber of cached values of the first Transformer layer: 23\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 24\nnumber of cached values of the first Transformer layer: 24\n[' Here', ' is', ' a', ' Python', ' function']\n```\n\nAs one can see, when using the key-value cache the text input tokens are not increased in length, but remain a single input vector. The length of the key-value cache on the other hand is increased by one at every decoding step.\n\nMaking use of the key-value cache means that the QKT \\mathbf{QK}^T QKT is essentially reduced to qcKT \\mathbf{q}_c\\mathbf{K}^T qc​KT with qc \\mathbf{q}_c qc​ being the query projection of the currently passed input token which is always just a single vector.\n\nUsing the key-value cache has two advantages:\n\n- Significant increase in computational efficiency as less computations are performed compared to computing the full QKT \\mathbf{QK}^T QKT matrix. This leads to an increase in inference speed\n\n- The maximum required memory is not increased quadratically with the number of generated tokens, but only increases linearly.\n\nOne should always make use of the key-value cache as it leads to identical results and a significant speed-up for longer input sequences. Transformers has the key-value cache enabled by default when making use of the text pipeline or the generate method.\n\nNote that the key-value cache is especially useful for applications such as chat where multiple passes of auto-regressive decoding are required. Let's look at an example.\n\n```\nUser: How many people live in France?\nAssistant: Roughly 75 million people live in France\nUser: And how many are in Germany?\nAssistant: Germany has ca. 81 million inhabitants\n```\n\nIn this chat, the LLM runs auto-regressive decoding twice:\n\n- The first time, the key-value cache is empty and the input prompt is \"User: How many people live in France?\" and the model auto-regressively generates the text \"Roughly 75 million people live in France\" while increasing the key-value cache at every decoding step.\n\n- The second time the input prompt is \"User: How many people live in France? \\n Assistant: Roughly 75 million people live in France \\n User: And how many in Germany?\". Thanks to the cache, all key-value vectors for the first two sentences are already computed. Therefore the input prompt only consists of \"User: And how many in Germany?\". While processing the shortened input prompt, it's computed key-value vectors are concatenated to the key-value cache of the first decoding. The second Assistant's answer \"Germany has ca. 81 million inhabitants\" is then auto-regressively generated with the key-value cache consisting of encoded key-value vectors of \"User: How many people live in France? \\n Assistant: Roughly 75 million people live in France \\n User: And how many are in Germany?\".\n\nTwo things should be noted here:\n\n- Keeping all the context is crucial for LLMs deployed in chat so that the LLM understands all the previous context of the conversation. E.g. for the example above the LLM needs to understand that the user refers to the population when asking \"And how many are in Germany\".\n\n- The key-value cache is extremely useful for chat as it allows us to continuously grow the encoded chat history instead of having to re-encode the chat history again from scratch (as e.g. would be the case when using an encoder-decoder architecture).\n\nThere is however one catch. While the required peak memory for the QKT \\mathbf{QK}^T QKT matrix is significantly reduced, holding the key-value cache in memory can become very memory expensive for long input sequences or multi-turn chat. Remember that the key-value cache needs to store the key-value vectors for all previous input vectors xi, for i∈{1,…,c−1} \\mathbf{x}_i \\text{, for } i \\in \\{1, \\ldots, c - 1\\} xi​, for i∈{1,…,c−1} for all self-attention layers and for all attention heads.\n\nLet's compute the number of float values that need to be stored in the key-value cache for the LLM bigcode/octocoder that we used before. The number of float values amounts to two times the sequence length times the number of attention heads times the attention head dimension and times the number of layers. Computing this for our LLM at a hypothetical input sequence length of 16000 gives:\n\n```\nconfig = model.config\n2 * 16_000 * config.n_layer * config.n_head * config.n_embd // config.n_head\n```\n\nOutput:\n\n```\n7864320000\n```\n\nRoughly 8 billion float values! Storing 8 billion float values in float16 precision requires around 15 GB of RAM which is circa half as much as the model weights themselves! Researchers have proposed two methods that allow to significantly reduce the memory cost of storing the key-value cache:\n\n- Multi-Query-Attention (MQA)\n\nMulti-Query-Attention was proposed in Noam Shazeer's Fast Transformer Decoding: One Write-Head is All You Need paper. As the title says, Noam found out that instead of using n_head key-value projections weights, one can use a single head-value projection weight pair that is shared across all attention heads without that the model's performance significantly degrades.\n\nBy using a single head-value projection weight pair, the key value vectors ki,vi \\mathbf{k}_i, \\mathbf{v}_i ki​,vi​ have to be identical across all attention heads which in turn means that we only need to store 1 key-value projection pair in the cache instead of n_head ones.\n\nAs most LLMs use between 20 and 100 attention heads, MQA significantly reduces the memory consumption of the key-value cache. For the LLM used in this notebook we could therefore reduce the required memory consumption from 15 GB to less than 400 MB at an input sequence length of 16000.\n\nIn addition to memory savings, MQA also leads to improved computational efficiency as explained in the following. In auto-regressive decoding, large key-value vectors need to be reloaded, concatenated with the current key-value vector pair to be then fed into the qcKT \\mathbf{q}_c\\mathbf{K}^T qc​KT computation at every step. For auto-regressive decoding, the required memory bandwidth for the constant reloading can become a serious time bottleneck. By reducing the size of the key-value vectors less memory needs to be accessed, thus reducing the memory bandwidth bottleneck. For more detail, please have a look at Noam's paper.\n\nThe important part to understand here is that reducing the number of key-value attention heads to 1 only makes sense if a key-value cache is used. The peak memory consumption of the model for a single forward pass without key-value cache stays unchanged as every attention head still has a unique query vector so that each attention head still has a different QKT \\mathbf{QK}^T QKT matrix.\n\nMQA has seen wide adoption by the community and is now used by many of the most popular LLMs:\n\n- Falcon\n\n- PaLM\n\n- MPT\n\n- BLOOM\n\nAlso, the checkpoint used in this notebook - bigcode/octocoder - makes use of MQA.\n\n- Grouped-Query-Attention (GQA)\n\nGrouped-Query-Attention, as proposed by Ainslie et al. from Google, found that using MQA can often lead to quality degradation compared to using vanilla multi-key-value head projections. The paper argues that more model performance can be kept by less drastically reducing the number of query head projection weights. Instead of using just a single key-value projection weight, n < n_head key-value projection weights should be used. By choosing n to a significantly smaller value than n_head, such as 2,4 or 8 almost all of the memory and speed gains from MQA can be kept while sacrificing less model capacity and thus arguably less performance.\n\nMoreover, the authors of GQA found out that existing model checkpoints can be uptrained to have a GQA architecture with as little as 5% of the original pre-training compute. While 5% of the original pre-training compute can still be a massive amount, GQA uptraining allows existing checkpoints to be useful for longer input sequences.\n\nGQA was only recently proposed which is why there is less adoption at the time of writing this notebook. The most notable application of GQA is Llama-v2.\n\nAs a conclusion, it is strongly recommended to make use of either GQA or MQA if the LLM is deployed with auto-regressive decoding and is required to handle large input sequences as is the case for example for chat.\n\n## Conclusion\n\nThe research community is constantly coming up with new, nifty ways to speed up inference time for ever-larger LLMs. As an example, one such promising research direction is speculative decoding where \"easy tokens\" are generated by smaller, faster language models and only \"hard tokens\" are generated by the LLM itself. Going into more detail is out of the scope of this notebook, but can be read upon in this nice blog post.\n\nThe reason massive LLMs such as GPT3/4, Llama-2-70b, Claude, PaLM can run so quickly in chat-interfaces such as Hugging Face Chat or ChatGPT is to a big part thanks to the above-mentioned improvements in precision, algorithms, and architecture. Going forward, accelerators such as GPUs, TPUs, etc... will only get faster and allow for more memory, but one should nevertheless always make sure to use the best available algorithms and architectures to get the most bang for your buck 🤗",
   "summaryZh": "本文详细探讨了在大模型生产环境中进行高效推理的优化技术，重点涵盖低精度量化（8-bit与4-bit）、Flash Attention优化注意力机制及长文本处理的架构创新，旨在应对大规模参数带来的显存与计算挑战。",
   "summaryGeneratedAt": "2026-09-06T02:29:17.698073Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +54,2514 @@
     "summaryZh": "本文详细探讨了在大模型生产环境中进行高效推理的优化技术，重点涵盖低精度量化（8-bit与4-bit）、Flash Attention优化注意力机制及长文本处理的架构创新，旨在应对大规模参数带来的显存与计算挑战。",
     "glossary": [],
     "duplicateKey": "optimizing-llm-in-production"
-  }
+  },
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/163_optimize_llm/self_attn_tokens.png",
+      "originalUrl": "https://huggingface.co/blog/assets/163_optimize_llm/self_attn_tokens.png",
+      "alt": "",
+      "id": "image_df26b43cfe81eb43"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/163_optimize_llm/alibi.png",
+      "originalUrl": "https://huggingface.co/blog/assets/163_optimize_llm/alibi.png",
+      "alt": "",
+      "id": "image_7dccfbab6f98c24a"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Note: This blog post is also available as a documentation page on Transformers.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "em"
+        },
+        {
+          "start": 66,
+          "end": 78,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/llm_tutorial_optimization"
+        },
+        {
+          "start": 6,
+          "end": 79,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Large Language Models (LLMs) such as GPT3/4, Falcon, and LLama are rapidly advancing in their ability to tackle human-centric tasks, establishing themselves as essential tools in modern knowledge-based industries. Deploying these models in real-world tasks remains challenging, however:",
+      "spans": [
+        {
+          "start": 45,
+          "end": 51,
+          "kind": "a",
+          "href": "https://huggingface.co/tiiuae/falcon-40b"
+        },
+        {
+          "start": 57,
+          "end": 62,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Llama-2-70b-hf"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "To exhibit near-human text understanding and generation capabilities, LLMs currently require to be composed of billions of parameters (see Kaplan et al, Wei et. al). This consequently amplifies the memory demands for inference.",
+      "spans": [
+        {
+          "start": 139,
+          "end": 151,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2001.08361"
+        },
+        {
+          "start": 153,
+          "end": 163,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2206.07682"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "In many real-world tasks, LLMs need to be given extensive contextual information. This necessitates the model's capability to manage very long input sequences during inference.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "The crux of these challenges lies in augmenting the computational and memory capabilities of LLMs, especially when handling expansive input sequences.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "In this blog post, we will go over the most effective techniques at the time of writing this blog post to tackle these challenges for efficient LLM deployment:",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Lower Precision: Research has shown that operating at reduced numerical precision, namely 8-bit and 4-bit, can achieve computational advantages without a considerable decline in model performance.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Flash Attention: Flash Attention is a variation of the attention algorithm that not only provides a more memory-efficient approach but also realizes increased efficiency due to optimized GPU memory utilization.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Architectural Innovations: Considering that LLMs are always deployed in the same way during inference, namely autoregressive text generation with a long input context, specialized model architectures have been proposed that allow for more efficient inference. The most important advancement in model architectures hereby are Alibi, Rotary embeddings, Multi-Query Attention (MQA) and Grouped-Query-Attention (GQA).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "strong"
+        },
+        {
+          "start": 325,
+          "end": 330,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2108.12409"
+        },
+        {
+          "start": 332,
+          "end": 349,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2104.09864"
+        },
+        {
+          "start": 351,
+          "end": 378,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1911.02150"
+        },
+        {
+          "start": 383,
+          "end": 412,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/(https://arxiv.org/abs/2305.13245)"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Throughout this notebook, we will offer an analysis of auto-regressive generation from a tensor's perspective. We delve into the pros and cons of adopting lower precision, provide a comprehensive exploration of the latest attention algorithms, and discuss improved LLM architectures. While doing so, we run practical examples showcasing each of the feature improvements.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "1. Harnessing the Power of Lower Precision",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Memory requirements of LLMs can be best understood by seeing the LLM as a set of weight matrices and vectors and the text inputs as a sequence of vectors. In the following, the definition weights will be used to signify all model weight matrices and vectors.",
+      "spans": [
+        {
+          "start": 188,
+          "end": 195,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "At the time of writing this post, LLMs consist of at least a couple billion parameters. Each parameter thereby is made of a decimal number, e.g. 4.5689 which is usually stored in either float32, bfloat16, or float16 format. This allows us to easily compute the memory requirement to load the LLM into memory:",
+      "spans": [
+        {
+          "start": 145,
+          "end": 151,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 193,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Single-precision_floating-point_format"
+        },
+        {
+          "start": 195,
+          "end": 203,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Bfloat16_floating-point_format"
+        },
+        {
+          "start": 208,
+          "end": 215,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Half-precision_floating-point_format"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Loading the weights of a model having X billion parameters requires roughly 4 * X GB of VRAM in float32 precision",
+      "spans": [
+        {
+          "start": 0,
+          "end": 113,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Nowadays, models are however rarely trained in full float32 precision, but usually in bfloat16 precision or less frequently in float16 precision. Therefore the rule of thumb becomes:",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Loading the weights of a model having X billion parameters requires roughly 2 * X GB of VRAM in bfloat16/float16 precision",
+      "spans": [
+        {
+          "start": 0,
+          "end": 122,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "For shorter text inputs (less than 1024 tokens), the memory requirement for inference is very much dominated by the memory requirement to load the weights. Therefore, for now, let's assume that the memory requirement for inference is equal to the memory requirement to load the model into the GPU VRAM.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "To give some examples of how much VRAM it roughly takes to load a model in bfloat16:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "GPT3 requires 2 * 175 GB = 350 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 27,
+          "end": 33,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Bloom requires 2 * 176 GB = 352 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://huggingface.co/bigscience/bloom"
+        },
+        {
+          "start": 28,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Llama-2-70b requires 2 * 70 GB = 140 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Llama-2-70b-hf"
+        },
+        {
+          "start": 33,
+          "end": 39,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Falcon-40b requires 2 * 40 GB = 80 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/tiiuae/falcon-40b"
+        },
+        {
+          "start": 32,
+          "end": 37,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "MPT-30b requires 2 * 30 GB = 60 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "a",
+          "href": "https://huggingface.co/mosaicml/mpt-30b"
+        },
+        {
+          "start": 29,
+          "end": 34,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "bigcode/starcoder requires 2 * 15.5 = 31 GB VRAM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://huggingface.co/bigcode/starcoder"
+        },
+        {
+          "start": 38,
+          "end": 43,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "As of writing this document, the largest GPU chip on the market is the A100 offering 80GB of VRAM. Most of the models listed before require more than 80GB just to be loaded and therefore necessarily require tensor parallelism and/or pipeline parallelism.",
+      "spans": [
+        {
+          "start": 207,
+          "end": 225,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/perf_train_gpu_many#tensor-parallelism"
+        },
+        {
+          "start": 233,
+          "end": 253,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/perf_train_gpu_many#naive-model-parallelism-vertical-and-pipeline-parallelism"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "🤗 Transformers does not support tensor parallelism out of the box as it requires the model architecture to be written in a specific way. If you're interested in writing models in a tensor-parallelism-friendly way, feel free to have a look at the text-generation-inference library.",
+      "spans": [
+        {
+          "start": 242,
+          "end": 279,
+          "kind": "a",
+          "href": "https://github.com/huggingface/text-generation-inference/tree/main/server/text_generation_server/models/custom_modeling"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Naive pipeline parallelism is supported out of the box. For this, simply load the model with device=\"auto\" which will automatically place the different layers on the available GPUs as explained here. Note, however that while very effective, this naive pipeline parallelism does not tackle the issues of GPU idling. For this more advanced pipeline parallelism is required as explained here.",
+      "spans": [
+        {
+          "start": 93,
+          "end": 106,
+          "kind": "code"
+        },
+        {
+          "start": 194,
+          "end": 198,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/v0.22.0/en/concept_guides/big_model_inference"
+        },
+        {
+          "start": 384,
+          "end": 388,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/v4.15.0/parallelism#naive-model-parallel-vertical-and-pipeline-parallel"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "If you have access to an 8 x 80GB A100 node, you could load BLOOM as follows",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "By using device_map=\"auto\" the attention layers would be equally distributed over all available GPUs.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 26,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "In this notebook, we will use bigcode/octocoder as it can be run on a single 40 GB A100 GPU device chip. Note that all memory and speed optimizations that we will apply going forward, are equally applicable to models that require model or tensor parallelism.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/bigcode/octocoder"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Since the model is loaded in bfloat16 precision, using our rule of thumb above, we would expect the memory requirement to run inference with bigcode/octocoder to be around 31 GB VRAM. Let's give it a try.",
+      "spans": [
+        {
+          "start": 141,
+          "end": 158,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "We first load the model and tokenizer and then pass both to Transformers' pipeline object.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 82,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/pipelines"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Nice, we can now directly use the result to convert bytes into Gigabytes.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Let's call torch.cuda.max_memory_allocated to measure the peak GPU memory allocation.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 11,
+          "end": 42,
+          "kind": "a",
+          "href": "https://pytorch.org/docs/stable/generated/torch.cuda.max_memory_allocated.html"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Close enough to our back-of-the-envelope computation! We can see the number is not exactly correct as going from bytes to kilobytes requires a multiplication of 1024 instead of 1000. Therefore the back-of-the-envelope formula can also be understood as an \"at most X GB\" computation. Note that if we had tried to run the model in full float32 precision, a whopping 64 GB of VRAM would have been required.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Almost all models are trained in bfloat16 nowadays, there is no reason to run the model in full float32 precision if your GPU supports bfloat16. Float32 won't give better inference results than the precision that was used to train the model.",
+      "spans": [
+        {
+          "start": 117,
+          "end": 143,
+          "kind": "a",
+          "href": "https://discuss.pytorch.org/t/bfloat16-native-support/117155/5"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "If you are unsure in which format the model weights are stored on the Hub, you can always look into the checkpoint's config under \"torch_dtype\", e.g. here. It is recommended to set the model to the same precision type as written in the config when loading with from_pretrained(..., torch_dtype=...) except when the original type is float32 in which case one can use both float16 or bfloat16 for inference.",
+      "spans": [
+        {
+          "start": 130,
+          "end": 143,
+          "kind": "code"
+        },
+        {
+          "start": 145,
+          "end": 149,
+          "kind": "em"
+        },
+        {
+          "start": 150,
+          "end": 154,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Llama-2-7b-hf/blob/6fdf2e60f86ff2481f2241aaee459f85b5b0bbb9/config.json#L21"
+        },
+        {
+          "start": 261,
+          "end": 298,
+          "kind": "code"
+        },
+        {
+          "start": 371,
+          "end": 378,
+          "kind": "code"
+        },
+        {
+          "start": 382,
+          "end": 390,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Let's define a flush(...) function to free all allocated memory so that we can accurately measure the peak allocated GPU memory.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Let's call it now for the next experiment.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "In the recent version of the accelerate library, you can also use an utility method called release_memory()",
+      "spans": [
+        {
+          "start": 91,
+          "end": 107,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Now what if your GPU does not have 32 GB of VRAM? It has been found that model weights can be quantized to 8-bit or 4-bits without a significant loss in performance (see Dettmers et al.). Model can be quantized to even 3 or 2 bits with an acceptable loss in performance as shown in the recent GPTQ paper 🤯.",
+      "spans": [
+        {
+          "start": 170,
+          "end": 185,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2208.07339"
+        },
+        {
+          "start": 293,
+          "end": 303,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2210.17323"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Without going into too many details, quantization schemes aim at reducing the precision of weights while trying to keep the model's inference results as accurate as possible (a.k.a as close as possible to bfloat16). Note that quantization works especially well for text generation since all we care about is choosing the set of most likely next tokens and don't really care about the exact values of the next token logit distribution. All that matters is that the next token logit distribution stays roughly the same so that an argmax or topk operation gives the same results.",
+      "spans": [
+        {
+          "start": 175,
+          "end": 180,
+          "kind": "em"
+        },
+        {
+          "start": 321,
+          "end": 351,
+          "kind": "em"
+        },
+        {
+          "start": 415,
+          "end": 420,
+          "kind": "em"
+        },
+        {
+          "start": 475,
+          "end": 480,
+          "kind": "em"
+        },
+        {
+          "start": 528,
+          "end": 534,
+          "kind": "code"
+        },
+        {
+          "start": 538,
+          "end": 542,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "There are various quantization techniques, which we won't discuss in detail here, but in general, all quantization techniques work as follows:",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Quantize all weights to the target precision",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Load the quantized weights, and pass the input sequence of vectors in bfloat16 precision",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Dynamically dequantize weights to bfloat16 to perform the computation with their input vectors in bfloat16 precision",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Quantize the weights again to the target precision after computation with their inputs.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "In a nutshell, this means that inputs-weight matrix multiplications, with X X X being the inputs, W W W being a weight matrix and Y Y Y being the output:",
+      "spans": [
+        {
+          "start": 31,
+          "end": 51,
+          "kind": "em"
+        },
+        {
+          "start": 90,
+          "end": 96,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Y=X∗W Y = X * W Y=X∗W",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "are changed to",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Y=X∗dequantize(W);quantize(W) Y = X * \\text{dequantize}(W); \\text{quantize}(W) Y=X∗dequantize(W);quantize(W)",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "for every matrix multiplication. Dequantization and re-quantization is performed sequentially for all weight matrices as the inputs run through the network graph.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Therefore, inference time is often not reduced when using quantized weights, but rather increases. Enough theory, let's give it a try! To quantize the weights with Transformers, you need to make sure that the bitsandbytes library is installed.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 38,
+          "kind": "strong"
+        },
+        {
+          "start": 209,
+          "end": 221,
+          "kind": "code"
+        },
+        {
+          "start": 209,
+          "end": 221,
+          "kind": "a",
+          "href": "https://github.com/TimDettmers/bitsandbytes"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "We can then load models in 8-bit quantization by simply adding a load_in_8bit=True flag to from_pretrained.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 82,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 106,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Now, let's run our example again and measure the memory usage.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Nice, we're getting the same result as before, so no loss in accuracy! Let's look at how much memory was used this time.",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Significantly less! We're down to just a bit over 15 GBs and could therefore run this model on consumer GPUs like the 4090. We're seeing a very nice gain in memory efficiency and more or less no degradation to the model's output. However, we can also notice a slight slow-down during inference.",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "We delete the models and flush the memory again.",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Let's see what peak GPU memory consumption 4-bit quantization gives. Quantizing the model to 4-bit can be done with the same API as before - this time by passing load_in_4bit=True instead of load_in_8bit=True.",
+      "spans": [
+        {
+          "start": 162,
+          "end": 179,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 208,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "We're almost seeing the same output text as before - just the python is missing just before the code snippet. Let's see how much memory was required.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 68,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "Just 9.5GB! That's really not a lot for a >15 billion parameter model.",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "While we see very little degradation in accuracy for our model here, 4-bit quantization can in practice often lead to different results compared to 8-bit quantization or full bfloat16 inference. It is up to the user to try it out.",
+      "spans": [
+        {
+          "start": 175,
+          "end": 183,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Also note that inference here was again a bit slower compared to 8-bit quantization which is due to the more aggressive quantization method used for 4-bit quantization leading to quantize \\text{quantize} quantize and dequantize \\text{dequantize} dequantize taking longer during inference.",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Overall, we saw that running OctoCoder in 8-bit precision reduced the required GPU VRAM from 32G GPU VRAM to only 15GB and running the model in 4-bit precision further reduces the required GPU VRAM to just a bit over 9GB.",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "4-bit quantization allows the model to be run on GPUs such as RTX3090, V100, and T4 which are quite accessible for most people.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "For more information on quantization and to see how one can quantize models to require even less GPU VRAM memory than 4-bit, we recommend looking into the AutoGPTQ implementation.",
+      "spans": [
+        {
+          "start": 155,
+          "end": 163,
+          "kind": "code"
+        },
+        {
+          "start": 155,
+          "end": 163,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/main_classes/quantization#autogptq-integration%60"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "As a conclusion, it is important to remember that model quantization trades improved memory efficiency against accuracy and in some cases inference time.",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "If GPU memory is not a constraint for your use case, there is often no need to look into quantization. However many GPUs simply can't run LLMs without quantization methods and in this case, 4-bit and 8-bit quantization schemes are extremely useful tools.",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "For more in-detail usage information, we strongly recommend taking a look at the Transformers Quantization Docs. Next, let's look into how we can improve computational and memory efficiency by using better algorithms and an improved model architecture.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 111,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/quantization#general-usage"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "2. Flash Attention: A Leap Forward",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Today's top-performing LLMs share more or less the same fundamental architecture that consists of feed-forward layers, activation layers, layer normalization layers, and most crucially, self-attention layers.",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Self-attention layers are central to Large Language Models (LLMs) in that they enable the model to understand the contextual relationships between input tokens. However, the peak GPU memory consumption for self-attention layers grows quadratically both in compute and memory complexity with number of input tokens (also called sequence length) that we denote in the following by N N N . While this is not really noticeable for shorter input sequences (of up to 1000 input tokens), it becomes a serious problem for longer input sequences (at around 16000 input tokens).",
+      "spans": [
+        {
+          "start": 234,
+          "end": 247,
+          "kind": "em"
+        },
+        {
+          "start": 327,
+          "end": 342,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "Let's take a closer look. The formula to compute the output O \\mathbf{O} O of a self-attention layer for an input X \\mathbf{X} X of length N N N is:",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "O=Attn(X)=V×Softmax(QKT) with Q=WqX,V=WvX,K=WkX \\textbf{O} = \\text{Attn}(\\mathbf{X}) = \\mathbf{V} \\times \\text{Softmax}(\\mathbf{QK}^T) \\text{ with } \\mathbf{Q} = \\mathbf{W}_q \\mathbf{X}, \\mathbf{V} = \\mathbf{W}_v \\mathbf{X}, \\mathbf{K} = \\mathbf{W}_k \\mathbf{X} O=Attn(X)=V×Softmax(QKT) with Q=Wq​X,V=Wv​X,K=Wk​X X=(x1,...xN) \\mathbf{X} = (\\mathbf{x}_1, ... \\mathbf{x}_{N}) X=(x1​,...xN​) is thereby the input sequence to the attention layer. The projections Q \\mathbf{Q} Q and K \\mathbf{K} K will each consist of N N N vectors resulting in the QKT \\mathbf{QK}^T QKT being of size N2 N^2 N2 .",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "LLMs usually have multiple attention heads, thus doing multiple self-attention computations in parallel. Assuming, the LLM has 40 attention heads and runs in bfloat16 precision, we can calculate the memory requirement to store the QKT \\mathbf{QK^T} QKT matrices to be 40∗2∗N2 40 * 2 * N^2 40∗2∗N2 bytes. For N=1000 N=1000 N=1000 only around 50 MB of VRAM are needed, however, for N=16000 N=16000 N=16000 we would need 19 GB of VRAM, and for N=100,000 N=100,000 N=100,000 we would need almost 1TB just to store the QKT \\mathbf{QK}^T QKT matrices.",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "Long story short, the default self-attention algorithm quickly becomes prohibitively memory-expensive for large input contexts.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "As LLMs improve in text comprehension and generation, they are applied to increasingly complex tasks. While models once handled the translation or summarization of a few sentences, they now manage entire pages, demanding the capability to process extensive input lengths.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "How can we get rid of the exorbitant memory requirements for large input lengths? We need a new way to compute the self-attention mechanism that gets rid of the QKT QK^T QKT matrix. Tri Dao et al. developed exactly such a new algorithm and called it Flash Attention.",
+      "spans": [
+        {
+          "start": 182,
+          "end": 196,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2205.14135"
+        },
+        {
+          "start": 250,
+          "end": 265,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "In a nutshell, Flash Attention breaks the V×Softmax(QKT\\mathbf{V} \\times \\text{Softmax}(\\mathbf{QK}^TV×Softmax(QKT) computation apart and instead computes smaller chunks of the output by iterating over multiple softmax computation steps:",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "Oi←sija∗Oi+sijb∗Vj×Softmax(QKi,jT) for multiple i,j iterations \\textbf{O}_i \\leftarrow s^a_{ij} * \\textbf{O}_i + s^b_{ij} * \\mathbf{V}_{j} \\times \\text{Softmax}(\\mathbf{QK}^T_{i,j}) \\text{ for multiple } i, j \\text{ iterations} Oi​←sija​∗Oi​+sijb​∗Vj​×Softmax(QKi,jT​) for multiple i,j iterations",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "with sija s^a_{ij} sija​ and sijb s^b_{ij} sijb​ being some softmax normalization statistics that need to be recomputed for every i i i and j j j .",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Please note that the whole Flash Attention is a bit more complex and is greatly simplified here as going in too much depth is out of scope for this notebook. The reader is invited to take a look at the well-written Flash Attention paper for more details.",
+      "spans": [
+        {
+          "start": 215,
+          "end": 236,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2205.14135"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "The main takeaway here is:",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "By keeping track of softmax normalization statistics and by using some smart mathematics, Flash Attention gives numerical identical outputs compared to the default self-attention layer at a memory cost that only increases linearly with N N N .",
+      "spans": [
+        {
+          "start": 112,
+          "end": 131,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "Looking at the formula, one would intuitively say that Flash Attention must be much slower compared to the default self-attention formula as more computation needs to be done. Indeed Flash Attention requires more FLOPs compared to normal attention as the softmax normalization statistics have to constantly be recomputed (see paper for more details if interested)",
+      "spans": [
+        {
+          "start": 326,
+          "end": 331,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2205.14135"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "However, Flash Attention is much faster in inference compared to default attention which comes from its ability to significantly reduce the demands on the slower, high-bandwidth memory of the GPU (VRAM), focusing instead on the faster on-chip memory (SRAM).",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "Essentially, Flash Attention makes sure that all intermediate write and read operations can be done using the fast on-chip SRAM memory instead of having to access the slower VRAM memory to compute the output vector O \\mathbf{O} O .",
+      "spans": [
+        {
+          "start": 115,
+          "end": 122,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0094",
+      "source": "In practice, there is currently absolutely no reason to not use Flash Attention if available. The algorithm gives mathematically the same outputs, and is both faster and more memory-efficient.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 59,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "Let's look at a practical example.",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "Our OctoCoder model now gets a significantly longer input prompt which includes a so-called system prompt. System prompts are used to steer the LLM into a better assistant that is tailored to the users' task. In the following, we use a system prompt that will make OctoCoder a better coding assistant.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 105,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "For demonstration purposes, we duplicate the system by ten so that the input length is long enough to observe Flash Attention's memory savings. We append the original text prompt \"Question: Please write a function in Python that transforms bytes to Giga bytes.\\n\\nAnswer: Here\"",
+      "spans": [
+        {
+          "start": 179,
+          "end": 277,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "We instantiate our model again in bfloat16 precision.",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "Let's now run the model just like before without Flash Attention and measure the peak GPU memory requirement and inference time.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 64,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "We're getting the same output as before, however this time, the model repeats the answer multiple times until it's 60 tokens cut-off. This is not surprising as we've repeated the system prompt ten times for demonstration purposes and thus cued the model to repeat itself.",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "Note that the system prompt should not be repeated ten times in real-world applications - one time is enough!",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0103",
+      "source": "Let's measure the peak GPU memory requirement.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "As we can see the peak GPU memory requirement is now significantly higher than in the beginning, which is largely due to the longer input sequence. Also the generation takes a little over a minute now.",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "We call flush() to free GPU memory for our next experiment.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 15,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "For comparison, let's run the same function, but enable Flash Attention instead. To do so, we convert the model to BetterTransformers and by doing so enabling PyTorch's SDPA self-attention which in turn is based on Flash Attention.",
+      "spans": [
+        {
+          "start": 115,
+          "end": 133,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/bettertransformer/overview"
+        },
+        {
+          "start": 169,
+          "end": 188,
+          "kind": "a",
+          "href": "https://pytorch.org/docs/master/generated/torch.nn.functional.scaled_dot_product_attention"
+        }
+      ]
+    },
+    {
+      "id": "b0108",
+      "source": "Now we run the exact same code snippet as before and under the hood Transformers will make use of Flash Attention.",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "We're getting the exact same result as before, but can observe a very significant speed-up thanks to Flash Attention.",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "Let's measure the memory consumption one last time.",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0113",
+      "source": "And we're almost back to our original 29GB peak GPU memory from the beginning.",
+      "spans": []
+    },
+    {
+      "id": "b0114",
+      "source": "We can observe that we only use roughly 100MB more GPU memory when passing a very long input sequence with Flash Attention compared to passing a short input sequence as done in the beginning.",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "3. The Science Behind LLM Architectures: Strategic Selection for Long Text Inputs and Chat",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "So far we have looked into improving computational and memory efficiency by:",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "Casting the weights to a lower precision format",
+      "spans": []
+    },
+    {
+      "id": "b0118",
+      "source": "Replacing the self-attention algorithm with a more memory- and compute efficient version",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "Let's now look into how we can change the architecture of an LLM so that it is most effective and efficient for task that require long text inputs, e.g.:",
+      "spans": [
+        {
+          "start": 148,
+          "end": 152,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0120",
+      "source": "Retrieval augmented Questions Answering,",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "Summarization,",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "Chat",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "Note that chat not only requires the LLM to handle long text inputs, but it also necessitates that the LLM is able to efficiently handle the back-and-forth dialogue between user and assistant (such as ChatGPT).",
+      "spans": [
+        {
+          "start": 10,
+          "end": 14,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "Once trained, the fundamental LLM architecture is difficult to change, so it is important to make considerations about the LLM's tasks beforehand and accordingly optimize the model's architecture. There are two important components of the model architecture that quickly become memory and/or performance bottlenecks for large input sequences.",
+      "spans": []
+    },
+    {
+      "id": "b0125",
+      "source": "The positional embeddings",
+      "spans": []
+    },
+    {
+      "id": "b0126",
+      "source": "The key-value cache",
+      "spans": []
+    },
+    {
+      "id": "b0127",
+      "source": "Let's go over each component in more detail",
+      "spans": []
+    },
+    {
+      "id": "b0128",
+      "source": "3.1 Improving positional embeddings of LLMs",
+      "spans": []
+    },
+    {
+      "id": "b0129",
+      "source": "Self-attention puts each token in relation to each other's tokens. As an example, the Softmax(QKT) \\text{Softmax}(\\mathbf{QK}^T) Softmax(QKT) matrix of the text input sequence \"Hello\", \"I\", \"love\", \"you\" could look as follows:",
+      "spans": [
+        {
+          "start": 176,
+          "end": 203,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0130",
+      "source": "Each word token is given a probability mass at which it attends all other word tokens and, therefore is put into relation with all other word tokens. E.g. the word \"love\" attends to the word \"Hello\" with 5%, to \"I\" with 30%, and to itself with 65%.",
+      "spans": [
+        {
+          "start": 164,
+          "end": 170,
+          "kind": "em"
+        },
+        {
+          "start": 191,
+          "end": 198,
+          "kind": "em"
+        },
+        {
+          "start": 211,
+          "end": 214,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0131",
+      "source": "A LLM based on self-attention, but without position embeddings would have great difficulties in understanding the positions of the text inputs to each other. This is because the probability score computed by QKT \\mathbf{QK}^T QKT relates each word token to each other word token in O(1) O(1) O(1) computations regardless of their relative positional distance to each other. Therefore, for the LLM without position embeddings each token appears to have the same distance to all other tokens, e.g. differentiating between \"Hello I love you\" and \"You love I hello\" would be very challenging.",
+      "spans": [
+        {
+          "start": 491,
+          "end": 495,
+          "kind": "em"
+        },
+        {
+          "start": 520,
+          "end": 538,
+          "kind": "em"
+        },
+        {
+          "start": 543,
+          "end": 561,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0132",
+      "source": "For the LLM to understand sentence order, an additional cue is needed and is usually applied in the form of positional encodings (or also called positional embeddings). Positional encodings, encode the position of each token into a numerical presentation that the LLM can leverage to better understand sentence order.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 59,
+          "kind": "em"
+        },
+        {
+          "start": 108,
+          "end": 128,
+          "kind": "em"
+        },
+        {
+          "start": 145,
+          "end": 166,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0133",
+      "source": "The authors of the Attention Is All You Need paper introduced sinusoidal positional embeddings P=p1,…,pN \\mathbf{P} = \\mathbf{p}_1, \\ldots, \\mathbf{p}_N P=p1​,…,pN​ . where each vector pi \\mathbf{p}_i pi​ is computed as a sinusoidal function of its position i i i . The positional encodings are then simply added to the input sequence vectors X^=x^1,…,x^N \\mathbf{\\hat{X}} = \\mathbf{\\hat{x}}_1, \\ldots, \\mathbf{\\hat{x}}_N X^=x^1​,…,x^N​ = x1+p1,…,xN+pN \\mathbf{x}_1 + \\mathbf{p}_1, \\ldots, \\mathbf{x}_N + \\mathbf{p}_N x1​+p1​,…,xN​+pN​ thereby cueing the model to better learn sentence order.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 44,
+          "kind": "em"
+        },
+        {
+          "start": 19,
+          "end": 44,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1706.03762"
+        }
+      ]
+    },
+    {
+      "id": "b0134",
+      "source": "Instead of using fixed position embeddings, others (such as Devlin et al.) used learned positional encodings for which the positional embeddings P \\mathbf{P} P are learned during training.",
+      "spans": [
+        {
+          "start": 60,
+          "end": 73,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1810.04805"
+        }
+      ]
+    },
+    {
+      "id": "b0135",
+      "source": "Sinusoidal and learned position embeddings used to be the predominant methods to encode sentence order into LLMs, but a couple of problems related to these positional encodings were found:",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "Sinusoidal and learned position embeddings are both absolute positional embeddings, i.e. encoding a unique embedding for each position id: 0,…,N 0, \\ldots, N 0,…,N . As shown by Huang et al. and Su et al., absolute positional embeddings lead to poor LLM performance for long text inputs. For long text inputs, it is advantageous if the model learns the relative positional distance input tokens have to each other instead of their absolute position.",
+      "spans": [
+        {
+          "start": 84,
+          "end": 88,
+          "kind": "em"
+        },
+        {
+          "start": 178,
+          "end": 190,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2009.13658"
+        },
+        {
+          "start": 195,
+          "end": 204,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2104.09864"
+        }
+      ]
+    },
+    {
+      "id": "b0137",
+      "source": "When using learned position embeddings, the LLM has to be trained on a fixed input length N N N, which makes it difficult to extrapolate to an input length longer than what it was trained on.",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "Recently, relative positional embeddings that can tackle the above mentioned problems have become more popular, most notably:",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "Rotary Position Embedding (RoPE)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2104.09864"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "ALiBi",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2108.12409"
+        }
+      ]
+    },
+    {
+      "id": "b0141",
+      "source": "Both RoPE and ALiBi argue that it's best to cue the LLM about sentence order directly in the self-attention algorithm as it's there that word tokens are put into relation with each other. More specifically, sentence order should be cued by modifying the QKT \\mathbf{QK}^T QKT computation.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 9,
+          "kind": "em"
+        },
+        {
+          "start": 14,
+          "end": 19,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0142",
+      "source": "Without going into too many details, RoPE notes that positional information can be encoded into query-key pairs, e.g. qi \\mathbf{q}_i qi​ and xj \\mathbf{x}_j xj​ by rotating each vector by an angle θ∗i \\theta * i θ∗i and θ∗j \\theta * j θ∗j respectively with i,j i, j i,j describing each vectors sentence position:",
+      "spans": [
+        {
+          "start": 37,
+          "end": 41,
+          "kind": "em"
+        },
+        {
+          "start": 113,
+          "end": 117,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0143",
+      "source": "q^iTx^j=qiTRθ,i−jxj. \\mathbf{\\hat{q}}_i^T \\mathbf{\\hat{x}}_j = \\mathbf{{q}}_i^T \\mathbf{R}_{\\theta, i -j} \\mathbf{{x}}_j. q^​iT​x^j​=qiT​Rθ,i−j​xj​. Rθ,i−j \\mathbf{R}_{\\theta, i - j} Rθ,i−j​ thereby represents a rotational matrix. θ \\theta θ is not learned during training, but instead set to a pre-defined value that depends on the maximum input sequence length during training.",
+      "spans": [
+        {
+          "start": 245,
+          "end": 248,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0144",
+      "source": "By doing so, the propability score between qi \\mathbf{q}_i qi​ and qj \\mathbf{q}_j qj​ is only affected if i≠j i \\ne j i=j and solely depends on the relative distance i−j i - j i−j regardless of each vector's specific positions i i i and j j j .",
+      "spans": []
+    },
+    {
+      "id": "b0145",
+      "source": "RoPE is used in multiple of today's most important LLMs, such as:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0146",
+      "source": "Falcon",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://huggingface.co/tiiuae/falcon-40b"
+        }
+      ]
+    },
+    {
+      "id": "b0147",
+      "source": "Llama",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2302.13971"
+        }
+      ]
+    },
+    {
+      "id": "b0148",
+      "source": "PaLM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2204.02311"
+        }
+      ]
+    },
+    {
+      "id": "b0149",
+      "source": "As an alternative, ALiBi proposes a much simpler relative position encoding scheme. The relative distance that input tokens have to each other is added as a negative integer scaled by a pre-defined value m to each query-key entry of the QKT \\mathbf{QK}^T QKT matrix right before the softmax computation.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 24,
+          "kind": "em"
+        },
+        {
+          "start": 204,
+          "end": 205,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0150",
+      "source": "As shown in the ALiBi paper, this simple relative positional encoding allows the model to retain a high performance even at very long text input sequences.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 21,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2108.12409"
+        }
+      ]
+    },
+    {
+      "id": "b0151",
+      "source": "ALiBi is used in multiple of today's most important LLMs, such as:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0152",
+      "source": "MPT",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "a",
+          "href": "https://huggingface.co/mosaicml/mpt-30b"
+        }
+      ]
+    },
+    {
+      "id": "b0153",
+      "source": "BLOOM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://huggingface.co/bigscience/bloom"
+        }
+      ]
+    },
+    {
+      "id": "b0154",
+      "source": "Both RoPE and ALiBi position encodings can extrapolate to input lengths not seen during training whereas it has been shown that extrapolation works much better out-of-the-box for ALiBi as compared to RoPE. For ALiBi, one simply increases the values of the lower triangular position matrix to match the length of the input sequence. For RoPE, keeping the same θ \\theta θ that was used during training leads to poor results when passing text inputs much longer than those seen during training, c.f Press et al.. However, the community has found a couple of effective tricks that adapt θ \\theta θ, thereby allowing RoPE position embeddings to work well for extrapolated text input sequences (see here).",
+      "spans": [
+        {
+          "start": 5,
+          "end": 9,
+          "kind": "em"
+        },
+        {
+          "start": 14,
+          "end": 19,
+          "kind": "em"
+        },
+        {
+          "start": 179,
+          "end": 184,
+          "kind": "em"
+        },
+        {
+          "start": 200,
+          "end": 204,
+          "kind": "em"
+        },
+        {
+          "start": 336,
+          "end": 340,
+          "kind": "em"
+        },
+        {
+          "start": 492,
+          "end": 495,
+          "kind": "em"
+        },
+        {
+          "start": 496,
+          "end": 508,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2108.12409"
+        },
+        {
+          "start": 612,
+          "end": 616,
+          "kind": "em"
+        },
+        {
+          "start": 693,
+          "end": 697,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/24653"
+        }
+      ]
+    },
+    {
+      "id": "b0155",
+      "source": "Both RoPE and ALiBi are relative positional embeddings that are not learned during training, but instead are based on the following intuitions:",
+      "spans": [
+        {
+          "start": 64,
+          "end": 67,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0156",
+      "source": "Positional cues about the text inputs should be given directly to the QKT QK^T QKT matrix of the self-attention layer",
+      "spans": []
+    },
+    {
+      "id": "b0157",
+      "source": "The LLM should be incentivized to learn a constant relative distance positional encodings have to each other",
+      "spans": [
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0158",
+      "source": "The further text input tokens are from each other, the lower the probability of their query-value probability. Both RoPE and ALiBi lower the query-key probability of tokens far away from each other. RoPE by decreasing their vector product by increasing the angle between the query-key vectors. ALiBi by adding large negative numbers to the vector product",
+      "spans": []
+    },
+    {
+      "id": "b0159",
+      "source": "In conclusion, LLMs that are intended to be deployed in tasks that require handling large text inputs are better trained with relative positional embeddings, such as RoPE and ALiBi. Also note that even if an LLM with RoPE and ALiBi has been trained only on a fixed length of say N1=2048 N_1 = 2048 N1​=2048 it can still be used in practice with text inputs much larger than N1 N_1 N1​, like N2=8192>N1 N_2 = 8192 > N_1 N2​=8192>N1​ by extrapolating the positional embeddings.",
+      "spans": []
+    },
+    {
+      "id": "b0160",
+      "source": "3.2 The key-value cache",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "Auto-regressive text generation with LLMs works by iteratively putting in an input sequence, sampling the next token, appending the next token to the input sequence, and continuing to do so until the LLM produces a token that signifies that the generation has finished.",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "Please have a look at Transformer's Generate Text Tutorial to get a more visual explanation of how auto-regressive generation works.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 58,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/llm_tutorial#generate-text"
+        }
+      ]
+    },
+    {
+      "id": "b0163",
+      "source": "Let's run a quick code snippet to show how auto-regressive works in practice. We will simply take the most likely next token via torch.argmax.",
+      "spans": [
+        {
+          "start": 129,
+          "end": 141,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0164",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0165",
+      "source": "As we can see every time we increase the text input tokens by the just sampled token.",
+      "spans": []
+    },
+    {
+      "id": "b0166",
+      "source": "With very few exceptions, LLMs are trained using the causal language modeling objective and therefore mask the upper triangle matrix of the attention score - this is why in the two diagrams above the attention scores are left blank (a.k.a have 0 probability). For a quick recap on causal language modeling you can refer to the Illustrated Self Attention blog.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 87,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/tasks/language_modeling#causal-language-modeling"
+        },
+        {
+          "start": 233,
+          "end": 238,
+          "kind": "em"
+        },
+        {
+          "start": 327,
+          "end": 358,
+          "kind": "em"
+        },
+        {
+          "start": 327,
+          "end": 358,
+          "kind": "a",
+          "href": "https://jalammar.github.io/illustrated-gpt2/#part-2-illustrated-self-attention"
+        }
+      ]
+    },
+    {
+      "id": "b0167",
+      "source": "As a consequence, tokens never depend on future tokens, more specifically the qi \\mathbf{q}_i qi​ vector is never put in relation with any key, values vectors kj,vj \\mathbf{k}_j, \\mathbf{v}_j kj​,vj​ if j>i j > i j>i . Instead qi \\mathbf{q}_i qi​ only attends to previous key-value vectors km<i,vm<i , for m∈{0,…i−1} \\mathbf{k}_{m < i}, \\mathbf{v}_{m < i} \\text{ , for } m \\in \\{0, \\ldots i - 1\\} km<i​,vm<i​ , for m∈{0,…i−1}. In order to reduce unnecessary computation, one can therefore cache each layer's key-value vectors for all previous timesteps.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 30,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0168",
+      "source": "In the following, we will tell the LLM to make use of the key-value cache by retrieving and forwarding it for each forward pass. In Transformers, we can retrieve the key-value cache by passing the use_cache flag to the forward call and can then pass it with the current token.",
+      "spans": [
+        {
+          "start": 197,
+          "end": 206,
+          "kind": "code"
+        },
+        {
+          "start": 219,
+          "end": 226,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0169",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0170",
+      "source": "As one can see, when using the key-value cache the text input tokens are not increased in length, but remain a single input vector. The length of the key-value cache on the other hand is increased by one at every decoding step.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 76,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0171",
+      "source": "Making use of the key-value cache means that the QKT \\mathbf{QK}^T QKT is essentially reduced to qcKT \\mathbf{q}_c\\mathbf{K}^T qc​KT with qc \\mathbf{q}_c qc​ being the query projection of the currently passed input token which is always just a single vector.",
+      "spans": [
+        {
+          "start": 230,
+          "end": 236,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0172",
+      "source": "Using the key-value cache has two advantages:",
+      "spans": []
+    },
+    {
+      "id": "b0173",
+      "source": "Significant increase in computational efficiency as less computations are performed compared to computing the full QKT \\mathbf{QK}^T QKT matrix. This leads to an increase in inference speed",
+      "spans": []
+    },
+    {
+      "id": "b0174",
+      "source": "The maximum required memory is not increased quadratically with the number of generated tokens, but only increases linearly.",
+      "spans": []
+    },
+    {
+      "id": "b0175",
+      "source": "One should always make use of the key-value cache as it leads to identical results and a significant speed-up for longer input sequences. Transformers has the key-value cache enabled by default when making use of the text pipeline or the generate method.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 17,
+          "kind": "em"
+        },
+        {
+          "start": 238,
+          "end": 246,
+          "kind": "code"
+        },
+        {
+          "start": 238,
+          "end": 253,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/text_generation"
+        }
+      ]
+    },
+    {
+      "id": "b0176",
+      "source": "Note that the key-value cache is especially useful for applications such as chat where multiple passes of auto-regressive decoding are required. Let's look at an example.",
+      "spans": []
+    },
+    {
+      "id": "b0177",
+      "source": "In this chat, the LLM runs auto-regressive decoding twice:",
+      "spans": []
+    },
+    {
+      "id": "b0178",
+      "source": "The first time, the key-value cache is empty and the input prompt is \"User: How many people live in France?\" and the model auto-regressively generates the text \"Roughly 75 million people live in France\" while increasing the key-value cache at every decoding step.",
+      "spans": [
+        {
+          "start": 69,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 160,
+          "end": 202,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0179",
+      "source": "The second time the input prompt is \"User: How many people live in France? \\n Assistant: Roughly 75 million people live in France \\n User: And how many in Germany?\". Thanks to the cache, all key-value vectors for the first two sentences are already computed. Therefore the input prompt only consists of \"User: And how many in Germany?\". While processing the shortened input prompt, it's computed key-value vectors are concatenated to the key-value cache of the first decoding. The second Assistant's answer \"Germany has ca. 81 million inhabitants\" is then auto-regressively generated with the key-value cache consisting of encoded key-value vectors of \"User: How many people live in France? \\n Assistant: Roughly 75 million people live in France \\n User: And how many are in Germany?\".",
+      "spans": [
+        {
+          "start": 36,
+          "end": 164,
+          "kind": "code"
+        },
+        {
+          "start": 303,
+          "end": 335,
+          "kind": "code"
+        },
+        {
+          "start": 507,
+          "end": 547,
+          "kind": "code"
+        },
+        {
+          "start": 652,
+          "end": 784,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0180",
+      "source": "Two things should be noted here:",
+      "spans": []
+    },
+    {
+      "id": "b0181",
+      "source": "Keeping all the context is crucial for LLMs deployed in chat so that the LLM understands all the previous context of the conversation. E.g. for the example above the LLM needs to understand that the user refers to the population when asking \"And how many are in Germany\".",
+      "spans": [
+        {
+          "start": 241,
+          "end": 270,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0182",
+      "source": "The key-value cache is extremely useful for chat as it allows us to continuously grow the encoded chat history instead of having to re-encode the chat history again from scratch (as e.g. would be the case when using an encoder-decoder architecture).",
+      "spans": []
+    },
+    {
+      "id": "b0183",
+      "source": "There is however one catch. While the required peak memory for the QKT \\mathbf{QK}^T QKT matrix is significantly reduced, holding the key-value cache in memory can become very memory expensive for long input sequences or multi-turn chat. Remember that the key-value cache needs to store the key-value vectors for all previous input vectors xi, for i∈{1,…,c−1} \\mathbf{x}_i \\text{, for } i \\in \\{1, \\ldots, c - 1\\} xi​, for i∈{1,…,c−1} for all self-attention layers and for all attention heads.",
+      "spans": []
+    },
+    {
+      "id": "b0184",
+      "source": "Let's compute the number of float values that need to be stored in the key-value cache for the LLM bigcode/octocoder that we used before. The number of float values amounts to two times the sequence length times the number of attention heads times the attention head dimension and times the number of layers. Computing this for our LLM at a hypothetical input sequence length of 16000 gives:",
+      "spans": [
+        {
+          "start": 99,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0185",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0186",
+      "source": "Roughly 8 billion float values! Storing 8 billion float values in float16 precision requires around 15 GB of RAM which is circa half as much as the model weights themselves! Researchers have proposed two methods that allow to significantly reduce the memory cost of storing the key-value cache:",
+      "spans": [
+        {
+          "start": 66,
+          "end": 73,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0187",
+      "source": "Multi-Query-Attention (MQA)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1911.02150"
+        }
+      ]
+    },
+    {
+      "id": "b0188",
+      "source": "Multi-Query-Attention was proposed in Noam Shazeer's Fast Transformer Decoding: One Write-Head is All You Need paper. As the title says, Noam found out that instead of using n_head key-value projections weights, one can use a single head-value projection weight pair that is shared across all attention heads without that the model's performance significantly degrades.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 110,
+          "kind": "em"
+        },
+        {
+          "start": 174,
+          "end": 180,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0189",
+      "source": "By using a single head-value projection weight pair, the key value vectors ki,vi \\mathbf{k}_i, \\mathbf{v}_i ki​,vi​ have to be identical across all attention heads which in turn means that we only need to store 1 key-value projection pair in the cache instead of n_head ones.",
+      "spans": [
+        {
+          "start": 263,
+          "end": 269,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0190",
+      "source": "As most LLMs use between 20 and 100 attention heads, MQA significantly reduces the memory consumption of the key-value cache. For the LLM used in this notebook we could therefore reduce the required memory consumption from 15 GB to less than 400 MB at an input sequence length of 16000.",
+      "spans": []
+    },
+    {
+      "id": "b0191",
+      "source": "In addition to memory savings, MQA also leads to improved computational efficiency as explained in the following. In auto-regressive decoding, large key-value vectors need to be reloaded, concatenated with the current key-value vector pair to be then fed into the qcKT \\mathbf{q}_c\\mathbf{K}^T qc​KT computation at every step. For auto-regressive decoding, the required memory bandwidth for the constant reloading can become a serious time bottleneck. By reducing the size of the key-value vectors less memory needs to be accessed, thus reducing the memory bandwidth bottleneck. For more detail, please have a look at Noam's paper.",
+      "spans": [
+        {
+          "start": 618,
+          "end": 630,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1911.02150"
+        }
+      ]
+    },
+    {
+      "id": "b0192",
+      "source": "The important part to understand here is that reducing the number of key-value attention heads to 1 only makes sense if a key-value cache is used. The peak memory consumption of the model for a single forward pass without key-value cache stays unchanged as every attention head still has a unique query vector so that each attention head still has a different QKT \\mathbf{QK}^T QKT matrix.",
+      "spans": []
+    },
+    {
+      "id": "b0193",
+      "source": "MQA has seen wide adoption by the community and is now used by many of the most popular LLMs:",
+      "spans": []
+    },
+    {
+      "id": "b0194",
+      "source": "Falcon",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://huggingface.co/tiiuae/falcon-40b"
+        }
+      ]
+    },
+    {
+      "id": "b0195",
+      "source": "PaLM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2204.02311"
+        }
+      ]
+    },
+    {
+      "id": "b0196",
+      "source": "MPT",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "a",
+          "href": "https://huggingface.co/mosaicml/mpt-30b"
+        }
+      ]
+    },
+    {
+      "id": "b0197",
+      "source": "BLOOM",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "a",
+          "href": "https://huggingface.co/bigscience/bloom"
+        }
+      ]
+    },
+    {
+      "id": "b0198",
+      "source": "Also, the checkpoint used in this notebook - bigcode/octocoder - makes use of MQA.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 62,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0199",
+      "source": "Grouped-Query-Attention (GQA)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2305.13245"
+        }
+      ]
+    },
+    {
+      "id": "b0200",
+      "source": "Grouped-Query-Attention, as proposed by Ainslie et al. from Google, found that using MQA can often lead to quality degradation compared to using vanilla multi-key-value head projections. The paper argues that more model performance can be kept by less drastically reducing the number of query head projection weights. Instead of using just a single key-value projection weight, n < n_head key-value projection weights should be used. By choosing n to a significantly smaller value than n_head, such as 2,4 or 8 almost all of the memory and speed gains from MQA can be kept while sacrificing less model capacity and thus arguably less performance.",
+      "spans": [
+        {
+          "start": 378,
+          "end": 388,
+          "kind": "code"
+        },
+        {
+          "start": 446,
+          "end": 447,
+          "kind": "code"
+        },
+        {
+          "start": 486,
+          "end": 492,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0201",
+      "source": "Moreover, the authors of GQA found out that existing model checkpoints can be uptrained to have a GQA architecture with as little as 5% of the original pre-training compute. While 5% of the original pre-training compute can still be a massive amount, GQA uptraining allows existing checkpoints to be useful for longer input sequences.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 87,
+          "kind": "em"
+        },
+        {
+          "start": 255,
+          "end": 265,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0202",
+      "source": "GQA was only recently proposed which is why there is less adoption at the time of writing this notebook. The most notable application of GQA is Llama-v2.",
+      "spans": [
+        {
+          "start": 144,
+          "end": 152,
+          "kind": "a",
+          "href": "https://huggingface.co/meta-llama/Llama-2-70b-hf"
+        }
+      ]
+    },
+    {
+      "id": "b0203",
+      "source": "As a conclusion, it is strongly recommended to make use of either GQA or MQA if the LLM is deployed with auto-regressive decoding and is required to handle large input sequences as is the case for example for chat.",
+      "spans": []
+    },
+    {
+      "id": "b0204",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0205",
+      "source": "The research community is constantly coming up with new, nifty ways to speed up inference time for ever-larger LLMs. As an example, one such promising research direction is speculative decoding where \"easy tokens\" are generated by smaller, faster language models and only \"hard tokens\" are generated by the LLM itself. Going into more detail is out of the scope of this notebook, but can be read upon in this nice blog post.",
+      "spans": [
+        {
+          "start": 173,
+          "end": 193,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2211.17192"
+        },
+        {
+          "start": 409,
+          "end": 423,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/assisted-generation"
+        }
+      ]
+    },
+    {
+      "id": "b0206",
+      "source": "The reason massive LLMs such as GPT3/4, Llama-2-70b, Claude, PaLM can run so quickly in chat-interfaces such as Hugging Face Chat or ChatGPT is to a big part thanks to the above-mentioned improvements in precision, algorithms, and architecture. Going forward, accelerators such as GPUs, TPUs, etc... will only get faster and allow for more memory, but one should nevertheless always make sure to use the best available algorithms and architectures to get the most bang for your buck 🤗",
+      "spans": [
+        {
+          "start": 112,
+          "end": 129,
+          "kind": "a",
+          "href": "https://huggingface.co/chat/"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "d5935405a7fff4b9c97a63ebc97d2f3dbdea1c3c0767d1e9edf911f313477e3e",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "!pip install transformers accelerate bitsandbytes optimum"
+    },
+    {
+      "id": "c0002",
+      "source": "from transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigscience/bloom\", device_map=\"auto\", pad_token_id=0)"
+    },
+    {
+      "id": "c0003",
+      "source": "from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline\nimport torch\n\nmodel = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\", pad_token_id=0)\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)"
+    },
+    {
+      "id": "c0004",
+      "source": "prompt = \"Question: Please write a function in Python that transforms bytes to Giga bytes.\\n\\nAnswer:\"\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult"
+    },
+    {
+      "id": "c0005",
+      "source": "Here is a Python function that transforms bytes to Giga bytes:\\n\\n```python\\ndef bytes_to_giga_bytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n```\\n\\nThis function takes a single"
+    },
+    {
+      "id": "c0006",
+      "source": "def bytes_to_giga_bytes(bytes):\n  return bytes / 1024 / 1024 / 1024"
+    },
+    {
+      "id": "c0007",
+      "source": "bytes_to_giga_bytes(torch.cuda.max_memory_allocated())"
+    },
+    {
+      "id": "c0008",
+      "source": "29.0260648727417"
+    },
+    {
+      "id": "c0009",
+      "source": "del pipe\ndel model\n\nimport gc\nimport torch\n\ndef flush():\n  gc.collect()\n  torch.cuda.empty_cache()\n  torch.cuda.reset_peak_memory_stats()"
+    },
+    {
+      "id": "c0010",
+      "source": "flush()"
+    },
+    {
+      "id": "c0011",
+      "source": "from accelerate.utils import release_memory\n# ...\n\nrelease_memory(model)"
+    },
+    {
+      "id": "c0012",
+      "source": "!pip install bitsandbytes"
+    },
+    {
+      "id": "c0013",
+      "source": "model = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_8bit=True, pad_token_id=0)"
+    },
+    {
+      "id": "c0014",
+      "source": "pipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult"
+    },
+    {
+      "id": "c0015",
+      "source": "Here is a Python function that transforms bytes to Giga bytes:\\n\\n```python\\ndef bytes_to_giga_bytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n```\\n\\nThis function takes a single"
+    },
+    {
+      "id": "c0016",
+      "source": "bytes_to_giga_bytes(torch.cuda.max_memory_allocated())"
+    },
+    {
+      "id": "c0017",
+      "source": "15.219234466552734"
+    },
+    {
+      "id": "c0018",
+      "source": "del model\ndel pipe"
+    },
+    {
+      "id": "c0019",
+      "source": "flush()"
+    },
+    {
+      "id": "c0020",
+      "source": "model = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", load_in_4bit=True, low_cpu_mem_usage=True, pad_token_id=0)\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)\n\nresult = pipe(prompt, max_new_tokens=60)[0][\"generated_text\"][len(prompt):]\nresult"
+    },
+    {
+      "id": "c0021",
+      "source": "Here is a Python function that transforms bytes to Giga bytes:\\n\\n```\\ndef bytes_to_gigabytes(bytes):\\n    return bytes / 1024 / 1024 / 1024\\n```\\n\\nThis function takes a single argument"
+    },
+    {
+      "id": "c0022",
+      "source": "bytes_to_giga_bytes(torch.cuda.max_memory_allocated())"
+    },
+    {
+      "id": "c0023",
+      "source": "9.543574333190918"
+    },
+    {
+      "id": "c0024",
+      "source": "del model\ndel pipe"
+    },
+    {
+      "id": "c0025",
+      "source": "flush()"
+    },
+    {
+      "id": "c0026",
+      "source": "system_prompt = \"\"\"Below are a series of dialogues between various people and an AI technical assistant.\nThe assistant tries to be helpful, polite, honest, sophisticated, emotionally aware, and humble but knowledgeable.\nThe assistant is happy to help with code questions and will do their best to understand exactly what is needed.\nIt also tries to avoid giving false or misleading information, and it caveats when it isn't entirely sure about the right answer.\nThat said, the assistant is practical really does its best, and doesn't let caution get too much in the way of being useful.\n\nThe Starcoder models are a series of 15.5B parameter models trained on 80+ programming languages from The Stack (v1.2) (excluding opt-out requests).\nThe model uses Multi Query Attention, was trained using the Fill-in-the-Middle objective, and with 8,192 tokens context window for a trillion tokens of heavily deduplicated data.\n\n-----\n\nQuestion: Write a function that takes two lists and returns a list that has alternating elements from each input list.\n\nAnswer: Sure. Here is a function that does that.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(len(list1)):\n       results.append(list1[i])\n       results.append(list2[i])\n   return results\n\nQuestion: Can you write some test cases for this function?\n\nAnswer: Sure, here are some tests.\n\nassert alternating([10, 20, 30], [1, 2, 3]) == [10, 1, 20, 2, 30, 3]\nassert alternating([True, False], [4, 5]) == [True, 4, False, 5]\nassert alternating([], []) == []\n\nQuestion: Modify the function so that it returns all input elements when the lists have uneven length. The elements from the longer list should be at the end.\n\nAnswer: Here is the modified function.\n\ndef alternating(list1, list2):\n   results = []\n   for i in range(min(len(list1), len(list2))):\n       results.append(list1[i])\n       results.append(list2[i])\n   if len(list1) > len(list2):\n       results.extend(list1[i+1:])\n   else:\n       results.extend(list2[i+1:])\n   return results\n\n-----\n\"\"\""
+    },
+    {
+      "id": "c0027",
+      "source": "long_prompt = 10 * system_prompt + prompt"
+    },
+    {
+      "id": "c0028",
+      "source": "model = AutoModelForCausalLM.from_pretrained(\"bigcode/octocoder\", torch_dtype=torch.bfloat16, device_map=\"auto\")\ntokenizer = AutoTokenizer.from_pretrained(\"bigcode/octocoder\")\n\npipe = pipeline(\"text-generation\", model=model, tokenizer=tokenizer)"
+    },
+    {
+      "id": "c0029",
+      "source": "import time\n\nstart_time = time.time()\nresult = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult"
+    },
+    {
+      "id": "c0030",
+      "source": "Generated in 10.96854019165039 seconds.\nSure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n   return bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef"
+    },
+    {
+      "id": "c0031",
+      "source": "bytes_to_giga_bytes(torch.cuda.max_memory_allocated())"
+    },
+    {
+      "id": "c0032",
+      "source": "37.668193340301514"
+    },
+    {
+      "id": "c0033",
+      "source": "flush()"
+    },
+    {
+      "id": "c0034",
+      "source": "model.to_bettertransformer()"
+    },
+    {
+      "id": "c0035",
+      "source": "start_time = time.time()\nwith torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):\n    result = pipe(long_prompt, max_new_tokens=60)[0][\"generated_text\"][len(long_prompt):]\n\nprint(f\"Generated in {time.time() - start_time} seconds.\")\nresult"
+    },
+    {
+      "id": "c0036",
+      "source": "Generated in 3.0211617946624756 seconds.\n Sure. Here is a function that does that.\\n\\ndef bytes_to_giga(bytes):\\n   return bytes / 1024 / 1024 / 1024\\n\\nAnswer: Sure. Here is a function that does that.\\n\\ndef"
+    },
+    {
+      "id": "c0037",
+      "source": "bytes_to_giga_bytes(torch.cuda.max_memory_allocated())"
+    },
+    {
+      "id": "c0038",
+      "source": "32.617331981658936"
+    },
+    {
+      "id": "c0039",
+      "source": "flush()"
+    },
+    {
+      "id": "c0040",
+      "source": "input_ids = tokenizer(prompt, return_tensors=\"pt\")[\"input_ids\"].to(\"cuda\")\n\nfor _ in range(5):\n  next_logits = model(input_ids)[\"logits\"][:, -1:]\n  next_token_id = torch.argmax(next_logits,dim=-1)\n\n  input_ids = torch.cat([input_ids, next_token_id], dim=-1)\n  print(\"shape of input_ids\", input_ids.shape)\n\ngenerated_text = tokenizer.batch_decode(input_ids[:, -5:])\ngenerated_text"
+    },
+    {
+      "id": "c0041",
+      "source": "shape of input_ids torch.Size([1, 21])\nshape of input_ids torch.Size([1, 22])\nshape of input_ids torch.Size([1, 23])\nshape of input_ids torch.Size([1, 24])\nshape of input_ids torch.Size([1, 25])\n[' Here is a Python function']"
+    },
+    {
+      "id": "c0042",
+      "source": "past_key_values = None # past_key_values is the key-value cache\ngenerated_tokens = []\nnext_token_id = tokenizer(prompt, return_tensors=\"pt\")[\"input_ids\"].to(\"cuda\")\n\nfor _ in range(5):\n  next_logits, past_key_values = model(next_token_id, past_key_values=past_key_values, use_cache=True).to_tuple()\n  next_logits = next_logits[:, -1:]\n  next_token_id = torch.argmax(next_logits, dim=-1)\n\n  print(\"shape of input_ids\", next_token_id.shape)\n  # past_key_values are a tuple (one for each Transformer layer) of tuples (one for the keys, one for the values)\n  # cached keys and values each are of shape (batch_size, num_heads, sequence_length, embed_size_per_head)\n  # hence let's print how many cached keys and values we have for the first Transformer layer\n  print(\"number of cached keys of the first Transformer layer\", len(past_key_values[0][0][0,0,:,:]))\n  print(\"number of cached values of the first Transformer layer\", len(past_key_values[0][1][0,0,:,:]))\n  \n  generated_tokens.append(next_token_id.item())\n\ngenerated_text = tokenizer.batch_decode(generated_tokens)\ngenerated_text"
+    },
+    {
+      "id": "c0043",
+      "source": "shape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 20\nnumber of cached values of the first Transformer layer: 20\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 21\nnumber of cached values of the first Transformer layer: 21\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 22\nnumber of cached values of the first Transformer layer: 22\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 23\nnumber of cached values of the first Transformer layer: 23\nshape of input_ids torch.Size([1, 1])\nnumber of cached keys of the first Transformer layer: 24\nnumber of cached values of the first Transformer layer: 24\n[' Here', ' is', ' a', ' Python', ' function']"
+    },
+    {
+      "id": "c0044",
+      "source": "User: How many people live in France?\nAssistant: Roughly 75 million people live in France\nUser: And how many are in Germany?\nAssistant: Germany has ca. 81 million inhabitants"
+    },
+    {
+      "id": "c0045",
+      "source": "config = model.config\n2 * 16_000 * config.n_layer * config.n_head * config.n_embd // config.n_head"
+    },
+    {
+      "id": "c0046",
+      "source": "7864320000"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "d5935405a7fff4b9c97a63ebc97d2f3dbdea1c3c0767d1e9edf911f313477e3e",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_df26b43cfe81eb43",
+      "type": "image",
+      "afterBlockId": "b0129",
+      "order": 1
+    },
+    {
+      "mediaId": "image_7dccfbab6f98c24a",
+      "type": "image",
+      "afterBlockId": "b0149",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T15:31:09.755073Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:31:09.755089Z"
 }
