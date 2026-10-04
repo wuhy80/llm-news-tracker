@@ -19,8 +19,8 @@
   "fetchedAt": "2026-08-30T10:57:41.850068Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Blazing Fast SetFit Inference with 🤗 Optimum Intel on Xeon\n\nThis article is also available in Chinese 简体中文 .\n\nSetFit is a promising solution for a common modeling problem: how to deal with lack of labeled data for training. Developed with Hugging Face’s research partners at Intel Labs and the UKP Lab , SetFit is an efficient framework for few-shot fine-tuning of Sentence Transformers models.\n\nSetFit achieves high accuracy with little labeled data - for example, SetFit outperforms GPT-3.5 in 3-shot prompting and with 5 shot it also outperforms 3-shot GPT-4 on the Banking 77 financial intent dataset.\n\nCompared to LLM based methods, SetFit has two unique advantages:\n\n🗣 No prompts or verbalisers : few-shot in-context learning with LLMs requires handcrafted prompts which make the results brittle, sensitive to phrasing and dependent on user expertise. SetFit dispenses with prompts altogether by generating rich embeddings directly from a small number of labeled text examples.\n\n🏎 Fast to train : SetFit doesn't rely on LLMs such as GPT-3.5 or Llama2 to achieve high accuracy. As a result, it is typically an order of magnitude (or more) faster to train and run inference with.\n\nFor more details on SetFit, check out our paper , blog , code , and data .\n\nSetfit has been widely adopted by the AI developer community, with ~100k downloads per month and ~1500 SetFit models on the Hub, and growing with an average of ~4 models per day!\n\nIn this blog post, we'll explain how you can accelerate inference with SetFit by 7.8x on Intel CPUs, by optimizing your SetFit model with 🤗 Optimum Intel . We’ll show how you can achieve huge throughput gains by performing a simple post-training quantization step on your model. This can enable production-grade deployment of SetFit solutions using Intel Xeon CPUs.\n\nOptimum Intel is an open-source library that accelerates end-to-end pipelines built with Hugging Face libraries on Intel Hardware. Optimum Intel includes several techniques to accelerate models such as low-bit quantization, model weight pruning, distillation, and an accelerated runtime.\n\nThe runtime and optimizations included in Optimum Intel take advantage of Intel® Advanced Vector Extensions 512 (Intel® AVX-512), Vector Neural Network Instructions (VNNI) and Intel® Advanced Matrix Extensions (Intel® AMX) on Intel CPUs to accelerate models. Specifically, it has built-in BFloat16 (bf16) and int8 GEMM accelerators in every core to accelerate deep learning training and inference workloads. AMX accelerated inference is introduced in PyTorch 2.0 and Intel Extension for PyTorch (IPEX) in addition to other optimizations for various common operators.\n\nOptimizing pre-trained models can be done easily with Optimum Intel; many simple examples can be found here . Our blog is accompanied by a notebook for a step-by-step walkthrough.\n\nStep 1: Quantize the SetFit Model using 🤗 Optimum Intel\n\nIn order to optimize our SetFit model, we will apply quantization to the model body, using Intel Neural Compressor (INC), part of Optimum Intel.\n\nQuantization is a very popular deep learning model optimization technique for improving inference speeds. It minimizes the number of bits required to represent the weights and/or activations in a neural network. This is done by converting a set of high-precision numbers into a lower-bit data representations, such as INT8. Moreover, quantization can enable faster computations in lower precision.\n\nSpecifically, we'll apply post-training static quantization (PTQ). PTQ can reduce the memory footprint and latency for inference, while still preserving the accuracy of the model, with only a small unlabeled calibration set and without any training. Before you begin, make sure you have all the necessary libraries installed and that your version of Optimum Intel is at least 1.14.0 since the functionality was introduced in that version:\n\n```\npip install --upgrade-strategy eager optimum[ipex]\n```\n\nPrepare a Calibration Dataset\n\nThe calibration dataset should be able to represent the distribution of unseen data. In general, preparing 100 samples is enough for calibration. We'll use the rotten_tomatoes dataset in our case, since it’s composed of movie reviews, similar to our target dataset, sst2 .\n\nFirst, we’ll load 100 random samples from this dataset. Then, to prepare the dataset for quantization, we'll need to tokenize each example. We won’t need the “text” and “label” columns, so let’s remove them.\n\n```\ncalibration_set = load_dataset(\"rotten_tomatoes\", split=\"train\").shuffle(seed=42).select(range(100)) \n\ndef tokenize(examples):\n    return tokenizer(examples[\"text\"], padding=\"max_length\", max_length=512, truncation=True)\n \ntokenizer = setfit_model.model_body.tokenizer\ncalibration_set = calibration_set.map(tokenize, remove_columns=[\"text\", \"label\"])\n```\n\nBefore we run quantization, we need to define the desired quantization process - in our case - Static Post Training Quantization , and use optimum.intel to run the quantization on our calibration dataset:\n\n```\nfrom optimum.intel import INCQuantizer\nfrom neural_compressor.config import PostTrainingQuantConfig\n\nsetfit_body = setfit_model.model_body[0].auto_model\nquantizer = INCQuantizer.from_pretrained(setfit_body)\noptimum_model_path = \"/tmp/bge-small-en-v1.5_setfit-sst2-english_opt\"\nquantization_config = PostTrainingQuantConfig(approach=\"static\", backend=\"ipex\", domain=\"nlp\")\n\nquantizer.quantize(\n    quantization_config=quantization_config,\n    calibration_dataset=calibration_set,\n    save_directory=optimum_model_path,\n    batch_size=1,\n)\ntokenizer.save_pretrained(optimum_model_path)\n```\n\nThat’s it! We now have a local copy of our quantized SetFit model. Let’s test it out.\n\nStep 2: Benchmark Inference\n\nIn our notebook , we’ve set up a PerformanceBenchmark class to compute model latency and throughput, as well as an accuracy measure. Let’s use it to benchmark our Optimum Intel model with two other commonly used methods:\n\nUsing PyTorch and 🤗 Transformers library with fp32.\n\nUsing Intel Extension for PyTorch (IPEX) runtime with bf16 and tracing the model using TorchScript.\n\nLoad our test dataset, sst2 , and run the benchmark using PyTorch and 🤗 Transformers library:\n\n```\nfrom datasets import load_dataset\nfrom setfit import SetFitModel\ntest_dataset = load_dataset(\"SetFit/sst2\")[\"validation\"]\n\nmodel_path = \"dkorat/bge-small-en-v1.5_setfit-sst2-english\"\nsetfit_model = SetFitModel.from_pretrained(model_path)\npb = PerformanceBenchmark(\n    model=setfit_model,\n    dataset=test_dataset,\n    optim_type=\"bge-small (transformers)\",\n)\nperf_metrics = pb.run_benchmark()\n```\n\nFor the second benchmark, we'll use Intel Extension for PyTorch (IPEX) with bf16 precision and TorchScript tracing. To use IPEX we simply import the IPEX library and apply ipex.optimize() to the target model, which, in our case, is the SetFit (transformer) model body:\n\n```\ndtype = torch.bfloat16\nbody = ipex.optimize(setfit_model.model_body, dtype=dtype)\n```\n\nFor TorchScript tracing, we generate a random sequence based on the model's maximum input length, with tokens sampled from the tokenizer's vocabulary:\n\n```\ntokenizer = setfit_model.model_body.tokenizer\nd = generate_random_sequences(batch_size=1, length=tokenizer.model_max_length, vocab_size=tokenizer.vocab_size)\n\nbody = torch.jit.trace(body, (d,), check_trace=False, strict=False)\nsetfit_model.model_body = torch.jit.freeze(body)\n```\n\nNow let's run the benchmark using our quantized Optimum model. We’ll first need to define a wrapper around our SetFit model which plugs in our quantized model body at inference (instead of the original model body). Then, we can run the benchmark using this wrapper.\n\n```\nfrom optimum.intel import IPEXModel\n\nclass OptimumSetFitModel:\n    def __init__(self, setfit_model, model_body):\n        model_body.tokenizer = setfit_model.model_body.tokenizer\n        self.model_body = model_body\n        self.model_head = setfit_model.model_head\n\n\noptimum_model = IPEXModel.from_pretrained(optimum_model_path)\noptimum_setfit_model = OptimumSetFitModel(setfit_model, model_body=optimum_model)\n\npb = PerformanceBenchmark(\n    model=optimum_setfit_model,\n    dataset=test_dataset,\n    optim_type=f\"bge-small (optimum-int8)\",\n    model_path=optimum_model_path,\n    autocast_dtype=torch.bfloat16,\n)\nperf_metrics.update(pb.run_benchmark())\n```\n\nAccuracy vs latency at batch size=1\n\nbge-small (transformers) bge-small (ipex-bfloat16) bge-small (optimum-int8)\n\nWhen inspecting the performance at batch size 1, there’s a 3.45x reduction in latency with our optimized model. Note that this is achieved with virtually no drop in accuracy! It's also worth mentioning that the model size has shrunk by 2.85x .\n\nWe move on to our main focus, which is the reported throughputs with different batch sizes. Here, the optimization has garnered even greater speedups. When comparing the highest achievable throughput (at any batch size), the optimized model is 7.8x faster than the original transformers fp32 model!\n\nIn this blog post, we have showed how to use quantization capabilities present in 🤗 Optimum Intel to optimize SetFit models. After running a quick and easy post-training quantization procedure, we've observed that accuracy level was preserved, while inference throughput increased by 7.8x . This optimization method can be readily applied to any existing SetFit deployment running on Intel Xeon.\n\nLewis Tunstall, Nils Reimers, Unso Eun Seo Jo, Luke Bates, Daniel Korat, Moshe Wasserblat, Oren Pereg, 2022. \"Efficient Few-Shot Learning Without Prompts\". https://arxiv.org/abs/2209.11055\n\nMore Articles from our Blog\n\nCPU Optimized Embeddings with 🤗 Optimum Intel and fastRAG\n\nAccelerate StarCoder with 🤗 Optimum Intel on Xeon: Q8/Q4 and Speculative Decoding\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "SetFit is a promising solution for a common modeling problem: how to deal with lack of labeled data for training. Developed with Hugging Face’s research partners at Intel Labs and the UKP Lab, SetFit is an efficient framework for few-shot fine-tuning of Sentence Transformers models.\n\nSetFit achieves high accuracy with little labeled data - for example, SetFit outperforms GPT-3.5 in 3-shot prompting and with 5 shot it also outperforms 3-shot GPT-4 on the Banking 77 financial intent dataset.\n\nCompared to LLM based methods, SetFit has two unique advantages:\n\n🗣 No prompts or verbalisers: few-shot in-context learning with LLMs requires handcrafted prompts which make the results brittle, sensitive to phrasing and dependent on user expertise. SetFit dispenses with prompts altogether by generating rich embeddings directly from a small number of labeled text examples.\n\n🏎 Fast to train: SetFit doesn't rely on LLMs such as GPT-3.5 or Llama2 to achieve high accuracy. As a result, it is typically an order of magnitude (or more) faster to train and run inference with.\n\nFor more details on SetFit, check out our paper, blog, code, and data.\n\nSetfit has been widely adopted by the AI developer community, with ~100k downloads per month and ~1500 SetFit models on the Hub, and growing with an average of ~4 models per day!\n\n## Faster!\n\nIn this blog post, we'll explain how you can accelerate inference with SetFit by 7.8x on Intel CPUs, by optimizing your SetFit model with 🤗 Optimum Intel. We’ll show how you can achieve huge throughput gains by performing a simple post-training quantization step on your model. This can enable production-grade deployment of SetFit solutions using Intel Xeon CPUs.\n\nOptimum Intel is an open-source library that accelerates end-to-end pipelines built with Hugging Face libraries on Intel Hardware. Optimum Intel includes several techniques to accelerate models such as low-bit quantization, model weight pruning, distillation, and an accelerated runtime.\n\nThe runtime and optimizations included in Optimum Intel take advantage of Intel® Advanced Vector Extensions 512 (Intel® AVX-512), Vector Neural Network Instructions (VNNI) and Intel® Advanced Matrix Extensions (Intel® AMX) on Intel CPUs to accelerate models. Specifically, it has built-in BFloat16 (bf16) and int8 GEMM accelerators in every core to accelerate deep learning training and inference workloads. AMX accelerated inference is introduced in PyTorch 2.0 and Intel Extension for PyTorch (IPEX) in addition to other optimizations for various common operators.\n\nOptimizing pre-trained models can be done easily with Optimum Intel; many simple examples can be found here. Our blog is accompanied by a notebook for a step-by-step walkthrough.\n\n## Step 1: Quantize the SetFit Model using 🤗 Optimum Intel\n\nIn order to optimize our SetFit model, we will apply quantization to the model body, using Intel Neural Compressor (INC), part of Optimum Intel.\n\nQuantization is a very popular deep learning model optimization technique for improving inference speeds. It minimizes the number of bits required to represent the weights and/or activations in a neural network. This is done by converting a set of high-precision numbers into a lower-bit data representations, such as INT8. Moreover, quantization can enable faster computations in lower precision.\n\nSpecifically, we'll apply post-training static quantization (PTQ). PTQ can reduce the memory footprint and latency for inference, while still preserving the accuracy of the model, with only a small unlabeled calibration set and without any training. Before you begin, make sure you have all the necessary libraries installed and that your version of Optimum Intel is at least 1.14.0 since the functionality was introduced in that version:\n\n```\npip install --upgrade-strategy eager optimum[ipex]\n```\n\n### Prepare a Calibration Dataset\n\nThe calibration dataset should be able to represent the distribution of unseen data. In general, preparing 100 samples is enough for calibration. We'll use the rotten_tomatoes dataset in our case, since it’s composed of movie reviews, similar to our target dataset, sst2.\n\nFirst, we’ll load 100 random samples from this dataset. Then, to prepare the dataset for quantization, we'll need to tokenize each example. We won’t need the “text” and “label” columns, so let’s remove them.\n\n```\ncalibration_set = load_dataset(\"rotten_tomatoes\", split=\"train\").shuffle(seed=42).select(range(100)) \n\ndef tokenize(examples):\n    return tokenizer(examples[\"text\"], padding=\"max_length\", max_length=512, truncation=True)\n \ntokenizer = setfit_model.model_body.tokenizer\ncalibration_set = calibration_set.map(tokenize, remove_columns=[\"text\", \"label\"])\n```\n\n### Run Quantization\n\nBefore we run quantization, we need to define the desired quantization process - in our case - Static Post Training Quantization, and use optimum.intel to run the quantization on our calibration dataset:\n\n```\nfrom optimum.intel import INCQuantizer\nfrom neural_compressor.config import PostTrainingQuantConfig\n\nsetfit_body = setfit_model.model_body[0].auto_model\nquantizer = INCQuantizer.from_pretrained(setfit_body)\noptimum_model_path = \"/tmp/bge-small-en-v1.5_setfit-sst2-english_opt\"\nquantization_config = PostTrainingQuantConfig(approach=\"static\", backend=\"ipex\", domain=\"nlp\")\n\nquantizer.quantize(\n    quantization_config=quantization_config,\n    calibration_dataset=calibration_set,\n    save_directory=optimum_model_path,\n    batch_size=1,\n)\ntokenizer.save_pretrained(optimum_model_path)\n```\n\nThat’s it! We now have a local copy of our quantized SetFit model. Let’s test it out.\n\n## Step 2: Benchmark Inference\n\nIn our notebook, we’ve set up a PerformanceBenchmark class to compute model latency and throughput, as well as an accuracy measure. Let’s use it to benchmark our Optimum Intel model with two other commonly used methods:\n\n- Using PyTorch and 🤗 Transformers library with fp32.\n\n- Using Intel Extension for PyTorch (IPEX) runtime with bf16 and tracing the model using TorchScript.\n\nLoad our test dataset, sst2, and run the benchmark using PyTorch and 🤗 Transformers library:\n\n```\nfrom datasets import load_dataset\nfrom setfit import SetFitModel\ntest_dataset = load_dataset(\"SetFit/sst2\")[\"validation\"]\n\nmodel_path = \"dkorat/bge-small-en-v1.5_setfit-sst2-english\"\nsetfit_model = SetFitModel.from_pretrained(model_path)\npb = PerformanceBenchmark(\n    model=setfit_model,\n    dataset=test_dataset,\n    optim_type=\"bge-small (transformers)\",\n)\nperf_metrics = pb.run_benchmark()\n```\n\nFor the second benchmark, we'll use Intel Extension for PyTorch (IPEX) with bf16 precision and TorchScript tracing. To use IPEX we simply import the IPEX library and apply ipex.optimize() to the target model, which, in our case, is the SetFit (transformer) model body:\n\n```\ndtype = torch.bfloat16\nbody = ipex.optimize(setfit_model.model_body, dtype=dtype)\n```\n\nFor TorchScript tracing, we generate a random sequence based on the model's maximum input length, with tokens sampled from the tokenizer's vocabulary:\n\n```\ntokenizer = setfit_model.model_body.tokenizer\nd = generate_random_sequences(batch_size=1, length=tokenizer.model_max_length, vocab_size=tokenizer.vocab_size)\n\nbody = torch.jit.trace(body, (d,), check_trace=False, strict=False)\nsetfit_model.model_body = torch.jit.freeze(body)\n```\n\nNow let's run the benchmark using our quantized Optimum model. We’ll first need to define a wrapper around our SetFit model which plugs in our quantized model body at inference (instead of the original model body). Then, we can run the benchmark using this wrapper.\n\n```\nfrom optimum.intel import IPEXModel\n\nclass OptimumSetFitModel:\n    def __init__(self, setfit_model, model_body):\n        model_body.tokenizer = setfit_model.model_body.tokenizer\n        self.model_body = model_body\n        self.model_head = setfit_model.model_head\n\n\noptimum_model = IPEXModel.from_pretrained(optimum_model_path)\noptimum_setfit_model = OptimumSetFitModel(setfit_model, model_body=optimum_model)\n\npb = PerformanceBenchmark(\n    model=optimum_setfit_model,\n    dataset=test_dataset,\n    optim_type=f\"bge-small (optimum-int8)\",\n    model_path=optimum_model_path,\n    autocast_dtype=torch.bfloat16,\n)\nperf_metrics.update(pb.run_benchmark())\n```\n\n## Results\n\nAccuracy vs latency at batch size=1\n\n—\n\nbge-small (transformers)\n\nbge-small (ipex-bfloat16)\n\nbge-small (optimum-int8)\n\nModel Size\n\n127.32 MB\n\n63.74 MB\n\n44.65 MB\n\nAccuracy on test set\n\n88.4%\n\n88.4%\n\n88.1%\n\nLatency (bs=1)\n\n15.69 +/- 0.57 ms\n\n5.67 +/- 0.66 ms\n\n4.55 +/- 0.25 ms\n\nWhen inspecting the performance at batch size 1, there’s a 3.45x reduction in latency with our optimized model. Note that this is achieved with virtually no drop in accuracy! It's also worth mentioning that the model size has shrunk by 2.85x.\n\nWe move on to our main focus, which is the reported throughputs with different batch sizes. Here, the optimization has garnered even greater speedups. When comparing the highest achievable throughput (at any batch size), the optimized model is 7.8x faster than the original transformers fp32 model!\n\n## Summary\n\nIn this blog post, we have showed how to use quantization capabilities present in 🤗 Optimum Intel to optimize SetFit models. After running a quick and easy post-training quantization procedure, we've observed that accuracy level was preserved, while inference throughput increased by 7.8x. This optimization method can be readily applied to any existing SetFit deployment running on Intel Xeon.\n\n## References\n\n- Lewis Tunstall, Nils Reimers, Unso Eun Seo Jo, Luke Bates, Daniel Korat, Moshe Wasserblat, Oren Pereg, 2022. \"Efficient Few-Shot Learning Without Prompts\". https://arxiv.org/abs/2209.11055",
   "summaryZh": "本文介绍了如何利用Hugging Face的Optimum Intel库对SetFit模型进行优化，在Intel Xeon CPU上实现了7.8倍的推理加速。SetFit作为一种高效的少样本微调框架，通过后训练量化技术，在保持高精度的同时大幅提升了吞吐量，为生产环境下的轻量级模型部署提供了切实可行的方案。",
   "summaryGeneratedAt": "2026-09-05T15:47:29.843809Z",
   "summaryModel": "gemini:gemini-3.1-flash-lite",
@@ -76,5 +76,720 @@
       }
     ],
     "duplicateKey": "setfit-intel-optimization"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/178_setfit_optimum_intel/latency.png",
+      "originalUrl": "https://huggingface.co/blog/assets/178_setfit_optimum_intel/latency.png",
+      "alt": "",
+      "id": "image_f865f506b38d4b38"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/178_setfit_optimum_intel/throughput.png",
+      "originalUrl": "https://huggingface.co/blog/assets/178_setfit_optimum_intel/throughput.png",
+      "alt": "",
+      "id": "image_f590a3f2d3dc30fc"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "SetFit is a promising solution for a common modeling problem: how to deal with lack of labeled data for training. Developed with Hugging Face’s research partners at Intel Labs and the UKP Lab, SetFit is an efficient framework for few-shot fine-tuning of Sentence Transformers models.",
+      "spans": [
+        {
+          "start": 165,
+          "end": 175,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/research/overview.html"
+        },
+        {
+          "start": 184,
+          "end": 191,
+          "kind": "a",
+          "href": "https://www.informatik.tu-darmstadt.de/ukp/ukp_home/index.en.jsp"
+        },
+        {
+          "start": 254,
+          "end": 275,
+          "kind": "a",
+          "href": "https://sbert.net/"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "SetFit achieves high accuracy with little labeled data - for example, SetFit outperforms GPT-3.5 in 3-shot prompting and with 5 shot it also outperforms 3-shot GPT-4 on the Banking 77 financial intent dataset.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 88,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2311.06102.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Compared to LLM based methods, SetFit has two unique advantages:",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "🗣 No prompts or verbalisers: few-shot in-context learning with LLMs requires handcrafted prompts which make the results brittle, sensitive to phrasing and dependent on user expertise. SetFit dispenses with prompts altogether by generating rich embeddings directly from a small number of labeled text examples.",
+      "spans": [
+        {
+          "start": 2,
+          "end": 27,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "🏎 Fast to train: SetFit doesn't rely on LLMs such as GPT-3.5 or Llama2 to achieve high accuracy. As a result, it is typically an order of magnitude (or more) faster to train and run inference with.",
+      "spans": [
+        {
+          "start": 2,
+          "end": 15,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "For more details on SetFit, check out our paper, blog, code, and data.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 47,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2209.11055"
+        },
+        {
+          "start": 49,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/setfit"
+        },
+        {
+          "start": 55,
+          "end": 59,
+          "kind": "a",
+          "href": "https://github.com/huggingface/setfit"
+        },
+        {
+          "start": 65,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/SetFit"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Setfit has been widely adopted by the AI developer community, with ~100k downloads per month and ~1500 SetFit models on the Hub, and growing with an average of ~4 models per day!",
+      "spans": [
+        {
+          "start": 97,
+          "end": 102,
+          "kind": "a",
+          "href": "https://huggingface.co/models?library=setfit"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Faster!",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "In this blog post, we'll explain how you can accelerate inference with SetFit by 7.8x on Intel CPUs, by optimizing your SetFit model with 🤗 Optimum Intel. We’ll show how you can achieve huge throughput gains by performing a simple post-training quantization step on your model. This can enable production-grade deployment of SetFit solutions using Intel Xeon CPUs.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 85,
+          "kind": "strong"
+        },
+        {
+          "start": 140,
+          "end": 153,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Optimum Intel is an open-source library that accelerates end-to-end pipelines built with Hugging Face libraries on Intel Hardware. Optimum Intel includes several techniques to accelerate models such as low-bit quantization, model weight pruning, distillation, and an accelerated runtime.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "The runtime and optimizations included in Optimum Intel take advantage of Intel® Advanced Vector Extensions 512 (Intel® AVX-512), Vector Neural Network Instructions (VNNI) and Intel® Advanced Matrix Extensions (Intel® AMX) on Intel CPUs to accelerate models. Specifically, it has built-in BFloat16 (bf16) and int8 GEMM accelerators in every core to accelerate deep learning training and inference workloads. AMX accelerated inference is introduced in PyTorch 2.0 and Intel Extension for PyTorch (IPEX) in addition to other optimizations for various common operators.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 55,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        },
+        {
+          "start": 289,
+          "end": 297,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Bfloat16_floating-point_format"
+        },
+        {
+          "start": 467,
+          "end": 494,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Optimizing pre-trained models can be done easily with Optimum Intel; many simple examples can be found here. Our blog is accompanied by a notebook for a step-by-step walkthrough.",
+      "spans": [
+        {
+          "start": 103,
+          "end": 107,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/main/en/intel/optimization_inc"
+        },
+        {
+          "start": 138,
+          "end": 146,
+          "kind": "a",
+          "href": "https://github.com/huggingface/setfit/blob/main/notebooks/setfit-optimum-intel.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Step 1: Quantize the SetFit Model using 🤗 Optimum Intel",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "In order to optimize our SetFit model, we will apply quantization to the model body, using Intel Neural Compressor (INC), part of Optimum Intel.",
+      "spans": [
+        {
+          "start": 91,
+          "end": 114,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Quantization is a very popular deep learning model optimization technique for improving inference speeds. It minimizes the number of bits required to represent the weights and/or activations in a neural network. This is done by converting a set of high-precision numbers into a lower-bit data representations, such as INT8. Moreover, quantization can enable faster computations in lower precision.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Specifically, we'll apply post-training static quantization (PTQ). PTQ can reduce the memory footprint and latency for inference, while still preserving the accuracy of the model, with only a small unlabeled calibration set and without any training. Before you begin, make sure you have all the necessary libraries installed and that your version of Optimum Intel is at least 1.14.0 since the functionality was introduced in that version:",
+      "spans": [
+        {
+          "start": 376,
+          "end": 382,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Prepare a Calibration Dataset",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "The calibration dataset should be able to represent the distribution of unseen data. In general, preparing 100 samples is enough for calibration. We'll use the rotten_tomatoes dataset in our case, since it’s composed of movie reviews, similar to our target dataset, sst2.",
+      "spans": [
+        {
+          "start": 160,
+          "end": 175,
+          "kind": "code"
+        },
+        {
+          "start": 266,
+          "end": 270,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "First, we’ll load 100 random samples from this dataset. Then, to prepare the dataset for quantization, we'll need to tokenize each example. We won’t need the “text” and “label” columns, so let’s remove them.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Run Quantization",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Before we run quantization, we need to define the desired quantization process - in our case - Static Post Training Quantization, and use optimum.intel to run the quantization on our calibration dataset:",
+      "spans": [
+        {
+          "start": 95,
+          "end": 128,
+          "kind": "strong"
+        },
+        {
+          "start": 138,
+          "end": 151,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "That’s it! We now have a local copy of our quantized SetFit model. Let’s test it out.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Step 2: Benchmark Inference",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "In our notebook, we’ve set up a PerformanceBenchmark class to compute model latency and throughput, as well as an accuracy measure. Let’s use it to benchmark our Optimum Intel model with two other commonly used methods:",
+      "spans": [
+        {
+          "start": 7,
+          "end": 15,
+          "kind": "a",
+          "href": "https://github.com/huggingface/setfit/blob/main/notebooks/setfit-optimum-intel.ipynb"
+        },
+        {
+          "start": 32,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Using PyTorch and 🤗 Transformers library with fp32.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Using Intel Extension for PyTorch (IPEX) runtime with bf16 and tracing the model using TorchScript.",
+      "spans": [
+        {
+          "start": 6,
+          "end": 33,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Load our test dataset, sst2, and run the benchmark using PyTorch and 🤗 Transformers library:",
+      "spans": [
+        {
+          "start": 23,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "For the second benchmark, we'll use Intel Extension for PyTorch (IPEX) with bf16 precision and TorchScript tracing. To use IPEX we simply import the IPEX library and apply ipex.optimize() to the target model, which, in our case, is the SetFit (transformer) model body:",
+      "spans": [
+        {
+          "start": 36,
+          "end": 63,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        },
+        {
+          "start": 172,
+          "end": 187,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "For TorchScript tracing, we generate a random sequence based on the model's maximum input length, with tokens sampled from the tokenizer's vocabulary:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Now let's run the benchmark using our quantized Optimum model. We’ll first need to define a wrapper around our SetFit model which plugs in our quantized model body at inference (instead of the original model body). Then, we can run the benchmark using this wrapper.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Results",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Accuracy vs latency at batch size=1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "bge-small (transformers)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "bge-small (ipex-bfloat16)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "bge-small (optimum-int8)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "Model Size",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "127.32 MB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "63.74 MB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "44.65 MB",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "Accuracy on test set",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "88.4%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "88.4%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "88.1%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "Latency (bs=1)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "15.69 +/- 0.57 ms",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "5.67 +/- 0.66 ms",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "4.55 +/- 0.25 ms",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "When inspecting the performance at batch size 1, there’s a 3.45x reduction in latency with our optimized model. Note that this is achieved with virtually no drop in accuracy! It's also worth mentioning that the model size has shrunk by 2.85x.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 85,
+          "kind": "strong"
+        },
+        {
+          "start": 236,
+          "end": 241,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "We move on to our main focus, which is the reported throughputs with different batch sizes. Here, the optimization has garnered even greater speedups. When comparing the highest achievable throughput (at any batch size), the optimized model is 7.8x faster than the original transformers fp32 model!",
+      "spans": [
+        {
+          "start": 244,
+          "end": 298,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Summary",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "In this blog post, we have showed how to use quantization capabilities present in 🤗 Optimum Intel to optimize SetFit models. After running a quick and easy post-training quantization procedure, we've observed that accuracy level was preserved, while inference throughput increased by 7.8x. This optimization method can be readily applied to any existing SetFit deployment running on Intel Xeon.",
+      "spans": [
+        {
+          "start": 284,
+          "end": 288,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Lewis Tunstall, Nils Reimers, Unso Eun Seo Jo, Luke Bates, Daniel Korat, Moshe Wasserblat, Oren Pereg, 2022. \"Efficient Few-Shot Learning Without Prompts\". https://arxiv.org/abs/2209.11055",
+      "spans": [
+        {
+          "start": 156,
+          "end": 188,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2209.11055"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "cd6755b50e283f23cef599d882f1054eab1b246f673c0824a744560423df6805",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install --upgrade-strategy eager optimum[ipex]"
+    },
+    {
+      "id": "c0002",
+      "source": "calibration_set = load_dataset(\"rotten_tomatoes\", split=\"train\").shuffle(seed=42).select(range(100)) \n\ndef tokenize(examples):\n    return tokenizer(examples[\"text\"], padding=\"max_length\", max_length=512, truncation=True)\n \ntokenizer = setfit_model.model_body.tokenizer\ncalibration_set = calibration_set.map(tokenize, remove_columns=[\"text\", \"label\"])"
+    },
+    {
+      "id": "c0003",
+      "source": "from optimum.intel import INCQuantizer\nfrom neural_compressor.config import PostTrainingQuantConfig\n\nsetfit_body = setfit_model.model_body[0].auto_model\nquantizer = INCQuantizer.from_pretrained(setfit_body)\noptimum_model_path = \"/tmp/bge-small-en-v1.5_setfit-sst2-english_opt\"\nquantization_config = PostTrainingQuantConfig(approach=\"static\", backend=\"ipex\", domain=\"nlp\")\n\nquantizer.quantize(\n    quantization_config=quantization_config,\n    calibration_dataset=calibration_set,\n    save_directory=optimum_model_path,\n    batch_size=1,\n)\ntokenizer.save_pretrained(optimum_model_path)"
+    },
+    {
+      "id": "c0004",
+      "source": "from datasets import load_dataset\nfrom setfit import SetFitModel\ntest_dataset = load_dataset(\"SetFit/sst2\")[\"validation\"]\n\nmodel_path = \"dkorat/bge-small-en-v1.5_setfit-sst2-english\"\nsetfit_model = SetFitModel.from_pretrained(model_path)\npb = PerformanceBenchmark(\n    model=setfit_model,\n    dataset=test_dataset,\n    optim_type=\"bge-small (transformers)\",\n)\nperf_metrics = pb.run_benchmark()"
+    },
+    {
+      "id": "c0005",
+      "source": "dtype = torch.bfloat16\nbody = ipex.optimize(setfit_model.model_body, dtype=dtype)"
+    },
+    {
+      "id": "c0006",
+      "source": "tokenizer = setfit_model.model_body.tokenizer\nd = generate_random_sequences(batch_size=1, length=tokenizer.model_max_length, vocab_size=tokenizer.vocab_size)\n\nbody = torch.jit.trace(body, (d,), check_trace=False, strict=False)\nsetfit_model.model_body = torch.jit.freeze(body)"
+    },
+    {
+      "id": "c0007",
+      "source": "from optimum.intel import IPEXModel\n\nclass OptimumSetFitModel:\n    def __init__(self, setfit_model, model_body):\n        model_body.tokenizer = setfit_model.model_body.tokenizer\n        self.model_body = model_body\n        self.model_head = setfit_model.model_head\n\n\noptimum_model = IPEXModel.from_pretrained(optimum_model_path)\noptimum_setfit_model = OptimumSetFitModel(setfit_model, model_body=optimum_model)\n\npb = PerformanceBenchmark(\n    model=optimum_setfit_model,\n    dataset=test_dataset,\n    optim_type=f\"bge-small (optimum-int8)\",\n    model_path=optimum_model_path,\n    autocast_dtype=torch.bfloat16,\n)\nperf_metrics.update(pb.run_benchmark())"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "cd6755b50e283f23cef599d882f1054eab1b246f673c0824a744560423df6805",
+  "mediaLayout": [
+    {
+      "mediaId": "image_f865f506b38d4b38",
+      "type": "image",
+      "afterBlockId": "b0031",
+      "order": 0
+    },
+    {
+      "mediaId": "image_f590a3f2d3dc30fc",
+      "type": "image",
+      "afterBlockId": "b0049",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T10:06:20.805742Z",
+  "mediaLayoutCheckedAt": "2026-10-04T10:06:20.805752Z"
 }

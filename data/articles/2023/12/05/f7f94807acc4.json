@@ -19,8 +19,8 @@
   "fetchedAt": "2026-08-30T11:10:38.237218Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "Goodbye cold boot - how we made LoRA Inference 300% faster\n\nPublished December 5, 2023\n\ntl;dr: We swap the Stable Diffusion LoRA adapters per user request, while keeping the base model warm allowing fast LoRA inference across multiple users. You can experience this by browsing our LoRA catalogue and playing with the inference widget.\n\nIn this blog we will go in detail over how we achieved that.\n\nWe've been able to drastically speed up inference in the Hub for public LoRAs based on public Diffusion models. This has allowed us to save compute resources and provide a faster and better user experience.\n\nTo perform inference on a given model, there are two steps:\n\nWarm up phase - that consists in downloading the model and setting up the service (25s).\n\nThen the inference job itself (10s).\n\nWith the improvements, we were able to reduce the warm up time from 25s to 3s. We are now able to serve inference for hundreds of distinct LoRAs, with less than 5 A10G GPUs, while the response time to user requests decreased from 35s to 13s.\n\nLet's talk more about how we can leverage some recent features developed in the Diffusers library to serve many distinct LoRAs in a dynamic fashion with one single service.\n\nLoRA is a fine-tuning technique that belongs to the family of \"parameter-efficient\" (PEFT) methods, which try to reduce the number of trainable parameters affected by the fine-tuning process. It increases fine-tuning speed while reducing the size of fine-tuned checkpoints.\n\nInstead of fine-tuning the model by performing tiny changes to all its weights, we freeze most of the layers and only train a few specific ones in the attention blocks. Furthermore, we avoid touching the parameters of those layers by adding the product of two smaller matrices to the original weights. Those small matrices are the ones whose weights are updated during the fine-tuning process, and then saved to disk. This means that all of the model original parameters are preserved, and we can load the LoRA weights on top using an adaptation method.\n\nThe LoRA name (Low Rank Adaptation) comes from the small matrices we mentioned. For more information about the method, please refer to this post or the original paper .\n\nThe diagram above shows two smaller orange matrices that are saved as part of the LoRA adapter. We can later load the LoRA adapter and merge it with the blue base model to obtain the yellow fine-tuned model. Crucially, unloading the adapter is also possible so we can revert back to the original base model at any point.\n\nIn other words, the LoRA adapter is like an add-on of a base model that can be added and removed on demand. And because of A and B smaller ranks, it is very light in comparison with the model size. Therefore, loading is much faster than loading the whole base model.\n\nIf you look, for example, inside the Stable Diffusion XL Base 1.0 model repo , which is widely used as a base model for many LoRA adapters, you can see that its size is around 7 GB . However, typical LoRA adapters like this one take a mere 24 MB of space !\n\nThere are far less blue base models than there are yellow ones on the Hub. If we can go quickly from the blue to yellow one and vice versa, then we have a way serve many distinct yellow models with only a few distinct blue deployments.\n\nFor a more exhaustive presentation on what LoRA is, please refer to the following blog post: Using LoRA for Efficient Stable Diffusion Fine-Tuning , or refer directly to the original paper .\n\nWe have approximately 2500 distinct public LoRAs on the Hub. The vast majority ( ~92% ) of them are LoRAs based on the Stable Diffusion XL Base 1.0 model.\n\nBefore this mutualization, this would have meant deploying a dedicated service for all of them (eg. for all the yellow merged matrices in the diagram above); releasing + reserving at least one new GPU. The time to spawn the service and have it ready to serve requests for a specific model is approximately 25s , then on top of this you have the inference time ( ~10s for a 1024x1024 SDXL inference diffusion with 25 inference steps on an A10G). If an adapter is only occasionally requested, its service gets stopped to free resources preempted by others.\n\nIf you were requesting a LoRA that was not so popular, even if it was based on the SDXL model like the vast majority of adapters found on the Hub so far, it would have required 35s to warm it up and get an answer on the first request (the following ones would have taken the inference time, eg. 10s ).\n\nNow: request time has decreased from 35s to 13s since adapters will use only a few distinct \"blue\" base models (like 2 significant ones for Diffusion). Even if your adapter is not so popular, there is a good chance that its \"blue\" service is already warmed up. In other words, there is a good chance that you avoid the 25s warm up time, even if you do not request your model that often. The blue model is already downloaded and ready, all we have to do is unload the previous adapter and load the new one, which takes 3s as we see below .\n\nOverall, this requires less GPUs to serve all distinct models, even though we already had a way to share GPUs between deployments to maximize their compute usage. In a 2min time frame, there are approximately 10 distinct LoRA weights that are requested. Instead of spawning 10 deployments, and keeping them warm, we simply serve all of them with 1 to 2 GPUs (or more if there is a request burst).\n\nWe implemented LoRA mutualization in the Inference API. When a request is performed on a model available in our platform, we first determine whether this is a LoRA or not. We then identify the base model for the LoRA and route the request to a common backend farm, with the ability to serve requests for the said model. Inference requests get served by keeping the base model warm and loading/unloading LoRAs on the fly. This way we can ultimately reuse the same compute resources to serve many distinct models at once.\n\nIn the Hub, LoRAs can be identified with two attributes:\n\nA LoRA will have a base_model attribute. This is simply the model which the LoRA was built for and should be applied to when performing inference.\n\nBecause LoRAs are not the only models with such an attribute (any duplicated model will have one), a LoRA will also need a lora tag to be properly identified.\n\nLoading/Offloading LoRA for Diffusers 🧨\n\nNote that there is a more seemless way to perform the same as what is presented in this section using the peft library. Please refer to the documentation for more details. The principle remains the same as below (going from/to the blue box to/from the yellow one in the diagram above)\n\n4 functions are used in the Diffusers library to load and unload distinct LoRA weights:\n\nload_lora_weights and fuse_lora for loading and merging weights with the main layers. Note that merging weights with the main model before performing inference can decrease the inference time by 30%.\n\nunload_lora_weights and unfuse_lora for unloading.\n\nWe provide an example below on how one can leverage the Diffusers library to quickly load several LoRA weights on top of a base model:\n\n```\nimport torch\n\n\nfrom diffusers import (\n    AutoencoderKL,\n    DiffusionPipeline,\n)\n\nimport time\n\nbase = \"stabilityai/stable-diffusion-xl-base-1.0\"\n\nadapter1 = 'nerijs/pixel-art-xl'\nweightname1 = 'pixel-art-xl.safetensors'\n\nadapter2 = 'minimaxir/sdxl-wrong-lora'\nweightname2 = None\n\ninputs = \"elephant\"\nkwargs = {}\n\nif torch.cuda.is_available():\n    kwargs[\"torch_dtype\"] = torch.float16\n\nstart = time.time()\n\n# Load VAE compatible with fp16 created by madebyollin\nvae = AutoencoderKL.from_pretrained(\n    \"madebyollin/sdxl-vae-fp16-fix\",\n    torch_dtype=torch.float16,\n)\nkwargs[\"vae\"] = vae\nkwargs[\"variant\"] = \"fp16\"\n\nmodel = DiffusionPipeline.from_pretrained(\n    base, **kwargs\n)\n\nif torch.cuda.is_available():\n    model.to(\"cuda\")\n\nelapsed = time.time() - start\n\nprint(f\"Base model loaded, elapsed {elapsed:.2f} seconds\")\n\n\ndef inference(adapter, weightname):\n    start = time.time()\n    model.load_lora_weights(adapter, weight_name=weightname)\n    # Fusing lora weights with the main layers improves inference time by 30 % !\n    model.fuse_lora()\n    elapsed = time.time() - start\n\n    print(f\"LoRA adapter loaded and fused to main model, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    data = model(inputs, num_inference_steps=25).images[0]\n    elapsed = time.time() - start\n    print(f\"Inference time, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    model.unfuse_lora()\n    model.unload_lora_weights()\n    elapsed = time.time() - start\n    print(f\"LoRA adapter unfused/unloaded from base model, elapsed {elapsed:.2f} seconds\")\n\n\ninference(adapter1, weightname1)\ninference(adapter2, weightname2)\n```\n\nAll numbers below are in seconds:\n\nBase model loading - not cached\n\nBase model loading - cached\n\nWith 2 to 4 additional seconds per inference, we can serve many distinct LoRAs. However, on an A10G GPU, the inference time decreases by a lot while the adapters loading time does not change much, so the LoRA's loading/unloading is relatively more expensive.\n\nTo serve inference requests, we use this open source community image\n\nYou can find the previously described mechanism used in the TextToImagePipeline class.\n\nWhen a LoRA is requested, we'll look at the one that is loaded and change it only if required, then we perform inference as usual. This way, we are able to serve requests for the base model and many distinct adapters.\n\nBelow is an example on how you can test and request this image:\n\n```\n$ git clone https://github.com/huggingface/api-inference-community.git\n\n$ cd api-inference-community/docker_images/diffusers\n\n$ docker build -t test:1.0 -f Dockerfile .\n\n$ cat > /tmp/env_file <<'EOF'\nMODEL_ID=stabilityai/stable-diffusion-xl-base-1.0\nTASK=text-to-image\nHF_XET_HIGH_PERFORMANCE=1\nEOF\n\n$ docker run --gpus all --rm --name test1 --env-file /tmp/env_file_minimal -p 8888:80 -it test:1.0\n```\n\nThen in another terminal perform requests to the base model and/or miscellaneous LoRA adapters to be found on the HF Hub.\n\n```\n# Request the base model\n$ curl 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/base.jpg\n\n# Request one adapter\n$ curl -H 'lora: minimaxir/sdxl-wrong-lora' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter1.jpg\n\n# Request another one\n$ curl -H 'lora: nerijs/pixel-art-xl' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter2.jpg\n```\n\nRecently a really interesting paper came out, that described how to increase the throughput by performing batched inference on LoRA models. In short, all inference requests would be gathered in a batch, the computation related to the common base model would be done all at once, then the remaining adapter-specific products would be computed. We did not implement such a technique (close to the approach adopted in text-generation-inference for LLMs). Instead, we stuck to single sequential inference requests. The reason is that we observed that batching was not interesting for diffusers: throughput does not increase significantly with batch size. On the simple image generation benchmark we performed, it only increased 25% for a batch size of 8, in exchange for 6 times increased latency! Comparatively, batching is far more interesting for LLMs because you get 8 times the sequential throughput with only a 10% latency increase. This is the reason why we did not implement batching for diffusers.\n\nUsing dynamic LoRA loading, we were able to save compute resources and improve the user experience in the Hub Inference API. Despite the extra time added by the process of unloading the previously loaded adapter and loading the one we're interested in, the fact that the serving process is most often already up and running makes the inference time response on the whole much shorter.\n\nNote that for a LoRA to benefit from this inference optimization on the Hub, it must both be public, non-gated and based on a non-gated public model. Please do let us know if you apply the same method to your deployment!\n\nModels mentioned in this article 2\n\nMore Articles from our Blog\n\nBeyond LoRA: Can you beat the most popular fine-tuning technique?\n\nguide collaboration diffusers\n\nLoRA training scripts of the world, unite!\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "tl;dr: We swap the Stable Diffusion LoRA adapters per user request, while keeping the base model warm allowing fast LoRA inference across multiple users. You can experience this by browsing our LoRA catalogue and playing with the inference widget.\n\nIn this blog we will go in detail over how we achieved that.\n\nWe've been able to drastically speed up inference in the Hub for public LoRAs based on public Diffusion models. This has allowed us to save compute resources and provide a faster and better user experience.\n\nTo perform inference on a given model, there are two steps:\n\n- Warm up phase - that consists in downloading the model and setting up the service (25s).\n\n- Then the inference job itself (10s).\n\nWith the improvements, we were able to reduce the warm up time from 25s to 3s. We are now able to serve inference for hundreds of distinct LoRAs, with less than 5 A10G GPUs, while the response time to user requests decreased from 35s to 13s.\n\nLet's talk more about how we can leverage some recent features developed in the Diffusers library to serve many distinct LoRAs in a dynamic fashion with one single service.\n\n## LoRA\n\nLoRA is a fine-tuning technique that belongs to the family of \"parameter-efficient\" (PEFT) methods, which try to reduce the number of trainable parameters affected by the fine-tuning process. It increases fine-tuning speed while reducing the size of fine-tuned checkpoints.\n\nInstead of fine-tuning the model by performing tiny changes to all its weights, we freeze most of the layers and only train a few specific ones in the attention blocks. Furthermore, we avoid touching the parameters of those layers by adding the product of two smaller matrices to the original weights. Those small matrices are the ones whose weights are updated during the fine-tuning process, and then saved to disk. This means that all of the model original parameters are preserved, and we can load the LoRA weights on top using an adaptation method.\n\nThe LoRA name (Low Rank Adaptation) comes from the small matrices we mentioned. For more information about the method, please refer to this post or the original paper.\n\nThe diagram above shows two smaller orange matrices that are saved as part of the LoRA adapter. We can later load the LoRA adapter and merge it with the blue base model to obtain the yellow fine-tuned model. Crucially, unloading the adapter is also possible so we can revert back to the original base model at any point.\n\nIn other words, the LoRA adapter is like an add-on of a base model that can be added and removed on demand. And because of A and B smaller ranks, it is very light in comparison with the model size. Therefore, loading is much faster than loading the whole base model.\n\nIf you look, for example, inside the Stable Diffusion XL Base 1.0 model repo, which is widely used as a base model for many LoRA adapters, you can see that its size is around 7 GB. However, typical LoRA adapters like this one take a mere 24 MB of space !\n\nThere are far less blue base models than there are yellow ones on the Hub. If we can go quickly from the blue to yellow one and vice versa, then we have a way serve many distinct yellow models with only a few distinct blue deployments.\n\nFor a more exhaustive presentation on what LoRA is, please refer to the following blog post:Using LoRA for Efficient Stable Diffusion Fine-Tuning, or refer directly to the original paper.\n\n## Benefits\n\nWe have approximately 2500 distinct public LoRAs on the Hub. The vast majority (~92%) of them are LoRAs based on the Stable Diffusion XL Base 1.0 model.\n\nBefore this mutualization, this would have meant deploying a dedicated service for all of them (eg. for all the yellow merged matrices in the diagram above); releasing + reserving at least one new GPU. The time to spawn the service and have it ready to serve requests for a specific model is approximately 25s, then on top of this you have the inference time (~10s for a 1024x1024 SDXL inference diffusion with 25 inference steps on an A10G). If an adapter is only occasionally requested, its service gets stopped to free resources preempted by others.\n\nIf you were requesting a LoRA that was not so popular, even if it was based on the SDXL model like the vast majority of adapters found on the Hub so far, it would have required 35s to warm it up and get an answer on the first request (the following ones would have taken the inference time, eg. 10s).\n\nNow: request time has decreased from 35s to 13s since adapters will use only a few distinct \"blue\" base models (like 2 significant ones for Diffusion). Even if your adapter is not so popular, there is a good chance that its \"blue\" service is already warmed up. In other words, there is a good chance that you avoid the 25s warm up time, even if you do not request your model that often. The blue model is already downloaded and ready, all we have to do is unload the previous adapter and load the new one, which takes 3s as we see below.\n\nOverall, this requires less GPUs to serve all distinct models, even though we already had a way to share GPUs between deployments to maximize their compute usage. In a 2min time frame, there are approximately 10 distinct LoRA weights that are requested. Instead of spawning 10 deployments, and keeping them warm, we simply serve all of them with 1 to 2 GPUs (or more if there is a request burst).\n\n## Implementation\n\nWe implemented LoRA mutualization in the Inference API. When a request is performed on a model available in our platform, we first determine whether this is a LoRA or not. We then identify the base model for the LoRA and route the request to a common backend farm, with the ability to serve requests for the said model. Inference requests get served by keeping the base model warm and loading/unloading LoRAs on the fly. This way we can ultimately reuse the same compute resources to serve many distinct models at once.\n\n### LoRA structure\n\nIn the Hub, LoRAs can be identified with two attributes:\n\nA LoRA will have a base_model attribute. This is simply the model which the LoRA was built for and should be applied to when performing inference.\n\nBecause LoRAs are not the only models with such an attribute (any duplicated model will have one), a LoRA will also need a lora tag to be properly identified.\n\n### Loading/Offloading LoRA for Diffusers 🧨\n\nNote that there is a more seemless way to perform the same as what is presented in this section using the peft library. Please refer to the documentation for more details. The principle remains the same as below (going from/to the blue box to/from the yellow one in the diagram above)\n\n4 functions are used in the Diffusers library to load and unload distinct LoRA weights:\n\nload_lora_weights and fuse_lora for loading and merging weights with the main layers. Note that merging weights with the main model before performing inference can decrease the inference time by 30%.\n\nunload_lora_weights and unfuse_lora for unloading.\n\nWe provide an example below on how one can leverage the Diffusers library to quickly load several LoRA weights on top of a base model:\n\n```\nimport torch\n\n\nfrom diffusers import (\n    AutoencoderKL,\n    DiffusionPipeline,\n)\n\nimport time\n\nbase = \"stabilityai/stable-diffusion-xl-base-1.0\"\n\nadapter1 = 'nerijs/pixel-art-xl'\nweightname1 = 'pixel-art-xl.safetensors'\n\nadapter2 = 'minimaxir/sdxl-wrong-lora'\nweightname2 = None\n\ninputs = \"elephant\"\nkwargs = {}\n\nif torch.cuda.is_available():\n    kwargs[\"torch_dtype\"] = torch.float16\n\nstart = time.time()\n\n# Load VAE compatible with fp16 created by madebyollin\nvae = AutoencoderKL.from_pretrained(\n    \"madebyollin/sdxl-vae-fp16-fix\",\n    torch_dtype=torch.float16,\n)\nkwargs[\"vae\"] = vae\nkwargs[\"variant\"] = \"fp16\"\n\nmodel = DiffusionPipeline.from_pretrained(\n    base, **kwargs\n)\n\nif torch.cuda.is_available():\n    model.to(\"cuda\")\n\nelapsed = time.time() - start\n\nprint(f\"Base model loaded, elapsed {elapsed:.2f} seconds\")\n\n\ndef inference(adapter, weightname):\n    start = time.time()\n    model.load_lora_weights(adapter, weight_name=weightname)\n    # Fusing lora weights with the main layers improves inference time by 30 % !\n    model.fuse_lora()\n    elapsed = time.time() - start\n\n    print(f\"LoRA adapter loaded and fused to main model, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    data = model(inputs, num_inference_steps=25).images[0]\n    elapsed = time.time() - start\n    print(f\"Inference time, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    model.unfuse_lora()\n    model.unload_lora_weights()\n    elapsed = time.time() - start\n    print(f\"LoRA adapter unfused/unloaded from base model, elapsed {elapsed:.2f} seconds\")\n\n\ninference(adapter1, weightname1)\ninference(adapter2, weightname2)\n```\n\n## Loading figures\n\nAll numbers below are in seconds:\n\nGPU\n\nT4\n\nA10G\n\nBase model loading - not cached\n\n20\n\n20\n\nBase model loading - cached\n\n5.95\n\n4.09\n\nAdapter 1 loading\n\n3.07\n\n3.46\n\nAdapter 1 unloading\n\n0.52\n\n0.28\n\nAdapter 2 loading\n\n1.44\n\n2.71\n\nAdapter 2 unloading\n\n0.19\n\n0.13\n\nInference time\n\n20.7\n\n8.5\n\nWith 2 to 4 additional seconds per inference, we can serve many distinct LoRAs. However, on an A10G GPU, the inference time decreases by a lot while the adapters loading time does not change much, so the LoRA's loading/unloading is relatively more expensive.\n\n### Serving requests\n\nTo serve inference requests, we use this open source community image\n\nYou can find the previously described mechanism used in the TextToImagePipeline class.\n\nWhen a LoRA is requested, we'll look at the one that is loaded and change it only if required, then we perform inference as usual. This way, we are able to serve requests for the base model and many distinct adapters.\n\nBelow is an example on how you can test and request this image:\n\n```\n$ git clone https://github.com/huggingface/api-inference-community.git\n\n$ cd api-inference-community/docker_images/diffusers\n\n$ docker build -t test:1.0 -f Dockerfile .\n\n$ cat > /tmp/env_file <<'EOF'\nMODEL_ID=stabilityai/stable-diffusion-xl-base-1.0\nTASK=text-to-image\nHF_XET_HIGH_PERFORMANCE=1\nEOF\n\n$ docker run --gpus all --rm --name test1 --env-file /tmp/env_file_minimal -p 8888:80 -it test:1.0\n```\n\nThen in another terminal perform requests to the base model and/or miscellaneous LoRA adapters to be found on the HF Hub.\n\n```\n# Request the base model\n$ curl 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/base.jpg\n\n# Request one adapter\n$ curl -H 'lora: minimaxir/sdxl-wrong-lora' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter1.jpg\n\n# Request another one\n$ curl -H 'lora: nerijs/pixel-art-xl' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter2.jpg\n```\n\n### What about batching ?\n\nRecently a really interesting paper came out, that described how to increase the throughput by performing batched inference on LoRA models. In short, all inference requests would be gathered in a batch, the computation related to the common base model would be done all at once, then the remaining adapter-specific products would be computed. We did not implement such a technique (close to the approach adopted in text-generation-inference for LLMs). Instead, we stuck to single sequential inference requests. The reason is that we observed that batching was not interesting for diffusers: throughput does not increase significantly with batch size. On the simple image generation benchmark we performed, it only increased 25% for a batch size of 8, in exchange for 6 times increased latency! Comparatively, batching is far more interesting for LLMs because you get 8 times the sequential throughput with only a 10% latency increase. This is the reason why we did not implement batching for diffusers.\n\n## Conclusion: Time!\n\nUsing dynamic LoRA loading, we were able to save compute resources and improve the user experience in the Hub Inference API. Despite the extra time added by the process of unloading the previously loaded adapter and loading the one we're interested in, the fact that the serving process is most often already up and running makes the inference time response on the whole much shorter.\n\nNote that for a LoRA to benefit from this inference optimization on the Hub, it must both be public, non-gated and based on a non-gated public model. Please do let us know if you apply the same method to your deployment!",
   "summaryZh": "Hugging Face通过优化技术将LoRA推理的冷启动时间从25秒缩短至3秒，整体响应时间从35秒降至13秒。该方案在保持基础扩散模型（Diffusion Model）常驻内存（Warm）的同时，根据用户请求动态交换LoRA适配器，从而在少量GPU上高效支撑数百个不同的LoRA模型服务。",
   "summaryGeneratedAt": "2026-09-05T20:34:28.858964Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -76,5 +76,857 @@
       }
     ],
     "duplicateKey": "huggingface-lora-inference-optimization"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/inference_widget.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/inference_widget.png",
+      "alt": "Inference Widget Example",
+      "id": "image_966ceb736960fec4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/lora_diagram.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/lora_diagram.png",
+      "alt": "LoRA decomposition",
+      "id": "image_dad7f74f9af4e3ca"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/lora_adapter_hub.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/171_load_lora_adapters/lora_adapter_hub.png",
+      "alt": "Hub",
+      "id": "image_74ab5cf18f91811a"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "tl;dr: We swap the Stable Diffusion LoRA adapters per user request, while keeping the base model warm allowing fast LoRA inference across multiple users. You can experience this by browsing our LoRA catalogue and playing with the inference widget.",
+      "spans": [
+        {
+          "start": 194,
+          "end": 208,
+          "kind": "a",
+          "href": "https://huggingface.co/models?library=diffusers&other=lora"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "In this blog we will go in detail over how we achieved that.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "We've been able to drastically speed up inference in the Hub for public LoRAs based on public Diffusion models. This has allowed us to save compute resources and provide a faster and better user experience.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "To perform inference on a given model, there are two steps:",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Warm up phase - that consists in downloading the model and setting up the service (25s).",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Then the inference job itself (10s).",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "With the improvements, we were able to reduce the warm up time from 25s to 3s. We are now able to serve inference for hundreds of distinct LoRAs, with less than 5 A10G GPUs, while the response time to user requests decreased from 35s to 13s.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Let's talk more about how we can leverage some recent features developed in the Diffusers library to serve many distinct LoRAs in a dynamic fashion with one single service.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 89,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers/"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "LoRA",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "LoRA is a fine-tuning technique that belongs to the family of \"parameter-efficient\" (PEFT) methods, which try to reduce the number of trainable parameters affected by the fine-tuning process. It increases fine-tuning speed while reducing the size of fine-tuned checkpoints.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Instead of fine-tuning the model by performing tiny changes to all its weights, we freeze most of the layers and only train a few specific ones in the attention blocks. Furthermore, we avoid touching the parameters of those layers by adding the product of two smaller matrices to the original weights. Those small matrices are the ones whose weights are updated during the fine-tuning process, and then saved to disk. This means that all of the model original parameters are preserved, and we can load the LoRA weights on top using an adaptation method.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "The LoRA name (Low Rank Adaptation) comes from the small matrices we mentioned. For more information about the method, please refer to this post or the original paper.",
+      "spans": [
+        {
+          "start": 135,
+          "end": 144,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lora"
+        },
+        {
+          "start": 152,
+          "end": 166,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2106.09685"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "The diagram above shows two smaller orange matrices that are saved as part of the LoRA adapter. We can later load the LoRA adapter and merge it with the blue base model to obtain the yellow fine-tuned model. Crucially, unloading the adapter is also possible so we can revert back to the original base model at any point.",
+      "spans": [
+        {
+          "start": 219,
+          "end": 228,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "In other words, the LoRA adapter is like an add-on of a base model that can be added and removed on demand. And because of A and B smaller ranks, it is very light in comparison with the model size. Therefore, loading is much faster than loading the whole base model.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "If you look, for example, inside the Stable Diffusion XL Base 1.0 model repo, which is widely used as a base model for many LoRA adapters, you can see that its size is around 7 GB. However, typical LoRA adapters like this one take a mere 24 MB of space !",
+      "spans": [
+        {
+          "start": 37,
+          "end": 76,
+          "kind": "a",
+          "href": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/tree/main"
+        },
+        {
+          "start": 175,
+          "end": 179,
+          "kind": "strong"
+        },
+        {
+          "start": 217,
+          "end": 225,
+          "kind": "a",
+          "href": "https://huggingface.co/minimaxir/sdxl-wrong-lora/"
+        },
+        {
+          "start": 238,
+          "end": 243,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "There are far less blue base models than there are yellow ones on the Hub. If we can go quickly from the blue to yellow one and vice versa, then we have a way serve many distinct yellow models with only a few distinct blue deployments.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "For a more exhaustive presentation on what LoRA is, please refer to the following blog post:Using LoRA for Efficient Stable Diffusion Fine-Tuning, or refer directly to the original paper.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 145,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lora"
+        },
+        {
+          "start": 172,
+          "end": 186,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2106.09685"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Benefits",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "We have approximately 2500 distinct public LoRAs on the Hub. The vast majority (~92%) of them are LoRAs based on the Stable Diffusion XL Base 1.0 model.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 26,
+          "kind": "strong"
+        },
+        {
+          "start": 80,
+          "end": 84,
+          "kind": "strong"
+        },
+        {
+          "start": 117,
+          "end": 145,
+          "kind": "a",
+          "href": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Before this mutualization, this would have meant deploying a dedicated service for all of them (eg. for all the yellow merged matrices in the diagram above); releasing + reserving at least one new GPU. The time to spawn the service and have it ready to serve requests for a specific model is approximately 25s, then on top of this you have the inference time (~10s for a 1024x1024 SDXL inference diffusion with 25 inference steps on an A10G). If an adapter is only occasionally requested, its service gets stopped to free resources preempted by others.",
+      "spans": [
+        {
+          "start": 306,
+          "end": 309,
+          "kind": "strong"
+        },
+        {
+          "start": 360,
+          "end": 364,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "If you were requesting a LoRA that was not so popular, even if it was based on the SDXL model like the vast majority of adapters found on the Hub so far, it would have required 35s to warm it up and get an answer on the first request (the following ones would have taken the inference time, eg. 10s).",
+      "spans": [
+        {
+          "start": 177,
+          "end": 180,
+          "kind": "strong"
+        },
+        {
+          "start": 295,
+          "end": 298,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Now: request time has decreased from 35s to 13s since adapters will use only a few distinct \"blue\" base models (like 2 significant ones for Diffusion). Even if your adapter is not so popular, there is a good chance that its \"blue\" service is already warmed up. In other words, there is a good chance that you avoid the 25s warm up time, even if you do not request your model that often. The blue model is already downloaded and ready, all we have to do is unload the previous adapter and load the new one, which takes 3s as we see below.",
+      "spans": [
+        {
+          "start": 518,
+          "end": 520,
+          "kind": "strong"
+        },
+        {
+          "start": 531,
+          "end": 536,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lora-adapters-dynamic-loading#loading-figures"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Overall, this requires less GPUs to serve all distinct models, even though we already had a way to share GPUs between deployments to maximize their compute usage. In a 2min time frame, there are approximately 10 distinct LoRA weights that are requested. Instead of spawning 10 deployments, and keeping them warm, we simply serve all of them with 1 to 2 GPUs (or more if there is a request burst).",
+      "spans": [
+        {
+          "start": 168,
+          "end": 172,
+          "kind": "strong"
+        },
+        {
+          "start": 209,
+          "end": 211,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Implementation",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "We implemented LoRA mutualization in the Inference API. When a request is performed on a model available in our platform, we first determine whether this is a LoRA or not. We then identify the base model for the LoRA and route the request to a common backend farm, with the ability to serve requests for the said model. Inference requests get served by keeping the base model warm and loading/unloading LoRAs on the fly. This way we can ultimately reuse the same compute resources to serve many distinct models at once.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "LoRA structure",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "In the Hub, LoRAs can be identified with two attributes:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "A LoRA will have a base_model attribute. This is simply the model which the LoRA was built for and should be applied to when performing inference.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Because LoRAs are not the only models with such an attribute (any duplicated model will have one), a LoRA will also need a lora tag to be properly identified.",
+      "spans": [
+        {
+          "start": 123,
+          "end": 127,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Loading/Offloading LoRA for Diffusers 🧨",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Note that there is a more seemless way to perform the same as what is presented in this section using the peft library. Please refer to the documentation for more details. The principle remains the same as below (going from/to the blue box to/from the yellow one in the diagram above)",
+      "spans": [
+        {
+          "start": 106,
+          "end": 110,
+          "kind": "a",
+          "href": "https://github.com/huggingface/peft"
+        },
+        {
+          "start": 136,
+          "end": 153,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/tutorials/using_peft_for_inference"
+        },
+        {
+          "start": 270,
+          "end": 277,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lora-adapters-dynamic-loading#diagram"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "4 functions are used in the Diffusers library to load and unload distinct LoRA weights:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "load_lora_weights and fuse_lora for loading and merging weights with the main layers. Note that merging weights with the main model before performing inference can decrease the inference time by 30%.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 22,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "unload_lora_weights and unfuse_lora for unloading.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 24,
+          "end": 35,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "We provide an example below on how one can leverage the Diffusers library to quickly load several LoRA weights on top of a base model:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Loading figures",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "All numbers below are in seconds:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "GPU",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "T4",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "A10G",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "Base model loading - not cached",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "20",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "20",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "Base model loading - cached",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "5.95",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "4.09",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "Adapter 1 loading",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "3.07",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "3.46",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "Adapter 1 unloading",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "0.52",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "0.28",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "Adapter 2 loading",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "1.44",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "2.71",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Adapter 2 unloading",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "0.19",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "0.13",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "Inference time",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "20.7",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "8.5",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "With 2 to 4 additional seconds per inference, we can serve many distinct LoRAs. However, on an A10G GPU, the inference time decreases by a lot while the adapters loading time does not change much, so the LoRA's loading/unloading is relatively more expensive.",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Serving requests",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "To serve inference requests, we use this open source community image",
+      "spans": [
+        {
+          "start": 36,
+          "end": 68,
+          "kind": "a",
+          "href": "https://github.com/huggingface/api-inference-community/tree/main/docker_images/diffusers"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "You can find the previously described mechanism used in the TextToImagePipeline class.",
+      "spans": [
+        {
+          "start": 60,
+          "end": 79,
+          "kind": "a",
+          "href": "https://github.com/huggingface/api-inference-community/blob/main/docker_images/diffusers/app/pipelines/text_to_image.py"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "When a LoRA is requested, we'll look at the one that is loaded and change it only if required, then we perform inference as usual. This way, we are able to serve requests for the base model and many distinct adapters.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Below is an example on how you can test and request this image:",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Then in another terminal perform requests to the base model and/or miscellaneous LoRA adapters to be found on the HF Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "What about batching ?",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Recently a really interesting paper came out, that described how to increase the throughput by performing batched inference on LoRA models. In short, all inference requests would be gathered in a batch, the computation related to the common base model would be done all at once, then the remaining adapter-specific products would be computed. We did not implement such a technique (close to the approach adopted in text-generation-inference for LLMs). Instead, we stuck to single sequential inference requests. The reason is that we observed that batching was not interesting for diffusers: throughput does not increase significantly with batch size. On the simple image generation benchmark we performed, it only increased 25% for a batch size of 8, in exchange for 6 times increased latency! Comparatively, batching is far more interesting for LLMs because you get 8 times the sequential throughput with only a 10% latency increase. This is the reason why we did not implement batching for diffusers.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 35,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2311.03285"
+        },
+        {
+          "start": 415,
+          "end": 440,
+          "kind": "a",
+          "href": "https://github.com/huggingface/text-generation-inference/"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "Conclusion: Time!",
+      "spans": [
+        {
+          "start": 12,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Using dynamic LoRA loading, we were able to save compute resources and improve the user experience in the Hub Inference API. Despite the extra time added by the process of unloading the previously loaded adapter and loading the one we're interested in, the fact that the serving process is most often already up and running makes the inference time response on the whole much shorter.",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "Note that for a LoRA to benefit from this inference optimization on the Hub, it must both be public, non-gated and based on a non-gated public model. Please do let us know if you apply the same method to your deployment!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "7cbcc04c2570d1f14d4d4c5bb5d3e198a58568bf313c2a6e31f483861cc1b34b",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import torch\n\n\nfrom diffusers import (\n    AutoencoderKL,\n    DiffusionPipeline,\n)\n\nimport time\n\nbase = \"stabilityai/stable-diffusion-xl-base-1.0\"\n\nadapter1 = 'nerijs/pixel-art-xl'\nweightname1 = 'pixel-art-xl.safetensors'\n\nadapter2 = 'minimaxir/sdxl-wrong-lora'\nweightname2 = None\n\ninputs = \"elephant\"\nkwargs = {}\n\nif torch.cuda.is_available():\n    kwargs[\"torch_dtype\"] = torch.float16\n\nstart = time.time()\n\n# Load VAE compatible with fp16 created by madebyollin\nvae = AutoencoderKL.from_pretrained(\n    \"madebyollin/sdxl-vae-fp16-fix\",\n    torch_dtype=torch.float16,\n)\nkwargs[\"vae\"] = vae\nkwargs[\"variant\"] = \"fp16\"\n\nmodel = DiffusionPipeline.from_pretrained(\n    base, **kwargs\n)\n\nif torch.cuda.is_available():\n    model.to(\"cuda\")\n\nelapsed = time.time() - start\n\nprint(f\"Base model loaded, elapsed {elapsed:.2f} seconds\")\n\n\ndef inference(adapter, weightname):\n    start = time.time()\n    model.load_lora_weights(adapter, weight_name=weightname)\n    # Fusing lora weights with the main layers improves inference time by 30 % !\n    model.fuse_lora()\n    elapsed = time.time() - start\n\n    print(f\"LoRA adapter loaded and fused to main model, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    data = model(inputs, num_inference_steps=25).images[0]\n    elapsed = time.time() - start\n    print(f\"Inference time, elapsed {elapsed:.2f} seconds\")\n\n    start = time.time()\n    model.unfuse_lora()\n    model.unload_lora_weights()\n    elapsed = time.time() - start\n    print(f\"LoRA adapter unfused/unloaded from base model, elapsed {elapsed:.2f} seconds\")\n\n\ninference(adapter1, weightname1)\ninference(adapter2, weightname2)"
+    },
+    {
+      "id": "c0002",
+      "source": "$ git clone https://github.com/huggingface/api-inference-community.git\n\n$ cd api-inference-community/docker_images/diffusers\n\n$ docker build -t test:1.0 -f Dockerfile .\n\n$ cat > /tmp/env_file <<'EOF'\nMODEL_ID=stabilityai/stable-diffusion-xl-base-1.0\nTASK=text-to-image\nHF_XET_HIGH_PERFORMANCE=1\nEOF\n\n$ docker run --gpus all --rm --name test1 --env-file /tmp/env_file_minimal -p 8888:80 -it test:1.0"
+    },
+    {
+      "id": "c0003",
+      "source": "# Request the base model\n$ curl 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/base.jpg\n\n# Request one adapter\n$ curl -H 'lora: minimaxir/sdxl-wrong-lora' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter1.jpg\n\n# Request another one\n$ curl -H 'lora: nerijs/pixel-art-xl' 0:8888 -d '{\"inputs\": \"elephant\", \"parameters\": {\"num_inference_steps\": 20}}' > /tmp/adapter2.jpg"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "7cbcc04c2570d1f14d4d4c5bb5d3e198a58568bf313c2a6e31f483861cc1b34b",
+  "mediaLayout": [
+    {
+      "mediaId": "image_966ceb736960fec4",
+      "type": "image",
+      "afterBlockId": "b0001",
+      "order": 0
+    },
+    {
+      "mediaId": "image_dad7f74f9af4e3ca",
+      "type": "image",
+      "afterBlockId": "b0012",
+      "order": 1
+    },
+    {
+      "mediaId": "image_74ab5cf18f91811a",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T10:09:30.901413Z",
+  "mediaLayoutCheckedAt": "2026-10-04T10:09:30.901430Z"
 }
