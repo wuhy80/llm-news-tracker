@@ -171,6 +171,11 @@ def _remove_stale_json(directory: Path, expected: set[Path]) -> None:
 
 
 COMMUNITY_SOURCE_HINTS = ("reddit", "linux do", "linux.do")
+# Forum posts are mostly one-liners, so a thin one is not worth a slot in the
+# feed. This is a listing floor, not a fetch floor: article_store.MIN_BODY_CHARS
+# still decides whether a body is worth storing at all, and keeping those two
+# apart is what stops this from affecting editorial sources.
+COMMUNITY_MIN_BODY_CHARS = 600
 
 
 def is_community_item(record: dict) -> bool:
@@ -178,17 +183,19 @@ def is_community_item(record: dict) -> bool:
     return any(hint in haystack for hint in COMMUNITY_SOURCE_HINTS)
 
 
-def is_unarchived_community_item(record: dict) -> bool:
-    """A forum post that was fetched and yielded no readable body.
+def is_thin_community_item(record: dict) -> bool:
+    """A forum post too thin to list.
 
-    ``archive:not attempted`` is deliberately not treated as unarchived: it marks
-    an item still queued behind the per-run archive limit, and dropping those
-    would discard articles that were never tried. An attempt that found nothing
-    overwrites the note with its error, which is what this matches.
+    ``archive:not attempted`` is deliberately not treated as thin: it marks an
+    item still queued behind the per-run archive limit, and dropping those would
+    discard articles that were never tried. An attempt that found nothing
+    overwrites the note with its error, which is what the first branch matches.
     """
-    if record.get("contentKind") != "summary" or not is_community_item(record):
+    if not is_community_item(record):
         return False
-    return record.get("note") != "archive:not attempted"
+    if record.get("contentKind") == "summary":
+        return record.get("note") != "archive:not attempted"
+    return len(str(record.get("body") or "").strip()) < COMMUNITY_MIN_BODY_CHARS
 
 
 def save_news(
@@ -211,10 +218,11 @@ def save_news(
         records.append(sync_article_record(item, articles_dir, generated_at))
     records.sort(key=lambda item: (item.get("publishedAt", ""), item.get("score", 0)), reverse=True)
 
-    # A forum post that was fetched and produced no body is not worth listing.
-    # Its snapshot stays on disk, so expected_articles below still covers it and
-    # the archive retry cooldown keeps working instead of re-fetching forever.
-    listed = [record for record in records if not is_unarchived_community_item(record)]
+    # A forum post that was fetched and produced nothing, or produced too little,
+    # is not worth listing. Its snapshot stays on disk, so expected_articles below
+    # still covers it and the archive retry cooldown keeps working instead of
+    # re-fetching forever.
+    listed = [record for record in records if not is_thin_community_item(record)]
     unlisted_community = len(records) - len(listed)
 
     by_day: dict[str, list[dict]] = {}

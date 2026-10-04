@@ -162,14 +162,43 @@ class NewsStoreTests(unittest.TestCase):
             self.assertEqual(result["unlistedCommunity"], 0)
             self.assertTrue((root / "data/news/2026/08/27.json").exists())
 
-    def test_a_community_post_with_a_body_is_listed(self):
+    def test_a_substantial_community_post_is_listed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest = root / "data/news.json"
             articles = root / "data/articles"
-            self.write_snapshot(articles, "abcdef012345", contentKind="community")
+            self.write_snapshot(articles, "abcdef012345", contentKind="community",
+                                body="x" * (news_store.COMMUNITY_MIN_BODY_CHARS + 120))
 
             result = news_store.save_news({"items": [self.community_item()]}, manifest, articles)
+
+            self.assertEqual(result["items"], 1)
+            self.assertEqual(result["unlistedCommunity"], 0)
+
+    def test_a_community_post_just_under_the_body_floor_is_unlisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "data/news.json"
+            articles = root / "data/articles"
+            path = self.write_snapshot(articles, "abcdef012345", contentKind="community",
+                                       body="x" * (news_store.COMMUNITY_MIN_BODY_CHARS - 1))
+
+            result = news_store.save_news({"items": [self.community_item()]}, manifest, articles)
+
+            self.assertEqual(result["items"], 0)
+            self.assertEqual(result["unlistedCommunity"], 1)
+            self.assertTrue(path.exists())
+
+    def test_a_thin_body_from_an_editorial_source_is_still_listed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "data/news.json"
+            articles = root / "data/articles"
+            self.write_snapshot(articles, "abcdef012345", contentKind="page", body="x" * 300)
+            item = self.community_item(source="Example", sourceDomain="example.com",
+                                       url="https://example.com/post")
+
+            result = news_store.save_news({"items": [item]}, manifest, articles)
 
             self.assertEqual(result["items"], 1)
             self.assertEqual(result["unlistedCommunity"], 0)
