@@ -28,25 +28,6 @@ TRACKING_QUERY_KEYS = {
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref_src", "s_cid",
 }
 
-def search_source(
-    name: str,
-    query: str,
-    domain: str,
-    hint: str,
-    official: bool = False,
-) -> dict:
-    """Build a Bing-backed source for topics without a direct publisher feed."""
-    bing_query = urllib.parse.quote_plus(query)
-    return {
-        "name": name,
-        "url": f"https://www.bing.com/news/search?q={bing_query}&format=rss",
-        "domain": domain,
-        "official": official,
-        "hint": hint,
-        "extract_embedded_source": True,
-    }
-
-
 SOURCES = [
     {"name": "OpenAI", "url": "https://openai.com/news/rss.xml", "domain": "openai.com", "official": True},
     {"name": "Google AI", "url": "https://blog.google/technology/ai/rss/", "domain": "blog.google", "official": True},
@@ -57,7 +38,7 @@ SOURCES = [
         "domain": "arxiv.org",
         "official": False,
     },
-    {"name": "Microsoft AI", "url": "https://blogs.microsoft.com/ai/feed/", "domain": "microsoft.com", "official": True},
+    {"name": "Microsoft AI", "url": "https://news.microsoft.com/source/topics/ai/feed/", "domain": "news.microsoft.com", "official": True},
     {"name": "NVIDIA AI", "url": "https://blogs.nvidia.com/blog/category/deep-learning/feed/", "domain": "nvidia.com", "official": True},
     {
         "name": "Anthropic News",
@@ -86,17 +67,6 @@ SOURCES = [
         "official": True,
         "hint": "agent",
         "title_prefix": "Claude Code",
-    },
-    {
-        "name": "Mistral AI News",
-        "url": "https://mistral.ai/sitemap.xml",
-        "domain": "mistral.ai",
-        "official": True,
-        "hint": "release",
-        "format": "sitemap",
-        "sitemap_prefixes": ("/news/",),
-        "sitemap_max_age_days": 90,
-        "sitemap_metadata_workers": 8,
     },
     {
         "name": "xAI News",
@@ -174,13 +144,35 @@ SOURCES = [
         "official": True,
         "hint": "release",
     },
-    search_source(
-        "LMArena",
-        '"LMArena" benchmark OR "Chatbot Arena" benchmark',
-        "bing.com",
-        "benchmark",
-        False,
-    ),
+    # Inference runtimes: the audience for this tracker runs models locally, and
+    # these three ship far more often than the agent-framework releases above.
+    {
+        "name": "llama.cpp Releases",
+        "url": "https://github.com/ggml-org/llama.cpp/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "release",
+    },
+    {
+        "name": "vLLM Releases",
+        "url": "https://github.com/vllm-project/vllm/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "release",
+    },
+    {
+        "name": "Ollama Releases",
+        "url": "https://github.com/ollama/ollama/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "release",
+    },
+    {
+        "name": "Hacker News · LLM",
+        "url": "https://hnrss.org/newest?q=LLM&points=50",
+        "domain": "hnrss.org",
+        "official": False,
+    },
     {
         "name": "Artificial Analysis",
         "url": "https://artificialanalysis.ai/sitemap.xml",
@@ -224,48 +216,11 @@ SOURCES = [
         "domain": "qbitai.com",
         "official": False,
     },
-    {"name": "VentureBeat AI", "url": "https://venturebeat.com/category/ai/feed/", "domain": "venturebeat.com", "official": False},
     {
         "name": "Reddit · LocalLLaMA",
         "url": "https://www.reddit.com/r/LocalLLaMA/new/.rss?limit=100",
         "domain": "reddit.com",
         "official": False,
-    },
-    {
-        "name": "LINUX DO · 444",
-        "url": "https://linux.do/tag/444-tag.rss",
-        "headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-        },
-        "domain": "linux.do",
-        "official": False,
-    },
-    {
-        "name": "全球大模型动态",
-        "url": "https://www.bing.com/news/search?q=%22large+language+model%22+OR+LLM&format=rss",
-        "domain": "bing.com", "official": False,
-        "extract_embedded_source": True,
-    },
-    {
-        "name": "Agent 技术动态",
-        "url": "https://www.bing.com/news/search?q=%22AI+agent%22+OR+%22agentic+AI%22&format=rss",
-        "domain": "bing.com", "official": False,
-        "extract_embedded_source": True,
-        "hint": "agent",
-    },
-    {
-        "name": "模型发布与评测",
-        "url": "https://www.bing.com/news/search?q=%22AI+model%22+release+OR+benchmark&format=rss",
-        "domain": "bing.com", "official": False,
-        "extract_embedded_source": True,
-        "hint": "release",
-    },
-    {
-        "name": "中文大模型动态",
-        "url": "https://www.bing.com/news/search?q=%E5%A4%A7%E6%A8%A1%E5%9E%8B+OR+AI%E6%99%BA%E8%83%BD%E4%BD%93&format=rss",
-        "domain": "bing.com", "official": False,
-        "extract_embedded_source": True,
     },
 ]
 
@@ -485,9 +440,22 @@ def fetch(url: str, extra_headers: dict[str, str] | None = None) -> bytes:
         return response.read()
 
 
-def parse_feed(payload: bytes, source: dict) -> list[dict]:
+# A news tracker should not ingest a decade of back catalogue: the OpenAI feed
+# reaches back to 2016 and Hugging Face to 2020, and those old posts mostly
+# cannot be fetched either (OpenAI's readable rate measured 14 percent). Feeds
+# are cut off at this age unless a source overrides feed_max_age_days.
+FEED_MAX_AGE_DAYS = 120
+
+
+def feed_cutoff(source: dict, now: datetime) -> datetime | None:
+    max_age_days = source.get("feed_max_age_days", FEED_MAX_AGE_DAYS)
+    return now - timedelta(days=max_age_days) if max_age_days else None
+
+
+def parse_feed(payload: bytes, source: dict, now: datetime | None = None) -> list[dict]:
     root = ET.fromstring(payload)
     nodes = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
+    cutoff = feed_cutoff(source, now or datetime.now(timezone.utc))
     items = []
     for node in nodes:
         title = strip_html(find_text(node, ("title",)))
@@ -498,13 +466,10 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
         summary = strip_html(reader_html)
         image_refs = find_feed_image_refs(node, url)
         published = parse_date(find_text(node, ("pubdate", "published", "updated", "date")))
+        if cutoff and published < cutoff:
+            continue
         source_name = source["name"]
         source_domain = source["domain"]
-        embedded_source = find_text(node, ("source",))
-        if source.get("extract_embedded_source") and embedded_source:
-            source_name = embedded_source
-            if " - " + embedded_source in title:
-                title = title.rsplit(" - " + embedded_source, 1)[0].strip()
         title_prefix = source.get("title_prefix")
         if title_prefix and not title.casefold().startswith(title_prefix.casefold()):
             title = f"{title_prefix} {title}"
@@ -523,21 +488,25 @@ def parse_feed(payload: bytes, source: dict) -> list[dict]:
     return items
 
 
-def parse_blog_cards(payload: bytes, source: dict) -> list[dict]:
+def parse_blog_cards(payload: bytes, source: dict, now: datetime | None = None) -> list[dict]:
     parser = BlogCardParser(source["link_prefix"])
     parser.feed(payload.decode("utf-8", "replace"))
+    cutoff = feed_cutoff(source, now or datetime.now(timezone.utc))
     items = []
     seen_urls = set()
     for card in parser.cards:
         url = urllib.parse.urljoin(source["url"], card["url"])
         if url in seen_urls:
             continue
+        published = parse_date(card["published"])
+        if cutoff and published < cutoff:
+            continue
         seen_urls.add(url)
         items.append({
             "title": card["title"],
             "url": url,
             "summary": "",
-            "published": parse_date(card["published"]),
+            "published": published,
             "source": source["name"],
             "sourceDomain": source["domain"],
             "official": source.get("official", False),

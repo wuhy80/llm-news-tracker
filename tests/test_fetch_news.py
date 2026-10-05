@@ -117,9 +117,10 @@ class FetchNewsTests(unittest.TestCase):
     def test_official_publisher_sources_do_not_use_news_search(self):
         search_hosts = {"news.google.com", "www.google.com", "bing.com", "www.bing.com"}
         direct_sources = {
-            "Mistral AI News": ("https://mistral.ai/sitemap.xml", "/news/"),
             "xAI News": ("https://x.ai/sitemap.xml", "/news/"),
             "Artificial Analysis": ("https://artificialanalysis.ai/sitemap.xml", "/articles/"),
+            "DeepSeek · 深度求索": ("https://www.deepseek.com/sitemap.xml", "/news/"),
+            "字节 Seed · 豆包": ("https://seed.bytedance.com/sitemap.xml", "/blog/"),
         }
         sources = {source["name"]: source for source in fetch_news.SOURCES}
         for name, (url, prefix) in direct_sources.items():
@@ -131,12 +132,46 @@ class FetchNewsTests(unittest.TestCase):
                 self.assertNotIn("fallback_urls", source)
                 self.assertIn(prefix, source["sitemap_prefixes"])
 
-        linux_do = sources["LINUX DO · 444"]
-        self.assertNotIn("fallback_urls", linux_do)
+        # No Bing-backed search source survives: they produced nothing and once
+        # injected dozens of unrelated publishers into the archive.
         for source in fetch_news.SOURCES:
             with self.subTest(source=source["name"]):
+                self.assertNotIn("bing.com", source["url"])
                 if source.get("official"):
                     self.assertNotIn(urllib.parse.urlparse(source["url"]).hostname, search_hosts)
+
+    def test_feed_cutoff_drops_back_catalogue_items(self):
+        payload = b"""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry><title>Fresh release</title><updated>2026-09-28T00:00:00Z</updated>
+                <link rel="alternate" href="https://example.com/new" /></entry>
+              <entry><title>Ancient post</title><updated>2016-11-14T00:00:00Z</updated>
+                <link rel="alternate" href="https://example.com/old" /></entry>
+            </feed>
+        """
+        source = {"name": "Example", "url": "https://example.com/feed",
+                  "domain": "example.com", "official": True}
+
+        items = fetch_news.parse_feed(
+            payload, source, now=fetch_news.parse_date("2026-10-05T00:00:00Z"))
+
+        self.assertEqual(fetch_news.FEED_MAX_AGE_DAYS, 120)
+        self.assertEqual([item["url"] for item in items], ["https://example.com/new"])
+
+    def test_a_source_can_disable_the_feed_cutoff(self):
+        payload = b"""
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <entry><title>Ancient post</title><updated>2016-11-14T00:00:00Z</updated>
+                <link rel="alternate" href="https://example.com/old" /></entry>
+            </feed>
+        """
+        source = {"name": "Example", "url": "https://example.com/feed", "domain": "example.com",
+                  "official": True, "feed_max_age_days": None}
+
+        items = fetch_news.parse_feed(
+            payload, source, now=fetch_news.parse_date("2026-10-05T00:00:00Z"))
+
+        self.assertEqual([item["url"] for item in items], ["https://example.com/old"])
 
     def test_sitemap_skip_urls_drops_a_section_page(self):
         source = {
@@ -189,7 +224,7 @@ class FetchNewsTests(unittest.TestCase):
             source for source in fetch_news.SOURCES if source["name"] == "Claude Code Releases"
         )
 
-        items = fetch_news.parse_feed(payload, source)
+        items = fetch_news.parse_feed(payload, source, now=fetch_news.parse_date("2026-09-02T00:00:00Z"))
 
         self.assertEqual(items[0]["title"], "Claude Code v2.1.250")
 
@@ -209,7 +244,7 @@ class FetchNewsTests(unittest.TestCase):
         """
         source = next(source for source in fetch_news.SOURCES if source["name"] == "arXiv · 大模型研究")
 
-        items = fetch_news.parse_feed(payload, source)
+        items = fetch_news.parse_feed(payload, source, now=fetch_news.parse_date("2026-09-02T00:00:00Z"))
 
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["title"], "Scaling large language model reasoning with tool use")
@@ -234,7 +269,7 @@ class FetchNewsTests(unittest.TestCase):
         """
         source = next(source for source in fetch_news.SOURCES if source["name"] == "Claude Blog")
 
-        items = fetch_news.parse_blog_cards(payload, source)
+        items = fetch_news.parse_blog_cards(payload, source, now=fetch_news.parse_date("2026-06-20T00:00:00Z"))
 
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["title"], "Claude Code now supports artifacts")
