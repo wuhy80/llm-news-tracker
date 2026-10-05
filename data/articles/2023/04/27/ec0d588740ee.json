@@ -18,77 +18,23 @@
   "fetchedAt": "2026-08-30T11:51:01.875314Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Training a language model with 🤗 Transformers using TensorFlow and TPUs\n\nPublished April 27, 2023\n\nTPU training is a useful skill to have: TPU pods are high-performance and extremely scalable, making it easy to train models at any scale from a few tens of millions of parameters up to truly enormous sizes: Google’s PaLM model (over 500 billion parameters!) was trained entirely on TPU pods.\n\nWe’ve previously written a tutorial and a Colab example showing small-scale TPU training with TensorFlow and introducing the core concepts you need to understand to get your model working on TPU. This time, we’re going to step that up another level and train a masked language model from scratch using TensorFlow and TPU, including every step from training your tokenizer and preparing your dataset through to the final model training and uploading. This is the kind of task that you’ll probably want a dedicated TPU node (or VM) for, rather than just Colab, and so that’s where we’ll focus.\n\nAs in our Colab example, we’re taking advantage of TensorFlow's very clean TPU support via XLA and TPUStrategy . We’ll also be benefiting from the fact that the majority of the TensorFlow models in 🤗 Transformers are fully XLA-compatible . So surprisingly, little work is needed to get them to run on TPU.\n\nUnlike our Colab example, however, this example is designed to be scalable and much closer to a realistic training run -- although we only use a BERT-sized model by default, the code could be expanded to a much larger model and a much more powerful TPU pod slice by changing a few configuration options.\n\nWhy are we writing this guide now? After all, 🤗 Transformers has had support for TensorFlow for several years now. But getting those models to train on TPUs has been a major pain point for the community. This is because:\n\n- Many models weren’t XLA-compatible\n\n- Data collators didn’t use native TF operations\n\nWe think XLA is the future: It’s the core compiler for JAX, it has first-class support in TensorFlow, and you can even use it from PyTorch . As such, we’ve made a big push to make our codebase XLA compatible and to remove any other roadblocks standing in the way of XLA and TPU compatibility. This means users should be able to train most of our TensorFlow models on TPUs without hassle.\n\nThere’s also another important reason to care about TPU training right now: Recent major advances in LLMs and generative AI have created huge public interest in model training, and so it’s become incredibly hard for most people to get access to state-of-the-art GPUs. Knowing how to train on TPU gives you another path to access ultra-high-performance compute hardware, which is much more dignified than losing a bidding war for the last H100 on eBay and then ugly crying at your desk. You deserve better. And speaking from experience: Once you get comfortable with training on TPU, you might not want to go back.\n\nWe’re going to train a RoBERTa (base model) from scratch on the WikiText dataset (v1) . As well as training the model, we’re also going to train the tokenizer, tokenize the data and upload it to Google Cloud Storage in TFRecord format, where it’ll be accessible for TPU training. You can find all the code in this directory . If you’re a certain kind of person, you can skip the rest of this blog post and just jump straight to the code. If you stick around, though, we’ll take a deeper look at some of the key ideas in the codebase.\n\nMany of the ideas here were also mentioned in our Colab example , but we wanted to show users a full end-to-end example that puts it all together and shows it in action, rather than just covering concepts at a high level. The following diagram gives you a pictorial overview of the steps involved in training a language model with 🤗 Transformers using TensorFlow and TPUs:\n\n## Getting the data and training a tokenizer\n\nAs mentioned, we used the WikiText dataset (v1) . You can head over to the dataset page on the Hugging Face Hub to explore the dataset.\n\nSince the dataset is already available on the Hub in a compatible format, we can easily load and interact with it using 🤗 datasets. However, for this example, since we’re also training a tokenizer from scratch, here’s what we did:\n\n- Loaded the train split of the WikiText using 🤗 datasets.\n\n- Leveraged 🤗 tokenizers to train a Unigram model .\n\n- Uploaded the trained tokenizer on the Hub.\n\nYou can find the tokenizer training code here and the tokenizer here . This script also allows you to run it with any compatible dataset from the Hub.\n\n💡 It’s easy to use 🤗 datasets to host your text datasets. Refer to this guide to learn more.\n\n## Tokenizing the data and creating TFRecords\n\nOnce the tokenizer is trained, we can use it on all the dataset splits ( train , validation , and test in this case) and create TFRecord shards out of them. Having the data splits spread across multiple TFRecord shards helps with massively parallel processing as opposed to having each split in single TFRecord files.\n\nWe tokenize the samples individually. We then take a batch of samples, concatenate them together, and split them into several chunks of a fixed size (128 in our case). We follow this strategy rather than tokenizing a batch of samples with a fixed length to avoid aggressively discarding text content (because of truncation).\n\nWe then take these tokenized samples in batches and serialize those batches as multiple TFRecord shards, where the total dataset length and individual shard size determine the number of shards. Finally, these shards are pushed to a Google Cloud Storage (GCS) bucket .\n\nIf you’re using a TPU node for training, then the data needs to be streamed from a GCS bucket since the node host memory is very small. But for TPU VMs, we can use datasets locally or even attach persistent storage to those VMs. Since TPU nodes are still quite heavily used, we based our example on using a GCS bucket for data storage.\n\nYou can see all of this in code in this script . For convenience, we have also hosted the resultant TFRecord shards in this repository on the Hub.\n\n## Training a model on data in GCS\n\nIf you’re familiar with using 🤗 Transformers, then you already know the modeling code:\n\n```\nfrom transformers import AutoConfig, AutoTokenizer, TFAutoModelForMaskedLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n\nconfig = AutoConfig.from_pretrained(\"roberta-base\")\nconfig.vocab_size = tokenizer.vocab_size\nmodel = TFAutoModelForMaskedLM.from_config(config)\n```\n\nBut since we’re in the TPU territory, we need to perform this initialization under a strategy scope so that it can be distributed across the TPU workers with data-parallel training:\n\n```\nimport tensorflow as tf\n\ntpu = tf.distribute.cluster_resolver.TPUClusterResolver(...)\nstrategy = tf.distribute.TPUStrategy(tpu)\n\nwith strategy.scope():\n    tokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n    config = AutoConfig.from_pretrained(\"roberta-base\")\n    config.vocab_size = tokenizer.vocab_size\n    model = TFAutoModelForMaskedLM.from_config(config)\n```\n\nSimilarly, the optimizer also needs to be initialized under the same strategy scope with which the model is going to be further compiled. Going over the full training code isn’t something we want to do in this post, so we welcome you to read it here . Instead, let’s discuss another key point of — a TensorFlow-native data collator — DataCollatorForLanguageModeling .\n\nDataCollatorForLanguageModeling is responsible for masking randomly selected tokens from the input sequence and preparing the labels. By default, we return the results from these collators as NumPy arrays. However, many collators also support returning these values as TensorFlow tensors if we specify return_tensor=\"tf\" . This was crucial for our data pipeline to be compatible with TPU training.\n\nThankfully, TensorFlow provides seamless support for reading files from a GCS bucket:\n\n```\ntraining_records = tf.io.gfile.glob(os.path.join(args.train_dataset, \"*.tfrecord\"))\n```\n\nIf args.dataset contains the gs:// identifier, TensorFlow will understand that it needs to look into a GCS bucket. Loading locally is as easy as removing the gs:// identifier. For the rest of the data pipeline-related code, you can refer to this section in the training script.\n\nOnce the datasets have been prepared, the model and the optimizer have been initialized, and the model has been compiled, we can do the community’s favorite - model.fit() . For training, we didn’t do extensive hyperparameter tuning. We just trained it for longer with a learning rate of 1e-4. We also leveraged the PushToHubCallback for model checkpointing and syncing them with the Hub. You can find the hyperparameter details and a trained model here: https://huggingface.co/tf-tpu/roberta-base-epochs-500-no-wd .\n\nOnce the model is trained, running inference with it is as easy as:\n\n```\nfrom transformers import pipeline\n\nmodel_id = \"tf-tpu/roberta-base-epochs-500-no-wd\"\nunmasker = pipeline(\"fill-mask\", model=model_id, framework=\"tf\")\nunmasker(\"Goal of my life is to [MASK].\")\n\n[{'score': 0.1003185287117958,\n  'token': 52,\n  'token_str': 'be',\n  'sequence': 'Goal of my life is to be.'},\n {'score': 0.032648514956235886,\n  'token': 5,\n  'token_str': '',\n  'sequence': 'Goal of my life is to .'},\n {'score': 0.02152673341333866,\n  'token': 138,\n  'token_str': 'work',\n  'sequence': 'Goal of my life is to work.'},\n {'score': 0.019547373056411743,\n  'token': 984,\n  'token_str': 'act',\n  'sequence': 'Goal of my life is to act.'},\n {'score': 0.01939118467271328,\n  'token': 73,\n  'token_str': 'have',\n  'sequence': 'Goal of my life is to have.'}]\n```\n\nIf there’s one thing we want to emphasize with this example, it’s that TPU training is powerful, scalable and easy. In fact, if you’re already using Transformers models with TF/Keras and streaming data from tf.data , you might be shocked at how little work it takes to move your whole training pipeline to TPU. They have a reputation as somewhat arcane, high-end, complex hardware, but they’re quite approachable, and instantiating a large pod slice is definitely easier than keeping multiple GPU servers in sync!\n\nDiversifying the hardware that state-of-the-art models are trained on is going to be critical in the 2020s, especially if the ongoing GPU shortage continues. We hope that this guide will give you the tools you need to power cutting-edge training runs no matter what circumstances you face.\n\nAs the great poet GPT-4 once said:\n\nIf you can keep your head when all around you\n\nAre losing theirs to GPU droughts,\n\nAnd trust your code, while others doubt you,\n\nTo train on TPUs, no second thoughts;\n\nIf you can learn from errors, and proceed,\n\nAnd optimize your aim to reach the sky,\n\nYours is the path to AI mastery,\n\nAnd you'll prevail, my friend, as time goes by.\n\nSure, it’s shamelessly ripping off Rudyard Kipling and it has no idea how to pronounce “drought”, but we hope you feel inspired regardless.\n\n## Models mentioned in this article 2\n\n## Datasets mentioned in this article 1\n\nMore Articles from our Blog\n\n## Training and Finetuning Multi-Vector Embedding Models with Sentence Transformers\n\n## Multi-Vector (Late Interaction) Embedding Models with Sentence Transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "## Introduction\n\nTPU training is a useful skill to have: TPU pods are high-performance and extremely scalable, making it easy to train models at any scale from a few tens of millions of parameters up to truly enormous sizes: Google’s PaLM model (over 500 billion parameters!) was trained entirely on TPU pods.\n\nWe’ve previously written a tutorial and a Colab example showing small-scale TPU training with TensorFlow and introducing the core concepts you need to understand to get your model working on TPU. This time, we’re going to step that up another level and train a masked language model from scratch using TensorFlow and TPU, including every step from training your tokenizer and preparing your dataset through to the final model training and uploading. This is the kind of task that you’ll probably want a dedicated TPU node (or VM) for, rather than just Colab, and so that’s where we’ll focus.\n\nAs in our Colab example, we’re taking advantage of TensorFlow's very clean TPU support via XLA and TPUStrategy. We’ll also be benefiting from the fact that the majority of the TensorFlow models in 🤗 Transformers are fully XLA-compatible. So surprisingly, little work is needed to get them to run on TPU.\n\nUnlike our Colab example, however, this example is designed to be scalable and much closer to a realistic training run -- although we only use a BERT-sized model by default, the code could be expanded to a much larger model and a much more powerful TPU pod slice by changing a few configuration options.\n\n## Motivation\n\nWhy are we writing this guide now? After all, 🤗 Transformers has had support for TensorFlow for several years now. But getting those models to train on TPUs has been a major pain point for the community. This is because:\n\n- Many models weren’t XLA-compatible\n\n- Data collators didn’t use native TF operations\n\nWe think XLA is the future: It’s the core compiler for JAX, it has first-class support in TensorFlow, and you can even use it from PyTorch. As such, we’ve made a big push to make our codebase XLA compatible and to remove any other roadblocks standing in the way of XLA and TPU compatibility. This means users should be able to train most of our TensorFlow models on TPUs without hassle.\n\nThere’s also another important reason to care about TPU training right now: Recent major advances in LLMs and generative AI have created huge public interest in model training, and so it’s become incredibly hard for most people to get access to state-of-the-art GPUs. Knowing how to train on TPU gives you another path to access ultra-high-performance compute hardware, which is much more dignified than losing a bidding war for the last H100 on eBay and then ugly crying at your desk. You deserve better. And speaking from experience: Once you get comfortable with training on TPU, you might not want to go back.\n\n## What to expect\n\nWe’re going to train a RoBERTa (base model) from scratch on the WikiText dataset (v1). As well as training the model, we’re also going to train the tokenizer, tokenize the data and upload it to Google Cloud Storage in TFRecord format, where it’ll be accessible for TPU training. You can find all the code in this directory. If you’re a certain kind of person, you can skip the rest of this blog post and just jump straight to the code. If you stick around, though, we’ll take a deeper look at some of the key ideas in the codebase.\n\nMany of the ideas here were also mentioned in our Colab example, but we wanted to show users a full end-to-end example that puts it all together and shows it in action, rather than just covering concepts at a high level. The following diagram gives you a pictorial overview of the steps involved in training a language model with 🤗 Transformers using TensorFlow and TPUs:\n\n## Getting the data and training a tokenizer\n\nAs mentioned, we used the WikiText dataset (v1). You can head over to the dataset page on the Hugging Face Hub to explore the dataset.\n\nSince the dataset is already available on the Hub in a compatible format, we can easily load and interact with it using 🤗 datasets. However, for this example, since we’re also training a tokenizer from scratch, here’s what we did:\n\n- Loaded the train split of the WikiText using 🤗 datasets.\n\n- Leveraged 🤗 tokenizers to train a Unigram model.\n\n- Uploaded the trained tokenizer on the Hub.\n\nYou can find the tokenizer training code here and the tokenizer here. This script also allows you to run it with any compatible dataset from the Hub.\n\n💡 It’s easy to use 🤗 datasets to host your text datasets. Refer to this guide to learn more.\n\n## Tokenizing the data and creating TFRecords\n\nOnce the tokenizer is trained, we can use it on all the dataset splits (train, validation, and test in this case) and create TFRecord shards out of them. Having the data splits spread across multiple TFRecord shards helps with massively parallel processing as opposed to having each split in single TFRecord files.\n\nWe tokenize the samples individually. We then take a batch of samples, concatenate them together, and split them into several chunks of a fixed size (128 in our case). We follow this strategy rather than tokenizing a batch of samples with a fixed length to avoid aggressively discarding text content (because of truncation).\n\nWe then take these tokenized samples in batches and serialize those batches as multiple TFRecord shards, where the total dataset length and individual shard size determine the number of shards. Finally, these shards are pushed to a Google Cloud Storage (GCS) bucket.\n\nIf you’re using a TPU node for training, then the data needs to be streamed from a GCS bucket since the node host memory is very small. But for TPU VMs, we can use datasets locally or even attach persistent storage to those VMs. Since TPU nodes are still quite heavily used, we based our example on using a GCS bucket for data storage.\n\nYou can see all of this in code in this script. For convenience, we have also hosted the resultant TFRecord shards in this repository on the Hub.\n\n## Training a model on data in GCS\n\nIf you’re familiar with using 🤗 Transformers, then you already know the modeling code:\n\n```\nfrom transformers import AutoConfig, AutoTokenizer, TFAutoModelForMaskedLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n\nconfig = AutoConfig.from_pretrained(\"roberta-base\")\nconfig.vocab_size = tokenizer.vocab_size\nmodel = TFAutoModelForMaskedLM.from_config(config) \n```\n\nBut since we’re in the TPU territory, we need to perform this initialization under a strategy scope so that it can be distributed across the TPU workers with data-parallel training:\n\n```\nimport tensorflow as tf\n\ntpu = tf.distribute.cluster_resolver.TPUClusterResolver(...)\nstrategy = tf.distribute.TPUStrategy(tpu)\n\nwith strategy.scope():\n    tokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n    config = AutoConfig.from_pretrained(\"roberta-base\")\n    config.vocab_size = tokenizer.vocab_size\n    model = TFAutoModelForMaskedLM.from_config(config) \n```\n\nSimilarly, the optimizer also needs to be initialized under the same strategy scope with which the model is going to be further compiled. Going over the full training code isn’t something we want to do in this post, so we welcome you to read it here. Instead, let’s discuss another key point of — a TensorFlow-native data collator — DataCollatorForLanguageModeling.\n\nDataCollatorForLanguageModeling is responsible for masking randomly selected tokens from the input sequence and preparing the labels. By default, we return the results from these collators as NumPy arrays. However, many collators also support returning these values as TensorFlow tensors if we specify return_tensor=\"tf\". This was crucial for our data pipeline to be compatible with TPU training.\n\nThankfully, TensorFlow provides seamless support for reading files from a GCS bucket:\n\n```\ntraining_records = tf.io.gfile.glob(os.path.join(args.train_dataset, \"*.tfrecord\"))\n```\n\nIf args.dataset contains the gs:// identifier, TensorFlow will understand that it needs to look into a GCS bucket. Loading locally is as easy as removing the gs:// identifier. For the rest of the data pipeline-related code, you can refer to this section in the training script.\n\nOnce the datasets have been prepared, the model and the optimizer have been initialized, and the model has been compiled, we can do the community’s favorite - model.fit(). For training, we didn’t do extensive hyperparameter tuning. We just trained it for longer with a learning rate of 1e-4. We also leveraged the PushToHubCallback for model checkpointing and syncing them with the Hub. You can find the hyperparameter details and a trained model here: https://huggingface.co/tf-tpu/roberta-base-epochs-500-no-wd.\n\nOnce the model is trained, running inference with it is as easy as:\n\n```\nfrom transformers import pipeline\n\nmodel_id = \"tf-tpu/roberta-base-epochs-500-no-wd\"\nunmasker = pipeline(\"fill-mask\", model=model_id, framework=\"tf\")\nunmasker(\"Goal of my life is to [MASK].\")\n\n[{'score': 0.1003185287117958,\n  'token': 52,\n  'token_str': 'be',\n  'sequence': 'Goal of my life is to be.'},\n {'score': 0.032648514956235886,\n  'token': 5,\n  'token_str': '',\n  'sequence': 'Goal of my life is to .'},\n {'score': 0.02152673341333866,\n  'token': 138,\n  'token_str': 'work',\n  'sequence': 'Goal of my life is to work.'},\n {'score': 0.019547373056411743,\n  'token': 984,\n  'token_str': 'act',\n  'sequence': 'Goal of my life is to act.'},\n {'score': 0.01939118467271328,\n  'token': 73,\n  'token_str': 'have',\n  'sequence': 'Goal of my life is to have.'}]\n```\n\n## Conclusion\n\nIf there’s one thing we want to emphasize with this example, it’s that TPU training is powerful, scalable and easy. In fact, if you’re already using Transformers models with TF/Keras and streaming data from tf.data, you might be shocked at how little work it takes to move your whole training pipeline to TPU. They have a reputation as somewhat arcane, high-end, complex hardware, but they’re quite approachable, and instantiating a large pod slice is definitely easier than keeping multiple GPU servers in sync!\n\nDiversifying the hardware that state-of-the-art models are trained on is going to be critical in the 2020s, especially if the ongoing GPU shortage continues. We hope that this guide will give you the tools you need to power cutting-edge training runs no matter what circumstances you face.\n\nAs the great poet GPT-4 once said:\n\nIf you can keep your head when all around you Are losing theirs to GPU droughts, And trust your code, while others doubt you, To train on TPUs, no second thoughts;\n\nIf you can learn from errors, and proceed, And optimize your aim to reach the sky, Yours is the path to AI mastery, And you'll prevail, my friend, as time goes by.\n\nSure, it’s shamelessly ripping off Rudyard Kipling and it has no idea how to pronounce “drought”, but we hope you feel inspired regardless.",
   "summaryZh": "该教程详细讲解了利用TensorFlow XLA和TPUStrategy在TPU节点上从头训练掩码语言模型的全流程。指南覆盖了词表分词、数据准备至分布式训练的完整步骤，解决了过去TPU训练配置繁琐的痛点。",
   "summaryGeneratedAt": "2026-09-06T02:36:21.147184Z",
   "summaryModel": "gemini:gemini-3.6-flash",
   "images": [
     {
-      "src": "https://huggingface.co/avatars/129d1e86bbaf764b507501f4feb177db.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/129d1e86bbaf764b507501f4feb177db.svg",
-      "id": "image_404a70be5f5bdd71"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1649681653581-5f7fbd813e94f16a85448745.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1649681653581-5f7fbd813e94f16a85448745.jpeg",
-      "id": "image_18cae9867b91bab9"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1660312628256-60ba519750effef3a58beac3.png",
-      "alt": "Matthew Carrigan's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1660312628256-60ba519750effef3a58beac3.png",
-      "id": "image_33f9ff1b8728864c"
-    },
-    {
       "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/tf_tpu/tf_tpu_steps.png",
-      "alt": "tf-tpu-training-steps",
       "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/tf_tpu/tf_tpu_steps.png",
+      "alt": "tf-tpu-training-steps",
       "id": "image_84e010a2459a4d82"
     },
     {
       "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/tf_tpu/wikitext_explore.png",
-      "alt": "dataset-explore",
       "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/tf_tpu/wikitext_explore.png",
+      "alt": "dataset-explore",
       "id": "image_1f2bdba4f0370608"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "id": "image_e5c56040668ba6c9"
-    },
-    {
-      "src": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "id": "image_dabb94fe94eb9c9a"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "id": "image_2f7cd9aaae2da43f"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/61929226ded356549e20c5da/ONUjP2S5fUWd07BiFXm0i.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/61929226ded356549e20c5da/ONUjP2S5fUWd07BiFXm0i.jpeg",
-      "id": "image_280c63c0d63ec397"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/train-sentence-transformers/st-hf-thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/train-sentence-transformers/st-hf-thumbnail.png",
-      "id": "image_3f59e95de0cdb130"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6317233cc92fd6fee317e030/cJHSvvimr1kqgQfHOjO5n.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6317233cc92fd6fee317e030/cJHSvvimr1kqgQfHOjO5n.png",
-      "id": "image_4846b3d76d1e92e2"
     }
   ],
   "videos": [],
@@ -96,98 +42,564 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:26.656365Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "9df146e9eb6e20ceb677722bf2b87a611e0d2ea5571f387345c1c2123d0b1918",
+  "mediaLayoutBodyHash": "62880d696eab68afc4e1e0ab520cb0daeb03c5951f2e226e5cc1c1281721e3f6",
   "mediaLayout": [
-    {
-      "mediaId": "image_404a70be5f5bdd71",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_18cae9867b91bab9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_33f9ff1b8728864c",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_18cae9867b91bab9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
     {
       "mediaId": "image_84e010a2459a4d82",
       "type": "image",
-      "afterBlockId": "b0013",
-      "order": 17
+      "afterBlockId": "b0014",
+      "order": 0
     },
     {
       "mediaId": "image_1f2bdba4f0370608",
       "type": "image",
-      "afterBlockId": "b0015",
-      "order": 20
-    },
-    {
-      "mediaId": "image_404a70be5f5bdd71",
-      "type": "image",
-      "afterBlockId": "b0055",
-      "order": 71
-    },
-    {
-      "mediaId": "image_18cae9867b91bab9",
-      "type": "image",
-      "afterBlockId": "b0055",
-      "order": 72
+      "afterBlockId": "b0016",
+      "order": 1
     }
   ],
-  "mediaLayoutUnplaced": [
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-05T01:17:31.934435Z",
+  "hfContentVersion": 1,
+  "inlineContent": [
     {
-      "mediaId": "image_e5c56040668ba6c9",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 61
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
     },
     {
-      "mediaId": "image_dabb94fe94eb9c9a",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 63
+      "id": "b0002",
+      "source": "TPU training is a useful skill to have: TPU pods are high-performance and extremely scalable, making it easy to train models at any scale from a few tens of millions of parameters up to truly enormous sizes: Google’s PaLM model (over 500 billion parameters!) was trained entirely on TPU pods.",
+      "spans": []
     },
     {
-      "mediaId": "image_2f7cd9aaae2da43f",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 64
+      "id": "b0003",
+      "source": "We’ve previously written a tutorial and a Colab example showing small-scale TPU training with TensorFlow and introducing the core concepts you need to understand to get your model working on TPU. This time, we’re going to step that up another level and train a masked language model from scratch using TensorFlow and TPU, including every step from training your tokenizer and preparing your dataset through to the final model training and uploading. This is the kind of task that you’ll probably want a dedicated TPU node (or VM) for, rather than just Colab, and so that’s where we’ll focus.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/perf_train_tpu_tf"
+        },
+        {
+          "start": 42,
+          "end": 55,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/examples/tpu_training-tf.ipynb"
+        }
+      ]
     },
     {
-      "mediaId": "image_280c63c0d63ec397",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 65
+      "id": "b0004",
+      "source": "As in our Colab example, we’re taking advantage of TensorFlow's very clean TPU support via XLA and TPUStrategy. We’ll also be benefiting from the fact that the majority of the TensorFlow models in 🤗 Transformers are fully XLA-compatible. So surprisingly, little work is needed to get them to run on TPU.",
+      "spans": [
+        {
+          "start": 99,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 222,
+          "end": 236,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tf-xla-generate"
+        }
+      ]
     },
     {
-      "mediaId": "image_3f59e95de0cdb130",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 66
+      "id": "b0005",
+      "source": "Unlike our Colab example, however, this example is designed to be scalable and much closer to a realistic training run -- although we only use a BERT-sized model by default, the code could be expanded to a much larger model and a much more powerful TPU pod slice by changing a few configuration options.",
+      "spans": [
+        {
+          "start": 66,
+          "end": 74,
+          "kind": "strong"
+        }
+      ]
     },
     {
-      "mediaId": "image_4846b3d76d1e92e2",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 68
+      "id": "b0006",
+      "source": "Motivation",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Why are we writing this guide now? After all, 🤗 Transformers has had support for TensorFlow for several years now. But getting those models to train on TPUs has been a major pain point for the community. This is because:",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Many models weren’t XLA-compatible",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Data collators didn’t use native TF operations",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "We think XLA is the future: It’s the core compiler for JAX, it has first-class support in TensorFlow, and you can even use it from PyTorch. As such, we’ve made a big push to make our codebase XLA compatible and to remove any other roadblocks standing in the way of XLA and TPU compatibility. This means users should be able to train most of our TensorFlow models on TPUs without hassle.",
+      "spans": [
+        {
+          "start": 131,
+          "end": 138,
+          "kind": "a",
+          "href": "https://github.com/pytorch/xla"
+        },
+        {
+          "start": 162,
+          "end": 170,
+          "kind": "a",
+          "href": "https://blog.tensorflow.org/2022/11/how-hugging-face-improved-text-generation-performance-with-xla.html"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "There’s also another important reason to care about TPU training right now: Recent major advances in LLMs and generative AI have created huge public interest in model training, and so it’s become incredibly hard for most people to get access to state-of-the-art GPUs. Knowing how to train on TPU gives you another path to access ultra-high-performance compute hardware, which is much more dignified than losing a bidding war for the last H100 on eBay and then ugly crying at your desk. You deserve better. And speaking from experience: Once you get comfortable with training on TPU, you might not want to go back.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "What to expect",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "We’re going to train a RoBERTa (base model) from scratch on the WikiText dataset (v1). As well as training the model, we’re also going to train the tokenizer, tokenize the data and upload it to Google Cloud Storage in TFRecord format, where it’ll be accessible for TPU training. You can find all the code in this directory. If you’re a certain kind of person, you can skip the rest of this blog post and just jump straight to the code. If you stick around, though, we’ll take a deeper look at some of the key ideas in the codebase.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/roberta"
+        },
+        {
+          "start": 64,
+          "end": 85,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/wikitext"
+        },
+        {
+          "start": 308,
+          "end": 322,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/tree/main/examples/tensorflow/language-modeling-tpu"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Many of the ideas here were also mentioned in our Colab example, but we wanted to show users a full end-to-end example that puts it all together and shows it in action, rather than just covering concepts at a high level. The following diagram gives you a pictorial overview of the steps involved in training a language model with 🤗 Transformers using TensorFlow and TPUs:",
+      "spans": [
+        {
+          "start": 50,
+          "end": 63,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/examples/tpu_training-tf.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Getting the data and training a tokenizer",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "As mentioned, we used the WikiText dataset (v1). You can head over to the dataset page on the Hugging Face Hub to explore the dataset.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/wikitext"
+        },
+        {
+          "start": 74,
+          "end": 110,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/wikitext"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Since the dataset is already available on the Hub in a compatible format, we can easily load and interact with it using 🤗 datasets. However, for this example, since we’re also training a tokenizer from scratch, here’s what we did:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Loaded the train split of the WikiText using 🤗 datasets.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 16,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Leveraged 🤗 tokenizers to train a Unigram model.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/course/chapter6/7?fw=pt"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Uploaded the trained tokenizer on the Hub.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "You can find the tokenizer training code here and the tokenizer here. This script also allows you to run it with any compatible dataset from the Hub.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 45,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/tree/main/examples/tensorflow/language-modeling-tpu#training-a-tokenizer"
+        },
+        {
+          "start": 64,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/tf-tpu/unigram-tokenizer-wikitext"
+        },
+        {
+          "start": 113,
+          "end": 135,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets?task_ids=task_ids:language-modeling"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "💡 It’s easy to use 🤗 datasets to host your text datasets. Refer to this guide to learn more.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 77,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/create_dataset"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Tokenizing the data and creating TFRecords",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Once the tokenizer is trained, we can use it on all the dataset splits (train, validation, and test in this case) and create TFRecord shards out of them. Having the data splits spread across multiple TFRecord shards helps with massively parallel processing as opposed to having each split in single TFRecord files.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 99,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "We tokenize the samples individually. We then take a batch of samples, concatenate them together, and split them into several chunks of a fixed size (128 in our case). We follow this strategy rather than tokenizing a batch of samples with a fixed length to avoid aggressively discarding text content (because of truncation).",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "We then take these tokenized samples in batches and serialize those batches as multiple TFRecord shards, where the total dataset length and individual shard size determine the number of shards. Finally, these shards are pushed to a Google Cloud Storage (GCS) bucket.",
+      "spans": [
+        {
+          "start": 232,
+          "end": 265,
+          "kind": "a",
+          "href": "https://cloud.google.com/storage/docs/json_api/v1/buckets"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "If you’re using a TPU node for training, then the data needs to be streamed from a GCS bucket since the node host memory is very small. But for TPU VMs, we can use datasets locally or even attach persistent storage to those VMs. Since TPU nodes are still quite heavily used, we based our example on using a GCS bucket for data storage.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "You can see all of this in code in this script. For convenience, we have also hosted the resultant TFRecord shards in this repository on the Hub.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 46,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/blob/main/examples/tensorflow/language-modeling-tpu/prepare_tfrecord_shards.py"
+        },
+        {
+          "start": 118,
+          "end": 133,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/tf-tpu/wikitext-v1-tfrecords"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Training a model on data in GCS",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "If you’re familiar with using 🤗 Transformers, then you already know the modeling code:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "But since we’re in the TPU territory, we need to perform this initialization under a strategy scope so that it can be distributed across the TPU workers with data-parallel training:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Similarly, the optimizer also needs to be initialized under the same strategy scope with which the model is going to be further compiled. Going over the full training code isn’t something we want to do in this post, so we welcome you to read it here. Instead, let’s discuss another key point of — a TensorFlow-native data collator — DataCollatorForLanguageModeling.",
+      "spans": [
+        {
+          "start": 245,
+          "end": 249,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/blob/main/examples/tensorflow/language-modeling-tpu/run_mlm.py"
+        },
+        {
+          "start": 333,
+          "end": 364,
+          "kind": "code"
+        },
+        {
+          "start": 333,
+          "end": 364,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/data_collator#transformers.DataCollatorForLanguageModeling"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "DataCollatorForLanguageModeling is responsible for masking randomly selected tokens from the input sequence and preparing the labels. By default, we return the results from these collators as NumPy arrays. However, many collators also support returning these values as TensorFlow tensors if we specify return_tensor=\"tf\". This was crucial for our data pipeline to be compatible with TPU training.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "code"
+        },
+        {
+          "start": 302,
+          "end": 320,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Thankfully, TensorFlow provides seamless support for reading files from a GCS bucket:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "If args.dataset contains the gs:// identifier, TensorFlow will understand that it needs to look into a GCS bucket. Loading locally is as easy as removing the gs:// identifier. For the rest of the data pipeline-related code, you can refer to this section in the training script.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 15,
+          "kind": "code"
+        },
+        {
+          "start": 29,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 158,
+          "end": 163,
+          "kind": "code"
+        },
+        {
+          "start": 241,
+          "end": 253,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/blob/474bf508dfe0d46fc38585a1bb793e5ba74fddfd/examples/tensorflow/language-modeling-tpu/run_mlm.py#L186-#L201"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Once the datasets have been prepared, the model and the optimizer have been initialized, and the model has been compiled, we can do the community’s favorite - model.fit(). For training, we didn’t do extensive hyperparameter tuning. We just trained it for longer with a learning rate of 1e-4. We also leveraged the PushToHubCallback for model checkpointing and syncing them with the Hub. You can find the hyperparameter details and a trained model here: https://huggingface.co/tf-tpu/roberta-base-epochs-500-no-wd.",
+      "spans": [
+        {
+          "start": 159,
+          "end": 170,
+          "kind": "code"
+        },
+        {
+          "start": 314,
+          "end": 331,
+          "kind": "code"
+        },
+        {
+          "start": 314,
+          "end": 331,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/keras_callbacks#transformers.PushToHubCallback"
+        },
+        {
+          "start": 453,
+          "end": 512,
+          "kind": "a",
+          "href": "https://huggingface.co/tf-tpu/roberta-base-epochs-500-no-wd"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Once the model is trained, running inference with it is as easy as:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "If there’s one thing we want to emphasize with this example, it’s that TPU training is powerful, scalable and easy. In fact, if you’re already using Transformers models with TF/Keras and streaming data from tf.data, you might be shocked at how little work it takes to move your whole training pipeline to TPU. They have a reputation as somewhat arcane, high-end, complex hardware, but they’re quite approachable, and instantiating a large pod slice is definitely easier than keeping multiple GPU servers in sync!",
+      "spans": [
+        {
+          "start": 87,
+          "end": 115,
+          "kind": "strong"
+        },
+        {
+          "start": 207,
+          "end": 214,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Diversifying the hardware that state-of-the-art models are trained on is going to be critical in the 2020s, especially if the ongoing GPU shortage continues. We hope that this guide will give you the tools you need to power cutting-edge training runs no matter what circumstances you face.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "As the great poet GPT-4 once said:",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "If you can keep your head when all around you Are losing theirs to GPU droughts, And trust your code, while others doubt you, To train on TPUs, no second thoughts;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "em"
+        },
+        {
+          "start": 46,
+          "end": 80,
+          "kind": "em"
+        },
+        {
+          "start": 81,
+          "end": 125,
+          "kind": "em"
+        },
+        {
+          "start": 126,
+          "end": 163,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "If you can learn from errors, and proceed, And optimize your aim to reach the sky, Yours is the path to AI mastery, And you'll prevail, my friend, as time goes by.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "em"
+        },
+        {
+          "start": 43,
+          "end": 82,
+          "kind": "em"
+        },
+        {
+          "start": 83,
+          "end": 115,
+          "kind": "em"
+        },
+        {
+          "start": 116,
+          "end": 163,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Sure, it’s shamelessly ripping off Rudyard Kipling and it has no idea how to pronounce “drought”, but we hope you feel inspired regardless.",
+      "spans": []
     }
   ],
-  "mediaLayoutMatched": 8,
-  "mediaLayoutStatus": "partial",
-  "mediaLayoutCheckedAt": "2026-09-26T20:08:51.015334Z",
+  "inlineContentBodyHash": "62880d696eab68afc4e1e0ab520cb0daeb03c5951f2e226e5cc1c1281721e3f6",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from transformers import AutoConfig, AutoTokenizer, TFAutoModelForMaskedLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n\nconfig = AutoConfig.from_pretrained(\"roberta-base\")\nconfig.vocab_size = tokenizer.vocab_size\nmodel = TFAutoModelForMaskedLM.from_config(config) "
+    },
+    {
+      "id": "c0002",
+      "source": "import tensorflow as tf\n\ntpu = tf.distribute.cluster_resolver.TPUClusterResolver(...)\nstrategy = tf.distribute.TPUStrategy(tpu)\n\nwith strategy.scope():\n    tokenizer = AutoTokenizer.from_pretrained(\"tf-tpu/unigram-tokenizer-wikitext\")\n    config = AutoConfig.from_pretrained(\"roberta-base\")\n    config.vocab_size = tokenizer.vocab_size\n    model = TFAutoModelForMaskedLM.from_config(config) "
+    },
+    {
+      "id": "c0003",
+      "source": "training_records = tf.io.gfile.glob(os.path.join(args.train_dataset, \"*.tfrecord\"))"
+    },
+    {
+      "id": "c0004",
+      "source": "from transformers import pipeline\n\nmodel_id = \"tf-tpu/roberta-base-epochs-500-no-wd\"\nunmasker = pipeline(\"fill-mask\", model=model_id, framework=\"tf\")\nunmasker(\"Goal of my life is to [MASK].\")\n\n[{'score': 0.1003185287117958,\n  'token': 52,\n  'token_str': 'be',\n  'sequence': 'Goal of my life is to be.'},\n {'score': 0.032648514956235886,\n  'token': 5,\n  'token_str': '',\n  'sequence': 'Goal of my life is to .'},\n {'score': 0.02152673341333866,\n  'token': 138,\n  'token_str': 'work',\n  'sequence': 'Goal of my life is to work.'},\n {'score': 0.019547373056411743,\n  'token': 984,\n  'token_str': 'act',\n  'sequence': 'Goal of my life is to act.'},\n {'score': 0.01939118467271328,\n  'token': 73,\n  'token_str': 'have',\n  'sequence': 'Goal of my life is to have.'}]"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T01:17:31.934417Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

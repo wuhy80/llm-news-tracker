@@ -16,13 +16,1725 @@
   "originalUrl": "https://huggingface.co/blog/time-series-transformers",
   "resolvedUrl": "https://huggingface.co/blog/time-series-transformers",
   "fetchedAt": "2026-08-27T03:10:35.848433Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "## Introduction\n\nTime series forecasting is an essential scientific and business problem and as such has also seen a lot of innovation recently with the use of deep learning based models in addition to the classical methods. An important difference between classical methods like ARIMA and novel deep learning methods is the following.\n\n## Probabilistic Forecasting\n\nTypically, classical methods are fitted on each time series in a dataset individually. These are often referred to as \"single\" or \"local\" methods. However, when dealing with a large amount of time series for some applications, it is beneficial to train a \"global\" model on all available time series, which enables the model to learn latent representations from many different sources.\n\nSome classical methods are point-valued (meaning, they just output a single value per time step) and models are trained by minimizing an L2 or L1 type of loss with respect to the ground truth data. However, since forecasts are often used in some real-world decision making pipeline, even with humans in the loop, it is much more beneficial to provide the uncertainties of predictions. This is also called \"probabilistic forecasting\", as opposed to \"point forecasting\". This entails modeling a probabilistic distribution, from which one can sample.\n\nSo in short, rather than training local point forecasting models, we hope to train global probabilistic models. Deep learning is a great fit for this, as neural networks can learn representations from several related time series as well as model the uncertainty of the data.\n\nIt is common in the probabilistic setting to learn the future parameters of some chosen parametric distribution, like Gaussian or Student-T; or learn the conditional quantile function; or use the framework of Conformal Prediction adapted to the time series setting. The choice of method does not affect the modeling aspect and thus can be typically thought of as yet another hyperparameter. One can always turn a probabilistic model into a point-forecasting model, by taking empirical means or medians.\n\n## The Time Series Transformer\n\nIn terms of modeling time series data which are sequential in nature, as one can imagine, researchers have come up with models which use Recurrent Neural Networks (RNN) like LSTM or GRU, or Convolutional Networks (CNN), and more recently Transformer based methods which fit naturally to the time series forecasting setting.\n\nIn this blog post, we're going to leverage the vanilla Transformer (Vaswani et al., 2017) for the univariate probabilistic forecasting task (i.e. predicting each time series' 1-d distribution individually). The Encoder-Decoder Transformer is a natural choice for forecasting as it encapsulates several inductive biases nicely.\n\nTo begin with, the use of an Encoder-Decoder architecture is helpful at inference time, where typically for some logged data we wish to forecast some prediction steps into the future. This can be thought of as analogous to the text generation task where given some context, we sample the next token and pass it back into the decoder (also called \"autoregressive generation\"). Similarly here we can also, given some distribution type, sample from it to provide forecasts up until our desired prediction horizon. This is known as Ancestral Sampling. Here is a great blog post about sampling in the context of language models.\n\nSecondly, a Transformer helps us to train on time series data which might contain thousands of time points. It might not be feasible to input all the history of a time series at once to the model, due to the time- and memory constraints of the attention mechanism. Thus, one can consider some appropriate context window and sample this window and the subsequent prediction length sized window from the training data when constructing batches for stochastic gradient descent (SGD). The context sized window can be passed to the encoder and the prediction window to a causal-masked decoder. This means that the decoder can only look at previous time steps when learning the next value. This is equivalent to how one would train a vanilla Transformer for machine translation, referred to as \"teacher forcing\".\n\nAnother benefit of Transformers over the other architectures is that we can incorporate missing values (which are common in the time series setting) as an additional mask to the encoder or decoder and still train without resorting to in-filling or imputation. This is equivalent to the attention_mask of models like BERT and GPT-2 in the Transformers library, to not include padding tokens in the computation of the attention matrix.\n\nA drawback of the Transformer architecture is the limit to the sizes of the context and prediction windows because of the quadratic compute and memory requirements of the vanilla Transformer, see Tay et al., 2020. Additionally, since the Transformer is a powerful architecture, it might overfit or learn spurious correlations much more easily compared to other methods.\n\nThe 🤗 Transformers library comes with a vanilla probabilistic time series Transformer model, simply called the Time Series Transformer. In the sections below, we'll show how to train such a model on a custom dataset.\n\n## Set-up Environment\n\nFirst, let's install the necessary libraries: 🤗 Transformers, 🤗 Datasets, 🤗 Evaluate, 🤗 Accelerate and GluonTS.\n\nAs we will show, GluonTS will be used for transforming the data to create features as well as for creating appropriate training, validation and test batches.\n\n```\n!pip install -q transformers\n\n!pip install -q datasets\n\n!pip install -q evaluate\n\n!pip install -q accelerate\n\n!pip install -q gluonts ujson\n```\n\n## Load Dataset\n\nIn this blog post, we'll use the tourism_monthly dataset, which is available on the Hugging Face Hub. This dataset contains monthly tourism volumes for 366 regions in Australia.\n\nThis dataset is part of the Monash Time Series Forecasting repository, a collection of time series datasets from a number of domains. It can be viewed as the GLUE benchmark of time series forecasting.\n\n```\nfrom datasets import load_dataset\n\ndataset = load_dataset(\"monash_tsf\", \"tourism_monthly\")\n```\n\nAs can be seen, the dataset contains 3 splits: train, validation and test.\n\n```\ndataset\n\n>>> DatasetDict({\n        train: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n        test: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n        validation: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n    })\n```\n\nEach example contains a few keys, of which start and target are the most important ones. Let us have a look at the first time series in the dataset:\n\n```\ntrain_example = dataset['train'][0]\ntrain_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])\n```\n\nThe start simply indicates the start of the time series (as a datetime), and the target contains the actual values of the time series.\n\nThe start will be useful to add time related features to the time series values, as extra input to the model (such as \"month of year\"). Since we know the frequency of the data is monthly, we know for instance that the second value has the timestamp 1979-02-01, etc.\n\n```\nprint(train_example['start'])\nprint(train_example['target'])\n\n>>> 1979-01-01 00:00:00\n    [1149.8699951171875, 1053.8001708984375, ..., 5772.876953125]\n```\n\nThe validation set contains the same data as the training set, just for a prediction_length longer amount of time. This allows us to validate the model's predictions against the ground truth.\n\nThe test set is again one prediction_length longer data compared to the validation set (or some multiple of prediction_length longer data compared to the training set for testing on multiple rolling windows).\n\n```\nvalidation_example = dataset['validation'][0]\nvalidation_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])\n```\n\nThe initial values are exactly the same as the corresponding training example:\n\n```\nprint(validation_example['start'])\nprint(validation_example['target'])\n\n>>> 1979-01-01 00:00:00\n    [1149.8699951171875, 1053.8001708984375, ..., 5985.830078125]\n```\n\nHowever, this example has prediction_length=24 additional values compared to the training example. Let us verify it.\n\n```\nfreq = \"1M\"\nprediction_length = 24\n\nassert len(train_example[\"target\"]) + prediction_length == len(\n    validation_example[\"target\"]\n)\n```\n\nLet's visualize this:\n\n```\nimport matplotlib.pyplot as plt\n\nfigure, axes = plt.subplots()\naxes.plot(train_example[\"target\"], color=\"blue\")\naxes.plot(validation_example[\"target\"], color=\"red\", alpha=0.5)\n\nplt.show()\n```\n\nLet's split up the data:\n\n```\ntrain_dataset = dataset[\"train\"]\ntest_dataset = dataset[\"test\"]\n```\n\n## Update start to pd.Period\n\nThe first thing we'll do is convert the start feature of each time series to a pandas Period index using the data's freq:\n\n```\nfrom functools import lru_cache\n\nimport pandas as pd\nimport numpy as np\n\n@lru_cache(10_000)\ndef convert_to_pandas_period(date, freq):\n    return pd.Period(date, freq)\n\ndef transform_start_field(batch, freq):\n    batch[\"start\"] = [convert_to_pandas_period(date, freq) for date in batch[\"start\"]]\n    return batch\n```\n\nWe now use datasets' set_transform functionality to do this on-the-fly in place:\n\n```\nfrom functools import partial\n\ntrain_dataset.set_transform(partial(transform_start_field, freq=freq))\ntest_dataset.set_transform(partial(transform_start_field, freq=freq))\n```\n\n## Define the Model\n\nNext, let's instantiate a model. The model will be trained from scratch, hence we won't use the from_pretrained method here, but rather randomly initialize the model from a config.\n\nWe specify a couple of additional parameters to the model:\n\n- prediction_length (in our case, 24 months): this is the horizon that the decoder of the Transformer will learn to predict for;\n\n- context_length: the model will set the context_length (input of the encoder) equal to the prediction_length, if no context_length is specified;\n\n- lags for a given frequency: these specify how much we \"look back\", to be added as additional features. e.g. for a Daily frequency we might consider a look back of [1, 2, 7, 30, ...] or in other words look back 1, 2, ... days while for Minute data we might consider [1, 30, 60, 60*24, ...] etc.;\n\n- the number of time features: in our case, this will be 2 as we'll add MonthOfYear and Age features;\n\n- the number of static categorical features: in our case, this will be just 1 as we'll add a single \"time series ID\" feature;\n\n- the cardinality: the number of values of each static categorical feature, as a list which for our case will be [366] as we have 366 different time series\n\n- the embedding dimension: the embedding dimension for each static categorical feature, as a list, for example [3] means the model will learn an embedding vector of size 3 for each of the 366 time series (regions).\n\nLet's use the default lags provided by GluonTS for the given frequency (\"monthly\"):\n\n```\nfrom gluonts.time_feature import get_lags_for_frequency\n\nlags_sequence = get_lags_for_frequency(freq)\nprint(lags_sequence)\n\n>>> [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 23, 24, 25, 35, 36, 37]\n```\n\nThis means that we'll look back up to 37 months for each time step, as additional features.\n\nLet's also check the default time features that GluonTS provides us:\n\n```\nfrom gluonts.time_feature import time_features_from_frequency_str\n\ntime_features = time_features_from_frequency_str(freq)\nprint(time_features)\n\n>>> [<function month_of_year at 0x7fa496d0ca70>]\n```\n\nIn this case, there's only a single feature, namely \"month of year\". This means that for each time step, we'll add the month as a scalar value (e.g. 1 in case the timestamp is \"january\", 2 in case the timestamp is \"february\", etc.).\n\nWe now have everything to define the model:\n\n```\nfrom transformers import TimeSeriesTransformerConfig, TimeSeriesTransformerForPrediction\n\nconfig = TimeSeriesTransformerConfig(\n    prediction_length=prediction_length,\n    # context length:\n    context_length=prediction_length * 2,\n    # lags coming from helper given the freq:\n    lags_sequence=lags_sequence,\n    # we'll add 2 time features (\"month of year\" and \"age\", see further):\n    num_time_features=len(time_features) + 1,\n    # we have a single static categorical feature, namely time series ID:\n    num_static_categorical_features=1,\n    # it has 366 possible values:\n    cardinality=[len(train_dataset)],\n    # the model will learn an embedding of size 2 for each of the 366 possible values:\n    embedding_dimension=[2],\n    \n    # transformer params:\n    encoder_layers=4,\n    decoder_layers=4,\n    d_model=32,\n)\n\nmodel = TimeSeriesTransformerForPrediction(config)\n```\n\nNote that, similar to other models in the 🤗 Transformers library, TimeSeriesTransformerModel corresponds to the encoder-decoder Transformer without any head on top, and TimeSeriesTransformerForPrediction corresponds to TimeSeriesTransformerModel with a distribution head on top. By default, the model uses a Student-t distribution (but this is configurable):\n\n```\nmodel.config.distribution_output\n\n>>> student_t\n```\n\nThis is an important difference with Transformers for NLP, where the head typically consists of a fixed categorical distribution implemented as an nn.Linear layer.\n\n## Define Transformations\n\nNext, we define the transformations for the data, in particular for the creation of the time features (based on the dataset or universal ones).\n\nAgain, we'll use the GluonTS library for this. We define a Chain of transformations (which is a bit comparable to torchvision.transforms.Compose for images). It allows us to combine several transformations into a single pipeline.\n\n```\nfrom gluonts.time_feature import (\n    time_features_from_frequency_str,\n    TimeFeature,\n    get_lags_for_frequency,\n)\nfrom gluonts.dataset.field_names import FieldName\nfrom gluonts.transform import (\n    AddAgeFeature,\n    AddObservedValuesIndicator,\n    AddTimeFeatures,\n    AsNumpyArray,\n    Chain,\n    ExpectedNumInstanceSampler,\n    InstanceSplitter,\n    RemoveFields,\n    SelectFields,\n    SetField,\n    TestSplitSampler,\n    Transformation,\n    ValidationSplitSampler,\n    VstackFeatures,\n    RenameFields,\n)\n```\n\nThe transformations below are annotated with comments, to explain what they do. At a high level, we will iterate over the individual time series of our dataset and add/remove fields or features:\n\n```\nfrom transformers import PretrainedConfig\n\ndef create_transformation(freq: str, config: PretrainedConfig) -> Transformation:\n    remove_field_names = []\n    if config.num_static_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_REAL)\n    if config.num_dynamic_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_DYNAMIC_REAL)\n    if config.num_static_categorical_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_CAT)\n\n    # a bit like torchvision.transforms.Compose\n    return Chain(\n        # step 1: remove static/dynamic fields if not specified\n        [RemoveFields(field_names=remove_field_names)]\n        # step 2: convert the data to NumPy (potentially not needed)\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_CAT,\n                    expected_ndim=1,\n                    dtype=int,\n                )\n            ]\n            if config.num_static_categorical_features > 0\n            else []\n        )\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_REAL,\n                    expected_ndim=1,\n                )\n            ]\n            if config.num_static_real_features > 0\n            else []\n        )\n        + [\n            AsNumpyArray(\n                field=FieldName.TARGET,\n                # we expect an extra dim for the multivariate case:\n                expected_ndim=1 if config.input_size == 1 else 2,\n            ),\n            # step 3: handle the NaN's by filling in the target with zero\n            # and return the mask (which is in the observed values)\n            # true for observed values, false for nan's\n            # the decoder uses this mask (no loss is incurred for unobserved values)\n            # see loss_weights inside the xxxForPrediction model\n            AddObservedValuesIndicator(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.OBSERVED_VALUES,\n            ),\n            # step 4: add temporal features based on freq of the dataset\n            # month of year in the case when freq=\"M\"\n            # these serve as positional encodings\n            AddTimeFeatures(\n                start_field=FieldName.START,\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_TIME,\n                time_features=time_features_from_frequency_str(freq),\n                pred_length=config.prediction_length,\n            ),\n            # step 5: add another temporal feature (just a single number)\n            # tells the model where in its life the value of the time series is,\n            # sort of a running counter\n            AddAgeFeature(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_AGE,\n                pred_length=config.prediction_length,\n                log_scale=True,\n            ),\n            # step 6: vertically stack all the temporal features into the key FEAT_TIME\n            VstackFeatures(\n                output_field=FieldName.FEAT_TIME,\n                input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]\n                + (\n                    [FieldName.FEAT_DYNAMIC_REAL]\n                    if config.num_dynamic_real_features > 0\n                    else []\n                ),\n            ),\n            # step 7: rename to match HuggingFace names\n            RenameFields(\n                mapping={\n                    FieldName.FEAT_STATIC_CAT: \"static_categorical_features\",\n                    FieldName.FEAT_STATIC_REAL: \"static_real_features\",\n                    FieldName.FEAT_TIME: \"time_features\",\n                    FieldName.TARGET: \"values\",\n                    FieldName.OBSERVED_VALUES: \"observed_mask\",\n                }\n            ),\n        ]\n    )\n```\n\n## Define InstanceSplitter\n\nFor training/validation/testing we next create an InstanceSplitter which is used to sample windows from the dataset (as, remember, we can't pass the entire history of values to the Transformer due to time- and memory constraints).\n\nThe instance splitter samples random context_length sized and subsequent prediction_length sized windows from the data, and appends a past_ or future_ key to any temporal keys in time_series_fields for the respective windows. The instance splitter can be configured into three different modes:\n\n- mode=\"train\": Here we sample the context and prediction length windows randomly from the dataset given to it (the training dataset)\n\n- mode=\"validation\": Here we sample the very last context length window and prediction window from the dataset given to it (for the back-testing or validation likelihood calculations)\n\n- mode=\"test\": Here we sample the very last context length window only (for the prediction use case)\n\n```\nfrom gluonts.transform.sampler import InstanceSampler\nfrom typing import Optional\n\ndef create_instance_splitter(\n    config: PretrainedConfig,\n    mode: str,\n    train_sampler: Optional[InstanceSampler] = None,\n    validation_sampler: Optional[InstanceSampler] = None,\n) -> Transformation:\n    assert mode in [\"train\", \"validation\", \"test\"]\n\n    instance_sampler = {\n        \"train\": train_sampler\n        or ExpectedNumInstanceSampler(\n            num_instances=1.0, min_future=config.prediction_length\n        ),\n        \"validation\": validation_sampler\n        or ValidationSplitSampler(min_future=config.prediction_length),\n        \"test\": TestSplitSampler(),\n    }[mode]\n\n    return InstanceSplitter(\n        target_field=\"values\",\n        is_pad_field=FieldName.IS_PAD,\n        start_field=FieldName.START,\n        forecast_start_field=FieldName.FORECAST_START,\n        instance_sampler=instance_sampler,\n        past_length=config.context_length + max(config.lags_sequence),\n        future_length=config.prediction_length,\n        time_series_fields=[\"time_features\", \"observed_mask\"],\n    )\n```\n\n## Create DataLoaders\n\nNext, it's time to create the DataLoaders, which allow us to have batches of (input, output) pairs - or in other words (past_values, future_values).\n\n```\nfrom typing import Iterable\n\nimport torch\nfrom gluonts.itertools import Cached, Cyclic\nfrom gluonts.dataset.loader import as_stacked_batches\n\n\ndef create_train_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    num_batches_per_epoch: int,\n    shuffle_buffer_length: Optional[int] = None,\n    cache_data: bool = True,\n    **kwargs,\n) -> Iterable:\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [\n        \"future_values\",\n        \"future_observed_mask\",\n    ]\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=True)\n    if cache_data:\n        transformed_data = Cached(transformed_data)\n\n    # we initialize a Training instance\n    instance_splitter = create_instance_splitter(config, \"train\")\n\n    # the instance splitter will sample a window of\n    # context length + lags + prediction length (from the 366 possible transformed time series)\n    # randomly from within the target time series and return an iterator.\n    stream = Cyclic(transformed_data).stream()\n    training_instances = instance_splitter.apply(stream)\n    \n    return as_stacked_batches(\n        training_instances,\n        batch_size=batch_size,\n        shuffle_buffer_length=shuffle_buffer_length,\n        field_names=TRAINING_INPUT_NAMES,\n        output_type=torch.tensor,\n        num_batches_per_epoch=num_batches_per_epoch,\n    )\n```\n\n```\ndef create_backtest_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data)\n\n    # we create a Validation Instance splitter which will sample the very last\n    # context window seen during training only for the encoder.\n    instance_sampler = create_instance_splitter(config, \"validation\")\n\n    # we apply the transformations in train mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=True)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )\n```\n\nWe have a test dataloader helper for completion, even though we will not use it here. This is useful in a production setting where we want to start forecasting from the end of a given time series. Thus, the test dataloader will sample the very last context window from the dataset provided and pass it to the model.\n\n```\ndef create_test_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=False)\n\n    # We create a test Instance splitter to sample the very last\n    # context window from the dataset provided.\n    instance_sampler = create_instance_splitter(config, \"test\")\n\n    # We apply the transformations in test mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=False)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )\n```\n\n```\ntrain_dataloader = create_train_dataloader(\n    config=config,\n    freq=freq,\n    data=train_dataset,\n    batch_size=256,\n    num_batches_per_epoch=100,\n)\n\ntest_dataloader = create_backtest_dataloader(\n    config=config,\n    freq=freq,\n    data=test_dataset,\n    batch_size=64,\n)\n```\n\nLet's check the first batch:\n\n```\nbatch = next(iter(train_dataloader))\nfor k, v in batch.items():\n    print(k, v.shape, v.type())\n\n>>> past_time_features torch.Size([256, 85, 2]) torch.FloatTensor\n    past_values torch.Size([256, 85]) torch.FloatTensor\n    past_observed_mask torch.Size([256, 85]) torch.FloatTensor\n    future_time_features torch.Size([256, 24, 2]) torch.FloatTensor\n    static_categorical_features torch.Size([256, 1]) torch.LongTensor\n    future_values torch.Size([256, 24]) torch.FloatTensor\n    future_observed_mask torch.Size([256, 24]) torch.FloatTensor\n```\n\nAs can be seen, we don't feed input_ids and attention_mask to the encoder (as would be the case for NLP models), but rather past_values, along with past_observed_mask, past_time_features, and static_categorical_features.\n\nThe decoder inputs consist of future_values, future_observed_mask and future_time_features. The future_values can be seen as the equivalent of decoder_input_ids in NLP.\n\nWe refer to the docs for a detailed explanation for each of them.\n\n## Forward Pass\n\nLet's perform a single forward pass with the batch we just created:\n\n```\n# perform forward pass\noutputs = model(\n    past_values=batch[\"past_values\"],\n    past_time_features=batch[\"past_time_features\"],\n    past_observed_mask=batch[\"past_observed_mask\"],\n    static_categorical_features=batch[\"static_categorical_features\"]\n    if config.num_static_categorical_features > 0\n    else None,\n    static_real_features=batch[\"static_real_features\"]\n    if config.num_static_real_features > 0\n    else None,\n    future_values=batch[\"future_values\"],\n    future_time_features=batch[\"future_time_features\"],\n    future_observed_mask=batch[\"future_observed_mask\"],\n    output_hidden_states=True,\n)\n```\n\n```\nprint(\"Loss:\", outputs.loss.item())\n\n>>> Loss: 9.069628715515137\n```\n\nNote that the model is returning a loss. This is possible as the decoder automatically shifts the future_values one position to the right in order to have the labels. This allows computing a loss between the predicted values and the labels.\n\nAlso, note that the decoder uses a causal mask to not look into the future as the values it needs to predict are in the future_values tensor.\n\n## Train the Model\n\nIt's time to train the model! We'll use a standard PyTorch training loop.\n\nWe will use the 🤗 Accelerate library here, which automatically places the model, optimizer and dataloader on the appropriate device.\n\n```\nfrom accelerate import Accelerator\nfrom torch.optim import AdamW\n\naccelerator = Accelerator()\ndevice = accelerator.device\n\nmodel.to(device)\noptimizer = AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), weight_decay=1e-1)\n\nmodel, optimizer, train_dataloader = accelerator.prepare(\n    model,\n    optimizer,\n    train_dataloader,\n)\n\nmodel.train()\nfor epoch in range(40):\n    for idx, batch in enumerate(train_dataloader):\n        optimizer.zero_grad()\n        outputs = model(\n            static_categorical_features=batch[\"static_categorical_features\"].to(device)\n            if config.num_static_categorical_features > 0\n            else None,\n            static_real_features=batch[\"static_real_features\"].to(device)\n            if config.num_static_real_features > 0\n            else None,\n            past_time_features=batch[\"past_time_features\"].to(device),\n            past_values=batch[\"past_values\"].to(device),\n            future_time_features=batch[\"future_time_features\"].to(device),\n            future_values=batch[\"future_values\"].to(device),\n            past_observed_mask=batch[\"past_observed_mask\"].to(device),\n            future_observed_mask=batch[\"future_observed_mask\"].to(device),\n        )\n        loss = outputs.loss\n\n        # Backpropagation\n        accelerator.backward(loss)\n        optimizer.step()\n\n        if idx % 100 == 0:\n            print(loss.item())\n```\n\n## Inference\n\nAt inference time, it's recommended to use the generate() method for autoregressive generation, similar to NLP models.\n\nForecasting involves getting data from the test instance sampler, which will sample the very last context_length sized window of values from each time series in the dataset, and pass it to the model. Note that we pass future_time_features, which are known ahead of time, to the decoder.\n\nThe model will autoregressively sample a certain number of values from the predicted distribution and pass them back to the decoder to return the prediction outputs:\n\n```\nmodel.eval()\n\nforecasts = []\n\nfor batch in test_dataloader:\n    outputs = model.generate(\n        static_categorical_features=batch[\"static_categorical_features\"].to(device)\n        if config.num_static_categorical_features > 0\n        else None,\n        static_real_features=batch[\"static_real_features\"].to(device)\n        if config.num_static_real_features > 0\n        else None,\n        past_time_features=batch[\"past_time_features\"].to(device),\n        past_values=batch[\"past_values\"].to(device),\n        future_time_features=batch[\"future_time_features\"].to(device),\n        past_observed_mask=batch[\"past_observed_mask\"].to(device),\n    )\n    forecasts.append(outputs.sequences.cpu().numpy())\n```\n\nThe model outputs a tensor of shape (batch_size, number of samples, prediction length).\n\nIn this case, we get 100 possible values for the next 24 months (for each example in the batch which is of size 64):\n\n```\nforecasts[0].shape\n\n>>> (64, 100, 24)\n```\n\nWe'll stack them vertically, to get forecasts for all time-series in the test dataset:\n\n```\nforecasts = np.vstack(forecasts)\nprint(forecasts.shape)\n\n>>> (366, 100, 24)\n```\n\nWe can evaluate the resulting forecast with respect to the ground truth out of sample values present in the test set. We will use the MASE and sMAPE metrics which we calculate for each time series in the dataset:\n\n```\nfrom evaluate import load\nfrom gluonts.time_feature import get_seasonality\n\nmase_metric = load(\"evaluate-metric/mase\")\nsmape_metric = load(\"evaluate-metric/smape\")\n\nforecast_median = np.median(forecasts, 1)\n\nmase_metrics = []\nsmape_metrics = []\nfor item_id, ts in enumerate(test_dataset):\n    training_data = ts[\"target\"][:-prediction_length]\n    ground_truth = ts[\"target\"][-prediction_length:]\n    mase = mase_metric.compute(\n        predictions=forecast_median[item_id], \n        references=np.array(ground_truth), \n        training=np.array(training_data), \n        periodicity=get_seasonality(freq))\n    mase_metrics.append(mase[\"mase\"])\n    \n    smape = smape_metric.compute(\n        predictions=forecast_median[item_id], \n        references=np.array(ground_truth), \n    )\n    smape_metrics.append(smape[\"smape\"])\n```\n\n```\nprint(f\"MASE: {np.mean(mase_metrics)}\")\n\n>>> MASE: 1.2564196892177717\n\nprint(f\"sMAPE: {np.mean(smape_metrics)}\")\n\n>>> sMAPE: 0.1609541520852549\n```\n\nWe can also plot the individual metrics of each time series in the dataset and observe that a handful of time series contribute a lot to the final test metric:\n\n```\nplt.scatter(mase_metrics, smape_metrics, alpha=0.3)\nplt.xlabel(\"MASE\")\nplt.ylabel(\"sMAPE\")\nplt.show()\n```\n\nTo plot the prediction for any time series with respect the ground truth test data we define the following helper:\n\n```\nimport matplotlib.dates as mdates\n\ndef plot(ts_index):\n    fig, ax = plt.subplots()\n\n    index = pd.period_range(\n        start=test_dataset[ts_index][FieldName.START],\n        periods=len(test_dataset[ts_index][FieldName.TARGET]),\n        freq=freq,\n    ).to_timestamp()\n\n    # Major ticks every half year, minor ticks every month,\n    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 7)))\n    ax.xaxis.set_minor_locator(mdates.MonthLocator())\n\n    ax.plot(\n        index[-2*prediction_length:], \n        test_dataset[ts_index][\"target\"][-2*prediction_length:],\n        label=\"actual\",\n    )\n\n    plt.plot(\n        index[-prediction_length:], \n        np.median(forecasts[ts_index], axis=0),\n        label=\"median\",\n    )\n    \n    plt.fill_between(\n        index[-prediction_length:],\n        forecasts[ts_index].mean(0) - forecasts[ts_index].std(axis=0), \n        forecasts[ts_index].mean(0) + forecasts[ts_index].std(axis=0), \n        alpha=0.3, \n        interpolate=True,\n        label=\"+/- 1-std\",\n    )\n    plt.legend()\n    plt.show()\n```\n\nFor example:\n\n```\nplot(334)\n```\n\nHow do we compare against other models? The Monash Time Series Repository has a comparison table of test set MASE metrics which we can add to:\n\nDataset\n\nSES\n\nTheta\n\nTBATS\n\nETS\n\n(DHR-)ARIMA\n\nPR\n\nCatBoost\n\nFFNN\n\nDeepAR\n\nN-BEATS\n\nWaveNet\n\nTransformer (Our)\n\nTourism Monthly\n\n3.306\n\n1.649\n\n1.751\n\n1.526\n\n1.589\n\n1.678\n\n1.699\n\n1.582\n\n1.409\n\n1.574\n\n1.482\n\n1.256\n\nNote that, with our model, we are beating all other models reported (see also table 2 in the corresponding paper), and we didn't do any hyperparameter tuning. We just trained the Transformer for 40 epochs.\n\nOf course, we need to be careful with just claiming state-of-the-art results on time series with neural networks, as it seems \"XGBoost is typically all you need\". We are just very curious to see how far neural networks can bring us, and whether Transformers are going to be useful in this domain. This particular dataset seems to indicate that it's definitely worth exploring.\n\n## Next Steps\n\nWe would encourage the readers to try out the notebook with other time series datasets from the Hub and replace the appropriate frequency and prediction length parameters. For your datasets, one would need to convert them to the convention used by GluonTS, which is explained nicely in their documentation here. We have also prepared an example notebook showing you how to convert your dataset into the 🤗 datasets format here.\n\nAs time series researchers will know, there has been a lot of interest in applying Transformer based models to the time series problem. The vanilla Transformer is just one of many attention-based models and so there is a need to add more models to the library.\n\nAt the moment nothing is stopping us from modeling multivariate time series, however for that one would need to instantiate the model with a multivariate distribution head. Currently, diagonal independent distributions are supported, and other multivariate distributions will be added. Stay tuned for a future blog post that will include a tutorial.\n\nAnother thing on the roadmap is time series classification. This entails adding a time series model with a classification head to the library, for the anomaly detection task for example.\n\nThe current model assumes the presence of a date-time together with the time series values, which might not be the case for every time series in the wild. See for instance neuroscience datasets like the one from WOODS. Thus, one would need to generalize the current model to make some inputs optional in the whole pipeline.\n\nFinally, the NLP/Vision domain has benefitted tremendously from large pre-trained models, while this is not the case as far as we are aware for the time series domain. Transformer based models seem like the obvious choice in pursuing this avenue of research and we cannot wait to see what researchers and practitioners come up with!",
   "summaryZh": "该文章介绍了如何利用Hugging Face的Transformers库进行概率时间序列预测，展示了Transformer架构在非自然语言领域的扩展应用。",
   "summaryGeneratedAt": "2026-09-06T02:38:06.788358Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_21_0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_21_0.png",
+      "alt": "png",
+      "id": "image_03d5f88c96c2f236"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_scatter.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_scatter.png",
+      "alt": "png",
+      "id": "image_cae36b8da49cd682"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_65_1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/time-series-transformers/output_65_1.png",
+      "alt": "png",
+      "id": "image_c2af6da45969e191"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Time series forecasting is an essential scientific and business problem and as such has also seen a lot of innovation recently with the use of deep learning based models in addition to the classical methods. An important difference between classical methods like ARIMA and novel deep learning methods is the following.",
+      "spans": [
+        {
+          "start": 143,
+          "end": 162,
+          "kind": "a",
+          "href": "https://dl.acm.org/doi/abs/10.1145/3533382"
+        },
+        {
+          "start": 189,
+          "end": 206,
+          "kind": "a",
+          "href": "https://otexts.com/fpp3/"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Probabilistic Forecasting",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Typically, classical methods are fitted on each time series in a dataset individually. These are often referred to as \"single\" or \"local\" methods. However, when dealing with a large amount of time series for some applications, it is beneficial to train a \"global\" model on all available time series, which enables the model to learn latent representations from many different sources.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Some classical methods are point-valued (meaning, they just output a single value per time step) and models are trained by minimizing an L2 or L1 type of loss with respect to the ground truth data. However, since forecasts are often used in some real-world decision making pipeline, even with humans in the loop, it is much more beneficial to provide the uncertainties of predictions. This is also called \"probabilistic forecasting\", as opposed to \"point forecasting\". This entails modeling a probabilistic distribution, from which one can sample.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "So in short, rather than training local point forecasting models, we hope to train global probabilistic models. Deep learning is a great fit for this, as neural networks can learn representations from several related time series as well as model the uncertainty of the data.",
+      "spans": [
+        {
+          "start": 83,
+          "end": 103,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "It is common in the probabilistic setting to learn the future parameters of some chosen parametric distribution, like Gaussian or Student-T; or learn the conditional quantile function; or use the framework of Conformal Prediction adapted to the time series setting. The choice of method does not affect the modeling aspect and thus can be typically thought of as yet another hyperparameter. One can always turn a probabilistic model into a point-forecasting model, by taking empirical means or medians.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "The Time Series Transformer",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "In terms of modeling time series data which are sequential in nature, as one can imagine, researchers have come up with models which use Recurrent Neural Networks (RNN) like LSTM or GRU, or Convolutional Networks (CNN), and more recently Transformer based methods which fit naturally to the time series forecasting setting.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "In this blog post, we're going to leverage the vanilla Transformer (Vaswani et al., 2017) for the univariate probabilistic forecasting task (i.e. predicting each time series' 1-d distribution individually). The Encoder-Decoder Transformer is a natural choice for forecasting as it encapsulates several inductive biases nicely.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 89,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1706.03762"
+        },
+        {
+          "start": 98,
+          "end": 108,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "To begin with, the use of an Encoder-Decoder architecture is helpful at inference time, where typically for some logged data we wish to forecast some prediction steps into the future. This can be thought of as analogous to the text generation task where given some context, we sample the next token and pass it back into the decoder (also called \"autoregressive generation\"). Similarly here we can also, given some distribution type, sample from it to provide forecasts up until our desired prediction horizon. This is known as Ancestral Sampling. Here is a great blog post about sampling in the context of language models.",
+      "spans": [
+        {
+          "start": 548,
+          "end": 552,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/how-to-generate"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Secondly, a Transformer helps us to train on time series data which might contain thousands of time points. It might not be feasible to input all the history of a time series at once to the model, due to the time- and memory constraints of the attention mechanism. Thus, one can consider some appropriate context window and sample this window and the subsequent prediction length sized window from the training data when constructing batches for stochastic gradient descent (SGD). The context sized window can be passed to the encoder and the prediction window to a causal-masked decoder. This means that the decoder can only look at previous time steps when learning the next value. This is equivalent to how one would train a vanilla Transformer for machine translation, referred to as \"teacher forcing\".",
+      "spans": [
+        {
+          "start": 142,
+          "end": 145,
+          "kind": "em"
+        },
+        {
+          "start": 566,
+          "end": 579,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Another benefit of Transformers over the other architectures is that we can incorporate missing values (which are common in the time series setting) as an additional mask to the encoder or decoder and still train without resorting to in-filling or imputation. This is equivalent to the attention_mask of models like BERT and GPT-2 in the Transformers library, to not include padding tokens in the computation of the attention matrix.",
+      "spans": [
+        {
+          "start": 286,
+          "end": 300,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "A drawback of the Transformer architecture is the limit to the sizes of the context and prediction windows because of the quadratic compute and memory requirements of the vanilla Transformer, see Tay et al., 2020. Additionally, since the Transformer is a powerful architecture, it might overfit or learn spurious correlations much more easily compared to other methods.",
+      "spans": [
+        {
+          "start": 196,
+          "end": 212,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2009.06732"
+        },
+        {
+          "start": 361,
+          "end": 368,
+          "kind": "a",
+          "href": "https://openreview.net/pdf?id=D7YBmfX_VQy"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "The 🤗 Transformers library comes with a vanilla probabilistic time series Transformer model, simply called the Time Series Transformer. In the sections below, we'll show how to train such a model on a custom dataset.",
+      "spans": [
+        {
+          "start": 111,
+          "end": 134,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/time_series_transformer"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Set-up Environment",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "First, let's install the necessary libraries: 🤗 Transformers, 🤗 Datasets, 🤗 Evaluate, 🤗 Accelerate and GluonTS.",
+      "spans": [
+        {
+          "start": 103,
+          "end": 110,
+          "kind": "a",
+          "href": "https://github.com/awslabs/gluonts"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "As we will show, GluonTS will be used for transforming the data to create features as well as for creating appropriate training, validation and test batches.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Load Dataset",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "In this blog post, we'll use the tourism_monthly dataset, which is available on the Hugging Face Hub. This dataset contains monthly tourism volumes for 366 regions in Australia.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 84,
+          "end": 100,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/monash_tsf"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "This dataset is part of the Monash Time Series Forecasting repository, a collection of time series datasets from a number of domains. It can be viewed as the GLUE benchmark of time series forecasting.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 58,
+          "kind": "a",
+          "href": "https://forecastingdata.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "As can be seen, the dataset contains 3 splits: train, validation and test.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Each example contains a few keys, of which start and target are the most important ones. Let us have a look at the first time series in the dataset:",
+      "spans": [
+        {
+          "start": 43,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 53,
+          "end": 59,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "The start simply indicates the start of the time series (as a datetime), and the target contains the actual values of the time series.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 81,
+          "end": 87,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "The start will be useful to add time related features to the time series values, as extra input to the model (such as \"month of year\"). Since we know the frequency of the data is monthly, we know for instance that the second value has the timestamp 1979-02-01, etc.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 179,
+          "end": 186,
+          "kind": "code"
+        },
+        {
+          "start": 249,
+          "end": 259,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "The validation set contains the same data as the training set, just for a prediction_length longer amount of time. This allows us to validate the model's predictions against the ground truth.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 91,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The test set is again one prediction_length longer data compared to the validation set (or some multiple of prediction_length longer data compared to the training set for testing on multiple rolling windows).",
+      "spans": [
+        {
+          "start": 26,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 125,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "The initial values are exactly the same as the corresponding training example:",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "However, this example has prediction_length=24 additional values compared to the training example. Let us verify it.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 46,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Let's visualize this:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Let's split up the data:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Update start to pd.Period",
+      "spans": [
+        {
+          "start": 7,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 16,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "The first thing we'll do is convert the start feature of each time series to a pandas Period index using the data's freq:",
+      "spans": [
+        {
+          "start": 40,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 120,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "We now use datasets' set_transform functionality to do this on-the-fly in place:",
+      "spans": [
+        {
+          "start": 11,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/v2.7.0/en/package_reference/main_classes#datasets.Dataset.set_transform"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Define the Model",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Next, let's instantiate a model. The model will be trained from scratch, hence we won't use the from_pretrained method here, but rather randomly initialize the model from a config.",
+      "spans": [
+        {
+          "start": 96,
+          "end": 111,
+          "kind": "code"
+        },
+        {
+          "start": 173,
+          "end": 179,
+          "kind": "code"
+        },
+        {
+          "start": 173,
+          "end": 179,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/time_series_transformer#transformers.TimeSeriesTransformerConfig"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "We specify a couple of additional parameters to the model:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "prediction_length (in our case, 24 months): this is the horizon that the decoder of the Transformer will learn to predict for;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 32,
+          "end": 34,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "context_length: the model will set the context_length (input of the encoder) equal to the prediction_length, if no context_length is specified;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "code"
+        },
+        {
+          "start": 39,
+          "end": 53,
+          "kind": "code"
+        },
+        {
+          "start": 90,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 115,
+          "end": 129,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "lags for a given frequency: these specify how much we \"look back\", to be added as additional features. e.g. for a Daily frequency we might consider a look back of [1, 2, 7, 30, ...] or in other words look back 1, 2, ... days while for Minute data we might consider [1, 30, 60, 60*24, ...] etc.;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "code"
+        },
+        {
+          "start": 114,
+          "end": 119,
+          "kind": "code"
+        },
+        {
+          "start": 163,
+          "end": 181,
+          "kind": "code"
+        },
+        {
+          "start": 235,
+          "end": 241,
+          "kind": "code"
+        },
+        {
+          "start": 265,
+          "end": 288,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "the number of time features: in our case, this will be 2 as we'll add MonthOfYear and Age features;",
+      "spans": [
+        {
+          "start": 55,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 81,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 89,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "the number of static categorical features: in our case, this will be just 1 as we'll add a single \"time series ID\" feature;",
+      "spans": [
+        {
+          "start": 74,
+          "end": 75,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "the cardinality: the number of values of each static categorical feature, as a list which for our case will be [366] as we have 366 different time series",
+      "spans": [
+        {
+          "start": 111,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "the embedding dimension: the embedding dimension for each static categorical feature, as a list, for example [3] means the model will learn an embedding vector of size 3 for each of the 366 time series (regions).",
+      "spans": [
+        {
+          "start": 109,
+          "end": 112,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 169,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 189,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Let's use the default lags provided by GluonTS for the given frequency (\"monthly\"):",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "This means that we'll look back up to 37 months for each time step, as additional features.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Let's also check the default time features that GluonTS provides us:",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "In this case, there's only a single feature, namely \"month of year\". This means that for each time step, we'll add the month as a scalar value (e.g. 1 in case the timestamp is \"january\", 2 in case the timestamp is \"february\", etc.).",
+      "spans": [
+        {
+          "start": 149,
+          "end": 150,
+          "kind": "code"
+        },
+        {
+          "start": 187,
+          "end": 188,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "We now have everything to define the model:",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Note that, similar to other models in the 🤗 Transformers library, TimeSeriesTransformerModel corresponds to the encoder-decoder Transformer without any head on top, and TimeSeriesTransformerForPrediction corresponds to TimeSeriesTransformerModel with a distribution head on top. By default, the model uses a Student-t distribution (but this is configurable):",
+      "spans": [
+        {
+          "start": 66,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 92,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/time_series_transformer#transformers.TimeSeriesTransformerModel"
+        },
+        {
+          "start": 169,
+          "end": 203,
+          "kind": "code"
+        },
+        {
+          "start": 169,
+          "end": 203,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/time_series_transformer#transformers.TimeSeriesTransformerForPrediction"
+        },
+        {
+          "start": 219,
+          "end": 245,
+          "kind": "code"
+        },
+        {
+          "start": 253,
+          "end": 270,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "This is an important difference with Transformers for NLP, where the head typically consists of a fixed categorical distribution implemented as an nn.Linear layer.",
+      "spans": [
+        {
+          "start": 147,
+          "end": 156,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Define Transformations",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Next, we define the transformations for the data, in particular for the creation of the time features (based on the dataset or universal ones).",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Again, we'll use the GluonTS library for this. We define a Chain of transformations (which is a bit comparable to torchvision.transforms.Compose for images). It allows us to combine several transformations into a single pipeline.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 114,
+          "end": 144,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "The transformations below are annotated with comments, to explain what they do. At a high level, we will iterate over the individual time series of our dataset and add/remove fields or features:",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Define InstanceSplitter",
+      "spans": [
+        {
+          "start": 7,
+          "end": 23,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "For training/validation/testing we next create an InstanceSplitter which is used to sample windows from the dataset (as, remember, we can't pass the entire history of values to the Transformer due to time- and memory constraints).",
+      "spans": [
+        {
+          "start": 50,
+          "end": 66,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "The instance splitter samples random context_length sized and subsequent prediction_length sized windows from the data, and appends a past_ or future_ key to any temporal keys in time_series_fields for the respective windows. The instance splitter can be configured into three different modes:",
+      "spans": [
+        {
+          "start": 37,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 134,
+          "end": 139,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 150,
+          "kind": "code"
+        },
+        {
+          "start": 179,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "mode=\"train\": Here we sample the context and prediction length windows randomly from the dataset given to it (the training dataset)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "mode=\"validation\": Here we sample the very last context length window and prediction window from the dataset given to it (for the back-testing or validation likelihood calculations)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "mode=\"test\": Here we sample the very last context length window only (for the prediction use case)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Create DataLoaders",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Next, it's time to create the DataLoaders, which allow us to have batches of (input, output) pairs - or in other words (past_values, future_values).",
+      "spans": [
+        {
+          "start": 120,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 146,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "We have a test dataloader helper for completion, even though we will not use it here. This is useful in a production setting where we want to start forecasting from the end of a given time series. Thus, the test dataloader will sample the very last context window from the dataset provided and pass it to the model.",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Let's check the first batch:",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "As can be seen, we don't feed input_ids and attention_mask to the encoder (as would be the case for NLP models), but rather past_values, along with past_observed_mask, past_time_features, and static_categorical_features.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 39,
+          "kind": "code"
+        },
+        {
+          "start": 44,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 148,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 186,
+          "kind": "code"
+        },
+        {
+          "start": 192,
+          "end": 219,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "The decoder inputs consist of future_values, future_observed_mask and future_time_features. The future_values can be seen as the equivalent of decoder_input_ids in NLP.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 96,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 160,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "We refer to the docs for a detailed explanation for each of them.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/time_series_transformer#transformers.TimeSeriesTransformerForPrediction.forward.past_values"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Forward Pass",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Let's perform a single forward pass with the batch we just created:",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Note that the model is returning a loss. This is possible as the decoder automatically shifts the future_values one position to the right in order to have the labels. This allows computing a loss between the predicted values and the labels.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 111,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Also, note that the decoder uses a causal mask to not look into the future as the values it needs to predict are in the future_values tensor.",
+      "spans": [
+        {
+          "start": 120,
+          "end": 133,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Train the Model",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "It's time to train the model! We'll use a standard PyTorch training loop.",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "We will use the 🤗 Accelerate library here, which automatically places the model, optimizer and dataloader on the appropriate device.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/index"
+        },
+        {
+          "start": 125,
+          "end": 131,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "At inference time, it's recommended to use the generate() method for autoregressive generation, similar to NLP models.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "Forecasting involves getting data from the test instance sampler, which will sample the very last context_length sized window of values from each time series in the dataset, and pass it to the model. Note that we pass future_time_features, which are known ahead of time, to the decoder.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 112,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 238,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "The model will autoregressively sample a certain number of values from the predicted distribution and pass them back to the decoder to return the prediction outputs:",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "The model outputs a tensor of shape (batch_size, number of samples, prediction length).",
+      "spans": [
+        {
+          "start": 37,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 49,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 68,
+          "end": 85,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "In this case, we get 100 possible values for the next 24 months (for each example in the batch which is of size 64):",
+      "spans": [
+        {
+          "start": 21,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 54,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 114,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "We'll stack them vertically, to get forecasts for all time-series in the test dataset:",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "We can evaluate the resulting forecast with respect to the ground truth out of sample values present in the test set. We will use the MASE and sMAPE metrics which we calculate for each time series in the dataset:",
+      "spans": [
+        {
+          "start": 134,
+          "end": 138,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/evaluate-metric/mase"
+        },
+        {
+          "start": 143,
+          "end": 148,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/evaluate-metric/smape"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "We can also plot the individual metrics of each time series in the dataset and observe that a handful of time series contribute a lot to the final test metric:",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "To plot the prediction for any time series with respect the ground truth test data we define the following helper:",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "For example:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "How do we compare against other models? The Monash Time Series Repository has a comparison table of test set MASE metrics which we can add to:",
+      "spans": [
+        {
+          "start": 44,
+          "end": 73,
+          "kind": "a",
+          "href": "https://forecastingdata.org/#results"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Dataset",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "SES",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "Theta",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "TBATS",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "ETS",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "(DHR-)ARIMA",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "PR",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "CatBoost",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "FFNN",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "DeepAR",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "N-BEATS",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "WaveNet",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 11,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "Transformer (Our)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 12,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "Tourism Monthly",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "3.306",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "1.649",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "1.751",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "1.526",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "1.589",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "1.678",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "1.699",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "1.582",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "1.409",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "1.574",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "1.482",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 11,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "1.256",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 12,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "Note that, with our model, we are beating all other models reported (see also table 2 in the corresponding paper), and we didn't do any hyperparameter tuning. We just trained the Transformer for 40 epochs.",
+      "spans": [
+        {
+          "start": 107,
+          "end": 112,
+          "kind": "a",
+          "href": "https://openreview.net/pdf?id=wEc1mgAjU-"
+        }
+      ]
+    },
+    {
+      "id": "b0115",
+      "source": "Of course, we need to be careful with just claiming state-of-the-art results on time series with neural networks, as it seems \"XGBoost is typically all you need\". We are just very curious to see how far neural networks can bring us, and whether Transformers are going to be useful in this domain. This particular dataset seems to indicate that it's definitely worth exploring.",
+      "spans": [
+        {
+          "start": 126,
+          "end": 161,
+          "kind": "a",
+          "href": "https://www.sciencedirect.com/science/article/pii/S0169207021001679"
+        }
+      ]
+    },
+    {
+      "id": "b0116",
+      "source": "Next Steps",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "We would encourage the readers to try out the notebook with other time series datasets from the Hub and replace the appropriate frequency and prediction length parameters. For your datasets, one would need to convert them to the convention used by GluonTS, which is explained nicely in their documentation here. We have also prepared an example notebook showing you how to convert your dataset into the 🤗 datasets format here.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 54,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/examples/time-series-transformers.ipynb"
+        },
+        {
+          "start": 96,
+          "end": 99,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/monash_tsf"
+        },
+        {
+          "start": 306,
+          "end": 310,
+          "kind": "a",
+          "href": "https://ts.gluon.ai/stable/tutorials/forecasting/extended_tutorial.html#What-is-in-a-dataset?"
+        },
+        {
+          "start": 421,
+          "end": 425,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/main/examples/time_series_datasets.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "As time series researchers will know, there has been a lot of interest in applying Transformer based models to the time series problem. The vanilla Transformer is just one of many attention-based models and so there is a need to add more models to the library.",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "At the moment nothing is stopping us from modeling multivariate time series, however for that one would need to instantiate the model with a multivariate distribution head. Currently, diagonal independent distributions are supported, and other multivariate distributions will be added. Stay tuned for a future blog post that will include a tutorial.",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Another thing on the roadmap is time series classification. This entails adding a time series model with a classification head to the library, for the anomaly detection task for example.",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "The current model assumes the presence of a date-time together with the time series values, which might not be the case for every time series in the wild. See for instance neuroscience datasets like the one from WOODS. Thus, one would need to generalize the current model to make some inputs optional in the whole pipeline.",
+      "spans": [
+        {
+          "start": 212,
+          "end": 217,
+          "kind": "a",
+          "href": "https://woods-benchmarks.github.io/"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "Finally, the NLP/Vision domain has benefitted tremendously from large pre-trained models, while this is not the case as far as we are aware for the time series domain. Transformer based models seem like the obvious choice in pursuing this avenue of research and we cannot wait to see what researchers and practitioners come up with!",
+      "spans": [
+        {
+          "start": 64,
+          "end": 88,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1810.04805"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "af43825bab97a71640ddd99c72e566822fd179b1b47203136fd240667202af78",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "!pip install -q transformers\n\n!pip install -q datasets\n\n!pip install -q evaluate\n\n!pip install -q accelerate\n\n!pip install -q gluonts ujson"
+    },
+    {
+      "id": "c0002",
+      "source": "from datasets import load_dataset\n\ndataset = load_dataset(\"monash_tsf\", \"tourism_monthly\")"
+    },
+    {
+      "id": "c0003",
+      "source": "dataset\n\n>>> DatasetDict({\n        train: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n        test: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n        validation: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 366\n        })\n    })"
+    },
+    {
+      "id": "c0004",
+      "source": "train_example = dataset['train'][0]\ntrain_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])"
+    },
+    {
+      "id": "c0005",
+      "source": "print(train_example['start'])\nprint(train_example['target'])\n\n>>> 1979-01-01 00:00:00\n    [1149.8699951171875, 1053.8001708984375, ..., 5772.876953125]"
+    },
+    {
+      "id": "c0006",
+      "source": "validation_example = dataset['validation'][0]\nvalidation_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])"
+    },
+    {
+      "id": "c0007",
+      "source": "print(validation_example['start'])\nprint(validation_example['target'])\n\n>>> 1979-01-01 00:00:00\n    [1149.8699951171875, 1053.8001708984375, ..., 5985.830078125]"
+    },
+    {
+      "id": "c0008",
+      "source": "freq = \"1M\"\nprediction_length = 24\n\nassert len(train_example[\"target\"]) + prediction_length == len(\n    validation_example[\"target\"]\n)"
+    },
+    {
+      "id": "c0009",
+      "source": "import matplotlib.pyplot as plt\n\nfigure, axes = plt.subplots()\naxes.plot(train_example[\"target\"], color=\"blue\")\naxes.plot(validation_example[\"target\"], color=\"red\", alpha=0.5)\n\nplt.show()"
+    },
+    {
+      "id": "c0010",
+      "source": "train_dataset = dataset[\"train\"]\ntest_dataset = dataset[\"test\"]"
+    },
+    {
+      "id": "c0011",
+      "source": "from functools import lru_cache\n\nimport pandas as pd\nimport numpy as np\n\n@lru_cache(10_000)\ndef convert_to_pandas_period(date, freq):\n    return pd.Period(date, freq)\n\ndef transform_start_field(batch, freq):\n    batch[\"start\"] = [convert_to_pandas_period(date, freq) for date in batch[\"start\"]]\n    return batch"
+    },
+    {
+      "id": "c0012",
+      "source": "from functools import partial\n\ntrain_dataset.set_transform(partial(transform_start_field, freq=freq))\ntest_dataset.set_transform(partial(transform_start_field, freq=freq))"
+    },
+    {
+      "id": "c0013",
+      "source": "from gluonts.time_feature import get_lags_for_frequency\n\nlags_sequence = get_lags_for_frequency(freq)\nprint(lags_sequence)\n\n>>> [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 23, 24, 25, 35, 36, 37]"
+    },
+    {
+      "id": "c0014",
+      "source": "from gluonts.time_feature import time_features_from_frequency_str\n\ntime_features = time_features_from_frequency_str(freq)\nprint(time_features)\n\n>>> [<function month_of_year at 0x7fa496d0ca70>]"
+    },
+    {
+      "id": "c0015",
+      "source": "from transformers import TimeSeriesTransformerConfig, TimeSeriesTransformerForPrediction\n\nconfig = TimeSeriesTransformerConfig(\n    prediction_length=prediction_length,\n    # context length:\n    context_length=prediction_length * 2,\n    # lags coming from helper given the freq:\n    lags_sequence=lags_sequence,\n    # we'll add 2 time features (\"month of year\" and \"age\", see further):\n    num_time_features=len(time_features) + 1,\n    # we have a single static categorical feature, namely time series ID:\n    num_static_categorical_features=1,\n    # it has 366 possible values:\n    cardinality=[len(train_dataset)],\n    # the model will learn an embedding of size 2 for each of the 366 possible values:\n    embedding_dimension=[2],\n    \n    # transformer params:\n    encoder_layers=4,\n    decoder_layers=4,\n    d_model=32,\n)\n\nmodel = TimeSeriesTransformerForPrediction(config)"
+    },
+    {
+      "id": "c0016",
+      "source": "model.config.distribution_output\n\n>>> student_t"
+    },
+    {
+      "id": "c0017",
+      "source": "from gluonts.time_feature import (\n    time_features_from_frequency_str,\n    TimeFeature,\n    get_lags_for_frequency,\n)\nfrom gluonts.dataset.field_names import FieldName\nfrom gluonts.transform import (\n    AddAgeFeature,\n    AddObservedValuesIndicator,\n    AddTimeFeatures,\n    AsNumpyArray,\n    Chain,\n    ExpectedNumInstanceSampler,\n    InstanceSplitter,\n    RemoveFields,\n    SelectFields,\n    SetField,\n    TestSplitSampler,\n    Transformation,\n    ValidationSplitSampler,\n    VstackFeatures,\n    RenameFields,\n)"
+    },
+    {
+      "id": "c0018",
+      "source": "from transformers import PretrainedConfig\n\ndef create_transformation(freq: str, config: PretrainedConfig) -> Transformation:\n    remove_field_names = []\n    if config.num_static_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_REAL)\n    if config.num_dynamic_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_DYNAMIC_REAL)\n    if config.num_static_categorical_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_CAT)\n\n    # a bit like torchvision.transforms.Compose\n    return Chain(\n        # step 1: remove static/dynamic fields if not specified\n        [RemoveFields(field_names=remove_field_names)]\n        # step 2: convert the data to NumPy (potentially not needed)\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_CAT,\n                    expected_ndim=1,\n                    dtype=int,\n                )\n            ]\n            if config.num_static_categorical_features > 0\n            else []\n        )\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_REAL,\n                    expected_ndim=1,\n                )\n            ]\n            if config.num_static_real_features > 0\n            else []\n        )\n        + [\n            AsNumpyArray(\n                field=FieldName.TARGET,\n                # we expect an extra dim for the multivariate case:\n                expected_ndim=1 if config.input_size == 1 else 2,\n            ),\n            # step 3: handle the NaN's by filling in the target with zero\n            # and return the mask (which is in the observed values)\n            # true for observed values, false for nan's\n            # the decoder uses this mask (no loss is incurred for unobserved values)\n            # see loss_weights inside the xxxForPrediction model\n            AddObservedValuesIndicator(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.OBSERVED_VALUES,\n            ),\n            # step 4: add temporal features based on freq of the dataset\n            # month of year in the case when freq=\"M\"\n            # these serve as positional encodings\n            AddTimeFeatures(\n                start_field=FieldName.START,\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_TIME,\n                time_features=time_features_from_frequency_str(freq),\n                pred_length=config.prediction_length,\n            ),\n            # step 5: add another temporal feature (just a single number)\n            # tells the model where in its life the value of the time series is,\n            # sort of a running counter\n            AddAgeFeature(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_AGE,\n                pred_length=config.prediction_length,\n                log_scale=True,\n            ),\n            # step 6: vertically stack all the temporal features into the key FEAT_TIME\n            VstackFeatures(\n                output_field=FieldName.FEAT_TIME,\n                input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]\n                + (\n                    [FieldName.FEAT_DYNAMIC_REAL]\n                    if config.num_dynamic_real_features > 0\n                    else []\n                ),\n            ),\n            # step 7: rename to match HuggingFace names\n            RenameFields(\n                mapping={\n                    FieldName.FEAT_STATIC_CAT: \"static_categorical_features\",\n                    FieldName.FEAT_STATIC_REAL: \"static_real_features\",\n                    FieldName.FEAT_TIME: \"time_features\",\n                    FieldName.TARGET: \"values\",\n                    FieldName.OBSERVED_VALUES: \"observed_mask\",\n                }\n            ),\n        ]\n    )"
+    },
+    {
+      "id": "c0019",
+      "source": "from gluonts.transform.sampler import InstanceSampler\nfrom typing import Optional\n\ndef create_instance_splitter(\n    config: PretrainedConfig,\n    mode: str,\n    train_sampler: Optional[InstanceSampler] = None,\n    validation_sampler: Optional[InstanceSampler] = None,\n) -> Transformation:\n    assert mode in [\"train\", \"validation\", \"test\"]\n\n    instance_sampler = {\n        \"train\": train_sampler\n        or ExpectedNumInstanceSampler(\n            num_instances=1.0, min_future=config.prediction_length\n        ),\n        \"validation\": validation_sampler\n        or ValidationSplitSampler(min_future=config.prediction_length),\n        \"test\": TestSplitSampler(),\n    }[mode]\n\n    return InstanceSplitter(\n        target_field=\"values\",\n        is_pad_field=FieldName.IS_PAD,\n        start_field=FieldName.START,\n        forecast_start_field=FieldName.FORECAST_START,\n        instance_sampler=instance_sampler,\n        past_length=config.context_length + max(config.lags_sequence),\n        future_length=config.prediction_length,\n        time_series_fields=[\"time_features\", \"observed_mask\"],\n    )"
+    },
+    {
+      "id": "c0020",
+      "source": "from typing import Iterable\n\nimport torch\nfrom gluonts.itertools import Cached, Cyclic\nfrom gluonts.dataset.loader import as_stacked_batches\n\n\ndef create_train_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    num_batches_per_epoch: int,\n    shuffle_buffer_length: Optional[int] = None,\n    cache_data: bool = True,\n    **kwargs,\n) -> Iterable:\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [\n        \"future_values\",\n        \"future_observed_mask\",\n    ]\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=True)\n    if cache_data:\n        transformed_data = Cached(transformed_data)\n\n    # we initialize a Training instance\n    instance_splitter = create_instance_splitter(config, \"train\")\n\n    # the instance splitter will sample a window of\n    # context length + lags + prediction length (from the 366 possible transformed time series)\n    # randomly from within the target time series and return an iterator.\n    stream = Cyclic(transformed_data).stream()\n    training_instances = instance_splitter.apply(stream)\n    \n    return as_stacked_batches(\n        training_instances,\n        batch_size=batch_size,\n        shuffle_buffer_length=shuffle_buffer_length,\n        field_names=TRAINING_INPUT_NAMES,\n        output_type=torch.tensor,\n        num_batches_per_epoch=num_batches_per_epoch,\n    )"
+    },
+    {
+      "id": "c0021",
+      "source": "def create_backtest_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data)\n\n    # we create a Validation Instance splitter which will sample the very last\n    # context window seen during training only for the encoder.\n    instance_sampler = create_instance_splitter(config, \"validation\")\n\n    # we apply the transformations in train mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=True)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )"
+    },
+    {
+      "id": "c0022",
+      "source": "def create_test_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=False)\n\n    # We create a test Instance splitter to sample the very last\n    # context window from the dataset provided.\n    instance_sampler = create_instance_splitter(config, \"test\")\n\n    # We apply the transformations in test mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=False)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )"
+    },
+    {
+      "id": "c0023",
+      "source": "train_dataloader = create_train_dataloader(\n    config=config,\n    freq=freq,\n    data=train_dataset,\n    batch_size=256,\n    num_batches_per_epoch=100,\n)\n\ntest_dataloader = create_backtest_dataloader(\n    config=config,\n    freq=freq,\n    data=test_dataset,\n    batch_size=64,\n)"
+    },
+    {
+      "id": "c0024",
+      "source": "batch = next(iter(train_dataloader))\nfor k, v in batch.items():\n    print(k, v.shape, v.type())\n\n>>> past_time_features torch.Size([256, 85, 2]) torch.FloatTensor\n    past_values torch.Size([256, 85]) torch.FloatTensor\n    past_observed_mask torch.Size([256, 85]) torch.FloatTensor\n    future_time_features torch.Size([256, 24, 2]) torch.FloatTensor\n    static_categorical_features torch.Size([256, 1]) torch.LongTensor\n    future_values torch.Size([256, 24]) torch.FloatTensor\n    future_observed_mask torch.Size([256, 24]) torch.FloatTensor"
+    },
+    {
+      "id": "c0025",
+      "source": "# perform forward pass\noutputs = model(\n    past_values=batch[\"past_values\"],\n    past_time_features=batch[\"past_time_features\"],\n    past_observed_mask=batch[\"past_observed_mask\"],\n    static_categorical_features=batch[\"static_categorical_features\"]\n    if config.num_static_categorical_features > 0\n    else None,\n    static_real_features=batch[\"static_real_features\"]\n    if config.num_static_real_features > 0\n    else None,\n    future_values=batch[\"future_values\"],\n    future_time_features=batch[\"future_time_features\"],\n    future_observed_mask=batch[\"future_observed_mask\"],\n    output_hidden_states=True,\n)"
+    },
+    {
+      "id": "c0026",
+      "source": "print(\"Loss:\", outputs.loss.item())\n\n>>> Loss: 9.069628715515137"
+    },
+    {
+      "id": "c0027",
+      "source": "from accelerate import Accelerator\nfrom torch.optim import AdamW\n\naccelerator = Accelerator()\ndevice = accelerator.device\n\nmodel.to(device)\noptimizer = AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), weight_decay=1e-1)\n\nmodel, optimizer, train_dataloader = accelerator.prepare(\n    model,\n    optimizer,\n    train_dataloader,\n)\n\nmodel.train()\nfor epoch in range(40):\n    for idx, batch in enumerate(train_dataloader):\n        optimizer.zero_grad()\n        outputs = model(\n            static_categorical_features=batch[\"static_categorical_features\"].to(device)\n            if config.num_static_categorical_features > 0\n            else None,\n            static_real_features=batch[\"static_real_features\"].to(device)\n            if config.num_static_real_features > 0\n            else None,\n            past_time_features=batch[\"past_time_features\"].to(device),\n            past_values=batch[\"past_values\"].to(device),\n            future_time_features=batch[\"future_time_features\"].to(device),\n            future_values=batch[\"future_values\"].to(device),\n            past_observed_mask=batch[\"past_observed_mask\"].to(device),\n            future_observed_mask=batch[\"future_observed_mask\"].to(device),\n        )\n        loss = outputs.loss\n\n        # Backpropagation\n        accelerator.backward(loss)\n        optimizer.step()\n\n        if idx % 100 == 0:\n            print(loss.item())"
+    },
+    {
+      "id": "c0028",
+      "source": "model.eval()\n\nforecasts = []\n\nfor batch in test_dataloader:\n    outputs = model.generate(\n        static_categorical_features=batch[\"static_categorical_features\"].to(device)\n        if config.num_static_categorical_features > 0\n        else None,\n        static_real_features=batch[\"static_real_features\"].to(device)\n        if config.num_static_real_features > 0\n        else None,\n        past_time_features=batch[\"past_time_features\"].to(device),\n        past_values=batch[\"past_values\"].to(device),\n        future_time_features=batch[\"future_time_features\"].to(device),\n        past_observed_mask=batch[\"past_observed_mask\"].to(device),\n    )\n    forecasts.append(outputs.sequences.cpu().numpy())"
+    },
+    {
+      "id": "c0029",
+      "source": "forecasts[0].shape\n\n>>> (64, 100, 24)"
+    },
+    {
+      "id": "c0030",
+      "source": "forecasts = np.vstack(forecasts)\nprint(forecasts.shape)\n\n>>> (366, 100, 24)"
+    },
+    {
+      "id": "c0031",
+      "source": "from evaluate import load\nfrom gluonts.time_feature import get_seasonality\n\nmase_metric = load(\"evaluate-metric/mase\")\nsmape_metric = load(\"evaluate-metric/smape\")\n\nforecast_median = np.median(forecasts, 1)\n\nmase_metrics = []\nsmape_metrics = []\nfor item_id, ts in enumerate(test_dataset):\n    training_data = ts[\"target\"][:-prediction_length]\n    ground_truth = ts[\"target\"][-prediction_length:]\n    mase = mase_metric.compute(\n        predictions=forecast_median[item_id], \n        references=np.array(ground_truth), \n        training=np.array(training_data), \n        periodicity=get_seasonality(freq))\n    mase_metrics.append(mase[\"mase\"])\n    \n    smape = smape_metric.compute(\n        predictions=forecast_median[item_id], \n        references=np.array(ground_truth), \n    )\n    smape_metrics.append(smape[\"smape\"])"
+    },
+    {
+      "id": "c0032",
+      "source": "print(f\"MASE: {np.mean(mase_metrics)}\")\n\n>>> MASE: 1.2564196892177717\n\nprint(f\"sMAPE: {np.mean(smape_metrics)}\")\n\n>>> sMAPE: 0.1609541520852549"
+    },
+    {
+      "id": "c0033",
+      "source": "plt.scatter(mase_metrics, smape_metrics, alpha=0.3)\nplt.xlabel(\"MASE\")\nplt.ylabel(\"sMAPE\")\nplt.show()"
+    },
+    {
+      "id": "c0034",
+      "source": "import matplotlib.dates as mdates\n\ndef plot(ts_index):\n    fig, ax = plt.subplots()\n\n    index = pd.period_range(\n        start=test_dataset[ts_index][FieldName.START],\n        periods=len(test_dataset[ts_index][FieldName.TARGET]),\n        freq=freq,\n    ).to_timestamp()\n\n    # Major ticks every half year, minor ticks every month,\n    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=(1, 7)))\n    ax.xaxis.set_minor_locator(mdates.MonthLocator())\n\n    ax.plot(\n        index[-2*prediction_length:], \n        test_dataset[ts_index][\"target\"][-2*prediction_length:],\n        label=\"actual\",\n    )\n\n    plt.plot(\n        index[-prediction_length:], \n        np.median(forecasts[ts_index], axis=0),\n        label=\"median\",\n    )\n    \n    plt.fill_between(\n        index[-prediction_length:],\n        forecasts[ts_index].mean(0) - forecasts[ts_index].std(axis=0), \n        forecasts[ts_index].mean(0) + forecasts[ts_index].std(axis=0), \n        alpha=0.3, \n        interpolate=True,\n        label=\"+/- 1-std\",\n    )\n    plt.legend()\n    plt.show()"
+    },
+    {
+      "id": "c0035",
+      "source": "plot(334)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "af43825bab97a71640ddd99c72e566822fd179b1b47203136fd240667202af78",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_03d5f88c96c2f236",
+      "type": "image",
+      "afterBlockId": "c0009",
+      "order": 1
+    },
+    {
+      "mediaId": "image_cae36b8da49cd682",
+      "type": "image",
+      "afterBlockId": "c0033",
+      "order": 2
+    },
+    {
+      "mediaId": "image_c2af6da45969e191",
+      "type": "image",
+      "afterBlockId": "c0035",
+      "order": 3
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 4,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 4,
+    "savedImages": 4,
+    "sourceImageOccurrences": 4,
+    "placedImageOccurrences": 4,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:20:42.484600Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:20:42.484617Z",
+  "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
     "provider": "gemini",

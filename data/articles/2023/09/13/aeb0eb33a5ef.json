@@ -19,11 +19,710 @@
   "fetchedAt": "2026-09-05T07:37:43.732159Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Fine-tuning Llama 2 70B using PyTorch FSDP\n\nPublished September 13, 2023\n\nThis article is also available in Chinese 简体中文 .\n\nIn this blog post, we will look at how to fine-tune Llama 2 70B using PyTorch FSDP and related best practices. We will be leveraging Hugging Face Transformers, Accelerate and TRL. We will also learn how to use Accelerate with SLURM.\n\nFully Sharded Data Parallelism (FSDP) is a paradigm in which the optimizer states, gradients and parameters are sharded across devices. During the forward pass, each FSDP unit performs an all-gather operation to get the complete weights, computation is performed followed by discarding the shards from other devices. After the forward pass, the loss is computed followed by the backward pass. In the backward pass, each FSDP unit performs an all-gather operation to get the complete weights, with computation performed to get the local gradients. These local gradients are averaged and sharded across the devices via a reduce-scatter operation so that each device can update the parameters of its shard. For more information on what PyTorch FSDP is, please refer to this blog post: Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel .\n\nNumber of nodes: 2. Minimum required is 1.\n\nNumber of GPUs per node: 8\n\nintra-node connection: NVLink\n\ninter-node connection: Elastic Fabric Adapter\n\n## Challenges with fine-tuning LLaMa 70B\n\nWe encountered three main challenges when trying to fine-tune LLaMa 70B with FSDP:\n\nFSDP wraps the model after loading the pre-trained model. If each process/rank within a node loads the Llama-70B model, it would require 70*4*8 GB ~ 2TB of CPU RAM, where 4 is the number of bytes per parameter and 8 is the number of GPUs on each node. This would result in the CPU RAM getting out of memory leading to processes being terminated.\n\nSaving entire intermediate checkpoints using FULL_STATE_DICT with CPU offloading on rank 0 takes a lot of time and often results in NCCL Timeout errors due to indefinite hanging during broadcasting. However, at the end of training, we want the whole model state dict instead of the sharded state dict which is only compatible with FSDP.\n\nWe need to improve the speed and reduce the VRAM usage to train faster and save compute costs.\n\nLet’s look at how to solve the above challenges and fine-tune a 70B model!\n\nBefore we get started, here's all the required resources to reproduce our results:\n\nCodebase: https://github.com/pacman100/DHS-LLM-Workshop/tree/main/chat_assistant/sft/training with flash-attn V2\n\nFSDP config: https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/configs/fsdp_config.yaml\n\nSLURM script launch.slurm : https://gist.github.com/pacman100/1cb1f17b2f1b3139a63b764263e70b25\n\nModel: meta-llama/Llama-2-70b-chat-hf\n\nDataset: smangrul/code-chat-assistant-v1 (mix of LIMA+GUANACO with proper formatting in a ready-to-train format)\n\nFirst follow these steps to install Flash Attention V2: Dao-AILab/flash-attention: Fast and memory-efficient exact attention (github.com). Install the latest nightlies of PyTorch with CUDA ≥11.8. Install the remaining requirements as per DHS-LLM-Workshop/code_assistant/training/requirements.txt. Here, we will be installing 🤗 Accelerate and 🤗 Transformers from the main branch.\n\n### Addressing Challenge 1\n\nPRs huggingface/transformers#25107 and huggingface/accelerate#1777 solve the first challenge and requires no code changes from user side. It does the following:\n\n- Create the model with no weights on all ranks (using the meta device).\n\n- Load the state dict only on rank==0 and set the model weights with that state dict on rank 0\n\n- For all other ranks, do torch.empty(*param.size(), dtype=dtype) for every parameter on meta device\n\n- So, rank==0 will have loaded the model with correct state dict while all other ranks will have random weights.\n\n- Set sync_module_states=True so that FSDP object takes care of broadcasting them to all the ranks before training starts.\n\nBelow is the output snippet on a 7B model on 2 GPUs measuring the memory consumed and model parameters at various stages. We can observe that during loading the pre-trained model rank 0 & rank 1 have CPU total peak memory of 32744 MB and 1506 MB , respectively. Therefore, only rank 0 is loading the pre-trained model leading to efficient usage of CPU RAM. The whole logs at be found here\n\n```\naccelerator.process_index=0 GPU Memory before entering the loading : 0\naccelerator.process_index=0 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=0 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=0 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=0 CPU Memory before entering the loading : 926\naccelerator.process_index=0 CPU Memory consumed at the end of the loading (end-begin): 26415\naccelerator.process_index=0 CPU Peak Memory consumed during the loading (max-begin): 31818\naccelerator.process_index=0 CPU Total Peak Memory consumed during the loading (max): 32744\n\naccelerator.process_index=1 GPU Memory before entering the loading : 0\naccelerator.process_index=1 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=1 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=1 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=1 CPU Memory before entering the loading : 933\naccelerator.process_index=1 CPU Memory consumed at the end of the loading (end-begin): 10\naccelerator.process_index=1 CPU Peak Memory consumed during the loading (max-begin): 573\naccelerator.process_index=1 CPU Total Peak Memory consumed during the loading (max): 1506\n```\n\n### Addressing Challenge 2\n\nIt is addressed via choosing SHARDED_STATE_DICT state dict type when creating FSDP config. SHARDED_STATE_DICT saves shard per GPU separately which makes it quick to save or resume training from intermediate checkpoint. When FULL_STATE_DICT is used, first process (rank 0) gathers the whole model on CPU and then saving it in a standard format.\n\nLet’s create the accelerate config via below command:\n\n```\naccelerate config --config_file \"fsdp_config.yaml\"\n```\n\nThe resulting config is available here: fsdp_config.yaml . Here, the sharding strategy is FULL_SHARD . We are using TRANSFORMER_BASED_WRAP for auto wrap policy and it uses _no_split_module to find the Transformer block name for nested FSDP auto wrap. We use SHARDED_STATE_DICT to save the intermediate checkpoints and optimizer states in this format recommended by the PyTorch team. Make sure to enable broadcasting module parameters from rank 0 at the start as mentioned in the above paragraph on addressing Challenge 1. We are enabling bf16 mixed precision training.\n\nFor final checkpoint being the whole model state dict, below code snippet is used:\n\n```\nif trainer.is_fsdp_enabled:\n    trainer.accelerator.state.fsdp_plugin.set_state_dict_type(\"FULL_STATE_DICT\")\n\ntrainer.save_model(script_args.output_dir) # alternatively, trainer.push_to_hub() if the whole ckpt is below 50GB as the LFS limit per file is 50GB\n```\n\n### Addressing Challenge 3\n\nFlash Attention and enabling gradient checkpointing are required for faster training and reducing VRAM usage to enable fine-tuning and save compute costs. The codebase currently uses monkey patching and the implementation is at chat_assistant/training/llama_flash_attn_monkey_patch.py .\n\nFlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness introduces a way to compute exact attention while being faster and memory-efficient by leveraging the knowledge of the memory hierarchy of the underlying hardware/GPUs - The higher the bandwidth/speed of the memory, the smaller its capacity as it becomes more expensive.\n\nIf we follow the blog Making Deep Learning Go Brrrr From First Principles , we can figure out that Attention module on current hardware is memory-bound/bandwidth-bound . The reason being that Attention mostly consists of elementwise operations as shown below on the left hand side. We can observe that masking, softmax and dropout operations take up the bulk of the time instead of matrix multiplications which consists of the bulk of FLOPs.\n\nThis is precisely the problem that Flash Attention addresses. The idea is to remove redundant HBM reads/writes. It does so by keeping everything in SRAM, perform all the intermediate steps and only then write the final result back to HBM, also known as Kernel Fusion . Below is an illustration of how this overcomes the memory-bound bottleneck.\n\nTiling is used during forward and backward passes to chunk the NxN softmax/scores computation into blocks to overcome the limitation of SRAM memory size. To enable tiling, online softmax algorithm is used. Recomputation is used during backward pass in order to avoid storing the entire NxN softmax/score matrix during forward pass. This greatly reduces the memory consumption.\n\nFor a simplified and in depth understanding of Flash Attention, please refer the blog posts ELI5: FlashAttention and Making Deep Learning Go Brrrr From First Principles along with the original paper FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness .\n\n## Bringing it all-together\n\nTo run the training using Accelerate launcher with SLURM, refer this gist launch.slurm . Below is an equivalent command showcasing how to use Accelerate launcher to run the training. Notice that we are overriding main_process_ip , main_process_port , machine_rank , num_processes and num_machines values of the fsdp_config.yaml . Here, another important point to note is that the storage is stored between all the nodes.\n\n```\naccelerate launch \\\n    --config_file configs/fsdp_config.yaml \\\n    --main_process_ip $MASTER_ADDR \\\n    --main_process_port $MASTER_PORT \\\n    --machine_rank \\$MACHINE_RANK \\\n    --num_processes 16 \\\n    --num_machines 2 \\\n    train.py \\\n    --seed 100 \\\n    --model_name \"meta-llama/Llama-2-70b-chat-hf\" \\\n    --dataset_name \"smangrul/code-chat-assistant-v1\" \\\n    --chat_template_format \"none\" \\\n    --add_special_tokens False \\\n    --append_concat_token False \\\n    --splits \"train,test\" \\\n    --max_seq_len 2048 \\\n    --max_steps 500 \\\n    --logging_steps 25 \\\n    --log_level \"info\" \\\n    --eval_steps 100 \\\n    --save_steps 250 \\\n    --logging_strategy \"steps\" \\\n    --evaluation_strategy \"steps\" \\\n    --save_strategy \"steps\" \\\n    --push_to_hub \\\n    --hub_private_repo True \\\n    --hub_strategy \"every_save\" \\\n    --bf16 True \\\n    --packing True \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --warmup_ratio 0.03 \\\n    --max_grad_norm 1.0 \\\n    --output_dir \"/shared_storage/sourab/experiments/full-finetune-llama-chat-asst\" \\\n    --per_device_train_batch_size 1 \\\n    --per_device_eval_batch_size 1 \\\n    --gradient_accumulation_steps 1 \\\n    --gradient_checkpointing True \\\n    --use_reentrant False \\\n    --dataset_text_field \"content\" \\\n    --use_flash_attn True \\\n    --ddp_timeout 5400 \\\n    --optim paged_adamw_32bit\n```\n\nFine-tuning completed in ~13.5 hours and below is the training loss plot.\n\nImportant Note : Here, if you are using only a single node with 8 A100 80GB GPUs, then paged_adamw_32bit optimizer from bitsandbytes is required. For more information about paged optimizers, please refer https://huggingface.co/docs/bitsandbytes/main/en/optimizers#paged-optimizers .\n\nBelow is an example conversation using the above model:\n\n```\nSystem Prompt: You are a helpful, respectful and honest assistant. Always answer as helpfully \\\nas possible, while being safe. Your answers should not include any harmful, \\\nunethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that \\\nyour responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why \\\ninstead of answering something not correct. If you don’t know the answer to a \\\nquestion, please don’t share false information.\n\n- Human: What is Deep Learning? Explain like a Pirate.\n\n+ Assistant: Arrr Grumete! Are ye lookin' fer a proper explanation o' Deep Learnin'? \n+ Alright then, listen up me hearty! Deep Learnin' be a type o' machine learnin' that uses artificial neural networks to analyze data. \n+ Aye, ye heard that right, mateys! Artificial neural networks be models o' the human brain, but instead o' using neurons, they use interconnected nodes or \"artificial neurons\" to process information. \n+ These nodes work together to form layers o' processing units that can learn from large amounts o' data. \n+ The more data these systems receive, the better they get at recognizing patterns and makin' decisions on their own. \n+ So hoist the sails and set course for adventure with deep learnin', me hearties! It's a treasure trove o' knowledge just waitin' to be discovered. \n+ Fair winds and following seas!\n\n- Human: Now explain it like a chef.\n\n+ Assistant: Certainly! Here's an explanation of deep learning from a culinary perspective:\n\n+ Think of a recipe as a sequence of steps used to transform raw ingredients into a delicious dish. \n+ Similarly, in deep learning, there are multiple layers of \"ingredients\" (or features) that are combined and transformed through various operations to produce a final output or prediction. \n+ Each layer builds upon the previous one, refining and enhancing the representation of the input data until it reaches the desired outcome. \n+ Just as different spices enhance the flavors of food, each layer adds depth and complexity to the model's understanding of the input, allowing it to make more accurate predictions. \n+ And much like how chefs must carefully balance the amount of salt, sugar, and other seasonings in a recipe, the training process in deep learning involves adjusting the weights and biases of the network to achieve the perfect blend of accuracy and efficiency. \n+ With enough practice and experimentation, anyone can become a master chef... I mean, a master of deep learning! Bon appétit!\n```\n\nThe whole conversation is formatted as below:\n\n```\n<|system|> system message <|endoftext|> <|prompter|> Q1 <|endoftext|> <|assistant|> A1 <|endoftext|> ...\n```\n\nWe successfully fine-tuned 70B Llama model using PyTorch FSDP in a multi-node multi-gpu setting while addressing various challenges. We saw how 🤗 Transformers and 🤗 Accelerates now supports efficient way of initializing large models when using FSDP to overcome CPU RAM getting out of memory. This was followed by recommended practices for saving/loading intermediate checkpoints and how to save the final model in a way to readily use it. To enable faster training and reducing GPU memory usage, we outlined the importance of Flash Attention and Gradient Checkpointing. Overall, we can see how a simple config using 🤗 Accelerate enables finetuning of such large models in a multi-node multi-gpu setting.\n\n## Datasets mentioned in this article 1\n\nMore Articles from our Blog\n\n## Accelerating Qwen3-8B Agent on Intel® Core™ Ultra with Depth-Pruned Draft Models\n\nguide nlp synthetic-data\n\n## Cosmopedia: how to create large-scale synthetic data for pre-training Large Language Models\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "## Introduction\n\nIn this blog post, we will look at how to fine-tune Llama 2 70B using PyTorch FSDP and related best practices. We will be leveraging Hugging Face Transformers, Accelerate and TRL. We will also learn how to use Accelerate with SLURM.\n\nFully Sharded Data Parallelism (FSDP) is a paradigm in which the optimizer states, gradients and parameters are sharded across devices. During the forward pass, each FSDP unit performs an all-gather operation to get the complete weights, computation is performed followed by discarding the shards from other devices. After the forward pass, the loss is computed followed by the backward pass. In the backward pass, each FSDP unit performs an all-gather operation to get the complete weights, with computation performed to get the local gradients. These local gradients are averaged and sharded across the devices via a reduce-scatter operation so that each device can update the parameters of its shard. For more information on what PyTorch FSDP is, please refer to this blog post: Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel.\n\n(Source: link)\n\n## Hardware Used\n\nNumber of nodes: 2. Minimum required is 1. Number of GPUs per node: 8 GPU type: A100 GPU memory: 80GB intra-node connection: NVLink RAM per node: 1TB CPU cores per node: 96 inter-node connection: Elastic Fabric Adapter\n\n## Challenges with fine-tuning LLaMa 70B\n\nWe encountered three main challenges when trying to fine-tune LLaMa 70B with FSDP:\n\nFSDP wraps the model after loading the pre-trained model. If each process/rank within a node loads the Llama-70B model, it would require 70*4*8 GB ~ 2TB of CPU RAM, where 4 is the number of bytes per parameter and 8 is the number of GPUs on each node. This would result in the CPU RAM getting out of memory leading to processes being terminated.\n\nSaving entire intermediate checkpoints using FULL_STATE_DICT with CPU offloading on rank 0 takes a lot of time and often results in NCCL Timeout errors due to indefinite hanging during broadcasting. However, at the end of training, we want the whole model state dict instead of the sharded state dict which is only compatible with FSDP.\n\nWe need to improve the speed and reduce the VRAM usage to train faster and save compute costs.\n\nLet’s look at how to solve the above challenges and fine-tune a 70B model!\n\nBefore we get started, here's all the required resources to reproduce our results:\n\nCodebase: https://github.com/pacman100/DHS-LLM-Workshop/tree/main/chat_assistant/sft/training with flash-attn V2\n\nFSDP config: https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/configs/fsdp_config.yaml\n\nSLURM script launch.slurm: https://gist.github.com/pacman100/1cb1f17b2f1b3139a63b764263e70b25\n\nModel: meta-llama/Llama-2-70b-chat-hf\n\nDataset: smangrul/code-chat-assistant-v1 (mix of LIMA+GUANACO with proper formatting in a ready-to-train format)\n\n### Pre-requisites\n\nFirst follow these steps to install Flash Attention V2: Dao-AILab/flash-attention: Fast and memory-efficient exact attention (github.com). Install the latest nightlies of PyTorch with CUDA ≥11.8. Install the remaining requirements as per DHS-LLM-Workshop/code_assistant/training/requirements.txt. Here, we will be installing 🤗 Accelerate and 🤗 Transformers from the main branch.\n\n## Fine-Tuning\n\n### Addressing Challenge 1\n\nPRs huggingface/transformers#25107 and huggingface/accelerate#1777 solve the first challenge and requires no code changes from user side. It does the following:\n\n- Create the model with no weights on all ranks (using the meta device).\n\n- Load the state dict only on rank==0 and set the model weights with that state dict on rank 0\n\n- For all other ranks, do torch.empty(*param.size(), dtype=dtype) for every parameter on meta device\n\n- So, rank==0 will have loaded the model with correct state dict while all other ranks will have random weights.\n\n- Set sync_module_states=True so that FSDP object takes care of broadcasting them to all the ranks before training starts.\n\nBelow is the output snippet on a 7B model on 2 GPUs measuring the memory consumed and model parameters at various stages. We can observe that during loading the pre-trained model rank 0 & rank 1 have CPU total peak memory of 32744 MB and 1506 MB , respectively. Therefore, only rank 0 is loading the pre-trained model leading to efficient usage of CPU RAM. The whole logs at be found here\n\n```\naccelerator.process_index=0 GPU Memory before entering the loading : 0\naccelerator.process_index=0 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=0 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=0 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=0 CPU Memory before entering the loading : 926\naccelerator.process_index=0 CPU Memory consumed at the end of the loading (end-begin): 26415\naccelerator.process_index=0 CPU Peak Memory consumed during the loading (max-begin): 31818\naccelerator.process_index=0 CPU Total Peak Memory consumed during the loading (max): 32744\n\naccelerator.process_index=1 GPU Memory before entering the loading : 0\naccelerator.process_index=1 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=1 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=1 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=1 CPU Memory before entering the loading : 933\naccelerator.process_index=1 CPU Memory consumed at the end of the loading (end-begin): 10\naccelerator.process_index=1 CPU Peak Memory consumed during the loading (max-begin): 573\naccelerator.process_index=1 CPU Total Peak Memory consumed during the loading (max): 1506\n```\n\n### Addressing Challenge 2\n\nIt is addressed via choosing SHARDED_STATE_DICT state dict type when creating FSDP config. SHARDED_STATE_DICT saves shard per GPU separately which makes it quick to save or resume training from intermediate checkpoint. When FULL_STATE_DICT is used, first process (rank 0) gathers the whole model on CPU and then saving it in a standard format.\n\nLet’s create the accelerate config via below command:\n\n```\naccelerate config --config_file \"fsdp_config.yaml\"\n```\n\nThe resulting config is available here: fsdp_config.yaml. Here, the sharding strategy is FULL_SHARD. We are using TRANSFORMER_BASED_WRAP for auto wrap policy and it uses _no_split_module to find the Transformer block name for nested FSDP auto wrap. We use SHARDED_STATE_DICT to save the intermediate checkpoints and optimizer states in this format recommended by the PyTorch team. Make sure to enable broadcasting module parameters from rank 0 at the start as mentioned in the above paragraph on addressing Challenge 1. We are enabling bf16 mixed precision training.\n\nFor final checkpoint being the whole model state dict, below code snippet is used:\n\n```\nif trainer.is_fsdp_enabled:\n    trainer.accelerator.state.fsdp_plugin.set_state_dict_type(\"FULL_STATE_DICT\")\n\ntrainer.save_model(script_args.output_dir) # alternatively, trainer.push_to_hub() if the whole ckpt is below 50GB as the LFS limit per file is 50GB \n```\n\n### Addressing Challenge 3\n\nFlash Attention and enabling gradient checkpointing are required for faster training and reducing VRAM usage to enable fine-tuning and save compute costs. The codebase currently uses monkey patching and the implementation is at chat_assistant/training/llama_flash_attn_monkey_patch.py.\n\nFlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness introduces a way to compute exact attention while being faster and memory-efficient by leveraging the knowledge of the memory hierarchy of the underlying hardware/GPUs - The higher the bandwidth/speed of the memory, the smaller its capacity as it becomes more expensive.\n\nIf we follow the blog Making Deep Learning Go Brrrr From First Principles, we can figure out that Attention module on current hardware is memory-bound/bandwidth-bound. The reason being that Attention mostly consists of elementwise operations as shown below on the left hand side. We can observe that masking, softmax and dropout operations take up the bulk of the time instead of matrix multiplications which consists of the bulk of FLOPs.\n\n(Source: link)\n\nThis is precisely the problem that Flash Attention addresses. The idea is to remove redundant HBM reads/writes. It does so by keeping everything in SRAM, perform all the intermediate steps and only then write the final result back to HBM, also known as Kernel Fusion. Below is an illustration of how this overcomes the memory-bound bottleneck.\n\n(Source: link)\n\nTiling is used during forward and backward passes to chunk the NxN softmax/scores computation into blocks to overcome the limitation of SRAM memory size. To enable tiling, online softmax algorithm is used. Recomputation is used during backward pass in order to avoid storing the entire NxN softmax/score matrix during forward pass. This greatly reduces the memory consumption.\n\nFor a simplified and in depth understanding of Flash Attention, please refer the blog posts ELI5: FlashAttention and Making Deep Learning Go Brrrr From First Principles along with the original paper FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.\n\n## Bringing it all-together\n\nTo run the training using Accelerate launcher with SLURM, refer this gist launch.slurm. Below is an equivalent command showcasing how to use Accelerate launcher to run the training. Notice that we are overriding main_process_ip , main_process_port , machine_rank , num_processes and num_machines values of the fsdp_config.yaml. Here, another important point to note is that the storage is stored between all the nodes.\n\n```\naccelerate launch \\\n    --config_file configs/fsdp_config.yaml \\\n    --main_process_ip $MASTER_ADDR \\\n    --main_process_port $MASTER_PORT \\\n    --machine_rank \\$MACHINE_RANK \\\n    --num_processes 16 \\\n    --num_machines 2 \\\n    train.py \\\n    --seed 100 \\\n    --model_name \"meta-llama/Llama-2-70b-chat-hf\" \\\n    --dataset_name \"smangrul/code-chat-assistant-v1\" \\\n    --chat_template_format \"none\" \\\n    --add_special_tokens False \\\n    --append_concat_token False \\\n    --splits \"train,test\" \\\n    --max_seq_len 2048 \\\n    --max_steps 500 \\\n    --logging_steps 25 \\\n    --log_level \"info\" \\\n    --eval_steps 100 \\\n    --save_steps 250 \\\n    --logging_strategy \"steps\" \\\n    --evaluation_strategy \"steps\" \\\n    --save_strategy \"steps\" \\\n    --push_to_hub \\\n    --hub_private_repo True \\\n    --hub_strategy \"every_save\" \\\n    --bf16 True \\\n    --packing True \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --warmup_ratio 0.03 \\\n    --max_grad_norm 1.0 \\\n    --output_dir \"/shared_storage/sourab/experiments/full-finetune-llama-chat-asst\" \\\n    --per_device_train_batch_size 1 \\\n    --per_device_eval_batch_size 1 \\\n    --gradient_accumulation_steps 1 \\\n    --gradient_checkpointing True \\\n    --use_reentrant False \\\n    --dataset_text_field \"content\" \\\n    --use_flash_attn True \\\n    --ddp_timeout 5400 \\\n    --optim paged_adamw_32bit \n```\n\nFine-tuning completed in ~13.5 hours and below is the training loss plot.\n\nImportant Note: Here, if you are using only a single node with 8 A100 80GB GPUs, then paged_adamw_32bit optimizer from bitsandbytes is required. For more information about paged optimizers, please refer https://huggingface.co/docs/bitsandbytes/main/en/optimizers#paged-optimizers.\n\nBelow is an example conversation using the above model:\n\n```\nSystem Prompt: You are a helpful, respectful and honest assistant. Always answer as helpfully \\\nas possible, while being safe. Your answers should not include any harmful, \\\nunethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that \\\nyour responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why \\\ninstead of answering something not correct. If you don’t know the answer to a \\\nquestion, please don’t share false information.\n\n- Human: What is Deep Learning? Explain like a Pirate.\n\n+ Assistant: Arrr Grumete! Are ye lookin' fer a proper explanation o' Deep Learnin'? \n+ Alright then, listen up me hearty! Deep Learnin' be a type o' machine learnin' that uses artificial neural networks to analyze data. \n+ Aye, ye heard that right, mateys! Artificial neural networks be models o' the human brain, but instead o' using neurons, they use interconnected nodes or \"artificial neurons\" to process information. \n+ These nodes work together to form layers o' processing units that can learn from large amounts o' data. \n+ The more data these systems receive, the better they get at recognizing patterns and makin' decisions on their own. \n+ So hoist the sails and set course for adventure with deep learnin', me hearties! It's a treasure trove o' knowledge just waitin' to be discovered. \n+ Fair winds and following seas!\n\n- Human: Now explain it like a chef.\n\n+ Assistant: Certainly! Here's an explanation of deep learning from a culinary perspective:\n\n+ Think of a recipe as a sequence of steps used to transform raw ingredients into a delicious dish. \n+ Similarly, in deep learning, there are multiple layers of \"ingredients\" (or features) that are combined and transformed through various operations to produce a final output or prediction. \n+ Each layer builds upon the previous one, refining and enhancing the representation of the input data until it reaches the desired outcome. \n+ Just as different spices enhance the flavors of food, each layer adds depth and complexity to the model's understanding of the input, allowing it to make more accurate predictions. \n+ And much like how chefs must carefully balance the amount of salt, sugar, and other seasonings in a recipe, the training process in deep learning involves adjusting the weights and biases of the network to achieve the perfect blend of accuracy and efficiency. \n+ With enough practice and experimentation, anyone can become a master chef... I mean, a master of deep learning! Bon appétit!\n```\n\nThe whole conversation is formatted as below:\n\n```\n<|system|> system message <|endoftext|> <|prompter|> Q1 <|endoftext|> <|assistant|> A1 <|endoftext|> ...\n```\n\n## Conclusion\n\nWe successfully fine-tuned 70B Llama model using PyTorch FSDP in a multi-node multi-gpu setting while addressing various challenges. We saw how 🤗 Transformers and 🤗 Accelerates now supports efficient way of initializing large models when using FSDP to overcome CPU RAM getting out of memory. This was followed by recommended practices for saving/loading intermediate checkpoints and how to save the final model in a way to readily use it. To enable faster training and reducing GPU memory usage, we outlined the importance of Flash Attention and Gradient Checkpointing. Overall, we can see how a simple config using 🤗 Accelerate enables finetuning of such large models in a multi-node multi-gpu setting.",
   "summaryZh": "本文深入探讨了如何利用PyTorch FSDP（完全分片数据并行）技术对Llama 2 70B大模型进行高效微调。文章结合Hugging Face生态工具链，详细分析了解决70B级别模型在CPU加载阶段显存溢出等训练挑战的最佳实践与工程方案。",
   "summaryGeneratedAt": "2026-09-06T02:29:17.698073Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/62_pytorch_fsdp/FSDP_workflow.png",
+      "originalUrl": "https://huggingface.co/blog/assets/62_pytorch_fsdp/FSDP_workflow.png",
+      "alt": "FSDP Workflow",
+      "id": "image_5b04de9439291bb4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/fsdp_config.jpg",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/fsdp_config.jpg",
+      "alt": "fsdp_config",
+      "id": "image_ba5673f2798f4c5d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/attention_bottleneck.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/attention_bottleneck.png",
+      "alt": "Attention Bottlenecks",
+      "id": "image_612a14b428e24452"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/kernel_fusion.webp",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/kernel_fusion.webp",
+      "alt": "kernel_fusion",
+      "id": "image_62a784eaecb333cc"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/train_loss.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/160_ram_efficient_fsdp/train_loss.png",
+      "alt": "train_loss",
+      "id": "image_710da4af47b4f055"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "In this blog post, we will look at how to fine-tune Llama 2 70B using PyTorch FSDP and related best practices. We will be leveraging Hugging Face Transformers, Accelerate and TRL. We will also learn how to use Accelerate with SLURM.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Fully Sharded Data Parallelism (FSDP) is a paradigm in which the optimizer states, gradients and parameters are sharded across devices. During the forward pass, each FSDP unit performs an all-gather operation to get the complete weights, computation is performed followed by discarding the shards from other devices. After the forward pass, the loss is computed followed by the backward pass. In the backward pass, each FSDP unit performs an all-gather operation to get the complete weights, with computation performed to get the local gradients. These local gradients are averaged and sharded across the devices via a reduce-scatter operation so that each device can update the parameters of its shard. For more information on what PyTorch FSDP is, please refer to this blog post: Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel.",
+      "spans": [
+        {
+          "start": 188,
+          "end": 208,
+          "kind": "em"
+        },
+        {
+          "start": 619,
+          "end": 643,
+          "kind": "em"
+        },
+        {
+          "start": 782,
+          "end": 855,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/pytorch-fsdp"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "(Source: link)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 13,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/introducing-pytorch-fully-sharded-data-parallel-api/"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Hardware Used",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Number of nodes: 2. Minimum required is 1. Number of GPUs per node: 8 GPU type: A100 GPU memory: 80GB intra-node connection: NVLink RAM per node: 1TB CPU cores per node: 96 inter-node connection: Elastic Fabric Adapter",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Challenges with fine-tuning LLaMa 70B",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "We encountered three main challenges when trying to fine-tune LLaMa 70B with FSDP:",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "FSDP wraps the model after loading the pre-trained model. If each process/rank within a node loads the Llama-70B model, it would require 70*4*8 GB ~ 2TB of CPU RAM, where 4 is the number of bytes per parameter and 8 is the number of GPUs on each node. This would result in the CPU RAM getting out of memory leading to processes being terminated.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Saving entire intermediate checkpoints using FULL_STATE_DICT with CPU offloading on rank 0 takes a lot of time and often results in NCCL Timeout errors due to indefinite hanging during broadcasting. However, at the end of training, we want the whole model state dict instead of the sharded state dict which is only compatible with FSDP.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 60,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "We need to improve the speed and reduce the VRAM usage to train faster and save compute costs.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Let’s look at how to solve the above challenges and fine-tune a 70B model!",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Before we get started, here's all the required resources to reproduce our results:",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Codebase: https://github.com/pacman100/DHS-LLM-Workshop/tree/main/chat_assistant/sft/training with flash-attn V2",
+      "spans": [
+        {
+          "start": 10,
+          "end": 93,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/tree/main/chat_assistant/sft/training"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "FSDP config: https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/configs/fsdp_config.yaml",
+      "spans": [
+        {
+          "start": 13,
+          "end": 117,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/configs/fsdp_config.yaml"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "SLURM script launch.slurm: https://gist.github.com/pacman100/1cb1f17b2f1b3139a63b764263e70b25",
+      "spans": [
+        {
+          "start": 13,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 27,
+          "end": 93,
+          "kind": "a",
+          "href": "https://gist.github.com/pacman100/1cb1f17b2f1b3139a63b764263e70b25"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Model: meta-llama/Llama-2-70b-chat-hf",
+      "spans": [
+        {
+          "start": 7,
+          "end": 37,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Dataset: smangrul/code-chat-assistant-v1 (mix of LIMA+GUANACO with proper formatting in a ready-to-train format)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 40,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/code-chat-assistant-v1"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Pre-requisites",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "First follow these steps to install Flash Attention V2: Dao-AILab/flash-attention: Fast and memory-efficient exact attention (github.com). Install the latest nightlies of PyTorch with CUDA ≥11.8. Install the remaining requirements as per DHS-LLM-Workshop/code_assistant/training/requirements.txt. Here, we will be installing 🤗 Accelerate and 🤗 Transformers from the main branch.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Fine-Tuning",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Addressing Challenge 1",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "PRs huggingface/transformers#25107 and huggingface/accelerate#1777 solve the first challenge and requires no code changes from user side. It does the following:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/pull/25107"
+        },
+        {
+          "start": 39,
+          "end": 66,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate/pull/1777"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Create the model with no weights on all ranks (using the meta device).",
+      "spans": [
+        {
+          "start": 57,
+          "end": 61,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Load the state dict only on rank==0 and set the model weights with that state dict on rank 0",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "For all other ranks, do torch.empty(*param.size(), dtype=dtype) for every parameter on meta device",
+      "spans": [
+        {
+          "start": 24,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 87,
+          "end": 91,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "So, rank==0 will have loaded the model with correct state dict while all other ranks will have random weights.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Set sync_module_states=True so that FSDP object takes care of broadcasting them to all the ranks before training starts.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Below is the output snippet on a 7B model on 2 GPUs measuring the memory consumed and model parameters at various stages. We can observe that during loading the pre-trained model rank 0 & rank 1 have CPU total peak memory of 32744 MB and 1506 MB , respectively. Therefore, only rank 0 is loading the pre-trained model leading to efficient usage of CPU RAM. The whole logs at be found here",
+      "spans": [
+        {
+          "start": 225,
+          "end": 233,
+          "kind": "code"
+        },
+        {
+          "start": 238,
+          "end": 245,
+          "kind": "code"
+        },
+        {
+          "start": 384,
+          "end": 388,
+          "kind": "a",
+          "href": "https://gist.github.com/pacman100/2fbda8eb4526443a73c1455de43e20f9"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Addressing Challenge 2",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "It is addressed via choosing SHARDED_STATE_DICT state dict type when creating FSDP config. SHARDED_STATE_DICT saves shard per GPU separately which makes it quick to save or resume training from intermediate checkpoint. When FULL_STATE_DICT is used, first process (rank 0) gathers the whole model on CPU and then saving it in a standard format.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 224,
+          "end": 239,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Let’s create the accelerate config via below command:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "The resulting config is available here: fsdp_config.yaml. Here, the sharding strategy is FULL_SHARD. We are using TRANSFORMER_BASED_WRAP for auto wrap policy and it uses _no_split_module to find the Transformer block name for nested FSDP auto wrap. We use SHARDED_STATE_DICT to save the intermediate checkpoints and optimizer states in this format recommended by the PyTorch team. Make sure to enable broadcasting module parameters from rank 0 at the start as mentioned in the above paragraph on addressing Challenge 1. We are enabling bf16 mixed precision training.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 56,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/configs/fsdp_config.yaml"
+        },
+        {
+          "start": 89,
+          "end": 99,
+          "kind": "code"
+        },
+        {
+          "start": 114,
+          "end": 136,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 186,
+          "kind": "code"
+        },
+        {
+          "start": 256,
+          "end": 274,
+          "kind": "code"
+        },
+        {
+          "start": 536,
+          "end": 540,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "For final checkpoint being the whole model state dict, below code snippet is used:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Addressing Challenge 3",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Flash Attention and enabling gradient checkpointing are required for faster training and reducing VRAM usage to enable fine-tuning and save compute costs. The codebase currently uses monkey patching and the implementation is at chat_assistant/training/llama_flash_attn_monkey_patch.py.",
+      "spans": [
+        {
+          "start": 228,
+          "end": 284,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/chat_assistant/training/llama_flash_attn_monkey_patch.py"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness introduces a way to compute exact attention while being faster and memory-efficient by leveraging the knowledge of the memory hierarchy of the underlying hardware/GPUs - The higher the bandwidth/speed of the memory, the smaller its capacity as it becomes more expensive.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 75,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2205.14135.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "If we follow the blog Making Deep Learning Go Brrrr From First Principles, we can figure out that Attention module on current hardware is memory-bound/bandwidth-bound. The reason being that Attention mostly consists of elementwise operations as shown below on the left hand side. We can observe that masking, softmax and dropout operations take up the bulk of the time instead of matrix multiplications which consists of the bulk of FLOPs.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 73,
+          "kind": "a",
+          "href": "https://horace.io/brrr_intro.html"
+        },
+        {
+          "start": 98,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 138,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 200,
+          "end": 241,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "(Source: link)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 13,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2205.14135.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "This is precisely the problem that Flash Attention addresses. The idea is to remove redundant HBM reads/writes. It does so by keeping everything in SRAM, perform all the intermediate steps and only then write the final result back to HBM, also known as Kernel Fusion. Below is an illustration of how this overcomes the memory-bound bottleneck.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 111,
+          "kind": "strong"
+        },
+        {
+          "start": 253,
+          "end": 266,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "(Source: link)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 13,
+          "kind": "a",
+          "href": "https://gordicaleksa.medium.com/eli5-flash-attention-5c44017022ad"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Tiling is used during forward and backward passes to chunk the NxN softmax/scores computation into blocks to overcome the limitation of SRAM memory size. To enable tiling, online softmax algorithm is used. Recomputation is used during backward pass in order to avoid storing the entire NxN softmax/score matrix during forward pass. This greatly reduces the memory consumption.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 206,
+          "end": 219,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "For a simplified and in depth understanding of Flash Attention, please refer the blog posts ELI5: FlashAttention and Making Deep Learning Go Brrrr From First Principles along with the original paper FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 112,
+          "kind": "a",
+          "href": "https://gordicaleksa.medium.com/eli5-flash-attention-5c44017022ad"
+        },
+        {
+          "start": 117,
+          "end": 168,
+          "kind": "a",
+          "href": "https://horace.io/brrr_intro.html"
+        },
+        {
+          "start": 199,
+          "end": 274,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2205.14135.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Bringing it all-together",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "To run the training using Accelerate launcher with SLURM, refer this gist launch.slurm. Below is an equivalent command showcasing how to use Accelerate launcher to run the training. Notice that we are overriding main_process_ip , main_process_port , machine_rank , num_processes and num_machines values of the fsdp_config.yaml. Here, another important point to note is that the storage is stored between all the nodes.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 36,
+          "kind": "code"
+        },
+        {
+          "start": 74,
+          "end": 86,
+          "kind": "a",
+          "href": "https://gist.github.com/pacman100/1cb1f17b2f1b3139a63b764263e70b25"
+        },
+        {
+          "start": 141,
+          "end": 151,
+          "kind": "code"
+        },
+        {
+          "start": 212,
+          "end": 227,
+          "kind": "code"
+        },
+        {
+          "start": 230,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 250,
+          "end": 262,
+          "kind": "code"
+        },
+        {
+          "start": 265,
+          "end": 278,
+          "kind": "code"
+        },
+        {
+          "start": 283,
+          "end": 295,
+          "kind": "code"
+        },
+        {
+          "start": 310,
+          "end": 326,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Fine-tuning completed in ~13.5 hours and below is the training loss plot.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Important Note: Here, if you are using only a single node with 8 A100 80GB GPUs, then paged_adamw_32bit optimizer from bitsandbytes is required. For more information about paged optimizers, please refer https://huggingface.co/docs/bitsandbytes/main/en/optimizers#paged-optimizers.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 86,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 203,
+          "end": 279,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/bitsandbytes/main/en/optimizers#paged-optimizers"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Below is an example conversation using the above model:",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "The whole conversation is formatted as below:",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "We successfully fine-tuned 70B Llama model using PyTorch FSDP in a multi-node multi-gpu setting while addressing various challenges. We saw how 🤗 Transformers and 🤗 Accelerates now supports efficient way of initializing large models when using FSDP to overcome CPU RAM getting out of memory. This was followed by recommended practices for saving/loading intermediate checkpoints and how to save the final model in a way to readily use it. To enable faster training and reducing GPU memory usage, we outlined the importance of Flash Attention and Gradient Checkpointing. Overall, we can see how a simple config using 🤗 Accelerate enables finetuning of such large models in a multi-node multi-gpu setting.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "e480d6a528554d491d9cfe2d5217f15d102c9ead2953fc1e0dfcae9048573402",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "accelerator.process_index=0 GPU Memory before entering the loading : 0\naccelerator.process_index=0 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=0 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=0 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=0 CPU Memory before entering the loading : 926\naccelerator.process_index=0 CPU Memory consumed at the end of the loading (end-begin): 26415\naccelerator.process_index=0 CPU Peak Memory consumed during the loading (max-begin): 31818\naccelerator.process_index=0 CPU Total Peak Memory consumed during the loading (max): 32744\n\naccelerator.process_index=1 GPU Memory before entering the loading : 0\naccelerator.process_index=1 GPU Memory consumed at the end of the loading (end-begin): 0\naccelerator.process_index=1 GPU Peak Memory consumed during the loading (max-begin): 0\naccelerator.process_index=1 GPU Total Peak Memory consumed during the loading (max): 0\naccelerator.process_index=1 CPU Memory before entering the loading : 933\naccelerator.process_index=1 CPU Memory consumed at the end of the loading (end-begin): 10\naccelerator.process_index=1 CPU Peak Memory consumed during the loading (max-begin): 573\naccelerator.process_index=1 CPU Total Peak Memory consumed during the loading (max): 1506"
+    },
+    {
+      "id": "c0002",
+      "source": "accelerate config --config_file \"fsdp_config.yaml\""
+    },
+    {
+      "id": "c0003",
+      "source": "if trainer.is_fsdp_enabled:\n    trainer.accelerator.state.fsdp_plugin.set_state_dict_type(\"FULL_STATE_DICT\")\n\ntrainer.save_model(script_args.output_dir) # alternatively, trainer.push_to_hub() if the whole ckpt is below 50GB as the LFS limit per file is 50GB "
+    },
+    {
+      "id": "c0004",
+      "source": "accelerate launch \\\n    --config_file configs/fsdp_config.yaml \\\n    --main_process_ip $MASTER_ADDR \\\n    --main_process_port $MASTER_PORT \\\n    --machine_rank \\$MACHINE_RANK \\\n    --num_processes 16 \\\n    --num_machines 2 \\\n    train.py \\\n    --seed 100 \\\n    --model_name \"meta-llama/Llama-2-70b-chat-hf\" \\\n    --dataset_name \"smangrul/code-chat-assistant-v1\" \\\n    --chat_template_format \"none\" \\\n    --add_special_tokens False \\\n    --append_concat_token False \\\n    --splits \"train,test\" \\\n    --max_seq_len 2048 \\\n    --max_steps 500 \\\n    --logging_steps 25 \\\n    --log_level \"info\" \\\n    --eval_steps 100 \\\n    --save_steps 250 \\\n    --logging_strategy \"steps\" \\\n    --evaluation_strategy \"steps\" \\\n    --save_strategy \"steps\" \\\n    --push_to_hub \\\n    --hub_private_repo True \\\n    --hub_strategy \"every_save\" \\\n    --bf16 True \\\n    --packing True \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --warmup_ratio 0.03 \\\n    --max_grad_norm 1.0 \\\n    --output_dir \"/shared_storage/sourab/experiments/full-finetune-llama-chat-asst\" \\\n    --per_device_train_batch_size 1 \\\n    --per_device_eval_batch_size 1 \\\n    --gradient_accumulation_steps 1 \\\n    --gradient_checkpointing True \\\n    --use_reentrant False \\\n    --dataset_text_field \"content\" \\\n    --use_flash_attn True \\\n    --ddp_timeout 5400 \\\n    --optim paged_adamw_32bit "
+    },
+    {
+      "id": "c0005",
+      "source": "System Prompt: You are a helpful, respectful and honest assistant. Always answer as helpfully \\\nas possible, while being safe. Your answers should not include any harmful, \\\nunethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that \\\nyour responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why \\\ninstead of answering something not correct. If you don’t know the answer to a \\\nquestion, please don’t share false information.\n\n- Human: What is Deep Learning? Explain like a Pirate.\n\n+ Assistant: Arrr Grumete! Are ye lookin' fer a proper explanation o' Deep Learnin'? \n+ Alright then, listen up me hearty! Deep Learnin' be a type o' machine learnin' that uses artificial neural networks to analyze data. \n+ Aye, ye heard that right, mateys! Artificial neural networks be models o' the human brain, but instead o' using neurons, they use interconnected nodes or \"artificial neurons\" to process information. \n+ These nodes work together to form layers o' processing units that can learn from large amounts o' data. \n+ The more data these systems receive, the better they get at recognizing patterns and makin' decisions on their own. \n+ So hoist the sails and set course for adventure with deep learnin', me hearties! It's a treasure trove o' knowledge just waitin' to be discovered. \n+ Fair winds and following seas!\n\n- Human: Now explain it like a chef.\n\n+ Assistant: Certainly! Here's an explanation of deep learning from a culinary perspective:\n\n+ Think of a recipe as a sequence of steps used to transform raw ingredients into a delicious dish. \n+ Similarly, in deep learning, there are multiple layers of \"ingredients\" (or features) that are combined and transformed through various operations to produce a final output or prediction. \n+ Each layer builds upon the previous one, refining and enhancing the representation of the input data until it reaches the desired outcome. \n+ Just as different spices enhance the flavors of food, each layer adds depth and complexity to the model's understanding of the input, allowing it to make more accurate predictions. \n+ And much like how chefs must carefully balance the amount of salt, sugar, and other seasonings in a recipe, the training process in deep learning involves adjusting the weights and biases of the network to achieve the perfect blend of accuracy and efficiency. \n+ With enough practice and experimentation, anyone can become a master chef... I mean, a master of deep learning! Bon appétit!"
+    },
+    {
+      "id": "c0006",
+      "source": "<|system|> system message <|endoftext|> <|prompter|> Q1 <|endoftext|> <|assistant|> A1 <|endoftext|> ..."
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "e480d6a528554d491d9cfe2d5217f15d102c9ead2953fc1e0dfcae9048573402",
+  "mediaLayout": [
+    {
+      "mediaId": "image_5b04de9439291bb4",
+      "type": "image",
+      "afterBlockId": "b0003",
+      "order": 0
+    },
+    {
+      "mediaId": "image_ba5673f2798f4c5d",
+      "type": "image",
+      "afterBlockId": "c0002",
+      "order": 1
+    },
+    {
+      "mediaId": "image_612a14b428e24452",
+      "type": "image",
+      "afterBlockId": "b0038",
+      "order": 2
+    },
+    {
+      "mediaId": "image_62a784eaecb333cc",
+      "type": "image",
+      "afterBlockId": "b0040",
+      "order": 3
+    },
+    {
+      "mediaId": "image_710da4af47b4f055",
+      "type": "image",
+      "afterBlockId": "b0046",
+      "order": 4
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 5,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 5,
+    "savedImages": 5,
+    "sourceImageOccurrences": 5,
+    "placedImageOccurrences": 5,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T15:31:16.692800Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:31:16.692814Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

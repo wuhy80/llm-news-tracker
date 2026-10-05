@@ -19,11 +19,651 @@
   "fetchedAt": "2026-09-05T07:37:42.920345Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Accelerating Stable Diffusion XL Inference with JAX on Cloud TPU v5e\n\nPublished October 3, 2023\n\nGenerative AI models, such as Stable Diffusion XL (SDXL), enable the creation of high-quality, realistic content with wide-ranging applications. However, harnessing the power of such models presents significant challenges and computational costs. SDXL is a large image generation model whose UNet component is about three times as large as the one in the previous version of the model. Deploying a model like this in production is challenging due to the increased memory requirements, as well as increased inference times. Today, we are thrilled to announce that Hugging Face Diffusers now supports serving SDXL using JAX on Cloud TPUs, enabling high-performance, cost-efficient inference.\n\nGoogle Cloud TPUs are custom-designed AI accelerators, which are optimized for training and inference of large AI models, including state-of-the-art LLMs and generative AI models such as SDXL. The new Cloud TPU v5e is purpose-built to bring the cost-efficiency and performance required for large-scale AI training and inference . At less than half the cost of TPU v4, TPU v5e makes it possible for more organizations to train and deploy AI models.\n\n🧨 Diffusers JAX integration offers a convenient way to run SDXL on TPU via XLA , and we built a demo to showcase it. You can try it out in this Space or in the playground embedded below:\n\nUnder the hood, this demo runs on several TPU v5e-4 instances (each instance has 4 TPU chips) and takes advantage of parallelization to serve four large 1024×1024 images in about 4 seconds. This time includes format conversions, communications time, and frontend processing; the actual generation time is about 2.3s, as we'll see below!\n\n- We describe why JAX + TPU + Diffusers is a powerful framework to run SDXL\n\n- Explain how you can write a simple image generation pipeline with Diffusers and JAX\n\n- Show benchmarks comparing different TPU settings\n\n## Why JAX + TPU v5e for SDXL?\n\nServing SDXL with JAX on Cloud TPU v5e with high performance and cost-efficiency is possible thanks to the combination of purpose-built TPU hardware and a software stack optimized for performance. Below we highlight two key factors: JAX just-in-time (jit) compilation and XLA compiler-driven parallelism with JAX pmap.\n\nA notable feature of JAX is its just-in-time (jit) compilation . The JIT compiler traces code during the first run and generates highly optimized TPU binaries that are re-used in subsequent calls. The catch of this process is that it requires all input, intermediate, and output shapes to be static , meaning that they must be known in advance. Every time we change the shapes a new and costly compilation process will be triggered again. JIT compilation is ideal for services that can be designed around static shapes: compilation runs once, and then we take advantage of super-fast inference times.\n\nImage generation is well-suited for JIT compilation. If we always generate the same number of images and they have the same size, then the output shapes are constant and known in advance. The text inputs are also constant: by design, Stable Diffusion and SDXL use fixed-shape embedding vectors (with padding) to represent the prompts typed by the user. Therefore, we can write JAX code that relies on fixed shapes, and that can be greatly optimized!\n\n#### High-performance throughput for high batch sizes\n\nWorkloads can be scaled across multiple devices using JAX's pmap , which expresses single-program multiple-data (SPMD) programs. Applying pmap to a function will compile a function with XLA, then execute it in parallel on various XLA devices. For text-to-image generation workloads this means that increasing the number of images rendered simultaneously is straightforward to implement and doesn't compromise performance. For example, running SDXL on a TPU with 8 chips will generate 8 images in the same time it takes for 1 chip to create a single image.\n\nTPU v5e instances come in multiple shapes, including 1, 4 and 8-chip shapes, all the way up to 256 chips (a full TPU v5e pod), with ultra-fast ICI links between chips. This allows you to choose the TPU shape that best suits your use case and easily take advantage of the parallelism that JAX and TPUs provide.\n\n## How to write an image generation pipeline in JAX\n\nWe'll go step by step over the code you need to write to run inference super-fast using JAX! First, let's import the dependencies.\n\n```\n# Show best practices for SDXL JAX\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nfrom flax.jax_utils import replicate\nfrom diffusers import FlaxStableDiffusionXLPipeline\nimport time\n```\n\nWe'll now load the base SDXL model and the rest of the components required for inference. The diffusers pipeline takes care of downloading and caching everything for us. Adhering to JAX's functional approach, the model's parameters are returned separately and will have to be passed to the pipeline during inference:\n\n```\npipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(\n    \"stabilityai/stable-diffusion-xl-base-1.0\", split_head_dim=True\n)\n```\n\nModel parameters are downloaded in 32-bit precision by default. To save memory and run computation faster we'll convert them to bfloat16 , an efficient 16-bit representation. However, there's a caveat: for best results, we have to keep the scheduler state in float32 , otherwise precision errors accumulate and result in low-quality or even black images.\n\n```\nscheduler_state = params.pop(\"scheduler\")\nparams = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)\nparams[\"scheduler\"] = scheduler_state\n```\n\nWe are now ready to set up our prompt and the rest of the pipeline inputs.\n\n```\ndefault_prompt = \"high-quality photo of a baby dolphin ​​playing in a pool and wearing a party hat\"\ndefault_neg_prompt = \"illustration, low-quality\"\ndefault_seed = 33\ndefault_guidance_scale = 5.0\ndefault_num_steps = 25\n```\n\nThe prompts have to be supplied as tensors to the pipeline, and they always have to have the same dimensions across invocations. This allows the inference call to be compiled. The pipeline prepare_inputs method performs all the necessary steps for us, so we'll create a helper function to prepare both our prompt and negative prompt as tensors. We'll use it later from our generate function:\n\n```\ndef tokenize_prompt(prompt, neg_prompt):\n    prompt_ids = pipeline.prepare_inputs(prompt)\n    neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)\n    return prompt_ids, neg_prompt_ids\n```\n\nTo take advantage of parallelization, we'll replicate the inputs across devices. A Cloud TPU v5e-4 has 4 chips, so by replicating the inputs we get each chip to generate a different image, in parallel. We need to be careful to supply a different random seed to each chip so the 4 images are different:\n\n```\nNUM_DEVICES = jax.device_count()\n\n# Model parameters don't change during inference,\n# so we only need to replicate them once.\np_params = replicate(params)\n\ndef replicate_all(prompt_ids, neg_prompt_ids, seed):\n    p_prompt_ids = replicate(prompt_ids)\n    p_neg_prompt_ids = replicate(neg_prompt_ids)\n    rng = jax.random.PRNGKey(seed)\n    rng = jax.random.split(rng, NUM_DEVICES)\n    return p_prompt_ids, p_neg_prompt_ids, rng\n```\n\nWe are now ready to put everything together in a generate function:\n\n```\ndef generate(\n    prompt,\n    negative_prompt,\n    seed=default_seed,\n    guidance_scale=default_guidance_scale,\n    num_inference_steps=default_num_steps,\n):\n    prompt_ids, neg_prompt_ids = tokenize_prompt(prompt, negative_prompt)\n    prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, seed)\n    images = pipeline(\n        prompt_ids,\n        p_params,\n        rng,\n        num_inference_steps=num_inference_steps,\n        neg_prompt_ids=neg_prompt_ids,\n        guidance_scale=guidance_scale,\n        jit=True,\n    ).images\n\n    # convert the images to PIL\n    images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])\n    return pipeline.numpy_to_pil(np.array(images))\n```\n\njit=True indicates that we want the pipeline call to be compiled. This will happen the first time we call generate , and it will be very slow – JAX needs to trace the operations, optimize them, and convert them to low-level primitives. We'll run a first generation to complete this process and warm things up:\n\n```\nstart = time.time()\nprint(f\"Compiling ...\")\ngenerate(default_prompt, default_neg_prompt)\nprint(f\"Compiled in {time.time() - start}\")\n```\n\nThis took about three minutes the first time we ran it. But once the code has been compiled, inference will be super fast. Let's try again!\n\n```\nstart = time.time()\nprompt = \"llama in ancient Greece, oil on canvas\"\nneg_prompt = \"cartoon, illustration, animation\"\nimages = generate(prompt, neg_prompt)\nprint(f\"Inference in {time.time() - start}\")\n```\n\nIt now took about 2s to generate the 4 images!\n\nThe following measures were obtained running SDXL 1.0 base for 20 steps, with the default Euler Discrete scheduler. We compare Cloud TPU v5e with TPUv4 for the same batch sizes. Do note that, due to parallelism, a TPU v5e-4 like the ones we use in our demo will generate 4 images when using a batch size of 1 (or 8 images with a batch size of 2). Similarly, a TPU v5e-8 will generate 8 images when using a batch size of 1.\n\nThe Cloud TPU tests were run using Python 3.10 and jax version 0.4.16. These are the same specs used in our demo Space .\n\nBatch Size Latency Perf/\n\nTPU v5e achieves up to 2.4x greater perf/ on SDXL compared to TPU v4, demonstrating the cost-efficiency of the latest TPU generation.\n\nTo measure inference performance, we use the industry-standard metric of throughput. First, we measure latency per image when the model has been compiled and loaded. Then, we calculate throughput by dividing batch size over latency per chip. As a result, throughput measures how the model is performing in production environments regardless of how many chips are used. We then divide throughput by the list price to get performance per dollar.\n\n## How does the demo work?\n\nThe demo we showed before was built using a script that essentially follows the code we posted in this blog post. It runs on a few Cloud TPU v5e devices with 4 chips each, and there's a simple load-balancing server that routes user requests to backend servers randomly. When you enter a prompt in the demo, your request will be assigned to one of the backend servers, and you'll receive the 4 images it generates.\n\nThis is a simple solution based on several pre-allocated TPU instances. In a future post, we'll cover how to create dynamic solutions that adapt to load using GKE.\n\nAll the code for the demo is open-source and available in Hugging Face Diffusers today. We are excited to see what you build with Diffusers + JAX + Cloud TPUs!\n\nMore Articles from our Blog\n\nsdxl lcm stable diffusion\n\n## SDXL in 4 steps with Latent Consistency LoRAs\n\nmultimodal on-device gemma4\n\n## Welcome Gemma 4: Frontier multimodal intelligence on device\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Generative AI models, such as Stable Diffusion XL (SDXL), enable the creation of high-quality, realistic content with wide-ranging applications. However, harnessing the power of such models presents significant challenges and computational costs. SDXL is a large image generation model whose UNet component is about three times as large as the one in the previous version of the model. Deploying a model like this in production is challenging due to the increased memory requirements, as well as increased inference times. Today, we are thrilled to announce that Hugging Face Diffusers now supports serving SDXL using JAX on Cloud TPUs, enabling high-performance, cost-efficient inference.\n\nGoogle Cloud TPUs are custom-designed AI accelerators, which are optimized for training and inference of large AI models, including state-of-the-art LLMs and generative AI models such as SDXL. The new Cloud TPU v5e is purpose-built to bring the cost-efficiency and performance required for large-scale AI training and inference. At less than half the cost of TPU v4, TPU v5e makes it possible for more organizations to train and deploy AI models.\n\n🧨 Diffusers JAX integration offers a convenient way to run SDXL on TPU via XLA, and we built a demo to showcase it. You can try it out in this Space or in the playground embedded below:\n\nUnder the hood, this demo runs on several TPU v5e-4 instances (each instance has 4 TPU chips) and takes advantage of parallelization to serve four large 1024×1024 images in about 4 seconds. This time includes format conversions, communications time, and frontend processing; the actual generation time is about 2.3s, as we'll see below!\n\nIn this blog post,\n\n- We describe why JAX + TPU + Diffusers is a powerful framework to run SDXL\n\n- Explain how you can write a simple image generation pipeline with Diffusers and JAX\n\n- Show benchmarks comparing different TPU settings\n\n## Why JAX + TPU v5e for SDXL?\n\nServing SDXL with JAX on Cloud TPU v5e with high performance and cost-efficiency is possible thanks to the combination of purpose-built TPU hardware and a software stack optimized for performance. Below we highlight two key factors: JAX just-in-time (jit) compilation and XLA compiler-driven parallelism with JAX pmap.\n\n#### JIT compilation\n\nA notable feature of JAX is its just-in-time (jit) compilation. The JIT compiler traces code during the first run and generates highly optimized TPU binaries that are re-used in subsequent calls. The catch of this process is that it requires all input, intermediate, and output shapes to be static, meaning that they must be known in advance. Every time we change the shapes a new and costly compilation process will be triggered again. JIT compilation is ideal for services that can be designed around static shapes: compilation runs once, and then we take advantage of super-fast inference times.\n\nImage generation is well-suited for JIT compilation. If we always generate the same number of images and they have the same size, then the output shapes are constant and known in advance. The text inputs are also constant: by design, Stable Diffusion and SDXL use fixed-shape embedding vectors (with padding) to represent the prompts typed by the user. Therefore, we can write JAX code that relies on fixed shapes, and that can be greatly optimized!\n\n#### High-performance throughput for high batch sizes\n\nWorkloads can be scaled across multiple devices using JAX's pmap, which expresses single-program multiple-data (SPMD) programs. Applying pmap to a function will compile a function with XLA, then execute it in parallel on various XLA devices. For text-to-image generation workloads this means that increasing the number of images rendered simultaneously is straightforward to implement and doesn't compromise performance. For example, running SDXL on a TPU with 8 chips will generate 8 images in the same time it takes for 1 chip to create a single image.\n\nTPU v5e instances come in multiple shapes, including 1, 4 and 8-chip shapes, all the way up to 256 chips (a full TPU v5e pod), with ultra-fast ICI links between chips. This allows you to choose the TPU shape that best suits your use case and easily take advantage of the parallelism that JAX and TPUs provide.\n\n## How to write an image generation pipeline in JAX\n\nWe'll go step by step over the code you need to write to run inference super-fast using JAX! First, let's import the dependencies.\n\n```\n# Show best practices for SDXL JAX\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nfrom flax.jax_utils import replicate\nfrom diffusers import FlaxStableDiffusionXLPipeline\nimport time\n```\n\nWe'll now load the base SDXL model and the rest of the components required for inference. The diffusers pipeline takes care of downloading and caching everything for us. Adhering to JAX's functional approach, the model's parameters are returned separately and will have to be passed to the pipeline during inference:\n\n```\npipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(\n    \"stabilityai/stable-diffusion-xl-base-1.0\", split_head_dim=True\n)\n```\n\nModel parameters are downloaded in 32-bit precision by default. To save memory and run computation faster we'll convert them to bfloat16, an efficient 16-bit representation. However, there's a caveat: for best results, we have to keep the scheduler state in float32, otherwise precision errors accumulate and result in low-quality or even black images.\n\n```\nscheduler_state = params.pop(\"scheduler\")\nparams = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)\nparams[\"scheduler\"] = scheduler_state\n```\n\nWe are now ready to set up our prompt and the rest of the pipeline inputs.\n\n```\ndefault_prompt = \"high-quality photo of a baby dolphin ​​playing in a pool and wearing a party hat\"\ndefault_neg_prompt = \"illustration, low-quality\"\ndefault_seed = 33\ndefault_guidance_scale = 5.0\ndefault_num_steps = 25\n```\n\nThe prompts have to be supplied as tensors to the pipeline, and they always have to have the same dimensions across invocations. This allows the inference call to be compiled. The pipeline prepare_inputs method performs all the necessary steps for us, so we'll create a helper function to prepare both our prompt and negative prompt as tensors. We'll use it later from our generate function:\n\n```\ndef tokenize_prompt(prompt, neg_prompt):\n    prompt_ids = pipeline.prepare_inputs(prompt)\n    neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)\n    return prompt_ids, neg_prompt_ids\n```\n\nTo take advantage of parallelization, we'll replicate the inputs across devices. A Cloud TPU v5e-4 has 4 chips, so by replicating the inputs we get each chip to generate a different image, in parallel. We need to be careful to supply a different random seed to each chip so the 4 images are different:\n\n```\nNUM_DEVICES = jax.device_count()\n\n# Model parameters don't change during inference,\n# so we only need to replicate them once.\np_params = replicate(params)\n\ndef replicate_all(prompt_ids, neg_prompt_ids, seed):\n    p_prompt_ids = replicate(prompt_ids)\n    p_neg_prompt_ids = replicate(neg_prompt_ids)\n    rng = jax.random.PRNGKey(seed)\n    rng = jax.random.split(rng, NUM_DEVICES)\n    return p_prompt_ids, p_neg_prompt_ids, rng\n```\n\nWe are now ready to put everything together in a generate function:\n\n```\ndef generate(\n    prompt,\n    negative_prompt,\n    seed=default_seed,\n    guidance_scale=default_guidance_scale,\n    num_inference_steps=default_num_steps,\n):\n    prompt_ids, neg_prompt_ids = tokenize_prompt(prompt, negative_prompt)\n    prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, seed)\n    images = pipeline(\n        prompt_ids,\n        p_params,\n        rng,\n        num_inference_steps=num_inference_steps,\n        neg_prompt_ids=neg_prompt_ids,\n        guidance_scale=guidance_scale,\n        jit=True,\n    ).images\n\n    # convert the images to PIL\n    images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])\n    return pipeline.numpy_to_pil(np.array(images))\n```\n\njit=True indicates that we want the pipeline call to be compiled. This will happen the first time we call generate, and it will be very slow – JAX needs to trace the operations, optimize them, and convert them to low-level primitives. We'll run a first generation to complete this process and warm things up:\n\n```\nstart = time.time()\nprint(f\"Compiling ...\")\ngenerate(default_prompt, default_neg_prompt)\nprint(f\"Compiled in {time.time() - start}\")\n```\n\nThis took about three minutes the first time we ran it. But once the code has been compiled, inference will be super fast. Let's try again!\n\n```\nstart = time.time()\nprompt = \"llama in ancient Greece, oil on canvas\"\nneg_prompt = \"cartoon, illustration, animation\"\nimages = generate(prompt, neg_prompt)\nprint(f\"Inference in {time.time() - start}\")\n```\n\nIt now took about 2s to generate the 4 images!\n\n## Benchmark\n\nThe following measures were obtained running SDXL 1.0 base for 20 steps, with the default Euler Discrete scheduler. We compare Cloud TPU v5e with TPUv4 for the same batch sizes. Do note that, due to parallelism, a TPU v5e-4 like the ones we use in our demo will generate 4 images when using a batch size of 1 (or 8 images with a batch size of 2). Similarly, a TPU v5e-8 will generate 8 images when using a batch size of 1.\n\nThe Cloud TPU tests were run using Python 3.10 and jax version 0.4.16. These are the same specs used in our demo Space.\n\n—\n\nBatch Size\n\nLatency\n\nPerf/$\n\nTPU v5e-4 (JAX)\n\n4\n\n2.33s\n\n21.46\n\n—\n\n8\n\n4.99s\n\n20.04\n\nTPU v4-8 (JAX)\n\n4\n\n2.16s\n\n9.05\n\n—\n\n8\n\n4.17\n\n8.98\n\nTPU v5e achieves up to 2.4x greater perf/$ on SDXL compared to TPU v4, demonstrating the cost-efficiency of the latest TPU generation.\n\nTo measure inference performance, we use the industry-standard metric of throughput. First, we measure latency per image when the model has been compiled and loaded. Then, we calculate throughput by dividing batch size over latency per chip. As a result, throughput measures how the model is performing in production environments regardless of how many chips are used. We then divide throughput by the list price to get performance per dollar.\n\n## How does the demo work?\n\nThe demo we showed before was built using a script that essentially follows the code we posted in this blog post. It runs on a few Cloud TPU v5e devices with 4 chips each, and there's a simple load-balancing server that routes user requests to backend servers randomly. When you enter a prompt in the demo, your request will be assigned to one of the backend servers, and you'll receive the 4 images it generates.\n\nThis is a simple solution based on several pre-allocated TPU instances. In a future post, we'll cover how to create dynamic solutions that adapt to load using GKE.\n\nAll the code for the demo is open-source and available in Hugging Face Diffusers today. We are excited to see what you build with Diffusers + JAX + Cloud TPUs!",
   "summaryZh": "Hugging Face宣布其Diffusers库现已支持在Google Cloud TPU v5e上使用JAX来运行Stable Diffusion XL（SDXL）。得益于TPU v5e的高性价比与XLA并行优化，该方案能够以较低的成本和约2.3秒的实际生成时间高效处理高分辨率图像生产任务。",
   "summaryGeneratedAt": "2026-09-05T20:35:03.780525Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Generative AI models, such as Stable Diffusion XL (SDXL), enable the creation of high-quality, realistic content with wide-ranging applications. However, harnessing the power of such models presents significant challenges and computational costs. SDXL is a large image generation model whose UNet component is about three times as large as the one in the previous version of the model. Deploying a model like this in production is challenging due to the increased memory requirements, as well as increased inference times. Today, we are thrilled to announce that Hugging Face Diffusers now supports serving SDXL using JAX on Cloud TPUs, enabling high-performance, cost-efficient inference.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Google Cloud TPUs are custom-designed AI accelerators, which are optimized for training and inference of large AI models, including state-of-the-art LLMs and generative AI models such as SDXL. The new Cloud TPU v5e is purpose-built to bring the cost-efficiency and performance required for large-scale AI training and inference. At less than half the cost of TPU v4, TPU v5e makes it possible for more organizations to train and deploy AI models.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://cloud.google.com/tpu"
+        },
+        {
+          "start": 201,
+          "end": 214,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/products/compute/announcing-cloud-tpu-v5e-and-a3-gpus-in-ga"
+        },
+        {
+          "start": 305,
+          "end": 313,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/products/compute/using-cloud-tpu-multislice-to-scale-ai-workloads"
+        },
+        {
+          "start": 318,
+          "end": 327,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/products/compute/how-cloud-tpu-v5e-accelerates-large-scale-ai-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "🧨 Diffusers JAX integration offers a convenient way to run SDXL on TPU via XLA, and we built a demo to showcase it. You can try it out in this Space or in the playground embedded below:",
+      "spans": [
+        {
+          "start": 75,
+          "end": 78,
+          "kind": "a",
+          "href": "https://github.com/openxla/xla"
+        },
+        {
+          "start": 138,
+          "end": 148,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/google/sdxl"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Under the hood, this demo runs on several TPU v5e-4 instances (each instance has 4 TPU chips) and takes advantage of parallelization to serve four large 1024×1024 images in about 4 seconds. This time includes format conversions, communications time, and frontend processing; the actual generation time is about 2.3s, as we'll see below!",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "In this blog post,",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "We describe why JAX + TPU + Diffusers is a powerful framework to run SDXL",
+      "spans": [
+        {
+          "start": 0,
+          "end": 73,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/sdxl_jax#why-jax--tpu-v5e-for-sdxl"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Explain how you can write a simple image generation pipeline with Diffusers and JAX",
+      "spans": [
+        {
+          "start": 0,
+          "end": 83,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/sdxl_jax#how-to-write-an-image-generation-pipeline-in-jax"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Show benchmarks comparing different TPU settings",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/sdxl_jax#benchmark"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Why JAX + TPU v5e for SDXL?",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Serving SDXL with JAX on Cloud TPU v5e with high performance and cost-efficiency is possible thanks to the combination of purpose-built TPU hardware and a software stack optimized for performance. Below we highlight two key factors: JAX just-in-time (jit) compilation and XLA compiler-driven parallelism with JAX pmap.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "JIT compilation",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "A notable feature of JAX is its just-in-time (jit) compilation. The JIT compiler traces code during the first run and generates highly optimized TPU binaries that are re-used in subsequent calls. The catch of this process is that it requires all input, intermediate, and output shapes to be static, meaning that they must be known in advance. Every time we change the shapes a new and costly compilation process will be triggered again. JIT compilation is ideal for services that can be designed around static shapes: compilation runs once, and then we take advantage of super-fast inference times.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 62,
+          "kind": "a",
+          "href": "https://jax.readthedocs.io/en/latest/jax-101/02-jitting.html"
+        },
+        {
+          "start": 291,
+          "end": 297,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Image generation is well-suited for JIT compilation. If we always generate the same number of images and they have the same size, then the output shapes are constant and known in advance. The text inputs are also constant: by design, Stable Diffusion and SDXL use fixed-shape embedding vectors (with padding) to represent the prompts typed by the user. Therefore, we can write JAX code that relies on fixed shapes, and that can be greatly optimized!",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "High-performance throughput for high batch sizes",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Workloads can be scaled across multiple devices using JAX's pmap, which expresses single-program multiple-data (SPMD) programs. Applying pmap to a function will compile a function with XLA, then execute it in parallel on various XLA devices. For text-to-image generation workloads this means that increasing the number of images rendered simultaneously is straightforward to implement and doesn't compromise performance. For example, running SDXL on a TPU with 8 chips will generate 8 images in the same time it takes for 1 chip to create a single image.",
+      "spans": [
+        {
+          "start": 60,
+          "end": 64,
+          "kind": "a",
+          "href": "https://jax.readthedocs.io/en/latest/_autosummary/jax.pmap.html"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "TPU v5e instances come in multiple shapes, including 1, 4 and 8-chip shapes, all the way up to 256 chips (a full TPU v5e pod), with ultra-fast ICI links between chips. This allows you to choose the TPU shape that best suits your use case and easily take advantage of the parallelism that JAX and TPUs provide.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "How to write an image generation pipeline in JAX",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "We'll go step by step over the code you need to write to run inference super-fast using JAX! First, let's import the dependencies.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "We'll now load the base SDXL model and the rest of the components required for inference. The diffusers pipeline takes care of downloading and caching everything for us. Adhering to JAX's functional approach, the model's parameters are returned separately and will have to be passed to the pipeline during inference:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Model parameters are downloaded in 32-bit precision by default. To save memory and run computation faster we'll convert them to bfloat16, an efficient 16-bit representation. However, there's a caveat: for best results, we have to keep the scheduler state in float32, otherwise precision errors accumulate and result in low-quality or even black images.",
+      "spans": [
+        {
+          "start": 128,
+          "end": 136,
+          "kind": "code"
+        },
+        {
+          "start": 239,
+          "end": 254,
+          "kind": "em"
+        },
+        {
+          "start": 258,
+          "end": 265,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "We are now ready to set up our prompt and the rest of the pipeline inputs.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "The prompts have to be supplied as tensors to the pipeline, and they always have to have the same dimensions across invocations. This allows the inference call to be compiled. The pipeline prepare_inputs method performs all the necessary steps for us, so we'll create a helper function to prepare both our prompt and negative prompt as tensors. We'll use it later from our generate function:",
+      "spans": [
+        {
+          "start": 189,
+          "end": 203,
+          "kind": "code"
+        },
+        {
+          "start": 373,
+          "end": 381,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "To take advantage of parallelization, we'll replicate the inputs across devices. A Cloud TPU v5e-4 has 4 chips, so by replicating the inputs we get each chip to generate a different image, in parallel. We need to be careful to supply a different random seed to each chip so the 4 images are different:",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "We are now ready to put everything together in a generate function:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "jit=True indicates that we want the pipeline call to be compiled. This will happen the first time we call generate, and it will be very slow – JAX needs to trace the operations, optimize them, and convert them to low-level primitives. We'll run a first generation to complete this process and warm things up:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 114,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "This took about three minutes the first time we ran it. But once the code has been compiled, inference will be super fast. Let's try again!",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "It now took about 2s to generate the 4 images!",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Benchmark",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "The following measures were obtained running SDXL 1.0 base for 20 steps, with the default Euler Discrete scheduler. We compare Cloud TPU v5e with TPUv4 for the same batch sizes. Do note that, due to parallelism, a TPU v5e-4 like the ones we use in our demo will generate 4 images when using a batch size of 1 (or 8 images with a batch size of 2). Similarly, a TPU v5e-8 will generate 8 images when using a batch size of 1.",
+      "spans": [
+        {
+          "start": 271,
+          "end": 279,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "The Cloud TPU tests were run using Python 3.10 and jax version 0.4.16. These are the same specs used in our demo Space.",
+      "spans": [
+        {
+          "start": 108,
+          "end": 118,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/google/sdxl"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "Batch Size",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "Latency",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "Perf/$",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "TPU v5e-4 (JAX)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "2.33s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "21.46",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "4.99s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "20.04",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "TPU v4-8 (JAX)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "2.16s",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "9.05",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "4.17",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "8.98",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "TPU v5e achieves up to 2.4x greater perf/$ on SDXL compared to TPU v4, demonstrating the cost-efficiency of the latest TPU generation.",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "To measure inference performance, we use the industry-standard metric of throughput. First, we measure latency per image when the model has been compiled and loaded. Then, we calculate throughput by dividing batch size over latency per chip. As a result, throughput measures how the model is performing in production environments regardless of how many chips are used. We then divide throughput by the list price to get performance per dollar.",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "How does the demo work?",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "The demo we showed before was built using a script that essentially follows the code we posted in this blog post. It runs on a few Cloud TPU v5e devices with 4 chips each, and there's a simple load-balancing server that routes user requests to backend servers randomly. When you enter a prompt in the demo, your request will be assigned to one of the backend servers, and you'll receive the 4 images it generates.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/google/sdxl"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "This is a simple solution based on several pre-allocated TPU instances. In a future post, we'll cover how to create dynamic solutions that adapt to load using GKE.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "All the code for the demo is open-source and available in Hugging Face Diffusers today. We are excited to see what you build with Diffusers + JAX + Cloud TPUs!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "7ecf83cb03d456ffda862007234b2ef1682aa90cd7f281787d7777e65f3be668",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "# Show best practices for SDXL JAX\nimport jax\nimport jax.numpy as jnp\nimport numpy as np\nfrom flax.jax_utils import replicate\nfrom diffusers import FlaxStableDiffusionXLPipeline\nimport time"
+    },
+    {
+      "id": "c0002",
+      "source": "pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(\n    \"stabilityai/stable-diffusion-xl-base-1.0\", split_head_dim=True\n)"
+    },
+    {
+      "id": "c0003",
+      "source": "scheduler_state = params.pop(\"scheduler\")\nparams = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)\nparams[\"scheduler\"] = scheduler_state"
+    },
+    {
+      "id": "c0004",
+      "source": "default_prompt = \"high-quality photo of a baby dolphin ​​playing in a pool and wearing a party hat\"\ndefault_neg_prompt = \"illustration, low-quality\"\ndefault_seed = 33\ndefault_guidance_scale = 5.0\ndefault_num_steps = 25"
+    },
+    {
+      "id": "c0005",
+      "source": "def tokenize_prompt(prompt, neg_prompt):\n    prompt_ids = pipeline.prepare_inputs(prompt)\n    neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)\n    return prompt_ids, neg_prompt_ids"
+    },
+    {
+      "id": "c0006",
+      "source": "NUM_DEVICES = jax.device_count()\n\n# Model parameters don't change during inference,\n# so we only need to replicate them once.\np_params = replicate(params)\n\ndef replicate_all(prompt_ids, neg_prompt_ids, seed):\n    p_prompt_ids = replicate(prompt_ids)\n    p_neg_prompt_ids = replicate(neg_prompt_ids)\n    rng = jax.random.PRNGKey(seed)\n    rng = jax.random.split(rng, NUM_DEVICES)\n    return p_prompt_ids, p_neg_prompt_ids, rng"
+    },
+    {
+      "id": "c0007",
+      "source": "def generate(\n    prompt,\n    negative_prompt,\n    seed=default_seed,\n    guidance_scale=default_guidance_scale,\n    num_inference_steps=default_num_steps,\n):\n    prompt_ids, neg_prompt_ids = tokenize_prompt(prompt, negative_prompt)\n    prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, seed)\n    images = pipeline(\n        prompt_ids,\n        p_params,\n        rng,\n        num_inference_steps=num_inference_steps,\n        neg_prompt_ids=neg_prompt_ids,\n        guidance_scale=guidance_scale,\n        jit=True,\n    ).images\n\n    # convert the images to PIL\n    images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])\n    return pipeline.numpy_to_pil(np.array(images))"
+    },
+    {
+      "id": "c0008",
+      "source": "start = time.time()\nprint(f\"Compiling ...\")\ngenerate(default_prompt, default_neg_prompt)\nprint(f\"Compiled in {time.time() - start}\")"
+    },
+    {
+      "id": "c0009",
+      "source": "start = time.time()\nprompt = \"llama in ancient Greece, oil on canvas\"\nneg_prompt = \"cartoon, illustration, animation\"\nimages = generate(prompt, neg_prompt)\nprint(f\"Inference in {time.time() - start}\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "7ecf83cb03d456ffda862007234b2ef1682aa90cd7f281787d7777e65f3be668",
+  "mediaLayout": [],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 0,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T15:30:31.029415Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:30:31.029430Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

@@ -16,13 +16,372 @@
   "originalUrl": "https://huggingface.co/blog/fl-with-flower",
   "resolvedUrl": "https://huggingface.co/blog/fl-with-flower",
   "fetchedAt": "2026-08-27T03:10:34.370631Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "This tutorial will show how to leverage Hugging Face to federate the training of language models over multiple clients using Flower. More specifically, we will fine-tune a pre-trained Transformer model (distilBERT) for sequence classification over a dataset of IMDB ratings. The end goal is to detect if a movie rating is positive or negative.\n\nA notebook is also available here but instead of running on multiple separate clients it utilizes the simulation functionality of Flower (using flwr['simulation']) in order to emulate a federated setting inside Google Colab (this also means that instead of calling start_server we will call start_simulation, and that a few other modifications are needed).\n\n## Dependencies\n\nTo follow along this tutorial you will need to install the following packages: datasets, evaluate, flwr, torch, and transformers. This can be done using pip:\n\n```\npip install datasets evaluate flwr torch transformers\n```\n\n## Standard Hugging Face workflow\n\n### Handling the data\n\nTo fetch the IMDB dataset, we will use Hugging Face's datasets library. We then need to tokenize the data and create PyTorch dataloaders, this is all done in the load_data function:\n\n```\nimport random\n\nimport torch\nfrom datasets import load_dataset\nfrom torch.utils.data import DataLoader\nfrom transformers import AutoTokenizer, DataCollatorWithPadding\n\n\nDEVICE = torch.device(\"cuda:0\" if torch.cuda.is_available() else \"cpu\")\nCHECKPOINT = \"distilbert-base-uncased\"\n\ndef load_data():\n    \"\"\"Load IMDB data (training and eval)\"\"\"\n    raw_datasets = load_dataset(\"imdb\")\n    raw_datasets = raw_datasets.shuffle(seed=42)\n\n    # remove unnecessary data split\n    del raw_datasets[\"unsupervised\"]\n\n    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)\n\n    def tokenize_function(examples):\n        return tokenizer(examples[\"text\"], truncation=True)\n\n    # We will take a small sample in order to reduce the compute time, this is optional\n    train_population = random.sample(range(len(raw_datasets[\"train\"])), 100)\n    test_population = random.sample(range(len(raw_datasets[\"test\"])), 100)\n\n    tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)\n    tokenized_datasets[\"train\"] = tokenized_datasets[\"train\"].select(train_population)\n    tokenized_datasets[\"test\"] = tokenized_datasets[\"test\"].select(test_population)\n    tokenized_datasets = tokenized_datasets.remove_columns(\"text\")\n    tokenized_datasets = tokenized_datasets.rename_column(\"label\", \"labels\")\n\n    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)\n    trainloader = DataLoader(\n        tokenized_datasets[\"train\"],\n        shuffle=True,\n        batch_size=32,\n        collate_fn=data_collator,\n    )\n\n    testloader = DataLoader(\n        tokenized_datasets[\"test\"], batch_size=32, collate_fn=data_collator\n    )\n\n    return trainloader, testloader\n    \ntrainloader, testloader = load_data()\n```\n\n### Training and testing the model\n\nOnce we have a way of creating our trainloader and testloader, we can take care of the training and testing. This is very similar to any PyTorch training or testing loop:\n\n```\nfrom evaluate import load as load_metric\nfrom transformers import AdamW\n\n\ndef train(net, trainloader, epochs):\n    optimizer = AdamW(net.parameters(), lr=5e-5)\n    net.train()\n    for _ in range(epochs):\n        for batch in trainloader:\n            batch = {k: v.to(DEVICE) for k, v in batch.items()}\n            outputs = net(**batch)\n            loss = outputs.loss\n            loss.backward()\n            optimizer.step()\n            optimizer.zero_grad()\n\ndef test(net, testloader):\n    metric = load_metric(\"accuracy\")\n    loss = 0\n    net.eval()\n    for batch in testloader:\n        batch = {k: v.to(DEVICE) for k, v in batch.items()}\n        with torch.no_grad():\n            outputs = net(**batch)\n        logits = outputs.logits\n        loss += outputs.loss.item()\n        predictions = torch.argmax(logits, dim=-1)\n        metric.add_batch(predictions=predictions, references=batch[\"labels\"])\n    loss /= len(testloader.dataset)\n    accuracy = metric.compute()[\"accuracy\"]\n    return loss, accuracy\n```\n\n### Creating the model itself\n\nTo create the model itself, we will just load the pre-trained distillBERT model using Hugging Face’s AutoModelForSequenceClassification :\n\n```\nfrom transformers import AutoModelForSequenceClassification \n\n\nnet = AutoModelForSequenceClassification.from_pretrained(\n        CHECKPOINT, num_labels=2\n    ).to(DEVICE)\n```\n\n## Federating the example\n\nThe idea behind Federated Learning is to train a model between multiple clients and a server without having to share any data. This is done by letting each client train the model locally on its data and send its parameters back to the server, which then aggregates all the clients’ parameters together using a predefined strategy. This process is made very simple by using the Flower framework. If you want a more complete overview, be sure to check out this guide: What is Federated Learning?\n\n### Creating the IMDBClient\n\nTo federate our example to multiple clients, we first need to write our Flower client class (inheriting from flwr.client.NumPyClient). This is very easy, as our model is a standard PyTorch model:\n\n```\nfrom collections import OrderedDict\n\nimport flwr as fl\n\n\nclass IMDBClient(fl.client.NumPyClient):\n        def get_parameters(self, config):\n            return [val.cpu().numpy() for _, val in net.state_dict().items()]\n\n        def set_parameters(self, parameters):\n            params_dict = zip(net.state_dict().keys(), parameters)\n            state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})\n            net.load_state_dict(state_dict, strict=True)\n\n        def fit(self, parameters, config):\n            self.set_parameters(parameters)\n            print(\"Training Started...\")\n            train(net, trainloader, epochs=1)\n            print(\"Training Finished.\")\n            return self.get_parameters(config={}), len(trainloader), {}\n\n        def evaluate(self, parameters, config):\n            self.set_parameters(parameters)\n            loss, accuracy = test(net, testloader)\n            return float(loss), len(testloader), {\"accuracy\": float(accuracy)}\n```\n\nThe get_parameters function lets the server get the client's parameters. Inversely, the set_parameters function allows the server to send its parameters to the client. Finally, the fit function trains the model locally for the client, and the evaluate function tests the model locally and returns the relevant metrics.\n\nWe can now start client instances using:\n\n```\nfl.client.start_numpy_client(\n    server_address=\"127.0.0.1:8080\",\n    client=IMDBClient(),\n)\n```\n\n### Starting the server\n\nNow that we have a way to instantiate clients, we need to create our server in order to aggregate the results. Using Flower, this can be done very easily by first choosing a strategy (here, we are using FedAvg, which will define the global weights as the average of all the clients' weights at each round) and then using the flwr.server.start_server function:\n\n```\ndef weighted_average(metrics):\n    accuracies = [num_examples * m[\"accuracy\"] for num_examples, m in metrics]\n    losses = [num_examples * m[\"loss\"] for num_examples, m in metrics]\n    examples = [num_examples for num_examples, _ in metrics]\n    return {\"accuracy\": sum(accuracies) / sum(examples), \"loss\": sum(losses) / sum(examples)}\n\n# Define strategy\nstrategy = fl.server.strategy.FedAvg(\n    fraction_fit=1.0,\n    fraction_evaluate=1.0,\n    evaluate_metrics_aggregation_fn=weighted_average,\n)\n\n# Start server\nfl.server.start_server(\n    server_address=\"0.0.0.0:8080\",\n    config=fl.server.ServerConfig(num_rounds=3),\n    strategy=strategy,\n)\n```\n\nThe weighted_average function is there to provide a way to aggregate the metrics distributed amongst the clients (basically this allows us to display a nice average accuracy and loss for every round).\n\n## Putting everything together\n\nIf you want to check out everything put together, you should check out the code example we wrote for the Flower repo: https://github.com/adap/flower/tree/main/examples/quickstart-huggingface.\n\nOf course, this is a very basic example, and a lot can be added or modified, it was just to showcase how simply we could federate a Hugging Face workflow using Flower.\n\nNote that in this example we used PyTorch, but we could have very well used TensorFlow.",
   "summaryZh": "本文探讨了如何结合Hugging Face与Flower框架实现联邦学习，为隐私合规环境下的模型训练提供了技术参考。",
   "summaryGeneratedAt": "2026-09-06T02:37:13.986171Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "This tutorial will show how to leverage Hugging Face to federate the training of language models over multiple clients using Flower. More specifically, we will fine-tune a pre-trained Transformer model (distilBERT) for sequence classification over a dataset of IMDB ratings. The end goal is to detect if a movie rating is positive or negative.",
+      "spans": [
+        {
+          "start": 125,
+          "end": 131,
+          "kind": "a",
+          "href": "https://flower.ai/"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "A notebook is also available here but instead of running on multiple separate clients it utilizes the simulation functionality of Flower (using flwr['simulation']) in order to emulate a federated setting inside Google Colab (this also means that instead of calling start_server we will call start_simulation, and that a few other modifications are needed).",
+      "spans": [
+        {
+          "start": 29,
+          "end": 33,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/blog/blob/main/notebooks/fl-with-flower.ipynb"
+        },
+        {
+          "start": 144,
+          "end": 162,
+          "kind": "code"
+        },
+        {
+          "start": 265,
+          "end": 277,
+          "kind": "code"
+        },
+        {
+          "start": 291,
+          "end": 307,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Dependencies",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "To follow along this tutorial you will need to install the following packages: datasets, evaluate, flwr, torch, and transformers. This can be done using pip:",
+      "spans": [
+        {
+          "start": 79,
+          "end": 87,
+          "kind": "code"
+        },
+        {
+          "start": 89,
+          "end": 97,
+          "kind": "code"
+        },
+        {
+          "start": 99,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 128,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 156,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Standard Hugging Face workflow",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Handling the data",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "To fetch the IMDB dataset, we will use Hugging Face's datasets library. We then need to tokenize the data and create PyTorch dataloaders, this is all done in the load_data function:",
+      "spans": [
+        {
+          "start": 54,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 124,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 171,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Training and testing the model",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Once we have a way of creating our trainloader and testloader, we can take care of the training and testing. This is very similar to any PyTorch training or testing loop:",
+      "spans": [
+        {
+          "start": 137,
+          "end": 144,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Creating the model itself",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "To create the model itself, we will just load the pre-trained distillBERT model using Hugging Face’s AutoModelForSequenceClassification :",
+      "spans": [
+        {
+          "start": 101,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Federating the example",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "The idea behind Federated Learning is to train a model between multiple clients and a server without having to share any data. This is done by letting each client train the model locally on its data and send its parameters back to the server, which then aggregates all the clients’ parameters together using a predefined strategy. This process is made very simple by using the Flower framework. If you want a more complete overview, be sure to check out this guide: What is Federated Learning?",
+      "spans": [
+        {
+          "start": 377,
+          "end": 383,
+          "kind": "a",
+          "href": "https://github.com/adap/flower"
+        },
+        {
+          "start": 466,
+          "end": 493,
+          "kind": "a",
+          "href": "https://flower.ai/docs/framework/tutorial-series-what-is-federated-learning.html"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Creating the IMDBClient",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "To federate our example to multiple clients, we first need to write our Flower client class (inheriting from flwr.client.NumPyClient). This is very easy, as our model is a standard PyTorch model:",
+      "spans": [
+        {
+          "start": 109,
+          "end": 132,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 188,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "The get_parameters function lets the server get the client's parameters. Inversely, the set_parameters function allows the server to send its parameters to the client. Finally, the fit function trains the model locally for the client, and the evaluate function tests the model locally and returns the relevant metrics.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 18,
+          "kind": "code"
+        },
+        {
+          "start": 88,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 184,
+          "kind": "code"
+        },
+        {
+          "start": 243,
+          "end": 251,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "We can now start client instances using:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Starting the server",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Now that we have a way to instantiate clients, we need to create our server in order to aggregate the results. Using Flower, this can be done very easily by first choosing a strategy (here, we are using FedAvg, which will define the global weights as the average of all the clients' weights at each round) and then using the flwr.server.start_server function:",
+      "spans": [
+        {
+          "start": 203,
+          "end": 209,
+          "kind": "code"
+        },
+        {
+          "start": 325,
+          "end": 349,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "The weighted_average function is there to provide a way to aggregate the metrics distributed amongst the clients (basically this allows us to display a nice average accuracy and loss for every round).",
+      "spans": [
+        {
+          "start": 4,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Putting everything together",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "If you want to check out everything put together, you should check out the code example we wrote for the Flower repo: https://github.com/adap/flower/tree/main/examples/quickstart-huggingface.",
+      "spans": [
+        {
+          "start": 118,
+          "end": 190,
+          "kind": "a",
+          "href": "https://github.com/adap/flower/tree/main/examples/quickstart-huggingface"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Of course, this is a very basic example, and a lot can be added or modified, it was just to showcase how simply we could federate a Hugging Face workflow using Flower.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Note that in this example we used PyTorch, but we could have very well used TensorFlow.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 76,
+          "end": 86,
+          "kind": "code"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "4212ddbffd5f8484eeb3c77d452fc6ce6e9b12d151b3e0b53f86f4c10537066d",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install datasets evaluate flwr torch transformers"
+    },
+    {
+      "id": "c0002",
+      "source": "import random\n\nimport torch\nfrom datasets import load_dataset\nfrom torch.utils.data import DataLoader\nfrom transformers import AutoTokenizer, DataCollatorWithPadding\n\n\nDEVICE = torch.device(\"cuda:0\" if torch.cuda.is_available() else \"cpu\")\nCHECKPOINT = \"distilbert-base-uncased\"\n\ndef load_data():\n    \"\"\"Load IMDB data (training and eval)\"\"\"\n    raw_datasets = load_dataset(\"imdb\")\n    raw_datasets = raw_datasets.shuffle(seed=42)\n\n    # remove unnecessary data split\n    del raw_datasets[\"unsupervised\"]\n\n    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)\n\n    def tokenize_function(examples):\n        return tokenizer(examples[\"text\"], truncation=True)\n\n    # We will take a small sample in order to reduce the compute time, this is optional\n    train_population = random.sample(range(len(raw_datasets[\"train\"])), 100)\n    test_population = random.sample(range(len(raw_datasets[\"test\"])), 100)\n\n    tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)\n    tokenized_datasets[\"train\"] = tokenized_datasets[\"train\"].select(train_population)\n    tokenized_datasets[\"test\"] = tokenized_datasets[\"test\"].select(test_population)\n    tokenized_datasets = tokenized_datasets.remove_columns(\"text\")\n    tokenized_datasets = tokenized_datasets.rename_column(\"label\", \"labels\")\n\n    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)\n    trainloader = DataLoader(\n        tokenized_datasets[\"train\"],\n        shuffle=True,\n        batch_size=32,\n        collate_fn=data_collator,\n    )\n\n    testloader = DataLoader(\n        tokenized_datasets[\"test\"], batch_size=32, collate_fn=data_collator\n    )\n\n    return trainloader, testloader\n    \ntrainloader, testloader = load_data()"
+    },
+    {
+      "id": "c0003",
+      "source": "from evaluate import load as load_metric\nfrom transformers import AdamW\n\n\ndef train(net, trainloader, epochs):\n    optimizer = AdamW(net.parameters(), lr=5e-5)\n    net.train()\n    for _ in range(epochs):\n        for batch in trainloader:\n            batch = {k: v.to(DEVICE) for k, v in batch.items()}\n            outputs = net(**batch)\n            loss = outputs.loss\n            loss.backward()\n            optimizer.step()\n            optimizer.zero_grad()\n\ndef test(net, testloader):\n    metric = load_metric(\"accuracy\")\n    loss = 0\n    net.eval()\n    for batch in testloader:\n        batch = {k: v.to(DEVICE) for k, v in batch.items()}\n        with torch.no_grad():\n            outputs = net(**batch)\n        logits = outputs.logits\n        loss += outputs.loss.item()\n        predictions = torch.argmax(logits, dim=-1)\n        metric.add_batch(predictions=predictions, references=batch[\"labels\"])\n    loss /= len(testloader.dataset)\n    accuracy = metric.compute()[\"accuracy\"]\n    return loss, accuracy"
+    },
+    {
+      "id": "c0004",
+      "source": "from transformers import AutoModelForSequenceClassification \n\n\nnet = AutoModelForSequenceClassification.from_pretrained(\n        CHECKPOINT, num_labels=2\n    ).to(DEVICE)"
+    },
+    {
+      "id": "c0005",
+      "source": "from collections import OrderedDict\n\nimport flwr as fl\n\n\nclass IMDBClient(fl.client.NumPyClient):\n        def get_parameters(self, config):\n            return [val.cpu().numpy() for _, val in net.state_dict().items()]\n\n        def set_parameters(self, parameters):\n            params_dict = zip(net.state_dict().keys(), parameters)\n            state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})\n            net.load_state_dict(state_dict, strict=True)\n\n        def fit(self, parameters, config):\n            self.set_parameters(parameters)\n            print(\"Training Started...\")\n            train(net, trainloader, epochs=1)\n            print(\"Training Finished.\")\n            return self.get_parameters(config={}), len(trainloader), {}\n\n        def evaluate(self, parameters, config):\n            self.set_parameters(parameters)\n            loss, accuracy = test(net, testloader)\n            return float(loss), len(testloader), {\"accuracy\": float(accuracy)}"
+    },
+    {
+      "id": "c0006",
+      "source": "fl.client.start_numpy_client(\n    server_address=\"127.0.0.1:8080\",\n    client=IMDBClient(),\n)"
+    },
+    {
+      "id": "c0007",
+      "source": "def weighted_average(metrics):\n    accuracies = [num_examples * m[\"accuracy\"] for num_examples, m in metrics]\n    losses = [num_examples * m[\"loss\"] for num_examples, m in metrics]\n    examples = [num_examples for num_examples, _ in metrics]\n    return {\"accuracy\": sum(accuracies) / sum(examples), \"loss\": sum(losses) / sum(examples)}\n\n# Define strategy\nstrategy = fl.server.strategy.FedAvg(\n    fraction_fit=1.0,\n    fraction_evaluate=1.0,\n    evaluate_metrics_aggregation_fn=weighted_average,\n)\n\n# Start server\nfl.server.start_server(\n    server_address=\"0.0.0.0:8080\",\n    config=fl.server.ServerConfig(num_rounds=3),\n    strategy=strategy,\n)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "4212ddbffd5f8484eeb3c77d452fc6ce6e9b12d151b3e0b53f86f4c10537066d",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:18:16.688503Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:18:16.688519Z",
+  "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
     "provider": "gemini",

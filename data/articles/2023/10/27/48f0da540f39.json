@@ -18,11 +18,2115 @@
   "fetchedAt": "2026-09-05T07:37:42.593056Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Personal Copilot: Train Your Own Coding Assistant\n\nPublished October 27, 2023\n\nThis article is also available in Chinese 简体中文 .\n\nIn the ever-evolving landscape of programming and software development, the quest for efficiency and productivity has led to remarkable innovations. One such innovation is the emergence of code generation models such as Codex , StarCoder and Code Llama . These models have demonstrated remarkable capabilities in generating human-like code snippets, thereby showing immense potential as coding assistants.\n\nHowever, while these pre-trained models can perform impressively across a range of tasks, there's an exciting possibility lying just beyond the horizon: the ability to tailor a code generation model to your specific needs. Think of personalized coding assistants which could be leveraged at an enterprise scale.\n\nIn this blog post we show how we created HugCoder 🤗, a code LLM fine-tuned on the code contents from the public repositories of the huggingface GitHub organization . We will discuss our data collection workflow, our training experiments, and some interesting results. This will enable you to create your own personal copilot based on your proprietary codebase. We will leave you with a couple of further extensions of this project for experimentation.\n\n## Data Collection Workflow\n\nOur desired dataset is conceptually simple, we structured it like so:\n\nFilepath in the Repository\n\nScraping code contents from GitHub is straightforward with the Python GitHub API . However, depending on the number of repositories and the number of code files within a repository, one might easily run into API rate-limiting issues.\n\nTo prevent such problems, we decided to clone all the public repositories locally and extract the contents from them instead of through the API. We used the multiprocessing module from Python to download all repos in parallel, as shown in this download script .\n\nA repository can often contain non-code files such as images, presentations and other assets. We’re not interested in scraping them. We created a list of extensions to filter them out. To parse code files other than Jupyter Notebooks, we simply used the \"utf-8\" encoding. For notebooks, we only considered the code cells.\n\nWe also excluded all file paths that were not directly related to code. These include: .git , __pycache__ , and xcodeproj .\n\nTo keep the serialization of this content relatively memory-friendly, we used chunking and the feather format . Refer to this script for the full implementation.\n\nThe final dataset is available on the Hub , and it looks like this:\n\nFor this blog, we considered the top 10 Hugging Face public repositories, based on stargazers. They are the following:\n\n['transformers', 'pytorch-image-models', 'datasets', 'diffusers', 'peft', 'tokenizers', 'accelerate', 'text-generation-inference', 'chat-ui', 'deep-rl-class']\n\nThis is the code we used to generate this dataset , and this is the dataset in the Hub . Here is a snapshot of what it looks like:\n\nTo reduce the project complexity, we didn’t consider deduplication of the dataset. If you are interested in applying deduplication techniques for a production application, this blog post is an excellent resource about the topic in the context of code LLMs.\n\n## Finetuning your own Personal Co-Pilot\n\nIn this section, we show how to fine-tune the following models: bigcode/starcoder (15.5B params), bigcode/starcoderbase-1b (1B params), Deci/DeciCoder-1b (1B params). We'll use a single A100 40GB Colab Notebook using 🤗 PEFT (Parameter-Efficient Fine-Tuning) for all the experiments. Additionally, we'll show how to fully finetune the bigcode/starcoder (15.5B params) on a machine with 8 A100 80GB GPUs using 🤗 Accelerate's FSDP integration. The training objective is fill in the middle (FIM) , wherein parts of a training sequence are moved to the end, and the reordered sequence is predicted auto-regressively.\n\nWhy PEFT? Full fine-tuning is expensive. Let’s have some numbers to put things in perspective:\n\nMinimum GPU memory required for full fine-tuning:\n\n- Weight: 2 bytes (Mixed-Precision training)\n\n- Weight gradient: 2 bytes\n\n- Optimizer state when using Adam: 4 bytes for original FP32 weight + 8 bytes for first and second moment estimates\n\n- Cost per parameter adding all of the above: 16 bytes per parameter\n\n- 15.5B model -> 248GB of GPU memory without even considering huge memory requirements for storing intermediate activations -> minimum 4X A100 80GB GPUs required\n\nSince the hardware requirements are huge, we'll be using parameter-efficient fine-tuning using QLoRA . Here are the minimal GPU memory requirements for fine-tuning StarCoder using QLoRA:\n\ntrainable params: 110,428,160 || all params: 15,627,884,544 || trainable%: 0.7066097761926236\n\n- Base model Weight: 0.5 bytes * 15.51B frozen params = 7.755 GB\n\n- Adapter weight: 2 bytes * 0.11B trainable params = 0.22GB\n\n- Weight gradient: 2 bytes * 0.11B trainable params = 0.12GB\n\n- Optimizer state when using Adam: 4 bytes * 0.11B trainable params * 3 = 1.32GB\n\n- Adding all of the above -> 9.51 GB ~10GB -> 1 A100 40GB GPU required 🤯. The reason for A100 40GB GPU is that the intermediate activations for long sequence lengths of 2048 and batch size of 4 for training lead to higher memory requirements. As we will see below, GPU memory required is 26GB which can be accommodated on A100 40GB GPU. Also, A100 GPUs have better compatibilty with Flash Attention 2.\n\nIn the above calculations, we didn't consider memory required for intermediate activation checkpointing which is considerably huge. We leverage Flash Attention V2 and Gradient Checkpointing to overcome this issue.\n\n- For QLoRA along with flash attention V2 and gradient checkpointing, the total memory occupied by the model on a single A100 40GB GPU is 26 GB with a batch size of 4 .\n\n- For full fine-tuning using FSDP along with Flash Attention V2 and Gradient Checkpointing, the memory occupied per GPU ranges between 70 GB to 77.6 GB with a per_gpu_batch_size of 1 .\n\nPlease refer to the model-memory-usage to easily calculate how much vRAM is needed to train and perform big model inference on a model hosted on the 🤗 Hugging Face Hub.\n\nWe will look at how to do full fine-tuning of bigcode/starcoder (15B params) on 8 A100 80GB GPUs using PyTorch Fully Sharded Data Parallel (FSDP) technique. For more information on FSDP, please refer to Fine-tuning Llama 2 70B using PyTorch FSDP and Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel .\n\n- Codebase: link . It uses the recently added Flash Attention V2 support in Transformers.\n\n- FSDP Config: fsdp_config.yaml\n\n- Model: bigcode/stacoder\n\n- Dataset: smangrul/hf-stack-v1\n\n- Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\nThe command to launch training is given at run_fsdp.sh .\n\n```\naccelerate launch --config_file \"configs/fsdp_config.yaml\"  train.py \\\n    --model_path \"bigcode/starcoder\" \\\n    --dataset_name \"smangrul/hf-stack-v1\" \\\n    --subset \"data\" \\\n    --data_column \"content\" \\\n    --split \"train\" \\\n    --seq_length 2048 \\\n    --max_steps 2000 \\\n    --batch_size 1 \\\n    --gradient_accumulation_steps 2 \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --num_warmup_steps 30 \\\n    --eval_freq 100 \\\n    --save_freq 500 \\\n    --log_freq 25 \\\n    --num_workers 4 \\\n    --bf16 \\\n    --no_fp16 \\\n    --output_dir \"starcoder-personal-copilot-A100-40GB-colab\" \\\n    --fim_rate 0.5 \\\n    --fim_spm_rate 0.5 \\\n    --use_flash_attn\n```\n\nThe total training time was 9 Hours . Taking the cost of 12.00 / hr based on lambdalabs for 8x A100 80GB GPUs, the total cost would be 108 .\n\nWe will look at how to use QLoRA for fine-tuning bigcode/starcoder (15B params) on a single A100 40GB GPU using 🤗 PEFT. For more information on QLoRA and PEFT methods, please refer to Making LLMs even more accessible with bitsandbytes, 4-bit quantization and QLoRA and 🤗 PEFT: Parameter-Efficient Fine-Tuning of Billion-Scale Models on Low-Resource Hardware .\n\n- Colab notebook: link . Make sure to choose A100 GPU with High RAM setting.\n\n- QLoRA Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\nThe command to launch training is given at run_peft.sh . The total training time was 12.5 Hours . Taking the cost of 1.10 / hr based on lambdalabs , the total cost would be 13.75 . That's pretty good 🚀! In terms of cost, it's 7.8X lower than the cost for full fine-tuning.\n\nThe plot below shows the eval loss, train loss and learning rate scheduler for QLoRA vs full fine-tuning. We observe that full fine-tuning leads to slightly lower loss and converges a bit faster compared to QLoRA. The learning rate for peft fine-tuning is 10X more than that of full fine-tuning.\n\nTo make sure that our QLoRA model doesn't lead to catastrophic forgetting, we run the Python Human Eval on it. Below are the results we got. Pass@1 measures the pass rate of completions considering just a single generated code candidate per problem. We can observe that the performance on humaneval-python is comparable between the base bigcode/starcoder (15B params) and the fine-tuned PEFT model smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab .\n\nsmangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\nLet's now look at some qualitative samples. In our manual analysis, we noticed that the QLoRA led to slight overfitting and as such we down weigh it by creating new weighted adapter with weight 0.8 via add_weighted_adapter utility of PEFT.\n\nWe will look at 2 code infilling examples wherein the task of the model is to fill the part denoted by the <FILL_ME> placeholder. We will consider infilling completions from GitHub Copilot, the QLoRA fine-tuned model and the full fine-tuned model.\n\nIn the example above, the completion from GitHub Copilot is along the correct lines but doesn't help much. On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. However, they are also adding a lot more noise afterwards. This could be controlled with a post-processing step to limit completions to closing brackets or new lines. Note that both QLoRA and full fine-tuned models produce results with similar quality.\n\nIn the second example above, GitHub Copilot didn't give any completion . This can be due to the fact that 🤗 PEFT is a recent library and not yet part of Copilot's training data, which is exactly the type of problem we are trying to address . On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. Again, note that both the QLoRA and the full fine-tuned models are giving generations of similar quality. Inference Code with various examples for full fine-tuned model and peft model are available at Full_Finetuned_StarCoder_Inference.ipynb and PEFT_StarCoder_Inference.ipynb , respectively.\n\nTherefore, we can observe that the generations from both the variants are as per expectations. Awesome! 🚀\n\n## How do I use it in VS Code?\n\nYou can easily configure a custom code-completion LLM in VS Code using 🤗 llm-vscode VS Code Extension, together with hosting the model via 🤗 Inference EndPoints . We'll go through the required steps below. You can learn more details about deploying an endpoint in the inference endpoints documentation .\n\n### Setting an Inference Endpoint\n\nBelow are the screenshots with the steps we followed to create our custom Inference Endpoint. We used our QLoRA model, exported as a full-sized merged model that can be easily loaded in transformers .\n\n### Setting up the VS Code Extension\n\nJust follow the installation steps . In the settings, replace the endpoint in the field below, so it points to the HF Inference Endpoint you deployed.\n\nUsage will look like below:\n\n## Finetuning your own Code Chat Assistant\n\nSo far, the models we trained were specifically trained as personal co-pilot for code completion tasks. They aren't trained to carry out conversations or for question answering. Octocoder and StarChat are great examples of such models. This section briefly describes how to achieve that.\n\n- Model: bigcode/stacoderplus\n\n- Dataset: smangrul/code-chat-assistant-v1 . Mix of LIMA+GUANACO with proper formatting in a ready-to-train format.\n\n- Trained Model: smangrul/peft-lora-starcoderplus-chat-asst-A100-40GB-colab\n\nIf you have dabbled with Stable Diffusion models and LoRAs for making your own Dreambooth models, you might be familiar with the concepts of combining different LoRAs with different weights, using a LoRA model with a different base model than the one on which it was trained. In text/code domain, this remains unexplored territory. We carry out experiments in this regard and have observed very promising findings. Are you ready? Let's go! 🚀\n\nPEFT currently supports 3 ways of combining LoRA models, linear , svd and cat . For more details, refer to tuners#peft.LoraModel.add_weighted_adapter .\n\nOur notebook Dance_of_LoRAs.ipynb includes all the inference code and various LoRA loading combinations, like loading the chat assistant on top of starcoder instead of starcodeplus , which is the base model that we fine-tuned.\n\nHere, we will consider 2 abilities ( chatting/QA and code-completion ) on 2 data distributions ( top 10 public hf codebase and generic codebase ). That gives us 4 axes on which we'll carry out some qualitative evaluation analyses.\n\n##### First, let us consider the chatting/QA task.\n\nIf we disable adapters, we observe that the task fails for both datasets, as the base model ( starcoder ) is only meant for code completion and not suitable for chatting/question-answering . Enabling copilot adapter performs similar to the disabled case because this LoRA was also specifically fine-tuned for code-completion.\n\nNow, let's enable the assistant adapter.\n\nQuestion Answering based on generic code\n\nQuestion Answering based on HF code\n\nWe can observe that generic question regarding scrapy is being answered properly. However, it is failing for the HF code related question which wasn't part of its pretraining data.\n\n###### Let us now consider the code-completion task.\n\nOn disabling adapters, we observe that the code completion for the generic two-sum works as expected. However, the HF code completion fails with wrong params to LoraConfig , because the base model hasn't seen it in its pretraining data. Enabling assistant performs similar to the disabled case as it was trained on natural language conversations which didn't have any Hugging Face code repos.\n\nNow, let's enable the copilot adapter.\n\nWe can observe that the copilot adapter gets it right in both cases. Therefore, it performs as expected for code-completions when working with HF specific codebase as well as generic codebases.\n\nNow, as a user, I want to combine the ability of assistant as well as copilot . This will enable me to use it for code completion while coding in an IDE, and also have it as a chatbot to answer my questions regarding APIs, classes, methods, documentation. It should be able to provide answers to questions like How do I use x , Please write a code snippet for Y on my codebase.\n\nPEFT allows you to do it via add_weighted_adapter . Let's create a new adapter code_buddy with equal weights to assistant and copilot adapters.\n\nCombining Multiple Adapters\n\nNow, let's see how code_buddy performs on the chatting/question_answering tasks.\n\nWe can observe that code_buddy is performing much better than the assistant or copilot adapters alone! It is able to answer the write a code snippet request to show how to use a specific HF repo API. However, it is also hallucinating the wrong links/explanations, which remains an open challenge for LLMs.\n\nBelow is the performance of code_buddy on code completion tasks.\n\nWe can observe that code_buddy is performing on par with copilot , which was specifically finetuned for this task.\n\n### Transfer LoRAs to different base models\n\nWe can also transfer the LoRA models to different base models. We will take the hot-off-the-press Octocoder model and apply on it the LoRA we trained above with starcoder base model. Please go through the following notebook PEFT_Personal_Code_CoPilot_Adapter_Transfer_Octocoder.ipynb for the entire code.\n\nPerformance on the Code Completion task\n\nWe can observe that octocoder is performing great. It is able to complete HF specific code snippets. It is also able to complete generic code snippets as seen in the notebook.\n\nPerformance on the Chatting/QA task\n\nAs Octocoder is trained to answer questions and carry out conversations about coding, let's see if it can use our LoRA adapter to answer HF specific questions.\n\nYay! It correctly answers in detail how to create LoraConfig and related peft model along with correctly using the model name, dataset name as well as param values of LoraConfig. On disabling the adapter, it fails to correctly use the API of LoraConfig or to create a PEFT model, suggesting that it isn't part of the training data of Octocoder.\n\n## How do I run it locally?\n\nI know, after all this, you want to finetune starcoder on your codebase and use it locally on your consumer hardware such as Mac laptops with M1 GPUs, windows with RTX 4090/3090 GPUs ... Don't worry, we have got you covered.\n\nWe will be using this super cool open source library mlc-llm 🔥. Specifically, we will be using this fork pacman100/mlc-llm which has changes to get it working with the Hugging Face Code Completion extension for VS Code. On my Mac latop with M1 Metal GPU, the 15B model was painfully slow. Hence, we will go small and train a PEFT LoRA version as well as a full finetuned version of bigcode/starcoderbase-1b . The training colab notebooks are linked below:\n\n- Colab notebook for Full fine-tuning and PEFT LoRA finetuning of starcoderbase-1b : link\n\nThe training loss, evaluation loss as well as learning rate schedules are plotted below:\n\nNow, we will look at detailed steps for locally hosting the merged model smangrul/starcoder1B-v2-personal-copilot-merged and using it with 🤗 llm-vscode VS Code Extension.\n\n```\ngit clone --recursive https://github.com/pacman100/mlc-llm.\ngit && \ncd mlc-llm/\n```\n\n- Install the mlc-ai and mlc-chat (in editable mode) :\n\n```\npip install --pre --force-reinstall mlc-ai-nightly mlc-chat-nightly -f https://mlc.ai/wheels\ncd python\npip uninstall mlc-chat-nightly\npip install -e \".\"\n```\n\n- Compile the model via:\n\n```\ntime python3 -m mlc_llm.build --hf-path smangrul/starcoder1B-v2-personal-copilot-merged --target metal  --use-cache=0\n```\n\n- Update the config with the following values in dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params/mlc-chat-config.json :\n\n```\n{\n    \"model_lib\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"local_id\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"conv_template\": \"code_gpt\",\n-    \"temperature\": 0.7,\n+    \"temperature\": 0.2,\n-    \"repetition_penalty\": 1.0,\n    \"top_p\": 0.95,\n-    \"mean_gen_len\": 128,\n+    \"mean_gen_len\": 64,\n-    \"max_gen_len\": 512,\n+    \"max_gen_len\": 64, \n    \"shift_fill_factor\": 0.3,\n    \"tokenizer_files\": [\n        \"tokenizer.json\",\n        \"merges.txt\",\n        \"vocab.json\"\n    ],\n    \"model_category\": \"gpt_bigcode\",\n    \"model_name\": \"starcoder1B-v2-personal-copilot-merged\"\n}\n```\n\n```\n python -m mlc_chat.rest --model dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params --lib-path dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/starcoder1B-v2-personal-copilot-merged-q4f16_1-metal.so\n```\n\n- Change the endpoint of HF Code Completion extension in VS Code to point to the local server:\n\n- Open a new file in VS code, paste the code below and have the cursor in-between the doc quotes, so that the model tries to infill the doc string:\n\nThe demo at the start of this post is this 1B model running locally on my Mac laptop.\n\nIn this blog plost, we saw how to finetune starcoder to create a personal co-pilot that knows about our code. We called it 🤗 HugCoder, as we trained it on Hugging Face code :) After looking at the data collection workflow, we compared training using QLoRA vs full fine-tuning. We also experimented by combining different LoRAs, which is still an unexplored technique in the text/code domain. For deployment, we examined remote inference using 🤗 Inference Endpoints, and also showed on-device execution of a smaller model with VS Code and MLC.\n\nPlease, let us know if you use these methods for your own codebase!\n\nWe would like to thank Pedro Cuenca , Leandro von Werra , Benjamin Bossan , Sylvain Gugger and Loubna Ben Allal for their help with the writing of this blogpost.\n\n## Models mentioned in this article 7\n\n## Datasets mentioned in this article 3\n\n## Spaces mentioned in this article 1\n\nMore Articles from our Blog\n\n## Run a Chatgpt-like Chatbot on a Single GPU with ROCm\n\n## Accelerating Qwen3-8B Agent on Intel® Core™ Ultra with Depth-Pruned Draft Models\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "In the ever-evolving landscape of programming and software development, the quest for efficiency and productivity has led to remarkable innovations. One such innovation is the emergence of code generation models such as Codex, StarCoder and Code Llama. These models have demonstrated remarkable capabilities in generating human-like code snippets, thereby showing immense potential as coding assistants.\n\nHowever, while these pre-trained models can perform impressively across a range of tasks, there's an exciting possibility lying just beyond the horizon: the ability to tailor a code generation model to your specific needs. Think of personalized coding assistants which could be leveraged at an enterprise scale.\n\nIn this blog post we show how we created HugCoder 🤗, a code LLM fine-tuned on the code contents from the public repositories of the huggingface GitHub organization. We will discuss our data collection workflow, our training experiments, and some interesting results. This will enable you to create your own personal copilot based on your proprietary codebase. We will leave you with a couple of further extensions of this project for experimentation.\n\nLet’s begin 🚀\n\n## Data Collection Workflow\n\nOur desired dataset is conceptually simple, we structured it like so:\n\n—\n\n—\n\n—\n\nRepository Name\n\nFilepath in the Repository\n\nFile Contents\n\n\\---\n\n\\---\n\n\\---\n\n\\---\n\n\\---\n\n\\---\n\nScraping code contents from GitHub is straightforward with the Python GitHub API. However, depending on the number of repositories and the number of code files within a repository, one might easily run into API rate-limiting issues.\n\nTo prevent such problems, we decided to clone all the public repositories locally and extract the contents from them instead of through the API. We used the multiprocessing module from Python to download all repos in parallel, as shown in this download script.\n\nA repository can often contain non-code files such as images, presentations and other assets. We’re not interested in scraping them. We created a list of extensions to filter them out. To parse code files other than Jupyter Notebooks, we simply used the \"utf-8\" encoding. For notebooks, we only considered the code cells.\n\nWe also excluded all file paths that were not directly related to code. These include: .git, __pycache__, and xcodeproj.\n\nTo keep the serialization of this content relatively memory-friendly, we used chunking and the feather format. Refer to this script for the full implementation.\n\nThe final dataset is available on the Hub, and it looks like this:\n\nFor this blog, we considered the top 10 Hugging Face public repositories, based on stargazers. They are the following:\n\n['transformers', 'pytorch-image-models', 'datasets', 'diffusers', 'peft', 'tokenizers', 'accelerate', 'text-generation-inference', 'chat-ui', 'deep-rl-class']\n\nThis is the code we used to generate this dataset, and this is the dataset in the Hub. Here is a snapshot of what it looks like:\n\nTo reduce the project complexity, we didn’t consider deduplication of the dataset. If you are interested in applying deduplication techniques for a production application, this blog post is an excellent resource about the topic in the context of code LLMs.\n\n## Finetuning your own Personal Co-Pilot\n\nIn this section, we show how to fine-tune the following models: bigcode/starcoder (15.5B params), bigcode/starcoderbase-1b (1B params), Deci/DeciCoder-1b (1B params). We'll use a single A100 40GB Colab Notebook using 🤗 PEFT (Parameter-Efficient Fine-Tuning) for all the experiments. Additionally, we'll show how to fully finetune the bigcode/starcoder (15.5B params) on a machine with 8 A100 80GB GPUs using 🤗 Accelerate's FSDP integration. The training objective is fill in the middle (FIM), wherein parts of a training sequence are moved to the end, and the reordered sequence is predicted auto-regressively.\n\nWhy PEFT? Full fine-tuning is expensive. Let’s have some numbers to put things in perspective:\n\nMinimum GPU memory required for full fine-tuning:\n\n- Weight: 2 bytes (Mixed-Precision training)\n\n- Weight gradient: 2 bytes\n\n- Optimizer state when using Adam: 4 bytes for original FP32 weight + 8 bytes for first and second moment estimates\n\n- Cost per parameter adding all of the above: 16 bytes per parameter\n\n- 15.5B model -> 248GB of GPU memory without even considering huge memory requirements for storing intermediate activations -> minimum 4X A100 80GB GPUs required\n\nSince the hardware requirements are huge, we'll be using parameter-efficient fine-tuning using QLoRA. Here are the minimal GPU memory requirements for fine-tuning StarCoder using QLoRA:\n\ntrainable params: 110,428,160 || all params: 15,627,884,544 || trainable%: 0.7066097761926236\n\n- Base model Weight: 0.5 bytes * 15.51B frozen params = 7.755 GB\n\n- Adapter weight: 2 bytes * 0.11B trainable params = 0.22GB\n\n- Weight gradient: 2 bytes * 0.11B trainable params = 0.12GB\n\n- Optimizer state when using Adam: 4 bytes * 0.11B trainable params * 3 = 1.32GB\n\n- Adding all of the above -> 9.51 GB ~10GB -> 1 A100 40GB GPU required 🤯. The reason for A100 40GB GPU is that the intermediate activations for long sequence lengths of 2048 and batch size of 4 for training lead to higher memory requirements. As we will see below, GPU memory required is 26GB which can be accommodated on A100 40GB GPU. Also, A100 GPUs have better compatibilty with Flash Attention 2.\n\nIn the above calculations, we didn't consider memory required for intermediate activation checkpointing which is considerably huge. We leverage Flash Attention V2 and Gradient Checkpointing to overcome this issue.\n\n- For QLoRA along with flash attention V2 and gradient checkpointing, the total memory occupied by the model on a single A100 40GB GPU is 26 GB with a batch size of 4.\n\n- For full fine-tuning using FSDP along with Flash Attention V2 and Gradient Checkpointing, the memory occupied per GPU ranges between 70 GB to 77.6 GB with a per_gpu_batch_size of 1.\n\nPlease refer to the model-memory-usage to easily calculate how much vRAM is needed to train and perform big model inference on a model hosted on the 🤗 Hugging Face Hub.\n\n## Full Finetuning\n\nWe will look at how to do full fine-tuning of bigcode/starcoder (15B params) on 8 A100 80GB GPUs using PyTorch Fully Sharded Data Parallel (FSDP) technique. For more information on FSDP, please refer to Fine-tuning Llama 2 70B using PyTorch FSDP and Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel.\n\nResources\n\n- Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.\n\n- FSDP Config: fsdp_config.yaml\n\n- Model: bigcode/stacoder\n\n- Dataset: smangrul/hf-stack-v1\n\n- Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\nThe command to launch training is given at run_fsdp.sh.\n\n```\naccelerate launch --config_file \"configs/fsdp_config.yaml\"  train.py \\\n    --model_path \"bigcode/starcoder\" \\\n    --dataset_name \"smangrul/hf-stack-v1\" \\\n    --subset \"data\" \\\n    --data_column \"content\" \\\n    --split \"train\" \\\n    --seq_length 2048 \\\n    --max_steps 2000 \\\n    --batch_size 1 \\\n    --gradient_accumulation_steps 2 \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --num_warmup_steps 30 \\\n    --eval_freq 100 \\\n    --save_freq 500 \\\n    --log_freq 25 \\\n    --num_workers 4 \\\n    --bf16 \\\n    --no_fp16 \\\n    --output_dir \"starcoder-personal-copilot-A100-40GB-colab\" \\\n    --fim_rate 0.5 \\\n    --fim_spm_rate 0.5 \\\n    --use_flash_attn\n```\n\nThe total training time was 9 Hours. Taking the cost of $12.00 / hr based on lambdalabs for 8x A100 80GB GPUs, the total cost would be $108.\n\n## PEFT\n\nWe will look at how to use QLoRA for fine-tuning bigcode/starcoder (15B params) on a single A100 40GB GPU using 🤗 PEFT. For more information on QLoRA and PEFT methods, please refer to Making LLMs even more accessible with bitsandbytes, 4-bit quantization and QLoRA and 🤗 PEFT: Parameter-Efficient Fine-Tuning of Billion-Scale Models on Low-Resource Hardware.\n\nResources\n\n- Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.\n\n- Colab notebook: link. Make sure to choose A100 GPU with High RAM setting.\n\n- Model: bigcode/stacoder\n\n- Dataset: smangrul/hf-stack-v1\n\n- QLoRA Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\nThe command to launch training is given at run_peft.sh. The total training time was 12.5 Hours. Taking the cost of $1.10 / hr based on lambdalabs, the total cost would be $13.75. That's pretty good 🚀! In terms of cost, it's 7.8X lower than the cost for full fine-tuning.\n\n## Comparison\n\nThe plot below shows the eval loss, train loss and learning rate scheduler for QLoRA vs full fine-tuning. We observe that full fine-tuning leads to slightly lower loss and converges a bit faster compared to QLoRA. The learning rate for peft fine-tuning is 10X more than that of full fine-tuning.\n\nTo make sure that our QLoRA model doesn't lead to catastrophic forgetting, we run the Python Human Eval on it. Below are the results we got. Pass@1 measures the pass rate of completions considering just a single generated code candidate per problem. We can observe that the performance on humaneval-python is comparable between the base bigcode/starcoder (15B params) and the fine-tuned PEFT model smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab.\n\n—\n\n—\n\nModel\n\nPass@1\n\nbigcode/starcoder\n\n33.57\n\nsmangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab\n\n33.37\n\nLet's now look at some qualitative samples. In our manual analysis, we noticed that the QLoRA led to slight overfitting and as such we down weigh it by creating new weighted adapter with weight 0.8 via add_weighted_adapter utility of PEFT.\n\nWe will look at 2 code infilling examples wherein the task of the model is to fill the part denoted by the <FILL_ME> placeholder. We will consider infilling completions from GitHub Copilot, the QLoRA fine-tuned model and the full fine-tuned model.\n\nQualitative Example 1\n\nIn the example above, the completion from GitHub Copilot is along the correct lines but doesn't help much. On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. However, they are also adding a lot more noise afterwards. This could be controlled with a post-processing step to limit completions to closing brackets or new lines. Note that both QLoRA and full fine-tuned models produce results with similar quality.\n\nQualitative Example 2\n\nIn the second example above, GitHub Copilot didn't give any completion. This can be due to the fact that 🤗 PEFT is a recent library and not yet part of Copilot's training data, which is exactly the type of problem we are trying to address. On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. Again, note that both the QLoRA and the full fine-tuned models are giving generations of similar quality. Inference Code with various examples for full fine-tuned model and peft model are available at Full_Finetuned_StarCoder_Inference.ipynb and PEFT_StarCoder_Inference.ipynb, respectively.\n\nTherefore, we can observe that the generations from both the variants are as per expectations. Awesome! 🚀\n\n## How do I use it in VS Code?\n\nYou can easily configure a custom code-completion LLM in VS Code using 🤗 llm-vscode VS Code Extension, together with hosting the model via 🤗 Inference EndPoints. We'll go through the required steps below. You can learn more details about deploying an endpoint in the inference endpoints documentation.\n\n### Setting an Inference Endpoint\n\nBelow are the screenshots with the steps we followed to create our custom Inference Endpoint. We used our QLoRA model, exported as a full-sized merged model that can be easily loaded in transformers.\n\n### Setting up the VS Code Extension\n\nJust follow the installation steps. In the settings, replace the endpoint in the field below, so it points to the HF Inference Endpoint you deployed.\n\nUsage will look like below:\n\n## Finetuning your own Code Chat Assistant\n\nSo far, the models we trained were specifically trained as personal co-pilot for code completion tasks. They aren't trained to carry out conversations or for question answering. Octocoder and StarChat are great examples of such models. This section briefly describes how to achieve that.\n\nResources\n\n- Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.\n\n- Colab notebook: link. Make sure to choose A100 GPU with High RAM setting.\n\n- Model: bigcode/stacoderplus\n\n- Dataset: smangrul/code-chat-assistant-v1. Mix of LIMA+GUANACO with proper formatting in a ready-to-train format.\n\n- Trained Model: smangrul/peft-lora-starcoderplus-chat-asst-A100-40GB-colab\n\n## Dance of LoRAs\n\nIf you have dabbled with Stable Diffusion models and LoRAs for making your own Dreambooth models, you might be familiar with the concepts of combining different LoRAs with different weights, using a LoRA model with a different base model than the one on which it was trained. In text/code domain, this remains unexplored territory. We carry out experiments in this regard and have observed very promising findings. Are you ready? Let's go! 🚀\n\n### Mix-and-Match LoRAs\n\nPEFT currently supports 3 ways of combining LoRA models, linear, svd and cat. For more details, refer to tuners#peft.LoraModel.add_weighted_adapter.\n\nOur notebook Dance_of_LoRAs.ipynb includes all the inference code and various LoRA loading combinations, like loading the chat assistant on top of starcoder instead of starcodeplus, which is the base model that we fine-tuned.\n\nHere, we will consider 2 abilities (chatting/QA and code-completion) on 2 data distributions (top 10 public hf codebase and generic codebase). That gives us 4 axes on which we'll carry out some qualitative evaluation analyses.\n\n##### First, let us consider the chatting/QA task.\n\nIf we disable adapters, we observe that the task fails for both datasets, as the base model (starcoder) is only meant for code completion and not suitable for chatting/question-answering. Enabling copilot adapter performs similar to the disabled case because this LoRA was also specifically fine-tuned for code-completion.\n\nNow, let's enable the assistant adapter.\n\nQuestion Answering based on generic code\n\nQuestion Answering based on HF code\n\nWe can observe that generic question regarding scrapy is being answered properly. However, it is failing for the HF code related question which wasn't part of its pretraining data.\n\n###### Let us now consider the code-completion task.\n\nOn disabling adapters, we observe that the code completion for the generic two-sum works as expected. However, the HF code completion fails with wrong params to LoraConfig, because the base model hasn't seen it in its pretraining data. Enabling assistant performs similar to the disabled case as it was trained on natural language conversations which didn't have any Hugging Face code repos.\n\nNow, let's enable the copilot adapter.\n\nWe can observe that the copilot adapter gets it right in both cases. Therefore, it performs as expected for code-completions when working with HF specific codebase as well as generic codebases.\n\nNow, as a user, I want to combine the ability of assistant as well as copilot. This will enable me to use it for code completion while coding in an IDE, and also have it as a chatbot to answer my questions regarding APIs, classes, methods, documentation. It should be able to provide answers to questions like How do I use x, Please write a code snippet for Y on my codebase.\n\nPEFT allows you to do it via add_weighted_adapter. Let's create a new adapter code_buddy with equal weights to assistant and copilot adapters.\n\nCombining Multiple Adapters\n\nNow, let's see how code_buddy performs on the chatting/question_answering tasks.\n\nWe can observe that code_buddy is performing much better than the assistant or copilot adapters alone! It is able to answer the write a code snippet request to show how to use a specific HF repo API. However, it is also hallucinating the wrong links/explanations, which remains an open challenge for LLMs.\n\nBelow is the performance of code_buddy on code completion tasks.\n\nWe can observe that code_buddy is performing on par with copilot, which was specifically finetuned for this task.\n\n### Transfer LoRAs to different base models\n\nWe can also transfer the LoRA models to different base models. We will take the hot-off-the-press Octocoder model and apply on it the LoRA we trained above with starcoder base model. Please go through the following notebook PEFT_Personal_Code_CoPilot_Adapter_Transfer_Octocoder.ipynb for the entire code.\n\nPerformance on the Code Completion task\n\nWe can observe that octocoder is performing great. It is able to complete HF specific code snippets. It is also able to complete generic code snippets as seen in the notebook.\n\nPerformance on the Chatting/QA task\n\nAs Octocoder is trained to answer questions and carry out conversations about coding, let's see if it can use our LoRA adapter to answer HF specific questions.\n\nYay! It correctly answers in detail how to create LoraConfig and related peft model along with correctly using the model name, dataset name as well as param values of LoraConfig. On disabling the adapter, it fails to correctly use the API of LoraConfig or to create a PEFT model, suggesting that it isn't part of the training data of Octocoder.\n\n## How do I run it locally?\n\nI know, after all this, you want to finetune starcoder on your codebase and use it locally on your consumer hardware such as Mac laptops with M1 GPUs, windows with RTX 4090/3090 GPUs ... Don't worry, we have got you covered.\n\nWe will be using this super cool open source library mlc-llm 🔥. Specifically, we will be using this fork pacman100/mlc-llm which has changes to get it working with the Hugging Face Code Completion extension for VS Code. On my Mac latop with M1 Metal GPU, the 15B model was painfully slow. Hence, we will go small and train a PEFT LoRA version as well as a full finetuned version of bigcode/starcoderbase-1b. The training colab notebooks are linked below:\n\n- Colab notebook for Full fine-tuning and PEFT LoRA finetuning of starcoderbase-1b: link\n\nThe training loss, evaluation loss as well as learning rate schedules are plotted below:\n\nNow, we will look at detailed steps for locally hosting the merged model smangrul/starcoder1B-v2-personal-copilot-merged and using it with 🤗 llm-vscode VS Code Extension.\n\n- Clone the repo\n\n```\ngit clone --recursive https://github.com/pacman100/mlc-llm.git && cd mlc-llm/\n```\n\n- Install the mlc-ai and mlc-chat (in editable mode) :\n\n```\npip install --pre --force-reinstall mlc-ai-nightly mlc-chat-nightly -f https://mlc.ai/wheels\ncd python\npip uninstall mlc-chat-nightly\npip install -e \".\"\n```\n\n- Compile the model via:\n\n```\ntime python3 -m mlc_llm.build --hf-path smangrul/starcoder1B-v2-personal-copilot-merged --target metal  --use-cache=0\n```\n\n- Update the config with the following values in dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params/mlc-chat-config.json:\n\n```\n{\n    \"model_lib\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"local_id\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"conv_template\": \"code_gpt\",\n-    \"temperature\": 0.7,\n+    \"temperature\": 0.2,\n-    \"repetition_penalty\": 1.0,\n    \"top_p\": 0.95,\n-    \"mean_gen_len\": 128,\n+    \"mean_gen_len\": 64,\n-    \"max_gen_len\": 512,\n+    \"max_gen_len\": 64, \n    \"shift_fill_factor\": 0.3,\n    \"tokenizer_files\": [\n        \"tokenizer.json\",\n        \"merges.txt\",\n        \"vocab.json\"\n    ],\n    \"model_category\": \"gpt_bigcode\",\n    \"model_name\": \"starcoder1B-v2-personal-copilot-merged\"\n}\n```\n\n- Run the local server:\n\n```\n python -m mlc_chat.rest --model dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params --lib-path dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/starcoder1B-v2-personal-copilot-merged-q4f16_1-metal.so\n```\n\n- Change the endpoint of HF Code Completion extension in VS Code to point to the local server:\n\n- Open a new file in VS code, paste the code below and have the cursor in-between the doc quotes, so that the model tries to infill the doc string:\n\nVoila! ⭐️\n\nThe demo at the start of this post is this 1B model running locally on my Mac laptop.\n\n### Conclusion\n\nIn this blog plost, we saw how to finetune starcoder to create a personal co-pilot that knows about our code. We called it 🤗 HugCoder, as we trained it on Hugging Face code :) After looking at the data collection workflow, we compared training using QLoRA vs full fine-tuning. We also experimented by combining different LoRAs, which is still an unexplored technique in the text/code domain. For deployment, we examined remote inference using 🤗 Inference Endpoints, and also showed on-device execution of a smaller model with VS Code and MLC.\n\nPlease, let us know if you use these methods for your own codebase!\n\n### Acknowledgements\n\nWe would like to thank Pedro Cuenca, Leandro von Werra, Benjamin Bossan, Sylvain Gugger and Loubna Ben Allal for their help with the writing of this blogpost.",
   "summaryZh": "Hugging Face发布了关于如何训练个人代码助手的技术博客，通过抓取GitHub公开仓库数据并微调代码大模型，展示了企业级代码生成模型定制化的完整工作流与实践经验。原始信息显示：来自原始信息源的最新动态，点击标题查看完整内容。该消息由Hugging Face发布，主题为“Personal Copilot: Train Your Own Coding Assistant”。其重要性主要体现在：介绍了如何利用代码大模型和自有代码库训练私有化编程助手的全流程工作流。建议结合原文核对关键数据、适用条件、技术限制与后续更新，以判断其对实际产品和研发决策的影响。",
   "summaryGeneratedAt": "2026-09-05T20:34:45.602000Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/personal-copilot-demo.gif",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/personal-copilot-demo.gif",
+      "alt": "Using HugCoder in Visual Studio Code to help create a LoRA fine-tune",
+      "id": "image_a51293e4fa1683ea"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/hf-stack-full.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/hf-stack-full.png",
+      "alt": "hf-stack-full",
+      "id": "image_104497b1a8c1919c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/hf-stack-v1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/hf-stack-v1.png",
+      "alt": "hf-stack-v1",
+      "id": "image_6b19cabb93d3c75f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/full_finetuning_vs_qlora.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/full_finetuning_vs_qlora.png",
+      "alt": "plots",
+      "id": "image_acee1e83a573176f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qlora_vs_finetune_1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qlora_vs_finetune_1.png",
+      "alt": "qualitative_comparison_1",
+      "id": "image_39a33fdef8f26f8c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qlora_vs_finetune_2.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qlora_vs_finetune_2.png",
+      "alt": "qualitative_comparison_2",
+      "id": "image_54d89785d66984a1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/inference_endpoint_1.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/inference_endpoint_1.png",
+      "alt": "ie_1",
+      "id": "image_9ea09208319e549e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/inference_endpoint_2.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/inference_endpoint_2.png",
+      "alt": "ie_2",
+      "id": "image_8555aa05cf3897cd"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/vs_code_endpoint.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/vs_code_endpoint.png",
+      "alt": "vs_code_endpoint",
+      "id": "image_871dec08b663c0e4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/vs_code_completion_usage.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/vs_code_completion_usage.png",
+      "alt": "code_completion",
+      "id": "image_2b76737f6543ce78"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/generic_qa_short.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/generic_qa_short.png",
+      "alt": "assistant_chat_generic",
+      "id": "image_244128484588460f"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qa_hf.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qa_hf.png",
+      "alt": "assistant_chat_hf",
+      "id": "image_dd59db87830640ed"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/infill.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/infill.png",
+      "alt": "copilot_code_generic",
+      "id": "image_137b59bb323f0569"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/combine_adapters.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/combine_adapters.png",
+      "alt": "combining_loras",
+      "id": "image_e6bcdf1f828935d2"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qa_combined_hf.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/qa_combined_hf.png",
+      "alt": "mix_chat_hf",
+      "id": "image_a818ef31bcc8e5b7"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/infill_combined.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/infill_combined.png",
+      "alt": "mix_code_generic",
+      "id": "image_437b644e2a584da7"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/octocoder_infill.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/octocoder_infill.png",
+      "alt": "octocoder_code_hf",
+      "id": "image_dc8eb4be7a8a1ef0"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/octocoder_qa.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/octocoder_qa.png",
+      "alt": "octocoder_chat_hf",
+      "id": "image_ea5f6791b178489d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/loss_plots.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/loss_plots.png",
+      "alt": "loss_plots",
+      "id": "image_293ce4cd449aa1fc"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/local_endpoint.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/local_endpoint.png",
+      "alt": "local_endpoint",
+      "id": "image_89d0a6356a73d2f4"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/local_inference.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/personal_copilot/local_inference.png",
+      "alt": "local_inference",
+      "id": "image_c95769d6b9aead5d"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In the ever-evolving landscape of programming and software development, the quest for efficiency and productivity has led to remarkable innovations. One such innovation is the emergence of code generation models such as Codex, StarCoder and Code Llama. These models have demonstrated remarkable capabilities in generating human-like code snippets, thereby showing immense potential as coding assistants.",
+      "spans": [
+        {
+          "start": 220,
+          "end": 225,
+          "kind": "a",
+          "href": "https://openai.com/blog/openai-codex"
+        },
+        {
+          "start": 227,
+          "end": 236,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2305.06161"
+        },
+        {
+          "start": 241,
+          "end": 251,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2308.12950"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "However, while these pre-trained models can perform impressively across a range of tasks, there's an exciting possibility lying just beyond the horizon: the ability to tailor a code generation model to your specific needs. Think of personalized coding assistants which could be leveraged at an enterprise scale.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In this blog post we show how we created HugCoder 🤗, a code LLM fine-tuned on the code contents from the public repositories of the huggingface GitHub organization. We will discuss our data collection workflow, our training experiments, and some interesting results. This will enable you to create your own personal copilot based on your proprietary codebase. We will leave you with a couple of further extensions of this project for experimentation.",
+      "spans": [
+        {
+          "start": 132,
+          "end": 143,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 163,
+          "kind": "a",
+          "href": "https://github.com/huggingface"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Let’s begin 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Data Collection Workflow",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Our desired dataset is conceptually simple, we structured it like so:",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0008",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0009",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0010",
+      "source": "Repository Name",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0011",
+      "source": "Filepath in the Repository",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0012",
+      "source": "File Contents",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0013",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0014",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0015",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0016",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0017",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "---",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "Scraping code contents from GitHub is straightforward with the Python GitHub API. However, depending on the number of repositories and the number of code files within a repository, one might easily run into API rate-limiting issues.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 80,
+          "kind": "a",
+          "href": "https://github.com/PyGithub/PyGithub"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "To prevent such problems, we decided to clone all the public repositories locally and extract the contents from them instead of through the API. We used the multiprocessing module from Python to download all repos in parallel, as shown in this download script.",
+      "spans": [
+        {
+          "start": 157,
+          "end": 172,
+          "kind": "code"
+        },
+        {
+          "start": 239,
+          "end": 259,
+          "kind": "a",
+          "href": "https://github.com/sayakpaul/hf-codegen/blob/main/data/parallel_clone_repos.py"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "A repository can often contain non-code files such as images, presentations and other assets. We’re not interested in scraping them. We created a list of extensions to filter them out. To parse code files other than Jupyter Notebooks, we simply used the \"utf-8\" encoding. For notebooks, we only considered the code cells.",
+      "spans": [
+        {
+          "start": 146,
+          "end": 164,
+          "kind": "a",
+          "href": "https://github.com/sayakpaul/hf-codegen/blob/f659eba76f07e622873211e5b975168b634e6c22/data/prepare_dataset.py#L17C1-L49C68"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "We also excluded all file paths that were not directly related to code. These include: .git, __pycache__, and xcodeproj.",
+      "spans": [
+        {
+          "start": 87,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 93,
+          "end": 104,
+          "kind": "code"
+        },
+        {
+          "start": 110,
+          "end": 119,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "To keep the serialization of this content relatively memory-friendly, we used chunking and the feather format. Refer to this script for the full implementation.",
+      "spans": [
+        {
+          "start": 95,
+          "end": 109,
+          "kind": "a",
+          "href": "https://arrow.apache.org/docs/python/feather.html#:~:text=Feather%20is%20a%20portable%20file,Python%20(pandas)%20and%20R."
+        },
+        {
+          "start": 120,
+          "end": 131,
+          "kind": "a",
+          "href": "https://github.com/sayakpaul/hf-codegen/blob/main/data/prepare_dataset.py"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "The final dataset is available on the Hub, and it looks like this:",
+      "spans": [
+        {
+          "start": 21,
+          "end": 41,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/sayakpaul/hf-codegen-v2"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "For this blog, we considered the top 10 Hugging Face public repositories, based on stargazers. They are the following:",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "['transformers', 'pytorch-image-models', 'datasets', 'diffusers', 'peft', 'tokenizers', 'accelerate', 'text-generation-inference', 'chat-ui', 'deep-rl-class']",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "This is the code we used to generate this dataset, and this is the dataset in the Hub. Here is a snapshot of what it looks like:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/tree/main/personal_copilot/dataset_generation"
+        },
+        {
+          "start": 55,
+          "end": 85,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/hf-stack-v1"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "To reduce the project complexity, we didn’t consider deduplication of the dataset. If you are interested in applying deduplication techniques for a production application, this blog post is an excellent resource about the topic in the context of code LLMs.",
+      "spans": [
+        {
+          "start": 172,
+          "end": 186,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/dedup"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Finetuning your own Personal Co-Pilot",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "In this section, we show how to fine-tune the following models: bigcode/starcoder (15.5B params), bigcode/starcoderbase-1b (1B params), Deci/DeciCoder-1b (1B params). We'll use a single A100 40GB Colab Notebook using 🤗 PEFT (Parameter-Efficient Fine-Tuning) for all the experiments. Additionally, we'll show how to fully finetune the bigcode/starcoder (15.5B params) on a machine with 8 A100 80GB GPUs using 🤗 Accelerate's FSDP integration. The training objective is fill in the middle (FIM), wherein parts of a training sequence are moved to the end, and the reordered sequence is predicted auto-regressively.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 81,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 81,
+          "kind": "a",
+          "href": "https://hf.co/bigcode/starcoder"
+        },
+        {
+          "start": 98,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 98,
+          "end": 122,
+          "kind": "a",
+          "href": "https://hf.co/bigcode/starcoderbase-1b"
+        },
+        {
+          "start": 136,
+          "end": 153,
+          "kind": "code"
+        },
+        {
+          "start": 136,
+          "end": 153,
+          "kind": "a",
+          "href": "https://hf.co/Deci/DeciCoder-1b"
+        },
+        {
+          "start": 334,
+          "end": 351,
+          "kind": "code"
+        },
+        {
+          "start": 467,
+          "end": 491,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2207.14255"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Why PEFT? Full fine-tuning is expensive. Let’s have some numbers to put things in perspective:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Minimum GPU memory required for full fine-tuning:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Weight: 2 bytes (Mixed-Precision training)",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Weight gradient: 2 bytes",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Optimizer state when using Adam: 4 bytes for original FP32 weight + 8 bytes for first and second moment estimates",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Cost per parameter adding all of the above: 16 bytes per parameter",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "15.5B model -> 248GB of GPU memory without even considering huge memory requirements for storing intermediate activations -> minimum 4X A100 80GB GPUs required",
+      "spans": [
+        {
+          "start": 0,
+          "end": 159,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Since the hardware requirements are huge, we'll be using parameter-efficient fine-tuning using QLoRA. Here are the minimal GPU memory requirements for fine-tuning StarCoder using QLoRA:",
+      "spans": [
+        {
+          "start": 95,
+          "end": 100,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2305.14314"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "trainable params: 110,428,160 || all params: 15,627,884,544 || trainable%: 0.7066097761926236",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Base model Weight: 0.5 bytes * 15.51B frozen params = 7.755 GB",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Adapter weight: 2 bytes * 0.11B trainable params = 0.22GB",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Weight gradient: 2 bytes * 0.11B trainable params = 0.12GB",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Optimizer state when using Adam: 4 bytes * 0.11B trainable params * 3 = 1.32GB",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Adding all of the above -> 9.51 GB ~10GB -> 1 A100 40GB GPU required 🤯. The reason for A100 40GB GPU is that the intermediate activations for long sequence lengths of 2048 and batch size of 4 for training lead to higher memory requirements. As we will see below, GPU memory required is 26GB which can be accommodated on A100 40GB GPU. Also, A100 GPUs have better compatibilty with Flash Attention 2.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 68,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "In the above calculations, we didn't consider memory required for intermediate activation checkpointing which is considerably huge. We leverage Flash Attention V2 and Gradient Checkpointing to overcome this issue.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "For QLoRA along with flash attention V2 and gradient checkpointing, the total memory occupied by the model on a single A100 40GB GPU is 26 GB with a batch size of 4.",
+      "spans": [
+        {
+          "start": 136,
+          "end": 141,
+          "kind": "strong"
+        },
+        {
+          "start": 149,
+          "end": 164,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "For full fine-tuning using FSDP along with Flash Attention V2 and Gradient Checkpointing, the memory occupied per GPU ranges between 70 GB to 77.6 GB with a per_gpu_batch_size of 1.",
+      "spans": [
+        {
+          "start": 133,
+          "end": 149,
+          "kind": "strong"
+        },
+        {
+          "start": 157,
+          "end": 180,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Please refer to the model-memory-usage to easily calculate how much vRAM is needed to train and perform big model inference on a model hosted on the 🤗 Hugging Face Hub.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 38,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/hf-accelerate/model-memory-usage"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Full Finetuning",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "We will look at how to do full fine-tuning of bigcode/starcoder (15B params) on 8 A100 80GB GPUs using PyTorch Fully Sharded Data Parallel (FSDP) technique. For more information on FSDP, please refer to Fine-tuning Llama 2 70B using PyTorch FSDP and Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 203,
+          "end": 245,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/ram-efficient-pytorch-fsdp"
+        },
+        {
+          "start": 250,
+          "end": 323,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/pytorch-fsdp"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/tree/main/personal_copilot/training"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "FSDP Config: fsdp_config.yaml",
+      "spans": [
+        {
+          "start": 13,
+          "end": 29,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/training/configs/fsdp_config.yaml"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Model: bigcode/stacoder",
+      "spans": [
+        {
+          "start": 7,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/bigcode/starcoder"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Dataset: smangrul/hf-stack-v1",
+      "spans": [
+        {
+          "start": 9,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/hf-stack-v1"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab",
+      "spans": [
+        {
+          "start": 18,
+          "end": 85,
+          "kind": "a",
+          "href": "https://huggingface.co/smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "The command to launch training is given at run_fsdp.sh.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 54,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/training/run_fsdp.sh"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "The total training time was 9 Hours. Taking the cost of $12.00 / hr based on lambdalabs for 8x A100 80GB GPUs, the total cost would be $108.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 35,
+          "kind": "strong"
+        },
+        {
+          "start": 77,
+          "end": 87,
+          "kind": "a",
+          "href": "https://lambdalabs.com/service/gpu-cloud/pricing"
+        },
+        {
+          "start": 135,
+          "end": 139,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "PEFT",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "We will look at how to use QLoRA for fine-tuning bigcode/starcoder (15B params) on a single A100 40GB GPU using 🤗 PEFT. For more information on QLoRA and PEFT methods, please refer to Making LLMs even more accessible with bitsandbytes, 4-bit quantization and QLoRA and 🤗 PEFT: Parameter-Efficient Fine-Tuning of Billion-Scale Models on Low-Resource Hardware.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 264,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/4bit-transformers-bitsandbytes"
+        },
+        {
+          "start": 269,
+          "end": 357,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/peft"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/tree/main/personal_copilot/training"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "Colab notebook: link. Make sure to choose A100 GPU with High RAM setting.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "a",
+          "href": "https://colab.research.google.com/drive/1Tz9KKgacppA4S6H4eo_sw43qEaC9lFLs?usp=sharing"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Model: bigcode/stacoder",
+      "spans": [
+        {
+          "start": 7,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/bigcode/starcoder"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "Dataset: smangrul/hf-stack-v1",
+      "spans": [
+        {
+          "start": 9,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/hf-stack-v1"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "QLoRA Fine-tuned Model: smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab",
+      "spans": [
+        {
+          "start": 24,
+          "end": 91,
+          "kind": "a",
+          "href": "https://huggingface.co/smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab"
+        }
+      ]
+    },
+    {
+      "id": "b0067",
+      "source": "The command to launch training is given at run_peft.sh. The total training time was 12.5 Hours. Taking the cost of $1.10 / hr based on lambdalabs, the total cost would be $13.75. That's pretty good 🚀! In terms of cost, it's 7.8X lower than the cost for full fine-tuning.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 54,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/training/run_peft.sh"
+        },
+        {
+          "start": 84,
+          "end": 94,
+          "kind": "strong"
+        },
+        {
+          "start": 115,
+          "end": 125,
+          "kind": "strong"
+        },
+        {
+          "start": 135,
+          "end": 145,
+          "kind": "a",
+          "href": "https://lambdalabs.com/service/gpu-cloud/pricing"
+        },
+        {
+          "start": 171,
+          "end": 177,
+          "kind": "strong"
+        },
+        {
+          "start": 224,
+          "end": 228,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Comparison",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "The plot below shows the eval loss, train loss and learning rate scheduler for QLoRA vs full fine-tuning. We observe that full fine-tuning leads to slightly lower loss and converges a bit faster compared to QLoRA. The learning rate for peft fine-tuning is 10X more than that of full fine-tuning.",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "To make sure that our QLoRA model doesn't lead to catastrophic forgetting, we run the Python Human Eval on it. Below are the results we got. Pass@1 measures the pass rate of completions considering just a single generated code candidate per problem. We can observe that the performance on humaneval-python is comparable between the base bigcode/starcoder (15B params) and the fine-tuned PEFT model smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab.",
+      "spans": [
+        {
+          "start": 141,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 289,
+          "end": 305,
+          "kind": "code"
+        },
+        {
+          "start": 337,
+          "end": 354,
+          "kind": "code"
+        },
+        {
+          "start": 398,
+          "end": 465,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "Model",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "Pass@1",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "bigcode/starcoder",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "33.57",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "smangrul/peft-lora-starcoder15B-v2-personal-copilot-A100-40GB-colab",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "33.37",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "Let's now look at some qualitative samples. In our manual analysis, we noticed that the QLoRA led to slight overfitting and as such we down weigh it by creating new weighted adapter with weight 0.8 via add_weighted_adapter utility of PEFT.",
+      "spans": [
+        {
+          "start": 202,
+          "end": 222,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "We will look at 2 code infilling examples wherein the task of the model is to fill the part denoted by the <FILL_ME> placeholder. We will consider infilling completions from GitHub Copilot, the QLoRA fine-tuned model and the full fine-tuned model.",
+      "spans": [
+        {
+          "start": 107,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Qualitative Example 1",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "In the example above, the completion from GitHub Copilot is along the correct lines but doesn't help much. On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. However, they are also adding a lot more noise afterwards. This could be controlled with a post-processing step to limit completions to closing brackets or new lines. Note that both QLoRA and full fine-tuned models produce results with similar quality.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "Qualitative Example 2",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "In the second example above, GitHub Copilot didn't give any completion. This can be due to the fact that 🤗 PEFT is a recent library and not yet part of Copilot's training data, which is exactly the type of problem we are trying to address. On the other hand, completions from QLoRA and full fine-tuned models are correctly infilling the entire function call with the necessary parameters. Again, note that both the QLoRA and the full fine-tuned models are giving generations of similar quality. Inference Code with various examples for full fine-tuned model and peft model are available at Full_Finetuned_StarCoder_Inference.ipynb and PEFT_StarCoder_Inference.ipynb, respectively.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 70,
+          "kind": "strong"
+        },
+        {
+          "start": 183,
+          "end": 238,
+          "kind": "strong"
+        },
+        {
+          "start": 590,
+          "end": 630,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/inference/Full_Finetuned_StarCoder_Inference.ipynb"
+        },
+        {
+          "start": 635,
+          "end": 665,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/inference/PEFT_StarCoder_Inference.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Therefore, we can observe that the generations from both the variants are as per expectations. Awesome! 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "How do I use it in VS Code?",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "You can easily configure a custom code-completion LLM in VS Code using 🤗 llm-vscode VS Code Extension, together with hosting the model via 🤗 Inference EndPoints. We'll go through the required steps below. You can learn more details about deploying an endpoint in the inference endpoints documentation.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 83,
+          "kind": "a",
+          "href": "https://marketplace.visualstudio.com/items?itemName=HuggingFace.huggingface-vscode"
+        },
+        {
+          "start": 139,
+          "end": 160,
+          "kind": "a",
+          "href": "https://ui.endpoints.huggingface.co/"
+        },
+        {
+          "start": 267,
+          "end": 300,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/inference-endpoints/index"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Setting an Inference Endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Below are the screenshots with the steps we followed to create our custom Inference Endpoint. We used our QLoRA model, exported as a full-sized merged model that can be easily loaded in transformers.",
+      "spans": [
+        {
+          "start": 144,
+          "end": 150,
+          "kind": "em"
+        },
+        {
+          "start": 186,
+          "end": 198,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Setting up the VS Code Extension",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Just follow the installation steps. In the settings, replace the endpoint in the field below, so it points to the HF Inference Endpoint you deployed.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/huggingface/llm-vscode#installation"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "Usage will look like below:",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "Finetuning your own Code Chat Assistant",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "So far, the models we trained were specifically trained as personal co-pilot for code completion tasks. They aren't trained to carry out conversations or for question answering. Octocoder and StarChat are great examples of such models. This section briefly describes how to achieve that.",
+      "spans": [
+        {
+          "start": 178,
+          "end": 187,
+          "kind": "code"
+        },
+        {
+          "start": 192,
+          "end": 200,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "Resources",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "Codebase: link. It uses the recently added Flash Attention V2 support in Transformers.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/tree/main/code_assistant/training"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "Colab notebook: link. Make sure to choose A100 GPU with High RAM setting.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "a",
+          "href": "https://colab.research.google.com/drive/1XFyePK-3IoyX81RM94JO73CcIZtAU4i4?usp=sharing"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Model: bigcode/stacoderplus",
+      "spans": [
+        {
+          "start": 7,
+          "end": 27,
+          "kind": "a",
+          "href": "https://huggingface.co/bigcode/starcoderplus"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "Dataset: smangrul/code-chat-assistant-v1. Mix of LIMA+GUANACO with proper formatting in a ready-to-train format.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 40,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/code-chat-assistant-v1"
+        },
+        {
+          "start": 49,
+          "end": 61,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "Trained Model: smangrul/peft-lora-starcoderplus-chat-asst-A100-40GB-colab",
+      "spans": [
+        {
+          "start": 15,
+          "end": 73,
+          "kind": "a",
+          "href": "https://huggingface.co/smangrul/peft-lora-starcoderplus-chat-asst-A100-40GB-colab"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "Dance of LoRAs",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "If you have dabbled with Stable Diffusion models and LoRAs for making your own Dreambooth models, you might be familiar with the concepts of combining different LoRAs with different weights, using a LoRA model with a different base model than the one on which it was trained. In text/code domain, this remains unexplored territory. We carry out experiments in this regard and have observed very promising findings. Are you ready? Let's go! 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "Mix-and-Match LoRAs",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "PEFT currently supports 3 ways of combining LoRA models, linear, svd and cat. For more details, refer to tuners#peft.LoraModel.add_weighted_adapter.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 68,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 147,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/peft/main/en/package_reference/tuners#peft.LoraModel.add_weighted_adapter"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "Our notebook Dance_of_LoRAs.ipynb includes all the inference code and various LoRA loading combinations, like loading the chat assistant on top of starcoder instead of starcodeplus, which is the base model that we fine-tuned.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 33,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/inference/Dance_of_LoRAs.ipynb"
+        },
+        {
+          "start": 147,
+          "end": 156,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 180,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0106",
+      "source": "Here, we will consider 2 abilities (chatting/QA and code-completion) on 2 data distributions (top 10 public hf codebase and generic codebase). That gives us 4 axes on which we'll carry out some qualitative evaluation analyses.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 94,
+          "end": 119,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 140,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "First, let us consider the chatting/QA task.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 38,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0108",
+      "source": "If we disable adapters, we observe that the task fails for both datasets, as the base model (starcoder) is only meant for code completion and not suitable for chatting/question-answering. Enabling copilot adapter performs similar to the disabled case because this LoRA was also specifically fine-tuned for code-completion.",
+      "spans": [
+        {
+          "start": 93,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 159,
+          "end": 186,
+          "kind": "code"
+        },
+        {
+          "start": 197,
+          "end": 204,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "Now, let's enable the assistant adapter.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "Question Answering based on generic code",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "Question Answering based on HF code",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "We can observe that generic question regarding scrapy is being answered properly. However, it is failing for the HF code related question which wasn't part of its pretraining data.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 53,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0113",
+      "source": "Let us now consider the code-completion task.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 39,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "On disabling adapters, we observe that the code completion for the generic two-sum works as expected. However, the HF code completion fails with wrong params to LoraConfig, because the base model hasn't seen it in its pretraining data. Enabling assistant performs similar to the disabled case as it was trained on natural language conversations which didn't have any Hugging Face code repos.",
+      "spans": [
+        {
+          "start": 161,
+          "end": 171,
+          "kind": "code"
+        },
+        {
+          "start": 245,
+          "end": 254,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0115",
+      "source": "Now, let's enable the copilot adapter.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0116",
+      "source": "We can observe that the copilot adapter gets it right in both cases. Therefore, it performs as expected for code-completions when working with HF specific codebase as well as generic codebases.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0117",
+      "source": "Now, as a user, I want to combine the ability of assistant as well as copilot. This will enable me to use it for code completion while coding in an IDE, and also have it as a chatbot to answer my questions regarding APIs, classes, methods, documentation. It should be able to provide answers to questions like How do I use x, Please write a code snippet for Y on my codebase.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 310,
+          "end": 324,
+          "kind": "code"
+        },
+        {
+          "start": 326,
+          "end": 359,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 375,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "PEFT allows you to do it via add_weighted_adapter. Let's create a new adapter code_buddy with equal weights to assistant and copilot adapters.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 78,
+          "end": 88,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 132,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0119",
+      "source": "Combining Multiple Adapters",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Now, let's see how code_buddy performs on the chatting/question_answering tasks.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 46,
+          "end": 73,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0121",
+      "source": "We can observe that code_buddy is performing much better than the assistant or copilot adapters alone! It is able to answer the write a code snippet request to show how to use a specific HF repo API. However, it is also hallucinating the wrong links/explanations, which remains an open challenge for LLMs.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 75,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 86,
+          "kind": "code"
+        },
+        {
+          "start": 128,
+          "end": 148,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "Below is the performance of code_buddy on code completion tasks.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 38,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0123",
+      "source": "We can observe that code_buddy is performing on par with copilot, which was specifically finetuned for this task.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0124",
+      "source": "Transfer LoRAs to different base models",
+      "spans": []
+    },
+    {
+      "id": "b0125",
+      "source": "We can also transfer the LoRA models to different base models. We will take the hot-off-the-press Octocoder model and apply on it the LoRA we trained above with starcoder base model. Please go through the following notebook PEFT_Personal_Code_CoPilot_Adapter_Transfer_Octocoder.ipynb for the entire code.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 170,
+          "kind": "code"
+        },
+        {
+          "start": 224,
+          "end": 283,
+          "kind": "a",
+          "href": "https://github.com/pacman100/DHS-LLM-Workshop/blob/main/personal_copilot/inference/PEFT_Personal_Code_CoPilot_Adapter_Transfer_Octocoder.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0126",
+      "source": "Performance on the Code Completion task",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "We can observe that octocoder is performing great. It is able to complete HF specific code snippets. It is also able to complete generic code snippets as seen in the notebook.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0128",
+      "source": "Performance on the Chatting/QA task",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0129",
+      "source": "As Octocoder is trained to answer questions and carry out conversations about coding, let's see if it can use our LoRA adapter to answer HF specific questions.",
+      "spans": []
+    },
+    {
+      "id": "b0130",
+      "source": "Yay! It correctly answers in detail how to create LoraConfig and related peft model along with correctly using the model name, dataset name as well as param values of LoraConfig. On disabling the adapter, it fails to correctly use the API of LoraConfig or to create a PEFT model, suggesting that it isn't part of the training data of Octocoder.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 242,
+          "end": 252,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0131",
+      "source": "How do I run it locally?",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "I know, after all this, you want to finetune starcoder on your codebase and use it locally on your consumer hardware such as Mac laptops with M1 GPUs, windows with RTX 4090/3090 GPUs ... Don't worry, we have got you covered.",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "We will be using this super cool open source library mlc-llm 🔥. Specifically, we will be using this fork pacman100/mlc-llm which has changes to get it working with the Hugging Face Code Completion extension for VS Code. On my Mac latop with M1 Metal GPU, the 15B model was painfully slow. Hence, we will go small and train a PEFT LoRA version as well as a full finetuned version of bigcode/starcoderbase-1b. The training colab notebooks are linked below:",
+      "spans": [
+        {
+          "start": 53,
+          "end": 60,
+          "kind": "a",
+          "href": "https://github.com/mlc-ai/mlc-llm"
+        },
+        {
+          "start": 105,
+          "end": 122,
+          "kind": "a",
+          "href": "https://github.com/pacman100/mlc-llm"
+        },
+        {
+          "start": 382,
+          "end": 406,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0134",
+      "source": "Colab notebook for Full fine-tuning and PEFT LoRA finetuning of starcoderbase-1b: link",
+      "spans": [
+        {
+          "start": 64,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 82,
+          "end": 86,
+          "kind": "a",
+          "href": "https://colab.research.google.com/drive/1tTdvc2buL3Iy1PKwrG_bBIDP06DC9r5m?usp=sharing"
+        }
+      ]
+    },
+    {
+      "id": "b0135",
+      "source": "The training loss, evaluation loss as well as learning rate schedules are plotted below:",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "Now, we will look at detailed steps for locally hosting the merged model smangrul/starcoder1B-v2-personal-copilot-merged and using it with 🤗 llm-vscode VS Code Extension.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 120,
+          "kind": "a",
+          "href": "https://huggingface.co/smangrul/starcoder1B-v2-personal-copilot-merged"
+        },
+        {
+          "start": 141,
+          "end": 151,
+          "kind": "a",
+          "href": "https://marketplace.visualstudio.com/items?itemName=HuggingFace.huggingface-vscode"
+        }
+      ]
+    },
+    {
+      "id": "b0137",
+      "source": "Clone the repo",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "Install the mlc-ai and mlc-chat (in editable mode) :",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "Compile the model via:",
+      "spans": []
+    },
+    {
+      "id": "b0140",
+      "source": "Update the config with the following values in dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params/mlc-chat-config.json:",
+      "spans": [
+        {
+          "start": 47,
+          "end": 126,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0141",
+      "source": "Run the local server:",
+      "spans": []
+    },
+    {
+      "id": "b0142",
+      "source": "Change the endpoint of HF Code Completion extension in VS Code to point to the local server:",
+      "spans": []
+    },
+    {
+      "id": "b0143",
+      "source": "Open a new file in VS code, paste the code below and have the cursor in-between the doc quotes, so that the model tries to infill the doc string:",
+      "spans": []
+    },
+    {
+      "id": "b0144",
+      "source": "Voila! ⭐️",
+      "spans": []
+    },
+    {
+      "id": "b0145",
+      "source": "The demo at the start of this post is this 1B model running locally on my Mac laptop.",
+      "spans": []
+    },
+    {
+      "id": "b0146",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "In this blog plost, we saw how to finetune starcoder to create a personal co-pilot that knows about our code. We called it 🤗 HugCoder, as we trained it on Hugging Face code :) After looking at the data collection workflow, we compared training using QLoRA vs full fine-tuning. We also experimented by combining different LoRAs, which is still an unexplored technique in the text/code domain. For deployment, we examined remote inference using 🤗 Inference Endpoints, and also showed on-device execution of a smaller model with VS Code and MLC.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 52,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0148",
+      "source": "Please, let us know if you use these methods for your own codebase!",
+      "spans": []
+    },
+    {
+      "id": "b0149",
+      "source": "Acknowledgements",
+      "spans": []
+    },
+    {
+      "id": "b0150",
+      "source": "We would like to thank Pedro Cuenca, Leandro von Werra, Benjamin Bossan, Sylvain Gugger and Loubna Ben Allal for their help with the writing of this blogpost.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 35,
+          "kind": "a",
+          "href": "https://github.com/pcuenca"
+        },
+        {
+          "start": 37,
+          "end": 54,
+          "kind": "a",
+          "href": "https://github.com/lvwerra"
+        },
+        {
+          "start": 56,
+          "end": 71,
+          "kind": "a",
+          "href": "https://github.com/BenjaminBossan"
+        },
+        {
+          "start": 73,
+          "end": 87,
+          "kind": "a",
+          "href": "https://github.com/sgugger"
+        },
+        {
+          "start": 92,
+          "end": 108,
+          "kind": "a",
+          "href": "https://github.com/loubnabnl"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "6d951e4025d8bef2842727c304da3cf8a852410f3cb6868a2bc53987eeba652e",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "accelerate launch --config_file \"configs/fsdp_config.yaml\"  train.py \\\n    --model_path \"bigcode/starcoder\" \\\n    --dataset_name \"smangrul/hf-stack-v1\" \\\n    --subset \"data\" \\\n    --data_column \"content\" \\\n    --split \"train\" \\\n    --seq_length 2048 \\\n    --max_steps 2000 \\\n    --batch_size 1 \\\n    --gradient_accumulation_steps 2 \\\n    --learning_rate 5e-5 \\\n    --lr_scheduler_type \"cosine\" \\\n    --weight_decay 0.01 \\\n    --num_warmup_steps 30 \\\n    --eval_freq 100 \\\n    --save_freq 500 \\\n    --log_freq 25 \\\n    --num_workers 4 \\\n    --bf16 \\\n    --no_fp16 \\\n    --output_dir \"starcoder-personal-copilot-A100-40GB-colab\" \\\n    --fim_rate 0.5 \\\n    --fim_spm_rate 0.5 \\\n    --use_flash_attn"
+    },
+    {
+      "id": "c0002",
+      "source": "git clone --recursive https://github.com/pacman100/mlc-llm.git && cd mlc-llm/"
+    },
+    {
+      "id": "c0003",
+      "source": "pip install --pre --force-reinstall mlc-ai-nightly mlc-chat-nightly -f https://mlc.ai/wheels\ncd python\npip uninstall mlc-chat-nightly\npip install -e \".\""
+    },
+    {
+      "id": "c0004",
+      "source": "time python3 -m mlc_llm.build --hf-path smangrul/starcoder1B-v2-personal-copilot-merged --target metal  --use-cache=0"
+    },
+    {
+      "id": "c0005",
+      "source": "{\n    \"model_lib\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"local_id\": \"starcoder7B-personal-copilot-merged-q4f16_1\",\n    \"conv_template\": \"code_gpt\",\n-    \"temperature\": 0.7,\n+    \"temperature\": 0.2,\n-    \"repetition_penalty\": 1.0,\n    \"top_p\": 0.95,\n-    \"mean_gen_len\": 128,\n+    \"mean_gen_len\": 64,\n-    \"max_gen_len\": 512,\n+    \"max_gen_len\": 64, \n    \"shift_fill_factor\": 0.3,\n    \"tokenizer_files\": [\n        \"tokenizer.json\",\n        \"merges.txt\",\n        \"vocab.json\"\n    ],\n    \"model_category\": \"gpt_bigcode\",\n    \"model_name\": \"starcoder1B-v2-personal-copilot-merged\"\n}"
+    },
+    {
+      "id": "c0006",
+      "source": " python -m mlc_chat.rest --model dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/params --lib-path dist/starcoder1B-v2-personal-copilot-merged-q4f16_1/starcoder1B-v2-personal-copilot-merged-q4f16_1-metal.so"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "6d951e4025d8bef2842727c304da3cf8a852410f3cb6868a2bc53987eeba652e",
+  "mediaLayout": [
+    {
+      "mediaId": "image_a51293e4fa1683ea",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 0
+    },
+    {
+      "mediaId": "image_104497b1a8c1919c",
+      "type": "image",
+      "afterBlockId": "b0024",
+      "order": 1
+    },
+    {
+      "mediaId": "image_6b19cabb93d3c75f",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 2
+    },
+    {
+      "mediaId": "image_acee1e83a573176f",
+      "type": "image",
+      "afterBlockId": "b0069",
+      "order": 3
+    },
+    {
+      "mediaId": "image_39a33fdef8f26f8c",
+      "type": "image",
+      "afterBlockId": "b0081",
+      "order": 4
+    },
+    {
+      "mediaId": "image_54d89785d66984a1",
+      "type": "image",
+      "afterBlockId": "b0083",
+      "order": 5
+    },
+    {
+      "mediaId": "image_9ea09208319e549e",
+      "type": "image",
+      "afterBlockId": "b0089",
+      "order": 6
+    },
+    {
+      "mediaId": "image_8555aa05cf3897cd",
+      "type": "image",
+      "afterBlockId": "b0089",
+      "order": 7
+    },
+    {
+      "mediaId": "image_871dec08b663c0e4",
+      "type": "image",
+      "afterBlockId": "b0091",
+      "order": 8
+    },
+    {
+      "mediaId": "image_2b76737f6543ce78",
+      "type": "image",
+      "afterBlockId": "b0092",
+      "order": 9
+    },
+    {
+      "mediaId": "image_244128484588460f",
+      "type": "image",
+      "afterBlockId": "b0110",
+      "order": 10
+    },
+    {
+      "mediaId": "image_dd59db87830640ed",
+      "type": "image",
+      "afterBlockId": "b0111",
+      "order": 11
+    },
+    {
+      "mediaId": "image_137b59bb323f0569",
+      "type": "image",
+      "afterBlockId": "b0115",
+      "order": 12
+    },
+    {
+      "mediaId": "image_e6bcdf1f828935d2",
+      "type": "image",
+      "afterBlockId": "b0119",
+      "order": 13
+    },
+    {
+      "mediaId": "image_a818ef31bcc8e5b7",
+      "type": "image",
+      "afterBlockId": "b0120",
+      "order": 14
+    },
+    {
+      "mediaId": "image_437b644e2a584da7",
+      "type": "image",
+      "afterBlockId": "b0122",
+      "order": 15
+    },
+    {
+      "mediaId": "image_dc8eb4be7a8a1ef0",
+      "type": "image",
+      "afterBlockId": "b0126",
+      "order": 16
+    },
+    {
+      "mediaId": "image_ea5f6791b178489d",
+      "type": "image",
+      "afterBlockId": "b0129",
+      "order": 17
+    },
+    {
+      "mediaId": "image_293ce4cd449aa1fc",
+      "type": "image",
+      "afterBlockId": "b0135",
+      "order": 18
+    },
+    {
+      "mediaId": "image_89d0a6356a73d2f4",
+      "type": "image",
+      "afterBlockId": "b0142",
+      "order": 19
+    },
+    {
+      "mediaId": "image_c95769d6b9aead5d",
+      "type": "image",
+      "afterBlockId": "b0143",
+      "order": 20
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 21,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 21,
+    "savedImages": 21,
+    "sourceImageOccurrences": 21,
+    "placedImageOccurrences": 21,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T15:30:04.624968Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:30:04.624982Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

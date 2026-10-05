@@ -16,13 +16,1572 @@
   "originalUrl": "https://huggingface.co/blog/controlnet",
   "resolvedUrl": "https://huggingface.co/blog/controlnet",
   "fetchedAt": "2026-08-27T03:10:34.648790Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Ever since Stable Diffusion took the world by storm, people have been looking for ways to have more control over the results of the generation process. ControlNet provides a minimal interface allowing users to customize the generation process up to a great extent. With ControlNet, users can easily condition the generation with different spatial contexts such as a depth map, a segmentation map, a scribble, keypoints, and so on!\n\nWe can turn a cartoon drawing into a realistic photo with incredible coherence.\n\nRealistic Lofi Girl\n\n—\n\nOr even use it as your interior designer.\n\nBefore\n\nAfter\n\n—\n\n—\n\nYou can turn your sketch scribble into an artistic drawing.\n\nBefore\n\nAfter\n\n—\n\n—\n\nAlso, make some of the famous logos coming to life.\n\nBefore\n\nAfter\n\n—\n\n—\n\nWith ControlNet, the sky is the limit 🌠\n\nIn this blog post, we first introduce the StableDiffusionControlNetPipeline and then show how it can be applied for various control conditionings. Let’s get controlling!\n\n## ControlNet: TL;DR\n\nControlNet was introduced in Adding Conditional Control to Text-to-Image Diffusion Models by Lvmin Zhang and Maneesh Agrawala. It introduces a framework that allows for supporting various spatial contexts that can serve as additional conditionings to Diffusion models such as Stable Diffusion. The diffusers implementation is adapted from the original source code.\n\nTraining ControlNet is comprised of the following steps:\n\n- Cloning the pre-trained parameters of a Diffusion model, such as Stable Diffusion's latent UNet, (referred to as “trainable copy”) while also maintaining the pre-trained parameters separately (”locked copy”). It is done so that the locked parameter copy can preserve the vast knowledge learned from a large dataset, whereas the trainable copy is employed to learn task-specific aspects.\n\n- The trainable and locked copies of the parameters are connected via “zero convolution” layers (see here for more information) which are optimized as a part of the ControlNet framework. This is a training trick to preserve the semantics already learned by frozen model as the new conditions are trained.\n\nPictorially, training a ControlNet looks like so:\n\nThe diagram is taken from here.\n\nA sample from the training set for ControlNet-like training looks like this (additional conditioning is via edge maps):\n\nPrompt\n\nOriginal Image\n\nConditioning\n\n\"bird\"\n\n—\n\n—\n\nSimilarly, if we were to condition ControlNet with semantic segmentation maps, a training sample would be like so:\n\nPrompt\n\nOriginal Image\n\nConditioning\n\n\"big house\"\n\n—\n\n—\n\nEvery new type of conditioning requires training a new copy of ControlNet weights. The paper proposed 8 different conditioning models that are all supported in Diffusers!\n\nFor inference, both the pre-trained diffusion models weights as well as the trained ControlNet weights are needed. For example, using Stable Diffusion v1-5 with a ControlNet checkpoint require roughly 700 million more parameters compared to just using the original Stable Diffusion model, which makes ControlNet a bit more memory-expensive for inference.\n\nBecause the pre-trained diffusion models are locked during training, one only needs to switch out the ControlNet parameters when using a different conditioning. This makes it fairly simple to deploy multiple ControlNet weights in one application as we will see below.\n\n## The StableDiffusionControlNetPipeline\n\nBefore we begin, we want to give a huge shout-out to the community contributor Takuma Mori for having led the integration of ControlNet into Diffusers ❤️ .\n\nTo experiment with ControlNet, Diffusers exposes the StableDiffusionControlNetPipeline similar to the other Diffusers pipelines. Central to the StableDiffusionControlNetPipeline is the controlnet argument which lets us provide a particular trained ControlNetModel instance while keeping the pre-trained diffusion model weights the same.\n\nWe will explore different use cases with the StableDiffusionControlNetPipeline in this blog post. The first ControlNet model we are going to walk through is the Canny model - this is one of the most popular models that generated some of the amazing images you are libely seeing on the internet.\n\nWe welcome you to run the code snippets shown in the sections below with this Colab Notebook.\n\nBefore we begin, let's make sure we have all the necessary libraries installed:\n\n```\npip install diffusers==0.14.0 transformers xformers git+https://github.com/huggingface/accelerate.git\n```\n\nTo process different conditionings depending on the chosen ControlNet, we also need to install some additional dependencies:\n\n- OpenCV\n\n- controlnet-aux - a simple collection of pre-processing models for ControlNet\n\n```\npip install opencv-contrib-python\npip install controlnet_aux\n```\n\nWe will use the famous painting \"Girl With A Pearl\" for this example. So, let's download the image and take a look:\n\n```\nfrom diffusers.utils import load_image\n\nimage = load_image(\n    \"https://hf.co/datasets/huggingface/documentation-images/resolve/main/diffusers/input_image_vermeer.png\"\n)\nimage\n```\n\nNext, we will put the image through the canny pre-processor:\n\n```\nimport cv2\nfrom PIL import Image\nimport numpy as np\n\nimage = np.array(image)\n\nlow_threshold = 100\nhigh_threshold = 200\n\nimage = cv2.Canny(image, low_threshold, high_threshold)\nimage = image[:, :, None]\nimage = np.concatenate([image, image, image], axis=2)\ncanny_image = Image.fromarray(image)\ncanny_image\n```\n\nAs we can see, it is essentially edge detection:\n\nNow, we load runwaylml/stable-diffusion-v1-5 as well as the ControlNet model for canny edges. The models are loaded in half-precision (torch.dtype) to allow for fast and memory-efficient inference.\n\n```\nfrom diffusers import StableDiffusionControlNetPipeline, ControlNetModel\nimport torch\n\ncontrolnet = ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-canny\", torch_dtype=torch.float16)\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    \"runwayml/stable-diffusion-v1-5\", controlnet=controlnet, torch_dtype=torch.float16\n)\n```\n\nInstead of using Stable Diffusion's default PNDMScheduler, we use one of the currently fastest diffusion model schedulers, called UniPCMultistepScheduler. Choosing an improved scheduler can drastically reduce inference time - in our case we are able to reduce the number of inference steps from 50 to 20 while more or less keeping the same image generation quality. More information regarding schedulers can be found here.\n\n```\nfrom diffusers import UniPCMultistepScheduler\n\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\n```\n\nInstead of loading our pipeline directly to GPU, we instead enable smart CPU offloading which can be achieved with the enable_model_cpu_offload function.\n\nRemember that during inference diffusion models, such as Stable Diffusion require not just one but multiple model components that are run sequentially. In the case of Stable Diffusion with ControlNet, we first use the CLIP text encoder, then the diffusion model unet and control net, then the VAE decoder and finally run a safety checker. Most components are only run once during the diffusion process and are thus not required to occupy GPU memory all the time. By enabling smart model offloading, we make sure that each component is only loaded into GPU when it's needed so that we can significantly save memory consumption without significantly slowing down infenence.\n\nNote: When running enable_model_cpu_offload, do not manually move the pipeline to GPU with .to(\"cuda\") - once CPU offloading is enabled, the pipeline automatically takes care of GPU memory management.\n\n```\npipe.enable_model_cpu_offload()\n```\n\nFinally, we want to take full advantage of the amazing FlashAttention/xformers attention layer acceleration, so let's enable this! If this command does not work for you, you might not have xformers correctly installed. In this case, you can just skip the following line of code.\n\n```\npipe.enable_xformers_memory_efficient_attention()\n```\n\nNow we are ready to run the ControlNet pipeline!\n\nWe still provide a prompt to guide the image generation process, just like what we would normally do with a Stable Diffusion image-to-image pipeline. However, ControlNet will allow a lot more control over the generated image because we will be able to control the exact composition in generated image with the canny edge image we just created.\n\nIt will be fun to see some images where contemporary celebrities posing for this exact same painting from the 17th century. And it's really easy to do that with ControlNet, all we have to do is to include the names of these celebrities in the prompt!\n\nLet's first create a simple helper function to display images as a grid.\n\n```\ndef image_grid(imgs, rows, cols):\n    assert len(imgs) == rows * cols\n\n    w, h = imgs[0].size\n    grid = Image.new(\"RGB\", size=(cols * w, rows * h))\n    grid_w, grid_h = grid.size\n\n    for i, img in enumerate(imgs):\n        grid.paste(img, box=(i % cols * w, i // cols * h))\n    return grid\n```\n\nNext, we define the input prompts and set a seed for reproducibility.\n\n```\nprompt = \", best quality, extremely detailed\"\nprompt = [t + prompt for t in [\"Sandra Oh\", \"Kim Kardashian\", \"rihanna\", \"taylor swift\"]]\ngenerator = [torch.Generator(device=\"cpu\").manual_seed(2) for i in range(len(prompt))]\n```\n\nFinally, we can run the pipeline and display the image!\n\n```\noutput = pipe(\n    prompt,\n    canny_image,\n    negative_prompt=[\"monochrome, lowres, bad anatomy, worst quality, low quality\"] * 4,\n    num_inference_steps=20,\n    generator=generator,\n)\n\nimage_grid(output.images, 2, 2)\n```\n\nWe can effortlessly combine ControlNet with fine-tuning too! For example, we can fine-tune a model with DreamBooth, and use it to render ourselves into different scenes.\n\nIn this post, we are going to use our beloved Mr Potato Head as an example to show how to use ControlNet with DreamBooth.\n\nWe can use the same ControlNet. However, instead of using the Stable Diffusion 1.5, we are going to load the Mr Potato Head model into our pipeline - Mr Potato Head is a Stable Diffusion model fine-tuned with Mr Potato Head concept using Dreambooth 🥔\n\nLet's run the above commands again, keeping the same controlnet though!\n\n```\nmodel_id = \"sd-dreambooth-library/mr-potato-head\"\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    model_id,\n    controlnet=controlnet,\n    torch_dtype=torch.float16,\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\npipe.enable_model_cpu_offload()\npipe.enable_xformers_memory_efficient_attention()\n```\n\nNow let's make Mr Potato posing for Johannes Vermeer!\n\n```\ngenerator = torch.manual_seed(2)\nprompt = \"a photo of sks mr potato head, best quality, extremely detailed\"\noutput = pipe(\n    prompt,\n    canny_image,\n    negative_prompt=\"monochrome, lowres, bad anatomy, worst quality, low quality\",\n    num_inference_steps=20,\n    generator=generator,\n)\noutput.images[0]\n```\n\nIt is noticeable that Mr Potato Head is not the best candidate but he tried his best and did a pretty good job in capturing some of the essence 🍟\n\nAnother exclusive application of ControlNet is that we can take a pose from one image and reuse it to generate a different image with the exact same pose. So in this next example, we are going to teach superheroes how to do yoga using Open Pose ControlNet!\n\nFirst, we will need to get some images of people doing yoga:\n\n```\nurls = \"yoga1.jpeg\", \"yoga2.jpeg\", \"yoga3.jpeg\", \"yoga4.jpeg\"\nimgs = [\n    load_image(\"https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/\" + url) \n    for url in urls\n]\n\nimage_grid(imgs, 2, 2)\n```\n\nNow let's extract yoga poses using the OpenPose pre-processors that are handily available via controlnet_aux.\n\n```\nfrom controlnet_aux import OpenposeDetector\n\nmodel = OpenposeDetector.from_pretrained(\"lllyasviel/ControlNet\")\n\nposes = [model(img) for img in imgs]\nimage_grid(poses, 2, 2)\n```\n\nTo use these yoga poses to generate new images, let's create a Open Pose ControlNet. We will generate some super-hero images but in the yoga poses shown above. Let's go 🚀\n\n```\ncontrolnet = ControlNetModel.from_pretrained(\n    \"fusing/stable-diffusion-v1-5-controlnet-openpose\", torch_dtype=torch.float16\n)\n\nmodel_id = \"runwayml/stable-diffusion-v1-5\"\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    model_id,\n    controlnet=controlnet,\n    torch_dtype=torch.float16,\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\npipe.enable_model_cpu_offload()\n```\n\nNow it's yoga time!\n\n```\ngenerator = [torch.Generator(device=\"cpu\").manual_seed(2) for i in range(4)]\nprompt = \"super-hero character, best quality, extremely detailed\"\noutput = pipe(\n    [prompt] * 4,\n    poses,\n    negative_prompt=[\"monochrome, lowres, bad anatomy, worst quality, low quality\"] * 4,\n    generator=generator,\n    num_inference_steps=20,\n)\nimage_grid(output.images, 2, 2)\n```\n\n### Combining multiple conditionings\n\nMultiple ControlNet conditionings can be combined for a single image generation. Pass a list of ControlNets to the pipeline's constructor and a corresponding list of conditionings to __call__.\n\nWhen combining conditionings, it is helpful to mask conditionings such that they do not overlap. In the example, we mask the middle of the canny map where the pose conditioning is located.\n\nIt can also be helpful to vary the controlnet_conditioning_scales to emphasize one conditioning over the other.\n\n#### Canny conditioning\n\nThe original image\n\nPrepare the conditioning\n\n```\nfrom diffusers.utils import load_image\nfrom PIL import Image\nimport cv2\nimport numpy as np\nfrom diffusers.utils import load_image\n\ncanny_image = load_image(\n    \"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/landscape.png\"\n)\ncanny_image = np.array(canny_image)\n\nlow_threshold = 100\nhigh_threshold = 200\n\ncanny_image = cv2.Canny(canny_image, low_threshold, high_threshold)\n\n# zero out middle columns of image where pose will be overlayed\nzero_start = canny_image.shape[1] // 4\nzero_end = zero_start + canny_image.shape[1] // 2\ncanny_image[:, zero_start:zero_end] = 0\n\ncanny_image = canny_image[:, :, None]\ncanny_image = np.concatenate([canny_image, canny_image, canny_image], axis=2)\ncanny_image = Image.fromarray(canny_image)\n```\n\n#### Openpose conditioning\n\nThe original image\n\nPrepare the conditioning\n\n```\nfrom controlnet_aux import OpenposeDetector\nfrom diffusers.utils import load_image\n\nopenpose = OpenposeDetector.from_pretrained(\"lllyasviel/ControlNet\")\n\nopenpose_image = load_image(\n    \"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/person.png\"\n)\nopenpose_image = openpose(openpose_image)\n```\n\n#### Running ControlNet with multiple conditionings\n\n```\nfrom diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler\nimport torch\n\ncontrolnet = [\n    ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-openpose\", torch_dtype=torch.float16),\n    ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-canny\", torch_dtype=torch.float16),\n]\n\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    \"runwayml/stable-diffusion-v1-5\", controlnet=controlnet, torch_dtype=torch.float16\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\n\npipe.enable_xformers_memory_efficient_attention()\npipe.enable_model_cpu_offload()\n\nprompt = \"a giant standing in a fantasy landscape, best quality\"\nnegative_prompt = \"monochrome, lowres, bad anatomy, worst quality, low quality\"\n\ngenerator = torch.Generator(device=\"cpu\").manual_seed(1)\n\nimages = [openpose_image, canny_image]\n\nimage = pipe(\n    prompt,\n    images,\n    num_inference_steps=20,\n    generator=generator,\n    negative_prompt=negative_prompt,\n    controlnet_conditioning_scale=[1.0, 0.8],\n).images[0]\n\nimage.save(\"./multi_controlnet_output.png\")\n```\n\nThroughout the examples, we explored multiple facets of the StableDiffusionControlNetPipeline to show how easy and intuitive it is play around with ControlNet via Diffusers. However, we didn't cover all types of conditionings supported by ControlNet. To know more about those, we encourage you to check out the respective model documentation pages:\n\n- lllyasviel/sd-controlnet-depth\n\n- lllyasviel/sd-controlnet-hed\n\n- lllyasviel/sd-controlnet-normal\n\n- lllyasviel/sd-controlnet-scribble\n\n- lllyasviel/sd-controlnet-seg\n\n- lllyasviel/sd-controlnet-openpose\n\n- lllyasviel/sd-controlnet-mlsd\n\n- lllyasviel/sd-controlnet-canny\n\nWe welcome you to combine these different elements and share your results with @diffuserslib. Be sure to check out the Colab Notebook to take some of the above examples for a spin!\n\nWe also showed some techniques to make the generation process faster and memory-friendly by using a fast scheduler, smart model offloading and xformers. With these techniques combined the generation process takes only ~3 seconds on a V100 GPU and consumes just ~4 GBs of VRAM for a single image ⚡️ On free services like Google Colab, generation takes about 5s on the default GPU (T4), whereas the original implementation requires 17s to create the same result! Combining all the pieces in the diffusers toolbox is a real superpower 💪\n\n## Conclusion\n\nWe have been playing a lot with StableDiffusionControlNetPipeline, and our experience has been fun so far! We’re excited to see what the community builds on top of this pipeline. If you want to check out other pipelines and techniques supported in Diffusers that allow for controlled generation, check out our official documentation.\n\nIf you cannot wait to try out ControlNet directly, we got you covered as well! Simply click on one of the following spaces to play around with ControlNet:",
   "summaryZh": "Hugging Face宣布在其Diffusers库中正式支持ControlNet。这一集成使得开发者能够更加便捷地利用ControlNet对扩散模型进行空间和条件控制，推动了高质量图像生成技术的广泛应用与二次开发。",
   "summaryGeneratedAt": "2026-09-06T02:37:28.898632Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/lofi.jpg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/lofi.jpg",
+      "alt": "",
+      "id": "image_5c1749c3097a05c1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/house_depth.png",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/house_depth.png",
+      "alt": "",
+      "id": "image_91faec0b3ddfae61"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/house_after.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/house_after.jpeg",
+      "alt": "",
+      "id": "image_45f8d57eba7b5c7c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/drawing_before.png",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/drawing_before.png",
+      "alt": "",
+      "id": "image_a36d034d2545096e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/drawing_after.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/drawing_after.jpeg",
+      "alt": "",
+      "id": "image_a6fc4b215b11158c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/starbucks_logo.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/starbucks_logo.jpeg",
+      "alt": "",
+      "id": "image_e276f51d7555d0a9"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/starbucks_after.png",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/starbucks_after.png",
+      "alt": "",
+      "id": "image_dd7d998977ef14cc"
+    },
+    {
+      "src": "https://github.com/lllyasviel/ControlNet/raw/main/github_page/sd.png",
+      "originalUrl": "https://github.com/lllyasviel/ControlNet/raw/main/github_page/sd.png",
+      "alt": "controlnet-structure",
+      "id": "image_854d1d0e7c0cbee1"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/original_bird.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/original_bird.png",
+      "alt": "",
+      "id": "image_090e016873c8e914"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/canny_map.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/canny_map.png",
+      "alt": "",
+      "id": "image_a0d3fc14a3a6ca1c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/original_house.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/original_house.png",
+      "alt": "",
+      "id": "image_e77e210278d2ce53"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/segmentation_map.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/segmentation_map.png",
+      "alt": "",
+      "id": "image_c2ed039e5d2b67dc"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_6_output_0.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_6_output_0.jpeg",
+      "alt": "",
+      "id": "image_e7f0033c565a947c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_10_output_0.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_10_output_0.jpeg",
+      "alt": "",
+      "id": "image_5bb3b9c7d594e60b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_16_output_1.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_16_output_1.jpeg",
+      "alt": "",
+      "id": "image_c70279272a46a10e"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_22_output_0.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_22_output_0.jpeg",
+      "alt": "",
+      "id": "image_cf2cd197d1ac41ea"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_25_output_0.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_25_output_0.jpeg",
+      "alt": "",
+      "id": "image_cffaceb5fe26c573"
+    },
+    {
+      "src": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_28_output_0.jpeg",
+      "originalUrl": "https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_28_output_0.jpeg",
+      "alt": "",
+      "id": "image_a8af53943b1c7b75"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/anime_do_yoga.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/anime_do_yoga.png",
+      "alt": "",
+      "id": "image_3c8d3c32086674d9"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/landscape.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/landscape.png",
+      "alt": "",
+      "id": "image_1765a81e93228cf2"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/landscape_canny_masked.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/landscape_canny_masked.png",
+      "alt": "",
+      "id": "image_06067d980a29d2aa"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/person.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/person.png",
+      "alt": "",
+      "id": "image_67859145eb07cba2"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/person_pose.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/person_pose.png",
+      "alt": "",
+      "id": "image_3d48814e7b09e3e3"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/multi_controlnet_output.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/controlnet/multi_controlnet_output.png",
+      "alt": "",
+      "id": "image_4b3399a65e88fe39"
+    },
+    {
+      "src": "https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue",
+      "originalUrl": "https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue",
+      "alt": "Canny ControlNet Spaces",
+      "id": "image_93f7c0e7800f7225"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Ever since Stable Diffusion took the world by storm, people have been looking for ways to have more control over the results of the generation process. ControlNet provides a minimal interface allowing users to customize the generation process up to a great extent. With ControlNet, users can easily condition the generation with different spatial contexts such as a depth map, a segmentation map, a scribble, keypoints, and so on!",
+      "spans": [
+        {
+          "start": 270,
+          "end": 280,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "We can turn a cartoon drawing into a realistic photo with incredible coherence.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Realistic Lofi Girl",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0004",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0005",
+      "source": "Or even use it as your interior designer.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Before",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0007",
+      "source": "After",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0008",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0009",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0010",
+      "source": "You can turn your sketch scribble into an artistic drawing.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Before",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0012",
+      "source": "After",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0013",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0014",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0015",
+      "source": "Also, make some of the famous logos coming to life.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Before",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0017",
+      "source": "After",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "With ControlNet, the sky is the limit 🌠",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "In this blog post, we first introduce the StableDiffusionControlNetPipeline and then show how it can be applied for various control conditionings. Let’s get controlling!",
+      "spans": [
+        {
+          "start": 42,
+          "end": 75,
+          "kind": "code"
+        },
+        {
+          "start": 42,
+          "end": 75,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "ControlNet: TL;DR",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "ControlNet was introduced in Adding Conditional Control to Text-to-Image Diffusion Models by Lvmin Zhang and Maneesh Agrawala. It introduces a framework that allows for supporting various spatial contexts that can serve as additional conditionings to Diffusion models such as Stable Diffusion. The diffusers implementation is adapted from the original source code.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 89,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2302.05543"
+        },
+        {
+          "start": 352,
+          "end": 363,
+          "kind": "a",
+          "href": "https://github.com/lllyasviel/ControlNet/"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Training ControlNet is comprised of the following steps:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Cloning the pre-trained parameters of a Diffusion model, such as Stable Diffusion's latent UNet, (referred to as “trainable copy”) while also maintaining the pre-trained parameters separately (”locked copy”). It is done so that the locked parameter copy can preserve the vast knowledge learned from a large dataset, whereas the trainable copy is employed to learn task-specific aspects.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "The trainable and locked copies of the parameters are connected via “zero convolution” layers (see here for more information) which are optimized as a part of the ControlNet framework. This is a training trick to preserve the semantics already learned by frozen model as the new conditions are trained.",
+      "spans": [
+        {
+          "start": 99,
+          "end": 103,
+          "kind": "a",
+          "href": "https://github.com/lllyasviel/ControlNet#controlnet"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Pictorially, training a ControlNet looks like so:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "The diagram is taken from here.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 30,
+          "kind": "a",
+          "href": "https://github.com/lllyasviel/ControlNet/blob/main/github_page/sd.png"
+        },
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "A sample from the training set for ControlNet-like training looks like this (additional conditioning is via edge maps):",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Prompt",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "Original Image",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "Conditioning",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "\"bird\"",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t5",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "Similarly, if we were to condition ControlNet with semantic segmentation maps, a training sample would be like so:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Prompt",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Original Image",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "Conditioning",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "\"big house\"",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t6",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "Every new type of conditioning requires training a new copy of ControlNet weights. The paper proposed 8 different conditioning models that are all supported in Diffusers!",
+      "spans": [
+        {
+          "start": 147,
+          "end": 156,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel?search=controlnet"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "For inference, both the pre-trained diffusion models weights as well as the trained ControlNet weights are needed. For example, using Stable Diffusion v1-5 with a ControlNet checkpoint require roughly 700 million more parameters compared to just using the original Stable Diffusion model, which makes ControlNet a bit more memory-expensive for inference.",
+      "spans": [
+        {
+          "start": 134,
+          "end": 155,
+          "kind": "a",
+          "href": "https://huggingface.co/runwayml/stable-diffusion-v1-5"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Because the pre-trained diffusion models are locked during training, one only needs to switch out the ControlNet parameters when using a different conditioning. This makes it fairly simple to deploy multiple ControlNet weights in one application as we will see below.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "The StableDiffusionControlNetPipeline",
+      "spans": [
+        {
+          "start": 4,
+          "end": 37,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Before we begin, we want to give a huge shout-out to the community contributor Takuma Mori for having led the integration of ControlNet into Diffusers ❤️ .",
+      "spans": [
+        {
+          "start": 79,
+          "end": 90,
+          "kind": "a",
+          "href": "https://github.com/takuma104"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "To experiment with ControlNet, Diffusers exposes the StableDiffusionControlNetPipeline similar to the other Diffusers pipelines. Central to the StableDiffusionControlNetPipeline is the controlnet argument which lets us provide a particular trained ControlNetModel instance while keeping the pre-trained diffusion model weights the same.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 86,
+          "kind": "code"
+        },
+        {
+          "start": 53,
+          "end": 86,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet"
+        },
+        {
+          "start": 102,
+          "end": 127,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/api/pipelines/overview"
+        },
+        {
+          "start": 144,
+          "end": 177,
+          "kind": "code"
+        },
+        {
+          "start": 185,
+          "end": 195,
+          "kind": "code"
+        },
+        {
+          "start": 248,
+          "end": 263,
+          "kind": "code"
+        },
+        {
+          "start": 248,
+          "end": 263,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/models#diffusers.ControlNetModel"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "We will explore different use cases with the StableDiffusionControlNetPipeline in this blog post. The first ControlNet model we are going to walk through is the Canny model - this is one of the most popular models that generated some of the amazing images you are libely seeing on the internet.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 172,
+          "kind": "a",
+          "href": "https://huggingface.co/runwayml/stable-diffusion-v1-5"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "We welcome you to run the code snippets shown in the sections below with this Colab Notebook.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 92,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/controlnet.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Before we begin, let's make sure we have all the necessary libraries installed:",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "To process different conditionings depending on the chosen ControlNet, we also need to install some additional dependencies:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "OpenCV",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://opencv.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "controlnet-aux - a simple collection of pre-processing models for ControlNet",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/patrickvonplaten/controlnet_aux#controlnet-auxiliary-models"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "We will use the famous painting \"Girl With A Pearl\" for this example. So, let's download the image and take a look:",
+      "spans": [
+        {
+          "start": 32,
+          "end": 51,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Girl_with_a_Pearl_Earring"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Next, we will put the image through the canny pre-processor:",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "As we can see, it is essentially edge detection:",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Now, we load runwaylml/stable-diffusion-v1-5 as well as the ControlNet model for canny edges. The models are loaded in half-precision (torch.dtype) to allow for fast and memory-efficient inference.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 44,
+          "kind": "a",
+          "href": "https://huggingface.co/runwayml/stable-diffusion-v1-5"
+        },
+        {
+          "start": 60,
+          "end": 92,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-canny"
+        },
+        {
+          "start": 135,
+          "end": 146,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Instead of using Stable Diffusion's default PNDMScheduler, we use one of the currently fastest diffusion model schedulers, called UniPCMultistepScheduler. Choosing an improved scheduler can drastically reduce inference time - in our case we are able to reduce the number of inference steps from 50 to 20 while more or less keeping the same image generation quality. More information regarding schedulers can be found here.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 57,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/schedulers/pndm"
+        },
+        {
+          "start": 130,
+          "end": 153,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/schedulers/unipc"
+        },
+        {
+          "start": 417,
+          "end": 421,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/using-diffusers/schedulers"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Instead of loading our pipeline directly to GPU, we instead enable smart CPU offloading which can be achieved with the enable_model_cpu_offload function.",
+      "spans": [
+        {
+          "start": 119,
+          "end": 143,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 152,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet#diffusers.StableDiffusionControlNetPipeline.enable_model_cpu_offload"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Remember that during inference diffusion models, such as Stable Diffusion require not just one but multiple model components that are run sequentially. In the case of Stable Diffusion with ControlNet, we first use the CLIP text encoder, then the diffusion model unet and control net, then the VAE decoder and finally run a safety checker. Most components are only run once during the diffusion process and are thus not required to occupy GPU memory all the time. By enabling smart model offloading, we make sure that each component is only loaded into GPU when it's needed so that we can significantly save memory consumption without significantly slowing down infenence.",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "Note: When running enable_model_cpu_offload, do not manually move the pipeline to GPU with .to(\"cuda\") - once CPU offloading is enabled, the pipeline automatically takes care of GPU memory management.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 19,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 91,
+          "end": 102,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "Finally, we want to take full advantage of the amazing FlashAttention/xformers attention layer acceleration, so let's enable this! If this command does not work for you, you might not have xformers correctly installed. In this case, you can just skip the following line of code.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 78,
+          "kind": "a",
+          "href": "https://github.com/facebookresearch/xformers"
+        },
+        {
+          "start": 189,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Now we are ready to run the ControlNet pipeline!",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "We still provide a prompt to guide the image generation process, just like what we would normally do with a Stable Diffusion image-to-image pipeline. However, ControlNet will allow a lot more control over the generated image because we will be able to control the exact composition in generated image with the canny edge image we just created.",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "It will be fun to see some images where contemporary celebrities posing for this exact same painting from the 17th century. And it's really easy to do that with ControlNet, all we have to do is to include the names of these celebrities in the prompt!",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Let's first create a simple helper function to display images as a grid.",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Next, we define the input prompts and set a seed for reproducibility.",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "Finally, we can run the pipeline and display the image!",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "We can effortlessly combine ControlNet with fine-tuning too! For example, we can fine-tune a model with DreamBooth, and use it to render ourselves into different scenes.",
+      "spans": [
+        {
+          "start": 104,
+          "end": 114,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/training/dreambooth"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "In this post, we are going to use our beloved Mr Potato Head as an example to show how to use ControlNet with DreamBooth.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "We can use the same ControlNet. However, instead of using the Stable Diffusion 1.5, we are going to load the Mr Potato Head model into our pipeline - Mr Potato Head is a Stable Diffusion model fine-tuned with Mr Potato Head concept using Dreambooth 🥔",
+      "spans": [
+        {
+          "start": 109,
+          "end": 129,
+          "kind": "a",
+          "href": "https://huggingface.co/sd-dreambooth-library/mr-potato-head"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Let's run the above commands again, keeping the same controlnet though!",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "Now let's make Mr Potato posing for Johannes Vermeer!",
+      "spans": [
+        {
+          "start": 36,
+          "end": 52,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Johannes_Vermeer"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "It is noticeable that Mr Potato Head is not the best candidate but he tried his best and did a pretty good job in capturing some of the essence 🍟",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Another exclusive application of ControlNet is that we can take a pose from one image and reuse it to generate a different image with the exact same pose. So in this next example, we are going to teach superheroes how to do yoga using Open Pose ControlNet!",
+      "spans": [
+        {
+          "start": 235,
+          "end": 255,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-openpose"
+        }
+      ]
+    },
+    {
+      "id": "b0077",
+      "source": "First, we will need to get some images of people doing yoga:",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Now let's extract yoga poses using the OpenPose pre-processors that are handily available via controlnet_aux.",
+      "spans": [
+        {
+          "start": 94,
+          "end": 108,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "To use these yoga poses to generate new images, let's create a Open Pose ControlNet. We will generate some super-hero images but in the yoga poses shown above. Let's go 🚀",
+      "spans": [
+        {
+          "start": 63,
+          "end": 83,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-openpose"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Now it's yoga time!",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "Combining multiple conditionings",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "Multiple ControlNet conditionings can be combined for a single image generation. Pass a list of ControlNets to the pipeline's constructor and a corresponding list of conditionings to __call__.",
+      "spans": [
+        {
+          "start": 183,
+          "end": 191,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "When combining conditionings, it is helpful to mask conditionings such that they do not overlap. In the example, we mask the middle of the canny map where the pose conditioning is located.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "It can also be helpful to vary the controlnet_conditioning_scales to emphasize one conditioning over the other.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Canny conditioning",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "The original image",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Prepare the conditioning",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Openpose conditioning",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "The original image",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "Prepare the conditioning",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Running ControlNet with multiple conditionings",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "Throughout the examples, we explored multiple facets of the StableDiffusionControlNetPipeline to show how easy and intuitive it is play around with ControlNet via Diffusers. However, we didn't cover all types of conditionings supported by ControlNet. To know more about those, we encourage you to check out the respective model documentation pages:",
+      "spans": [
+        {
+          "start": 60,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 60,
+          "end": 93,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "lllyasviel/sd-controlnet-depth",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-depth"
+        }
+      ]
+    },
+    {
+      "id": "b0094",
+      "source": "lllyasviel/sd-controlnet-hed",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-hed"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "lllyasviel/sd-controlnet-normal",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-normal"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "lllyasviel/sd-controlnet-scribble",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-scribble"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "lllyasviel/sd-controlnet-seg",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-scribble"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "lllyasviel/sd-controlnet-openpose",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-openpose"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "lllyasviel/sd-controlnet-mlsd",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-mlsd"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "lllyasviel/sd-controlnet-canny",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/lllyasviel/sd-controlnet-canny"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "We welcome you to combine these different elements and share your results with @diffuserslib. Be sure to check out the Colab Notebook to take some of the above examples for a spin!",
+      "spans": [
+        {
+          "start": 79,
+          "end": 92,
+          "kind": "a",
+          "href": "https://twitter.com/diffuserslib"
+        },
+        {
+          "start": 115,
+          "end": 133,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/controlnet.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "We also showed some techniques to make the generation process faster and memory-friendly by using a fast scheduler, smart model offloading and xformers. With these techniques combined the generation process takes only ~3 seconds on a V100 GPU and consumes just ~4 GBs of VRAM for a single image ⚡️ On free services like Google Colab, generation takes about 5s on the default GPU (T4), whereas the original implementation requires 17s to create the same result! Combining all the pieces in the diffusers toolbox is a real superpower 💪",
+      "spans": [
+        {
+          "start": 143,
+          "end": 151,
+          "kind": "code"
+        },
+        {
+          "start": 493,
+          "end": 502,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0103",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "We have been playing a lot with StableDiffusionControlNetPipeline, and our experience has been fun so far! We’re excited to see what the community builds on top of this pipeline. If you want to check out other pipelines and techniques supported in Diffusers that allow for controlled generation, check out our official documentation.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 32,
+          "end": 65,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/api/pipelines/stable_diffusion/controlnet"
+        },
+        {
+          "start": 310,
+          "end": 332,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/using-diffusers/controlling_generation"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "If you cannot wait to try out ControlNet directly, we got you covered as well! Simply click on one of the following spaces to play around with ControlNet:",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "f62a7b4de361f3e41aea3760971c978026ba451bbf3274f9d41e45f1f0ffc9ef",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install diffusers==0.14.0 transformers xformers git+https://github.com/huggingface/accelerate.git"
+    },
+    {
+      "id": "c0002",
+      "source": "pip install opencv-contrib-python\npip install controlnet_aux"
+    },
+    {
+      "id": "c0003",
+      "source": "from diffusers.utils import load_image\n\nimage = load_image(\n    \"https://hf.co/datasets/huggingface/documentation-images/resolve/main/diffusers/input_image_vermeer.png\"\n)\nimage"
+    },
+    {
+      "id": "c0004",
+      "source": "import cv2\nfrom PIL import Image\nimport numpy as np\n\nimage = np.array(image)\n\nlow_threshold = 100\nhigh_threshold = 200\n\nimage = cv2.Canny(image, low_threshold, high_threshold)\nimage = image[:, :, None]\nimage = np.concatenate([image, image, image], axis=2)\ncanny_image = Image.fromarray(image)\ncanny_image"
+    },
+    {
+      "id": "c0005",
+      "source": "from diffusers import StableDiffusionControlNetPipeline, ControlNetModel\nimport torch\n\ncontrolnet = ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-canny\", torch_dtype=torch.float16)\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    \"runwayml/stable-diffusion-v1-5\", controlnet=controlnet, torch_dtype=torch.float16\n)"
+    },
+    {
+      "id": "c0006",
+      "source": "from diffusers import UniPCMultistepScheduler\n\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)"
+    },
+    {
+      "id": "c0007",
+      "source": "pipe.enable_model_cpu_offload()"
+    },
+    {
+      "id": "c0008",
+      "source": "pipe.enable_xformers_memory_efficient_attention()"
+    },
+    {
+      "id": "c0009",
+      "source": "def image_grid(imgs, rows, cols):\n    assert len(imgs) == rows * cols\n\n    w, h = imgs[0].size\n    grid = Image.new(\"RGB\", size=(cols * w, rows * h))\n    grid_w, grid_h = grid.size\n\n    for i, img in enumerate(imgs):\n        grid.paste(img, box=(i % cols * w, i // cols * h))\n    return grid"
+    },
+    {
+      "id": "c0010",
+      "source": "prompt = \", best quality, extremely detailed\"\nprompt = [t + prompt for t in [\"Sandra Oh\", \"Kim Kardashian\", \"rihanna\", \"taylor swift\"]]\ngenerator = [torch.Generator(device=\"cpu\").manual_seed(2) for i in range(len(prompt))]"
+    },
+    {
+      "id": "c0011",
+      "source": "output = pipe(\n    prompt,\n    canny_image,\n    negative_prompt=[\"monochrome, lowres, bad anatomy, worst quality, low quality\"] * 4,\n    num_inference_steps=20,\n    generator=generator,\n)\n\nimage_grid(output.images, 2, 2)"
+    },
+    {
+      "id": "c0012",
+      "source": "model_id = \"sd-dreambooth-library/mr-potato-head\"\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    model_id,\n    controlnet=controlnet,\n    torch_dtype=torch.float16,\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\npipe.enable_model_cpu_offload()\npipe.enable_xformers_memory_efficient_attention()"
+    },
+    {
+      "id": "c0013",
+      "source": "generator = torch.manual_seed(2)\nprompt = \"a photo of sks mr potato head, best quality, extremely detailed\"\noutput = pipe(\n    prompt,\n    canny_image,\n    negative_prompt=\"monochrome, lowres, bad anatomy, worst quality, low quality\",\n    num_inference_steps=20,\n    generator=generator,\n)\noutput.images[0]"
+    },
+    {
+      "id": "c0014",
+      "source": "urls = \"yoga1.jpeg\", \"yoga2.jpeg\", \"yoga3.jpeg\", \"yoga4.jpeg\"\nimgs = [\n    load_image(\"https://huggingface.co/datasets/YiYiXu/controlnet-testing/resolve/main/\" + url) \n    for url in urls\n]\n\nimage_grid(imgs, 2, 2)"
+    },
+    {
+      "id": "c0015",
+      "source": "from controlnet_aux import OpenposeDetector\n\nmodel = OpenposeDetector.from_pretrained(\"lllyasviel/ControlNet\")\n\nposes = [model(img) for img in imgs]\nimage_grid(poses, 2, 2)"
+    },
+    {
+      "id": "c0016",
+      "source": "controlnet = ControlNetModel.from_pretrained(\n    \"fusing/stable-diffusion-v1-5-controlnet-openpose\", torch_dtype=torch.float16\n)\n\nmodel_id = \"runwayml/stable-diffusion-v1-5\"\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    model_id,\n    controlnet=controlnet,\n    torch_dtype=torch.float16,\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\npipe.enable_model_cpu_offload()"
+    },
+    {
+      "id": "c0017",
+      "source": "generator = [torch.Generator(device=\"cpu\").manual_seed(2) for i in range(4)]\nprompt = \"super-hero character, best quality, extremely detailed\"\noutput = pipe(\n    [prompt] * 4,\n    poses,\n    negative_prompt=[\"monochrome, lowres, bad anatomy, worst quality, low quality\"] * 4,\n    generator=generator,\n    num_inference_steps=20,\n)\nimage_grid(output.images, 2, 2)"
+    },
+    {
+      "id": "c0018",
+      "source": "from diffusers.utils import load_image\nfrom PIL import Image\nimport cv2\nimport numpy as np\nfrom diffusers.utils import load_image\n\ncanny_image = load_image(\n    \"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/landscape.png\"\n)\ncanny_image = np.array(canny_image)\n\nlow_threshold = 100\nhigh_threshold = 200\n\ncanny_image = cv2.Canny(canny_image, low_threshold, high_threshold)\n\n# zero out middle columns of image where pose will be overlayed\nzero_start = canny_image.shape[1] // 4\nzero_end = zero_start + canny_image.shape[1] // 2\ncanny_image[:, zero_start:zero_end] = 0\n\ncanny_image = canny_image[:, :, None]\ncanny_image = np.concatenate([canny_image, canny_image, canny_image], axis=2)\ncanny_image = Image.fromarray(canny_image)"
+    },
+    {
+      "id": "c0019",
+      "source": "from controlnet_aux import OpenposeDetector\nfrom diffusers.utils import load_image\n\nopenpose = OpenposeDetector.from_pretrained(\"lllyasviel/ControlNet\")\n\nopenpose_image = load_image(\n    \"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/person.png\"\n)\nopenpose_image = openpose(openpose_image)"
+    },
+    {
+      "id": "c0020",
+      "source": "from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler\nimport torch\n\ncontrolnet = [\n    ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-openpose\", torch_dtype=torch.float16),\n    ControlNetModel.from_pretrained(\"lllyasviel/sd-controlnet-canny\", torch_dtype=torch.float16),\n]\n\npipe = StableDiffusionControlNetPipeline.from_pretrained(\n    \"runwayml/stable-diffusion-v1-5\", controlnet=controlnet, torch_dtype=torch.float16\n)\npipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)\n\npipe.enable_xformers_memory_efficient_attention()\npipe.enable_model_cpu_offload()\n\nprompt = \"a giant standing in a fantasy landscape, best quality\"\nnegative_prompt = \"monochrome, lowres, bad anatomy, worst quality, low quality\"\n\ngenerator = torch.Generator(device=\"cpu\").manual_seed(1)\n\nimages = [openpose_image, canny_image]\n\nimage = pipe(\n    prompt,\n    images,\n    num_inference_steps=20,\n    generator=generator,\n    negative_prompt=negative_prompt,\n    controlnet_conditioning_scale=[1.0, 0.8],\n).images[0]\n\nimage.save(\"./multi_controlnet_output.png\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "f62a7b4de361f3e41aea3760971c978026ba451bbf3274f9d41e45f1f0ffc9ef",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_5c1749c3097a05c1",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 1
+    },
+    {
+      "mediaId": "image_91faec0b3ddfae61",
+      "type": "image",
+      "afterBlockId": "b0008",
+      "order": 2
+    },
+    {
+      "mediaId": "image_45f8d57eba7b5c7c",
+      "type": "image",
+      "afterBlockId": "b0009",
+      "order": 3
+    },
+    {
+      "mediaId": "image_a36d034d2545096e",
+      "type": "image",
+      "afterBlockId": "b0013",
+      "order": 4
+    },
+    {
+      "mediaId": "image_a6fc4b215b11158c",
+      "type": "image",
+      "afterBlockId": "b0014",
+      "order": 5
+    },
+    {
+      "mediaId": "image_e276f51d7555d0a9",
+      "type": "image",
+      "afterBlockId": "b0018",
+      "order": 6
+    },
+    {
+      "mediaId": "image_dd7d998977ef14cc",
+      "type": "image",
+      "afterBlockId": "b0019",
+      "order": 7
+    },
+    {
+      "mediaId": "image_854d1d0e7c0cbee1",
+      "type": "image",
+      "afterBlockId": "b0028",
+      "order": 8
+    },
+    {
+      "mediaId": "image_090e016873c8e914",
+      "type": "image",
+      "afterBlockId": "b0034",
+      "order": 9
+    },
+    {
+      "mediaId": "image_a0d3fc14a3a6ca1c",
+      "type": "image",
+      "afterBlockId": "b0035",
+      "order": 10
+    },
+    {
+      "mediaId": "image_e77e210278d2ce53",
+      "type": "image",
+      "afterBlockId": "b0041",
+      "order": 11
+    },
+    {
+      "mediaId": "image_c2ed039e5d2b67dc",
+      "type": "image",
+      "afterBlockId": "b0042",
+      "order": 12
+    },
+    {
+      "mediaId": "image_e7f0033c565a947c",
+      "type": "image",
+      "afterBlockId": "c0003",
+      "order": 13
+    },
+    {
+      "mediaId": "image_5bb3b9c7d594e60b",
+      "type": "image",
+      "afterBlockId": "b0057",
+      "order": 14
+    },
+    {
+      "mediaId": "image_c70279272a46a10e",
+      "type": "image",
+      "afterBlockId": "c0011",
+      "order": 15
+    },
+    {
+      "mediaId": "image_cf2cd197d1ac41ea",
+      "type": "image",
+      "afterBlockId": "b0075",
+      "order": 16
+    },
+    {
+      "mediaId": "image_cffaceb5fe26c573",
+      "type": "image",
+      "afterBlockId": "c0014",
+      "order": 17
+    },
+    {
+      "mediaId": "image_a8af53943b1c7b75",
+      "type": "image",
+      "afterBlockId": "c0015",
+      "order": 18
+    },
+    {
+      "mediaId": "image_3c8d3c32086674d9",
+      "type": "image",
+      "afterBlockId": "c0017",
+      "order": 19
+    },
+    {
+      "mediaId": "image_1765a81e93228cf2",
+      "type": "image",
+      "afterBlockId": "b0086",
+      "order": 20
+    },
+    {
+      "mediaId": "image_06067d980a29d2aa",
+      "type": "image",
+      "afterBlockId": "c0018",
+      "order": 21
+    },
+    {
+      "mediaId": "image_67859145eb07cba2",
+      "type": "image",
+      "afterBlockId": "b0089",
+      "order": 22
+    },
+    {
+      "mediaId": "image_3d48814e7b09e3e3",
+      "type": "image",
+      "afterBlockId": "c0019",
+      "order": 23
+    },
+    {
+      "mediaId": "image_4b3399a65e88fe39",
+      "type": "image",
+      "afterBlockId": "c0020",
+      "order": 24
+    },
+    {
+      "mediaId": "image_93f7c0e7800f7225",
+      "type": "image",
+      "afterBlockId": "b0105",
+      "order": 25
+    },
+    {
+      "mediaId": "image_93f7c0e7800f7225",
+      "type": "image",
+      "afterBlockId": "b0105",
+      "order": 26
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 27,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 26,
+    "savedImages": 26,
+    "sourceImageOccurrences": 27,
+    "placedImageOccurrences": 27,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:18:37.627619Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:18:37.627635Z",
+  "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
     "provider": "gemini",

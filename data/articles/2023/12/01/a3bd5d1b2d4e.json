@@ -18,11 +18,481 @@
   "fetchedAt": "2026-09-05T07:37:42.437184Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Open LLM Leaderboard: DROP deep dive\n\nPublished December 1, 2023\n\nThis article is also available in Chinese 简体中文 .\n\nRecently, three new benchmarks were added to the Open LLM Leaderboard : Winogrande, GSM8k and DROP, using the original implementations reproduced in the EleutherAI Harness . A cursory look at the scores for DROP revealed something strange was going on, with the overwhelming majority of models scoring less than 10 out of 100 on their f1-score! We did a deep dive to understand what was going on, come with us to see what we found out!\n\nDROP (Discrete Reasoning Over Paragraphs) is an evaluation where models must extract relevant information from English-text paragraphs before executing discrete reasoning steps on them (for example, sorting or counting items to arrive at the correct answer, see the table below for examples). The metrics used are custom f1 and exact match scores.\n\nExamples of reasoning and paragraph from the original article.\n\nWe added it to the Open LLM Leaderboard three weeks ago, and observed that the f1-scores of pretrained models followed an unexpected trend: when we plotted DROP scores against the leaderboard original average (of ARC, HellaSwag, TruthfulQA and MMLU), which is a reasonable proxy for overall model performance, we expected DROP scores to be correlated with it (with better models having better performance). However, this was only the case for a small number of models, and all the others had a very low DROP f1-score, below 10.\n\nTwo trends can be observed in the DROP scores: some follow the average (in diagonal), others are stuck around 5 (vertical line on the right of the graph).\n\n## Normalization interrogations\n\nDuring our first deeper dive in these surprising behavior, we observed that the normalization step was possibly not working as intended: in some cases, this normalization ignored the correct numerical answers when they were directly followed by a whitespace character other than a space (a line return, for example). Let's look at an example, with the generation being 10: The 2011 census recorded a population of 1,001,360 , and the gold answer being 10 .\n\nNormalization happens in several steps, both for generation and gold:\n\n- Split on separators | , - , or The beginning sequence of the generation 10: contain no such separator, and is therefore considered a single entity after this step.\n\n- Punctuation removal The first token then becomes 10 ( : is removed)\n\n- Homogenization of numbers Every string that can be cast to float is considered a number and cast to float, then re-converted to string. 10 stays the same, as it cannot be cast to float, whereas the gold 10 becomes 10.0 .\n\n- Other steps A lot of other normalization steps ensue (removing articles, removing other whitespaces, etc.) and our original example becomes 10 passage 2011.0 census recorded population of 1001360.0 .\n\nHowever, the overall score is not computed on the string, but on the bag of words (BOW) extracted from the string, here 'recorded', 'population', 'passage', 'census', '2011.0', '1001360.0', '10' , which is compared with the BOW of the gold, also normalized in the above manner, 10.0 . As you can see, they don’t intersect, even though the model predicted the correct output!\n\nIn summary, if a number is followed by any kind of whitespace other than a simple space, it will not pass through the number normalization, hence never match the gold if it is also a number! This first issue was likely to mess up the scores quite a bit, but clearly it was not the only factor causing DROP scores to be so low. We decided to investigate a bit more.\n\n## Diving into the results\n\nExtending our investigations, our friends at Zeno joined us and undertook a much more thorough exploration of the results, looking at 5 models which were representative of the problems we noticed in DROP scores: falcon-180B and mistral-7B were underperforming compared to what we were expecting, Yi-34B and tigerbot-70B had a very good performance on DROP correlated with their average scores, and facebook/xglm-7.5B fell in the middle.\n\nYou can give analyzing the results a try in the Zeno project here if you want to!\n\nThe Zeno team found two even more concerning features:\n\n- Not a single model got a correct result on floating point answers\n\n- High quality models which generate long answers actually have a lower f1-score\n\nAt this point, we believed that both failure cases were actually caused by the same root factor: using . as a stopword token (to end the generations):\n\n- Floating point answers are systematically interrupted before their generation is complete\n\n- Higher quality models, which try to match the few-shot prompt format, will generate Answer prompt for the next question. , and only stop during the plausible prompt continuation after the actual answer on the first . , therefore generating too many words and getting a bad f1 score.\n\nWe hypothesized that both these problems could be fixed by using instead of . as an end of generation stop word.\n\n## Changing the end of generation token\n\nSo we gave it a try! We investigated using as the end of generation token on the available results. We split the generated answer on the first it contained, if one was present, and recomputed the scores. Note that this is only an approximation of the correct result, as it won't fix answers that were cut too early on . (for example floating point answers) - but it also won’t give unfair advantage to any model, as all of them were affected by this problem. However it’s the best we could do without rerunning models (as we wanted to keep the community posted as soon as possible).\n\nThe results we got were the following - splitting on correlates really well with other scores and therefore with overall performance.\n\nWe can see in orange that the scores computed on the new strings correlate much better with the average performance.\n\nA quick calculation shows that re-running the full evaluation of all models would be quite costly (the full update took 8 years of GPU time, and a lot of it was taken by DROP), we estimated how much it would cost to only re-run failing examples.\n\nIn 10% of the cases, the gold answer is a floating number (for example 12.25 ) and model predictions start with the correct beginning (for our example, 12 ) but are cut off on a . - these predictions likely would have actually been correct if the generation was to continue. We would definitely need to re-run them! Our estimation does not count generated sentences that finish with a number which was possibly interrupted (40% of the other generations), nor any prediction messed up by its normalization.\n\nTo get correct results, we would thus need to re-run more than 50% of the examples, a huge amount of GPU time! We need to be certain that the implementation we'll run is correct this time.\n\nAfter discussing it with the fantastic EleutherAI team (both on GitHub and internally), who guided us through the code and helped our investigations, it became very clear that the LM Eval Harness implementation follows the \"official DROP\" code very strictly: a new version of this benchmark’s evaluation thus needs to be developed! We have therefore taken the decision to remove DROP from the Open LLM Leaderboard until a new version arises.\n\nOne take away of this investiguation is the value in having the many eyes of the community collaboratively investiguate a benchmark in order to detect errors that were previously missed. Here again the power of open-source, community and developping in the open-shines in that it allows to transparently investigate the root cause of an issue on a benchmark which has been out there for a couple of years.\n\nWe hope that interested members of the community will join forces with academics working on DROP evaluation to fix both its scoring and its normalization. We'd love it becomes usable again, as the dataset itself is really quite interesting and cool. We encourage you to provide feedback on how we should evaluate DROP on this issue .\n\nThanks to the many community members who pointed out issues on DROP scores, and many thanks to the EleutherAI Harness and Zeno teams for their great help on this issue.\n\nMore Articles from our Blog\n\n## What's going on with the Open LLM Leaderboard?\n\n## Letting Large Models Debate: The First Multilingual LLM Debate Competition\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "Recently, three new benchmarks were added to the Open LLM Leaderboard: Winogrande, GSM8k and DROP, using the original implementations reproduced in the EleutherAI Harness. A cursory look at the scores for DROP revealed something strange was going on, with the overwhelming majority of models scoring less than 10 out of 100 on their f1-score! We did a deep dive to understand what was going on, come with us to see what we found out!\n\n## Initial observations\n\nDROP (Discrete Reasoning Over Paragraphs) is an evaluation where models must extract relevant information from English-text paragraphs before executing discrete reasoning steps on them (for example, sorting or counting items to arrive at the correct answer, see the table below for examples). The metrics used are custom f1 and exact match scores.\n\nExamples of reasoning and paragraph from the original article.\n\nWe added it to the Open LLM Leaderboard three weeks ago, and observed that the f1-scores of pretrained models followed an unexpected trend: when we plotted DROP scores against the leaderboard original average (of ARC, HellaSwag, TruthfulQA and MMLU), which is a reasonable proxy for overall model performance, we expected DROP scores to be correlated with it (with better models having better performance). However, this was only the case for a small number of models, and all the others had a very low DROP f1-score, below 10.\n\nTwo trends can be observed in the DROP scores: some follow the average (in diagonal), others are stuck around 5 (vertical line on the right of the graph).\n\n## Normalization interrogations\n\nDuring our first deeper dive in these surprising behavior, we observed that the normalization step was possibly not working as intended: in some cases, this normalization ignored the correct numerical answers when they were directly followed by a whitespace character other than a space (a line return, for example). Let's look at an example, with the generation being 10\\n\\nPassage: The 2011 census recorded a population of 1,001,360, and the gold answer being 10.\n\nNormalization happens in several steps, both for generation and gold:\n\n- Split on separators |, -, or The beginning sequence of the generation 10\\n\\nPassage: contain no such separator, and is therefore considered a single entity after this step.\n\n- Punctuation removal The first token then becomes 10\\n\\nPassage (: is removed)\n\n- Homogenization of numbers Every string that can be cast to float is considered a number and cast to float, then re-converted to string. 10\\n\\nPassage stays the same, as it cannot be cast to float, whereas the gold 10 becomes 10.0.\n\n- Other steps A lot of other normalization steps ensue (removing articles, removing other whitespaces, etc.) and our original example becomes 10 passage 2011.0 census recorded population of 1001360.0.\n\nHowever, the overall score is not computed on the string, but on the bag of words (BOW) extracted from the string, here {'recorded', 'population', 'passage', 'census', '2011.0', '1001360.0', '10'}, which is compared with the BOW of the gold, also normalized in the above manner, {10.0}. As you can see, they don’t intersect, even though the model predicted the correct output!\n\nIn summary, if a number is followed by any kind of whitespace other than a simple space, it will not pass through the number normalization, hence never match the gold if it is also a number! This first issue was likely to mess up the scores quite a bit, but clearly it was not the only factor causing DROP scores to be so low. We decided to investigate a bit more.\n\n## Diving into the results\n\nExtending our investigations, our friends at Zeno joined us and undertook a much more thorough exploration of the results, looking at 5 models which were representative of the problems we noticed in DROP scores: falcon-180B and mistral-7B were underperforming compared to what we were expecting, Yi-34B and tigerbot-70B had a very good performance on DROP correlated with their average scores, and facebook/xglm-7.5B fell in the middle.\n\nYou can give analyzing the results a try in the Zeno project here if you want to!\n\nThe Zeno team found two even more concerning features:\n\n- Not a single model got a correct result on floating point answers\n\n- High quality models which generate long answers actually have a lower f1-score\n\nAt this point, we believed that both failure cases were actually caused by the same root factor: using . as a stopword token (to end the generations):\n\n- Floating point answers are systematically interrupted before their generation is complete\n\n- Higher quality models, which try to match the few-shot prompt format, will generate Answer\\n\\nPlausible prompt for the next question., and only stop during the plausible prompt continuation after the actual answer on the first ., therefore generating too many words and getting a bad f1 score.\n\nWe hypothesized that both these problems could be fixed by using \\n instead of . as an end of generation stop word.\n\n## Changing the end of generation token\n\nSo we gave it a try! We investigated using \\n as the end of generation token on the available results. We split the generated answer on the first \\n it contained, if one was present, and recomputed the scores. Note that this is only an approximation of the correct result, as it won't fix answers that were cut too early on . (for example floating point answers) - but it also won’t give unfair advantage to any model, as all of them were affected by this problem. However it’s the best we could do without rerunning models (as we wanted to keep the community posted as soon as possible).\n\nThe results we got were the following - splitting on \\n correlates really well with other scores and therefore with overall performance.\n\nWe can see in orange that the scores computed on the new strings correlate much better with the average performance.\n\n## So what's next?\n\nA quick calculation shows that re-running the full evaluation of all models would be quite costly (the full update took 8 years of GPU time, and a lot of it was taken by DROP), we estimated how much it would cost to only re-run failing examples.\n\nIn 10% of the cases, the gold answer is a floating number (for example 12.25) and model predictions start with the correct beginning (for our example, 12) but are cut off on a . - these predictions likely would have actually been correct if the generation was to continue. We would definitely need to re-run them! Our estimation does not count generated sentences that finish with a number which was possibly interrupted (40% of the other generations), nor any prediction messed up by its normalization.\n\nTo get correct results, we would thus need to re-run more than 50% of the examples, a huge amount of GPU time! We need to be certain that the implementation we'll run is correct this time.\n\nAfter discussing it with the fantastic EleutherAI team (both on GitHub and internally), who guided us through the code and helped our investigations, it became very clear that the LM Eval Harness implementation follows the \"official DROP\" code very strictly: a new version of this benchmark’s evaluation thus needs to be developed! We have therefore taken the decision to remove DROP from the Open LLM Leaderboard until a new version arises.\n\nOne take away of this investiguation is the value in having the many eyes of the community collaboratively investiguate a benchmark in order to detect errors that were previously missed. Here again the power of open-source, community and developping in the open-shines in that it allows to transparently investigate the root cause of an issue on a benchmark which has been out there for a couple of years.\n\nWe hope that interested members of the community will join forces with academics working on DROP evaluation to fix both its scoring and its normalization. We'd love it becomes usable again, as the dataset itself is really quite interesting and cool. We encourage you to provide feedback on how we should evaluate DROP on this issue.\n\nThanks to the many community members who pointed out issues on DROP scores, and many thanks to the EleutherAI Harness and Zeno teams for their great help on this issue.",
   "summaryZh": "Hugging Face团队对Open LLM Leaderboard中新引入的DROP基准测试进行了深入探讨。他们发现大多数模型在此项离散推理任务上的f1分数低于预期，深入分析了其中的归一化及评估机制，揭示了评测结果与模型真实性能之间的潜在偏差。",
   "summaryGeneratedAt": "2026-09-05T20:34:39.392870Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_example.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_example.png",
+      "alt": "",
+      "id": "image_935ebf24d8317c38"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_bimodal.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_bimodal.png",
+      "alt": "",
+      "id": "image_7cafbc7d72ebfbde"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_partial_fix.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/open-llm-leaderboard/drop/drop_partial_fix.png",
+      "alt": "",
+      "id": "image_93100da4f0fef96e"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Recently, three new benchmarks were added to the Open LLM Leaderboard: Winogrande, GSM8k and DROP, using the original implementations reproduced in the EleutherAI Harness. A cursory look at the scores for DROP revealed something strange was going on, with the overwhelming majority of models scoring less than 10 out of 100 on their f1-score! We did a deep dive to understand what was going on, come with us to see what we found out!",
+      "spans": [
+        {
+          "start": 10,
+          "end": 30,
+          "kind": "a",
+          "href": "https://twitter.com/clefourrier/status/1722555555338956840"
+        },
+        {
+          "start": 49,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard"
+        },
+        {
+          "start": 152,
+          "end": 170,
+          "kind": "a",
+          "href": "https://github.com/EleutherAI/lm-evaluation-harness/"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Initial observations",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "DROP (Discrete Reasoning Over Paragraphs) is an evaluation where models must extract relevant information from English-text paragraphs before executing discrete reasoning steps on them (for example, sorting or counting items to arrive at the correct answer, see the table below for examples). The metrics used are custom f1 and exact match scores.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Examples of reasoning and paragraph from the original article.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "We added it to the Open LLM Leaderboard three weeks ago, and observed that the f1-scores of pretrained models followed an unexpected trend: when we plotted DROP scores against the leaderboard original average (of ARC, HellaSwag, TruthfulQA and MMLU), which is a reasonable proxy for overall model performance, we expected DROP scores to be correlated with it (with better models having better performance). However, this was only the case for a small number of models, and all the others had a very low DROP f1-score, below 10.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Two trends can be observed in the DROP scores: some follow the average (in diagonal), others are stuck around 5 (vertical line on the right of the graph).",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Normalization interrogations",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "During our first deeper dive in these surprising behavior, we observed that the normalization step was possibly not working as intended: in some cases, this normalization ignored the correct numerical answers when they were directly followed by a whitespace character other than a space (a line return, for example). Let's look at an example, with the generation being 10\\n\\nPassage: The 2011 census recorded a population of 1,001,360, and the gold answer being 10.",
+      "spans": [
+        {
+          "start": 369,
+          "end": 434,
+          "kind": "code"
+        },
+        {
+          "start": 462,
+          "end": 464,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Normalization happens in several steps, both for generation and gold:",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Split on separators |, -, or The beginning sequence of the generation 10\\n\\nPassage: contain no such separator, and is therefore considered a single entity after this step.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 20,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 23,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 84,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Punctuation removal The first token then becomes 10\\n\\nPassage (: is removed)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 49,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Homogenization of numbers Every string that can be cast to float is considered a number and cast to float, then re-converted to string. 10\\n\\nPassage stays the same, as it cannot be cast to float, whereas the gold 10 becomes 10.0.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        },
+        {
+          "start": 136,
+          "end": 149,
+          "kind": "code"
+        },
+        {
+          "start": 214,
+          "end": 216,
+          "kind": "code"
+        },
+        {
+          "start": 225,
+          "end": 229,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Other steps A lot of other normalization steps ensue (removing articles, removing other whitespaces, etc.) and our original example becomes 10 passage 2011.0 census recorded population of 1001360.0.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        },
+        {
+          "start": 140,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "However, the overall score is not computed on the string, but on the bag of words (BOW) extracted from the string, here {'recorded', 'population', 'passage', 'census', '2011.0', '1001360.0', '10'}, which is compared with the BOW of the gold, also normalized in the above manner, {10.0}. As you can see, they don’t intersect, even though the model predicted the correct output!",
+      "spans": [
+        {
+          "start": 120,
+          "end": 196,
+          "kind": "code"
+        },
+        {
+          "start": 279,
+          "end": 285,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "In summary, if a number is followed by any kind of whitespace other than a simple space, it will not pass through the number normalization, hence never match the gold if it is also a number! This first issue was likely to mess up the scores quite a bit, but clearly it was not the only factor causing DROP scores to be so low. We decided to investigate a bit more.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Diving into the results",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Extending our investigations, our friends at Zeno joined us and undertook a much more thorough exploration of the results, looking at 5 models which were representative of the problems we noticed in DROP scores: falcon-180B and mistral-7B were underperforming compared to what we were expecting, Yi-34B and tigerbot-70B had a very good performance on DROP correlated with their average scores, and facebook/xglm-7.5B fell in the middle.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 49,
+          "kind": "a",
+          "href": "https://zenoml.com"
+        },
+        {
+          "start": 64,
+          "end": 106,
+          "kind": "a",
+          "href": "https://hub.zenoml.com/report/1255/DROP%20Benchmark%20Exploration"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "You can give analyzing the results a try in the Zeno project here if you want to!",
+      "spans": [
+        {
+          "start": 41,
+          "end": 65,
+          "kind": "a",
+          "href": "https://hub.zenoml.com/project/2f5dec90-df5e-4e3e-a4d1-37faf814c5ae/OpenLLM%20Leaderboard%20DROP%20Comparison/explore?params=eyJtb2RlbCI6ImZhY2Vib29rX194Z2xtLTcuNUIiLCJtZXRyaWMiOnsiaWQiOjk1NjUsIm5hbWUiOiJmMSIsInR5cGUiOiJtZWFuIiwiY29sdW1ucyI6WyJmMSJdfSwiY29tcGFyaXNvbk1vZGVsIjoiVGlnZXJSZXNlYXJjaF9fdGlnZXJib3QtNzBiLWNoYXQiLCJjb21wYXJpc29uQ29sdW1uIjp7ImlkIjoiYzJmNTY1Y2EtYjJjZC00MDkwLWIwYzctYTNiNTNkZmViM2RiIiwibmFtZSI6ImVtIiwiY29sdW1uVHlwZSI6IkZFQVRVUkUiLCJkYXRhVHlwZSI6IkNPTlRJTlVPVVMiLCJtb2RlbCI6ImZhY2Vib29rX194Z2xtLTcuNUIifSwiY29tcGFyZVNvcnQiOltudWxsLHRydWVdLCJtZXRyaWNSYW5nZSI6W251bGwsbnVsbF0sInNlbGVjdGlvbnMiOnsic2xpY2VzIjpbXSwibWV0YWRhdGEiOnt9LCJ0YWdzIjpbXX19"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "The Zeno team found two even more concerning features:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Not a single model got a correct result on floating point answers",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "High quality models which generate long answers actually have a lower f1-score",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "At this point, we believed that both failure cases were actually caused by the same root factor: using . as a stopword token (to end the generations):",
+      "spans": [
+        {
+          "start": 103,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Floating point answers are systematically interrupted before their generation is complete",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Higher quality models, which try to match the few-shot prompt format, will generate Answer\\n\\nPlausible prompt for the next question., and only stop during the plausible prompt continuation after the actual answer on the first ., therefore generating too many words and getting a bad f1 score.",
+      "spans": [
+        {
+          "start": 84,
+          "end": 133,
+          "kind": "code"
+        },
+        {
+          "start": 227,
+          "end": 228,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "We hypothesized that both these problems could be fixed by using \\n instead of . as an end of generation stop word.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 80,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Changing the end of generation token",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "So we gave it a try! We investigated using \\n as the end of generation token on the available results. We split the generated answer on the first \\n it contained, if one was present, and recomputed the scores. Note that this is only an approximation of the correct result, as it won't fix answers that were cut too early on . (for example floating point answers) - but it also won’t give unfair advantage to any model, as all of them were affected by this problem. However it’s the best we could do without rerunning models (as we wanted to keep the community posted as soon as possible).",
+      "spans": [
+        {
+          "start": 43,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 146,
+          "end": 148,
+          "kind": "code"
+        },
+        {
+          "start": 324,
+          "end": 325,
+          "kind": "code"
+        },
+        {
+          "start": 210,
+          "end": 588,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "The results we got were the following - splitting on \\n correlates really well with other scores and therefore with overall performance.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 55,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "We can see in orange that the scores computed on the new strings correlate much better with the average performance.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "So what's next?",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "A quick calculation shows that re-running the full evaluation of all models would be quite costly (the full update took 8 years of GPU time, and a lot of it was taken by DROP), we estimated how much it would cost to only re-run failing examples.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "In 10% of the cases, the gold answer is a floating number (for example 12.25) and model predictions start with the correct beginning (for our example, 12) but are cut off on a . - these predictions likely would have actually been correct if the generation was to continue. We would definitely need to re-run them! Our estimation does not count generated sentences that finish with a number which was possibly interrupted (40% of the other generations), nor any prediction messed up by its normalization.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 151,
+          "end": 153,
+          "kind": "code"
+        },
+        {
+          "start": 176,
+          "end": 177,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "To get correct results, we would thus need to re-run more than 50% of the examples, a huge amount of GPU time! We need to be certain that the implementation we'll run is correct this time.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "After discussing it with the fantastic EleutherAI team (both on GitHub and internally), who guided us through the code and helped our investigations, it became very clear that the LM Eval Harness implementation follows the \"official DROP\" code very strictly: a new version of this benchmark’s evaluation thus needs to be developed! We have therefore taken the decision to remove DROP from the Open LLM Leaderboard until a new version arises.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 70,
+          "kind": "a",
+          "href": "https://github.com/EleutherAI/lm-evaluation-harness/issues/978"
+        },
+        {
+          "start": 332,
+          "end": 441,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "One take away of this investiguation is the value in having the many eyes of the community collaboratively investiguate a benchmark in order to detect errors that were previously missed. Here again the power of open-source, community and developping in the open-shines in that it allows to transparently investigate the root cause of an issue on a benchmark which has been out there for a couple of years.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "We hope that interested members of the community will join forces with academics working on DROP evaluation to fix both its scoring and its normalization. We'd love it becomes usable again, as the dataset itself is really quite interesting and cool. We encourage you to provide feedback on how we should evaluate DROP on this issue.",
+      "spans": [
+        {
+          "start": 318,
+          "end": 331,
+          "kind": "a",
+          "href": "https://github.com/EleutherAI/lm-evaluation-harness/issues/1050"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Thanks to the many community members who pointed out issues on DROP scores, and many thanks to the EleutherAI Harness and Zeno teams for their great help on this issue.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "9b117d860b1288457de75be36daf34240e783f14600e6b11ef6177ea90ccde55",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "9b117d860b1288457de75be36daf34240e783f14600e6b11ef6177ea90ccde55",
+  "mediaLayout": [
+    {
+      "mediaId": "image_935ebf24d8317c38",
+      "type": "image",
+      "afterBlockId": "b0003",
+      "order": 0
+    },
+    {
+      "mediaId": "image_7cafbc7d72ebfbde",
+      "type": "image",
+      "afterBlockId": "b0005",
+      "order": 1
+    },
+    {
+      "mediaId": "image_93100da4f0fef96e",
+      "type": "image",
+      "afterBlockId": "b0028",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T10:09:37.927161Z",
+  "mediaLayoutCheckedAt": "2026-10-04T10:09:37.927171Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

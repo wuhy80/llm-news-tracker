@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/tf-serving-vision",
   "resolvedUrl": "https://huggingface.co/blog/tf-serving-vision",
   "fetchedAt": "2026-08-27T03:10:37.421769Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "In the past few months, the Hugging Face team and external contributors added a variety of vision models in TensorFlow to Transformers. This list is growing comprehensively and already includes state-of-the-art pre-trained models like Vision Transformer, Masked Autoencoders, RegNet, ConvNeXt, and many others!\n\nWhen it comes to deploying TensorFlow models, you have got a variety of options. Depending on your use case, you may want to expose your model as an endpoint or package it in an application itself. TensorFlow provides tools that cater to each of these different scenarios.\n\nIn this post, you'll see how to deploy a Vision Transformer (ViT) model (for image classification) locally using TensorFlow Serving (TF Serving). This will allow developers to expose the model either as a REST or gRPC endpoint. Moreover, TF Serving supports many deployment-specific features off-the-shelf such as model warmup, server-side batching, etc.\n\nTo get the complete working code shown throughout this post, refer to the Colab Notebook shown at the beginning.\n\n## Saving the Model\n\nAll TensorFlow models in 🤗 Transformers have a method named save_pretrained(). With it, you can serialize the model weights in the h5 format as well as in the standalone SavedModel format. TF Serving needs a model to be present in the SavedModel format. So, let's first load a Vision Transformer model and save it:\n\n```\nfrom transformers import TFViTForImageClassification\n\ntemp_model_dir = \"vit\"\nckpt = \"google/vit-base-patch16-224\"\n\nmodel = TFViTForImageClassification.from_pretrained(ckpt)\nmodel.save_pretrained(temp_model_dir, saved_model=True)\n```\n\nBy default, save_pretrained() will first create a version directory inside the path we provide to it. So, the path ultimately becomes: {temp_model_dir}/saved_model/{version}.\n\nWe can inspect the serving signature of the SavedModel like so:\n\n```\nsaved_model_cli show --dir {temp_model_dir}/saved_model/1 --tag_set serve --signature_def serving_default\n```\n\nThis should output:\n\n```\nThe given SavedModel SignatureDef contains the following input(s):\n  inputs['pixel_values'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1, -1, -1, -1)\n      name: serving_default_pixel_values:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['logits'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1, 1000)\n      name: StatefulPartitionedCall:0\nMethod name is: tensorflow/serving/predict\n```\n\nAs can be noticed the model accepts single 4-d inputs (namely pixel_values) which has the following axes: (batch_size, num_channels, height, width). For this model, the acceptable height and width are set to 224, and the number of channels is 3. You can verify this by inspecting the config argument of the model (model.config). The model yields a 1000-d vector of logits.\n\n## Model Surgery\n\nUsually, every ML model has certain preprocessing and postprocessing steps. The ViT model is no exception to this. The major preprocessing steps include:\n\nScaling the image pixel values to [0, 1] range.\n\nNormalizing the scaled pixel values to [-1, 1].\n\nResizing the image so that it has a spatial resolution of (224, 224).\n\nYou can confirm these by investigating the image processor associated with the model:\n\n```\nfrom transformers import AutoImageProcessor\n\nprocessor = AutoImageProcessor.from_pretrained(ckpt)\nprint(processor)\n```\n\nThis should print:\n\n```\nViTImageProcessor {\n  \"do_normalize\": true,\n  \"do_resize\": true,\n  \"image_mean\": [\n    0.5,\n    0.5,\n    0.5\n  ],\n  \"image_std\": [\n    0.5,\n    0.5,\n    0.5\n  ],\n  \"resample\": 2,\n  \"size\": 224\n}\n```\n\nSince this is an image classification model pre-trained on the ImageNet-1k dataset, the model outputs need to be mapped to the ImageNet-1k classes as the post-processing step.\n\nTo reduce the developers' cognitive load and training-serving skew, it's often a good idea to ship a model that has most of the preprocessing and postprocessing steps in built. Therefore, you should serialize the model as a SavedModel such that the above-mentioned processing ops get embedded into its computation graph.\n\n### Preprocessing\n\nFor preprocessing, image normalization is one of the most essential components:\n\n```\ndef normalize_img(\n    img, mean=processor.image_mean, std=processor.image_std\n):\n    # Scale to the value range of [0, 1] first and then normalize.\n    img = img / 255\n    mean = tf.constant(mean)\n    std = tf.constant(std)\n    return (img - mean) / std\n```\n\nYou also need to resize the image and transpose it so that it has leading channel dimensions since following the standard format of 🤗 Transformers. The below code snippet shows all the preprocessing steps:\n\n```\nCONCRETE_INPUT = \"pixel_values\" # Which is what we investigated via the SavedModel CLI.\nSIZE = processor.size[\"height\"]\n\n\ndef normalize_img(\n    img, mean=processor.image_mean, std=processor.image_std\n):\n    # Scale to the value range of [0, 1] first and then normalize.\n    img = img / 255\n    mean = tf.constant(mean)\n    std = tf.constant(std)\n    return (img - mean) / std\n\n\ndef preprocess(string_input):\n    decoded_input = tf.io.decode_base64(string_input)\n    decoded = tf.io.decode_jpeg(decoded_input, channels=3)\n    resized = tf.image.resize(decoded, size=(SIZE, SIZE))\n    normalized = normalize_img(resized)\n    normalized = tf.transpose(\n        normalized, (2, 0, 1)\n    )  # Since HF models are channel-first.\n    return normalized\n\n\n@tf.function(input_signature=[tf.TensorSpec([None], tf.string)])\ndef preprocess_fn(string_input):\n    decoded_images = tf.map_fn(\n        preprocess, string_input, dtype=tf.float32, back_prop=False\n    )\n    return {CONCRETE_INPUT: decoded_images}\n```\n\nNote on making the model accept string inputs:\n\nWhen dealing with images via REST or gRPC requests the size of the request payload can easily spiral up depending on the resolution of the images being passed. This is why it is a good practice to compress them reliably and then prepare the request payload.\n\n### Postprocessing and Model Export\n\nYou're now equipped with the preprocessing operations that you can inject into the model's existing computation graph. In this section, you'll also inject the post-processing operations into the graph and export the model!\n\n```\ndef model_exporter(model: tf.keras.Model):\n    m_call = tf.function(model.call).get_concrete_function(\n        tf.TensorSpec(\n            shape=[None, 3, SIZE, SIZE], dtype=tf.float32, name=CONCRETE_INPUT\n        )\n    )\n\n    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])\n    def serving_fn(string_input):\n        labels = tf.constant(list(model.config.id2label.values()), dtype=tf.string)\n        \n        images = preprocess_fn(string_input)\n        predictions = m_call(**images)\n        \n        indices = tf.argmax(predictions.logits, axis=1)\n        pred_source = tf.gather(params=labels, indices=indices)\n        probs = tf.nn.softmax(predictions.logits, axis=1)\n        pred_confidence = tf.reduce_max(probs, axis=1)\n        return {\"label\": pred_source, \"confidence\": pred_confidence}\n\n    return serving_fn\n```\n\nYou can first derive the concrete function from the model's forward pass method (call()) so the model is nicely compiled into a graph. After that, you can apply the following steps in order:\n\nPass the inputs through the preprocessing operations.\n\nPass the preprocessing inputs through the derived concrete function.\n\nPost-process the outputs and return them in a nicely formatted dictionary.\n\nNow it's time to export the model!\n\n```\nMODEL_DIR = tempfile.gettempdir()\nVERSION = 1\n\ntf.saved_model.save(\n    model,\n    os.path.join(MODEL_DIR, str(VERSION)),\n    signatures={\"serving_default\": model_exporter(model)},\n)\nos.environ[\"MODEL_DIR\"] = MODEL_DIR\n```\n\nAfter exporting, let's inspect the model signatures again:\n\n```\nsaved_model_cli show --dir {MODEL_DIR}/1 --tag_set serve --signature_def serving_default\n```\n\n```\nThe given SavedModel SignatureDef contains the following input(s):\n  inputs['string_input'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: serving_default_string_input:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['confidence'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1)\n      name: StatefulPartitionedCall:0\n  outputs['label'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: StatefulPartitionedCall:1\nMethod name is: tensorflow/serving/predict\n```\n\nYou can notice that the model's signature has now changed. Specifically, the input type is now a string and the model returns two things: a confidence score and the string label.\n\nProvided you've already installed TF Serving (covered in the Colab Notebook), you're now ready to deploy this model!\n\n## Deployment with TensorFlow Serving\n\nIt just takes a single command to do this:\n\n```\nnohup tensorflow_model_server \\\n  --rest_api_port=8501 \\\n  --model_name=vit \\\n  --model_base_path=$MODEL_DIR >server.log 2>&1\n```\n\nFrom the above command, the important parameters are:\n\nrest_api_port denotes the port number that TF Serving will use deploying the REST endpoint of your model. By default, TF Serving uses the 8500 port for the gRPC endpoint.\n\nmodel_name specifies the model name (can be anything) that will used for calling the APIs.\n\nmodel_base_path denotes the base model path that TF Serving will use to load the latest version of the model.\n\n(The complete list of supported parameters is here.)\n\nAnd voila! Within minutes, you should be up and running with a deployed model having two endpoints - REST and gRPC.\n\n## Querying the REST Endpoint\n\nRecall that you exported the model such that it accepts string inputs encoded with the base64 format. So, to craft the request payload you can do something like this:\n\n```\n# Get image of a cute cat.\nimage_path = tf.keras.utils.get_file(\n    \"image.jpg\", \"http://images.cocodataset.org/val2017/000000039769.jpg\"\n)\n\n# Read the image from disk as raw bytes and then encode it. \nbytes_inputs = tf.io.read_file(image_path)\nb64str = base64.urlsafe_b64encode(bytes_inputs.numpy()).decode(\"utf-8\")\n\n\n# Create the request payload.\ndata = json.dumps({\"signature_name\": \"serving_default\", \"instances\": [b64str]})\n```\n\nTF Serving's request payload format specification for the REST endpoint is available here. Within the instances you can pass multiple encoded images. This kind of endpoints are meant to be consumed for online prediction scenarios. For inputs having more than a single data point, you would to want to enable batching to get performance optimization benefits.\n\nNow you can call the API:\n\n```\nheaders = {\"content-type\": \"application/json\"}\njson_response = requests.post(\n    \"http://localhost:8501/v1/models/vit:predict\", data=data, headers=headers\n)\nprint(json.loads(json_response.text))\n# {'predictions': [{'label': 'Egyptian cat', 'confidence': 0.896659195}]}\n```\n\nThe REST API is - http://localhost:8501/v1/models/vit:predict following the specification from here. By default, this always picks up the latest version of the model. But if you wanted a specific version you can do: http://localhost:8501/v1/models/vit/versions/1:predict.\n\n## Querying the gRPC Endpoint\n\nWhile REST is quite popular in the API world, many applications often benefit from gRPC. This post does a good job comparing the two ways of deployment. gRPC is usually preferred for low-latency, highly scalable, and distributed systems.\n\nThere are a couple of steps are. First, you need to open a communication channel:\n\n```\nimport grpc\nfrom tensorflow_serving.apis import predict_pb2\nfrom tensorflow_serving.apis import prediction_service_pb2_grpc\n\n\nchannel = grpc.insecure_channel(\"localhost:8500\")\nstub = prediction_service_pb2_grpc.PredictionServiceStub(channel)\n```\n\nThen, create the request payload:\n\n```\nrequest = predict_pb2.PredictRequest()\nrequest.model_spec.name = \"vit\"\nrequest.model_spec.signature_name = \"serving_default\"\nrequest.inputs[serving_input].CopyFrom(tf.make_tensor_proto([b64str]))\n```\n\nYou can determine the serving_input key programmatically like so:\n\n```\nloaded = tf.saved_model.load(f\"{MODEL_DIR}/{VERSION}\")\nserving_input = list(\n    loaded.signatures[\"serving_default\"].structured_input_signature[1].keys()\n)[0]\nprint(\"Serving function input:\", serving_input)\n# Serving function input: string_input\n```\n\nNow, you can get some predictions:\n\n```\ngrpc_predictions = stub.Predict(request, 10.0)  # 10 secs timeout\nprint(grpc_predictions)\n```\n\n```\noutputs {\n  key: \"confidence\"\n  value {\n    dtype: DT_FLOAT\n    tensor_shape {\n      dim {\n        size: 1\n      }\n    }\n    float_val: 0.8966591954231262\n  }\n}\noutputs {\n  key: \"label\"\n  value {\n    dtype: DT_STRING\n    tensor_shape {\n      dim {\n        size: 1\n      }\n    }\n    string_val: \"Egyptian cat\"\n  }\n}\nmodel_spec {\n  name: \"resnet\"\n  version {\n    value: 1\n  }\n  signature_name: \"serving_default\"\n}\n```\n\nYou can also fetch the key-values of our interest from the above results like so:\n\n```\ngrpc_predictions.outputs[\"label\"].string_val, grpc_predictions.outputs[\n    \"confidence\"\n].float_val\n# ([b'Egyptian cat'], [0.8966591954231262])\n```\n\n## Wrapping Up\n\nIn this post, we learned how to deploy a TensorFlow vision model from Transformers with TF Serving. While local deployments are great for weekend projects, we would want to be able to scale these deployments to serve many users. In the next series of posts, you'll see how to scale up these deployments with Kubernetes and Vertex AI.\n\n## Additional References\n\ngRPC\n\nPractical Machine Learning for Computer Vision\n\nFaster TensorFlow models in Hugging Face Transformers",
   "summaryZh": "介绍如何使用TF Serving在Hugging Face中部署TensorFlow视觉模型。",
   "summaryGeneratedAt": "2026-09-06T03:12:01.454224Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,631 @@
     "summaryZh": "介绍如何使用TF Serving在Hugging Face中部署TensorFlow视觉模型。",
     "glossary": [],
     "duplicateKey": "deploying-tensorflow-vision-models"
-  }
+  },
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In the past few months, the Hugging Face team and external contributors added a variety of vision models in TensorFlow to Transformers. This list is growing comprehensively and already includes state-of-the-art pre-trained models like Vision Transformer, Masked Autoencoders, RegNet, ConvNeXt, and many others!",
+      "spans": [
+        {
+          "start": 235,
+          "end": 253,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/vit"
+        },
+        {
+          "start": 255,
+          "end": 274,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/vit_mae"
+        },
+        {
+          "start": 276,
+          "end": 282,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/regnet"
+        },
+        {
+          "start": 284,
+          "end": 292,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/convnext"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "When it comes to deploying TensorFlow models, you have got a variety of options. Depending on your use case, you may want to expose your model as an endpoint or package it in an application itself. TensorFlow provides tools that cater to each of these different scenarios.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In this post, you'll see how to deploy a Vision Transformer (ViT) model (for image classification) locally using TensorFlow Serving (TF Serving). This will allow developers to expose the model either as a REST or gRPC endpoint. Moreover, TF Serving supports many deployment-specific features off-the-shelf such as model warmup, server-side batching, etc.",
+      "spans": [
+        {
+          "start": 113,
+          "end": 131,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/tfx/tutorials/serving/rest_simple"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "To get the complete working code shown throughout this post, refer to the Colab Notebook shown at the beginning.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Saving the Model",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "All TensorFlow models in 🤗 Transformers have a method named save_pretrained(). With it, you can serialize the model weights in the h5 format as well as in the standalone SavedModel format. TF Serving needs a model to be present in the SavedModel format. So, let's first load a Vision Transformer model and save it:",
+      "spans": [
+        {
+          "start": 60,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 187,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/guide/saved_model"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "By default, save_pretrained() will first create a version directory inside the path we provide to it. So, the path ultimately becomes: {temp_model_dir}/saved_model/{version}.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 135,
+          "end": 173,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "We can inspect the serving signature of the SavedModel like so:",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "This should output:",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "As can be noticed the model accepts single 4-d inputs (namely pixel_values) which has the following axes: (batch_size, num_channels, height, width). For this model, the acceptable height and width are set to 224, and the number of channels is 3. You can verify this by inspecting the config argument of the model (model.config). The model yields a 1000-d vector of logits.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 74,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 147,
+          "kind": "code"
+        },
+        {
+          "start": 314,
+          "end": 326,
+          "kind": "code"
+        },
+        {
+          "start": 365,
+          "end": 371,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Model Surgery",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Usually, every ML model has certain preprocessing and postprocessing steps. The ViT model is no exception to this. The major preprocessing steps include:",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Scaling the image pixel values to [0, 1] range.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Normalizing the scaled pixel values to [-1, 1].",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Resizing the image so that it has a spatial resolution of (224, 224).",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "You can confirm these by investigating the image processor associated with the model:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "This should print:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Since this is an image classification model pre-trained on the ImageNet-1k dataset, the model outputs need to be mapped to the ImageNet-1k classes as the post-processing step.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 82,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/imagenet-1k"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "To reduce the developers' cognitive load and training-serving skew, it's often a good idea to ship a model that has most of the preprocessing and postprocessing steps in built. Therefore, you should serialize the model as a SavedModel such that the above-mentioned processing ops get embedded into its computation graph.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Preprocessing",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "For preprocessing, image normalization is one of the most essential components:",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "You also need to resize the image and transpose it so that it has leading channel dimensions since following the standard format of 🤗 Transformers. The below code snippet shows all the preprocessing steps:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Note on making the model accept string inputs:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "When dealing with images via REST or gRPC requests the size of the request payload can easily spiral up depending on the resolution of the images being passed. This is why it is a good practice to compress them reliably and then prepare the request payload.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Postprocessing and Model Export",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "You're now equipped with the preprocessing operations that you can inject into the model's existing computation graph. In this section, you'll also inject the post-processing operations into the graph and export the model!",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "You can first derive the concrete function from the model's forward pass method (call()) so the model is nicely compiled into a graph. After that, you can apply the following steps in order:",
+      "spans": [
+        {
+          "start": 25,
+          "end": 42,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/guide/function"
+        },
+        {
+          "start": 81,
+          "end": 87,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Pass the inputs through the preprocessing operations.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Pass the preprocessing inputs through the derived concrete function.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Post-process the outputs and return them in a nicely formatted dictionary.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Now it's time to export the model!",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "After exporting, let's inspect the model signatures again:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "You can notice that the model's signature has now changed. Specifically, the input type is now a string and the model returns two things: a confidence score and the string label.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Provided you've already installed TF Serving (covered in the Colab Notebook), you're now ready to deploy this model!",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Deployment with TensorFlow Serving",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "It just takes a single command to do this:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "From the above command, the important parameters are:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "rest_api_port denotes the port number that TF Serving will use deploying the REST endpoint of your model. By default, TF Serving uses the 8500 port for the gRPC endpoint.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "model_name specifies the model name (can be anything) that will used for calling the APIs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "model_base_path denotes the base model path that TF Serving will use to load the latest version of the model.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "(The complete list of supported parameters is here.)",
+      "spans": [
+        {
+          "start": 46,
+          "end": 50,
+          "kind": "a",
+          "href": "https://github.com/tensorflow/serving/blob/master/tensorflow_serving/model_servers/main.cc"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "And voila! Within minutes, you should be up and running with a deployed model having two endpoints - REST and gRPC.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Querying the REST Endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Recall that you exported the model such that it accepts string inputs encoded with the base64 format. So, to craft the request payload you can do something like this:",
+      "spans": [
+        {
+          "start": 87,
+          "end": 100,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Base64"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "TF Serving's request payload format specification for the REST endpoint is available here. Within the instances you can pass multiple encoded images. This kind of endpoints are meant to be consumed for online prediction scenarios. For inputs having more than a single data point, you would to want to enable batching to get performance optimization benefits.",
+      "spans": [
+        {
+          "start": 85,
+          "end": 89,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/tfx/serving/api_rest#request_format_2"
+        },
+        {
+          "start": 102,
+          "end": 111,
+          "kind": "code"
+        },
+        {
+          "start": 301,
+          "end": 316,
+          "kind": "a",
+          "href": "https://github.com/tensorflow/serving/blob/master/tensorflow_serving/batching/README.md"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Now you can call the API:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "The REST API is - http://localhost:8501/v1/models/vit:predict following the specification from here. By default, this always picks up the latest version of the model. But if you wanted a specific version you can do: http://localhost:8501/v1/models/vit/versions/1:predict.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 61,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 99,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/tfx/serving/api_rest#predict_api"
+        },
+        {
+          "start": 216,
+          "end": 270,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Querying the gRPC Endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "While REST is quite popular in the API world, many applications often benefit from gRPC. This post does a good job comparing the two ways of deployment. gRPC is usually preferred for low-latency, highly scalable, and distributed systems.",
+      "spans": [
+        {
+          "start": 89,
+          "end": 98,
+          "kind": "a",
+          "href": "https://blog.dreamfactory.com/grpc-vs-rest-how-does-grpc-compare-with-traditional-rest-apis/"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "There are a couple of steps are. First, you need to open a communication channel:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Then, create the request payload:",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "You can determine the serving_input key programmatically like so:",
+      "spans": [
+        {
+          "start": 22,
+          "end": 35,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Now, you can get some predictions:",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "You can also fetch the key-values of our interest from the above results like so:",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Wrapping Up",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "In this post, we learned how to deploy a TensorFlow vision model from Transformers with TF Serving. While local deployments are great for weekend projects, we would want to be able to scale these deployments to serve many users. In the next series of posts, you'll see how to scale up these deployments with Kubernetes and Vertex AI.",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "Additional References",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "gRPC",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://grpc.io/"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Practical Machine Learning for Computer Vision",
+      "spans": [
+        {
+          "start": 0,
+          "end": 46,
+          "kind": "a",
+          "href": "https://www.oreilly.com/library/view/practical-machine-learning/9781098102357/"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Faster TensorFlow models in Hugging Face Transformers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tf-serving"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "99a176f045a75efc1a2f357dd85f18c813e6511459d62e67f6121c184394699f",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from transformers import TFViTForImageClassification\n\ntemp_model_dir = \"vit\"\nckpt = \"google/vit-base-patch16-224\"\n\nmodel = TFViTForImageClassification.from_pretrained(ckpt)\nmodel.save_pretrained(temp_model_dir, saved_model=True)"
+    },
+    {
+      "id": "c0002",
+      "source": "saved_model_cli show --dir {temp_model_dir}/saved_model/1 --tag_set serve --signature_def serving_default"
+    },
+    {
+      "id": "c0003",
+      "source": "The given SavedModel SignatureDef contains the following input(s):\n  inputs['pixel_values'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1, -1, -1, -1)\n      name: serving_default_pixel_values:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['logits'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1, 1000)\n      name: StatefulPartitionedCall:0\nMethod name is: tensorflow/serving/predict"
+    },
+    {
+      "id": "c0004",
+      "source": "from transformers import AutoImageProcessor\n\nprocessor = AutoImageProcessor.from_pretrained(ckpt)\nprint(processor)"
+    },
+    {
+      "id": "c0005",
+      "source": "ViTImageProcessor {\n  \"do_normalize\": true,\n  \"do_resize\": true,\n  \"image_mean\": [\n    0.5,\n    0.5,\n    0.5\n  ],\n  \"image_std\": [\n    0.5,\n    0.5,\n    0.5\n  ],\n  \"resample\": 2,\n  \"size\": 224\n}"
+    },
+    {
+      "id": "c0006",
+      "source": "def normalize_img(\n    img, mean=processor.image_mean, std=processor.image_std\n):\n    # Scale to the value range of [0, 1] first and then normalize.\n    img = img / 255\n    mean = tf.constant(mean)\n    std = tf.constant(std)\n    return (img - mean) / std"
+    },
+    {
+      "id": "c0007",
+      "source": "CONCRETE_INPUT = \"pixel_values\" # Which is what we investigated via the SavedModel CLI.\nSIZE = processor.size[\"height\"]\n\n\ndef normalize_img(\n    img, mean=processor.image_mean, std=processor.image_std\n):\n    # Scale to the value range of [0, 1] first and then normalize.\n    img = img / 255\n    mean = tf.constant(mean)\n    std = tf.constant(std)\n    return (img - mean) / std\n\n\ndef preprocess(string_input):\n    decoded_input = tf.io.decode_base64(string_input)\n    decoded = tf.io.decode_jpeg(decoded_input, channels=3)\n    resized = tf.image.resize(decoded, size=(SIZE, SIZE))\n    normalized = normalize_img(resized)\n    normalized = tf.transpose(\n        normalized, (2, 0, 1)\n    )  # Since HF models are channel-first.\n    return normalized\n\n\n@tf.function(input_signature=[tf.TensorSpec([None], tf.string)])\ndef preprocess_fn(string_input):\n    decoded_images = tf.map_fn(\n        preprocess, string_input, dtype=tf.float32, back_prop=False\n    )\n    return {CONCRETE_INPUT: decoded_images}"
+    },
+    {
+      "id": "c0008",
+      "source": "def model_exporter(model: tf.keras.Model):\n    m_call = tf.function(model.call).get_concrete_function(\n        tf.TensorSpec(\n            shape=[None, 3, SIZE, SIZE], dtype=tf.float32, name=CONCRETE_INPUT\n        )\n    )\n\n    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])\n    def serving_fn(string_input):\n        labels = tf.constant(list(model.config.id2label.values()), dtype=tf.string)\n        \n        images = preprocess_fn(string_input)\n        predictions = m_call(**images)\n        \n        indices = tf.argmax(predictions.logits, axis=1)\n        pred_source = tf.gather(params=labels, indices=indices)\n        probs = tf.nn.softmax(predictions.logits, axis=1)\n        pred_confidence = tf.reduce_max(probs, axis=1)\n        return {\"label\": pred_source, \"confidence\": pred_confidence}\n\n    return serving_fn"
+    },
+    {
+      "id": "c0009",
+      "source": "MODEL_DIR = tempfile.gettempdir()\nVERSION = 1\n\ntf.saved_model.save(\n    model,\n    os.path.join(MODEL_DIR, str(VERSION)),\n    signatures={\"serving_default\": model_exporter(model)},\n)\nos.environ[\"MODEL_DIR\"] = MODEL_DIR"
+    },
+    {
+      "id": "c0010",
+      "source": "saved_model_cli show --dir {MODEL_DIR}/1 --tag_set serve --signature_def serving_default"
+    },
+    {
+      "id": "c0011",
+      "source": "The given SavedModel SignatureDef contains the following input(s):\n  inputs['string_input'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: serving_default_string_input:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['confidence'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1)\n      name: StatefulPartitionedCall:0\n  outputs['label'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: StatefulPartitionedCall:1\nMethod name is: tensorflow/serving/predict"
+    },
+    {
+      "id": "c0012",
+      "source": "nohup tensorflow_model_server \\\n  --rest_api_port=8501 \\\n  --model_name=vit \\\n  --model_base_path=$MODEL_DIR >server.log 2>&1"
+    },
+    {
+      "id": "c0013",
+      "source": "# Get image of a cute cat.\nimage_path = tf.keras.utils.get_file(\n    \"image.jpg\", \"http://images.cocodataset.org/val2017/000000039769.jpg\"\n)\n\n# Read the image from disk as raw bytes and then encode it. \nbytes_inputs = tf.io.read_file(image_path)\nb64str = base64.urlsafe_b64encode(bytes_inputs.numpy()).decode(\"utf-8\")\n\n\n# Create the request payload.\ndata = json.dumps({\"signature_name\": \"serving_default\", \"instances\": [b64str]})"
+    },
+    {
+      "id": "c0014",
+      "source": "headers = {\"content-type\": \"application/json\"}\njson_response = requests.post(\n    \"http://localhost:8501/v1/models/vit:predict\", data=data, headers=headers\n)\nprint(json.loads(json_response.text))\n# {'predictions': [{'label': 'Egyptian cat', 'confidence': 0.896659195}]}"
+    },
+    {
+      "id": "c0015",
+      "source": "import grpc\nfrom tensorflow_serving.apis import predict_pb2\nfrom tensorflow_serving.apis import prediction_service_pb2_grpc\n\n\nchannel = grpc.insecure_channel(\"localhost:8500\")\nstub = prediction_service_pb2_grpc.PredictionServiceStub(channel)"
+    },
+    {
+      "id": "c0016",
+      "source": "request = predict_pb2.PredictRequest()\nrequest.model_spec.name = \"vit\"\nrequest.model_spec.signature_name = \"serving_default\"\nrequest.inputs[serving_input].CopyFrom(tf.make_tensor_proto([b64str]))"
+    },
+    {
+      "id": "c0017",
+      "source": "loaded = tf.saved_model.load(f\"{MODEL_DIR}/{VERSION}\")\nserving_input = list(\n    loaded.signatures[\"serving_default\"].structured_input_signature[1].keys()\n)[0]\nprint(\"Serving function input:\", serving_input)\n# Serving function input: string_input"
+    },
+    {
+      "id": "c0018",
+      "source": "grpc_predictions = stub.Predict(request, 10.0)  # 10 secs timeout\nprint(grpc_predictions)"
+    },
+    {
+      "id": "c0019",
+      "source": "outputs {\n  key: \"confidence\"\n  value {\n    dtype: DT_FLOAT\n    tensor_shape {\n      dim {\n        size: 1\n      }\n    }\n    float_val: 0.8966591954231262\n  }\n}\noutputs {\n  key: \"label\"\n  value {\n    dtype: DT_STRING\n    tensor_shape {\n      dim {\n        size: 1\n      }\n    }\n    string_val: \"Egyptian cat\"\n  }\n}\nmodel_spec {\n  name: \"resnet\"\n  version {\n    value: 1\n  }\n  signature_name: \"serving_default\"\n}"
+    },
+    {
+      "id": "c0020",
+      "source": "grpc_predictions.outputs[\"label\"].string_val, grpc_predictions.outputs[\n    \"confidence\"\n].float_val\n# ([b'Egyptian cat'], [0.8966591954231262])"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "99a176f045a75efc1a2f357dd85f18c813e6511459d62e67f6121c184394699f",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:43:12.438175Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:43:12.438192Z"
 }

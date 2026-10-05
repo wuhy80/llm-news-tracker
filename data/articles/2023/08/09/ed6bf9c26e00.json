@@ -18,11 +18,2060 @@
   "fetchedAt": "2026-09-05T07:37:44.352207Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Optimizing a Text-To-Speech model using 🤗 Transformers\n\nPublished August 9, 2023\n\nThis article is also available in Chinese 简体中文 .\n\n🤗 Transformers provides many of the latest state-of-the-art (SoTA) models across domains and tasks. To get the best performance from these models, they need to be optimized for inference speed and memory usage.\n\nThe 🤗 Hugging Face ecosystem offers precisely such ready & easy to use optimization tools that can be applied across the board to all the models in the library. This makes it easy to reduce memory footprint and improve inference with just a few extra lines of code.\n\nIn this hands-on tutorial, I'll demonstrate how you can optimize Bark , a Text-To-Speech (TTS) model supported by 🤗 Transformers, based on three simple optimizations. These optimizations rely solely on the Transformers , Optimum and Accelerate libraries from the 🤗 ecosystem.\n\nThis tutorial is also a demonstration of how one can benchmark a non-optimized model and its varying optimizations.\n\nFor a more streamlined version of the tutorial with fewer explanations but all the code, see the accompanying Google Colab .\n\nThis blog post is organized as follows:\n\n- A reminder of Bark architecture\n\n- An overview of different optimization techniques and their advantages\n\n- A presentation of benchmark results\n\nBark is a transformer-based text-to-speech model proposed by Suno AI in suno-ai/bark . It is capable of generating a wide range of audio outputs, including speech, music, background noise, and simple sound effects. Additionally, it can produce nonverbal communication sounds such as laughter, sighs, and sobs.\n\nBark has been available in 🤗 Transformers since v4.31.0 onwards!\n\nYou can play around with Bark and discover it's abilities here .\n\nBark is made of 4 main models:\n\n- BarkSemanticModel (also referred to as the 'text' model): a causal auto-regressive transformer model that takes as input tokenized text, and predicts semantic text tokens that capture the meaning of the text.\n\n- BarkCoarseModel (also referred to as the 'coarse acoustics' model): a causal autoregressive transformer, that takes as input the results of the BarkSemanticModel model. It aims at predicting the first two audio codebooks necessary for EnCodec.\n\n- BarkFineModel (the 'fine acoustics' model), this time a non-causal autoencoder transformer, which iteratively predicts the last codebooks based on the sum of the previous codebooks embeddings.\n\n- having predicted all the codebook channels from the EncodecModel , Bark uses it to decode the output audio array.\n\nAt the time of writing, two Bark checkpoints are available, a smaller and a larger version.\n\n### Load the Model and its Processor\n\nThe pre-trained Bark small and large checkpoints can be loaded from the pre-trained weights on the Hugging Face Hub. You can change the repo-id with the checkpoint size that you wish to use.\n\nWe'll default to the small checkpoint, to keep it fast. But you can try the large checkpoint by using \"suno/bark\" instead of \"suno/bark-small\" .\n\n```\nfrom transformers import BarkModel\n\nmodel = BarkModel.from_pretrained(\"suno/bark-small\")\n```\n\nPlace the model to an accelerator device to get the most of the optimization techniques:\n\n```\nimport torch\n\ndevice = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\nmodel = model.to(device)\n```\n\nLoad the processor, which will take care of tokenization and optional speaker embeddings.\n\n```\nfrom transformers import AutoProcessor\n\nprocessor = AutoProcessor.from_pretrained(\"suno/bark-small\")\n```\n\n## Optimization techniques\n\nIn this section, we'll explore how to use off-the-shelf features from the 🤗 Optimum and 🤗 Accelerate libraries to optimize the Bark model, with minimal changes to the code.\n\nLet's prepare the inputs and define a function to measure the latency and GPU memory footprint of the Bark generation method.\n\n```\ntext_prompt = \"Let's try generating speech, with Bark, a text-to-speech model\"\ninputs = processor(text_prompt).to(device)\n```\n\nMeasuring the latency and GPU memory footprint requires the use of specific CUDA methods. We define a utility function that measures both the latency and GPU memory footprint of the model at inference time. To ensure we get an accurate picture of these metrics, we average over a specified number of runs nb_loops :\n\n```\nimport torch\nfrom transformers import set_seed\n\n\ndef measure_latency_and_memory_use(model, inputs, nb_loops = 5):\n\n  # define Events that measure start and end of the generate pass\n  start_event = torch.cuda.Event(enable_timing=True)\n  end_event = torch.cuda.Event(enable_timing=True)\n\n  # reset cuda memory stats and empty cache\n  torch.cuda.reset_peak_memory_stats(device)\n  torch.cuda.empty_cache()\n  torch.cuda.synchronize()\n\n  # get the start time\n  start_event.record()\n\n  # actually generate\n  for _ in range(nb_loops):\n        # set seed for reproducibility\n        set_seed(0)\n        output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)\n\n  # get the end time\n  end_event.record()\n  torch.cuda.synchronize()\n\n  # measure memory footprint and elapsed time\n  max_memory = torch.cuda.max_memory_allocated(device)\n  elapsed_time = start_event.elapsed_time(end_event) * 1.0e-3\n\n  print('Execution time:', elapsed_time/nb_loops, 'seconds')\n  print('Max memory footprint', max_memory*1e-9, ' GB')\n\n  return output\n```\n\nBefore incorporating any optimizations, let's measure the performance of the baseline model and listen to a generated example. We'll benchmark the model over five iterations and report an average of the metrics:\n\n```\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\n```\nExecution time: 9.3841625 seconds\nMax memory footprint 1.914612224  GB\n```\n\nNow, listen to the output:\n\n```\nfrom IPython.display import Audio\n\n# now, listen to the output\nsampling_rate = model.generation_config.sample_rate\nAudio(speech_output[0].cpu().numpy(), rate=sampling_rate)\n```\n\nThe output sounds like this ( download audio ):\n\nYour browser does not support the audio element.\n\nHere, the number of iterations is actually quite low. To accurately measure and compare results, one should increase it to at least 100.\n\nOne of the main reasons for the importance of increasing nb_loops is that the speech lengths generated vary greatly between different iterations, even with a fixed input.\n\nOne consequence of this is that the latency measured by measure_latency_and_memory_use may not actually reflect the actual performance of optimization techniques! The benchmark at the end of the blog post reports the results averaged over 100 iterations, which gives a true indication of the performance of the model.\n\n### 1. 🤗 Better Transformer\n\nBetter Transformer is an 🤗 Optimum feature that performs kernel fusion under the hood. This means that certain model operations will be better optimized on the GPU and that the model will ultimately be faster.\n\nTo be more specific, most models supported by 🤗 Transformers rely on attention, which allows them to selectively focus on certain parts of the input when generating output. This enables the models to effectively handle long-range dependencies and capture complex contextual relationships in the data.\n\nThe naive attention technique can be greatly optimized via a technique called Flash Attention , proposed by the authors Dao et. al. in 2022.\n\nFlash Attention is a faster and more efficient algorithm for attention computations that combines traditional methods (such as tiling and recomputation) to minimize memory usage and increase speed. Unlike previous algorithms, Flash Attention reduces memory usage from quadratic to linear in sequence length, making it particularly useful for applications where memory efficiency is important.\n\nTurns out that Flash Attention is supported by 🤗 Better Transformer out of the box! It requires one line of code to export the model to 🤗 Better Transformer and enable Flash Attention:\n\n```\nmodel =  model.to_bettertransformer()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\n```\nExecution time: 5.43284375 seconds\nMax memory footprint 1.9151841280000002  GB\n```\n\nWhat does it bring to the table?\n\nThere's no performance degradation, which means you can get exactly the same result as without this function, while gaining 20% to 30% in speed! Want to know more? See this blog post .\n\nMost AI models typically use a storage format called single-precision floating point, i.e. fp32 . What does it mean in practice? Each number is stored using 32 bits.\n\nYou can thus choose to encode the numbers using 16 bits, with what is called half-precision floating point, i.e. fp16 , and use half as much storage as before! More than that, you also get inference speed-up!\n\nOf course, it also comes with small performance degradation since operations inside the model won't be as precise as using fp32 .\n\nYou can load a 🤗 Transformers model with half-precision by simpling adding torch_dtype=torch.float16 to the BarkModel.from_pretrained(...) line!\n\n```\nmodel = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\n```\nExecution time: 7.00045390625 seconds\nMax memory footprint 2.7436124160000004  GB\n```\n\nWith a slight degradation in performance, you benefit from a memory footprint reduced by 50% and a speed gain of 5%.\n\nAs mentioned in the first section of this booklet, Bark comprises 4 sub-models, which are called up sequentially during audio generation. In other words, while one sub-model is in use, the other sub-models are idle.\n\nWhy is this a problem? GPU memory is precious in AI, because it's where operations are fastest, and it's often a bottleneck.\n\nA simple solution is to unload sub-models from the GPU when inactive. This operation is called CPU offload.\n\nGood news: CPU offload for Bark was integrated into 🤗 Transformers and you can use it with only one line of code.\n\nYou only need to make sure 🤗 Accelerate is installed!\n\n```\nmodel = BarkModel.from_pretrained(\"suno/bark-small\")\n\n# Enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\n```\nExecution time: 8.97633828125 seconds\nMax memory footprint 1.3231160320000002  GB\n```\n\nWith a slight degradation in speed (10%), you benefit from a huge memory footprint reduction (60% 🤯).\n\nWith this feature enabled, bark-large footprint is now only 2GB instead of 5GB. That's the same memory footprint as bark-small !\n\nWant more? With fp16 enabled, it's even down to 1GB. We'll see this in practice in the next section!\n\nLet's bring it all together. The good news is that you can combine optimization techniques, which means you can use CPU offload, as well as half-precision and 🤗 Better Transformer!\n\n```\n# load in fp16\nmodel = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\n# convert to bettertransformer\nmodel = BetterTransformer.transform(model, keep_original_model=False)\n\n# enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\n```\nExecution time: 7.4496484375000005 seconds\nMax memory footprint 0.46871091200000004  GB\n```\n\nUltimately, you get a 23% speed-up and a huge 80% memory saving!\n\nAltogether, the 3 optimization techniques bring even better results when batching. Batching means combining operations for multiple samples to bring the overall time spent generating the samples lower than generating sample per sample.\n\nHere is a quick example of how you can use it:\n\n```\ntext_prompt = [\n    \"Let's try generating speech, with Bark, a text-to-speech model\",\n    \"Wow, batching is so great!\",\n    \"I love Hugging Face, it's so cool.\"]\n\ninputs = processor(text_prompt).to(device)\n\n\nwith torch.inference_mode():\n  # samples are generated all at once\n  speech_output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)\n```\n\nThe output sounds like this (download first , second , and last audio):\n\nYour browser does not support the audio element. Your browser does not support the audio element. Your browser does not support the audio element.\n\nAs mentioned above, the little experiment we've carried out is an exercise in thinking and needs to be extended for a better measure of performance. One also needs to warm up the GPU with a few blank iterations before properly measuring performance.\n\nHere are the results of a 100-sample benchmark extending the measurements, using the large version of Bark .\n\nThe benchmark was run on an NVIDIA TITAN RTX 24GB with a maximum of 256 new tokens.\n\n### How to read the results?\n\nIt measures the duration of a single call to the generation method, regardless of batch size.\n\nIn other words, it's equal to e l a p s e d T i m e n b L o o p s (elapsedTime)/(nbLoops) nb L oo p s e l a p se d T im e ​ .\n\nA lower latency is preferred.\n\n#### Maximum memory footprint\n\nIt measures the maximum memory used during a single call to the generation method.\n\nA lower footprint is preferred.\n\nIt measures the number of samples generated per second. This time, the batch size is taken into account.\n\nIn other words, it's equal to n b L o o p s ∗ b a t c h S i z e e l a p s e d T i m e (nbLoops*batchSize)/(elapsedTime) e l a p se d T im e nb L oo p s ∗ ba t c h S i ze ​ .\n\nA higher throughput is preferred.\n\nHere are the results with batch_size=1 .\n\nAbsolute values Latency Memory\n\noffload + bettertransformer\n\noffload + bettertransformer + fp16\n\nRelative value Latency Memory\n\nAs expected, CPU offload greatly reduces memory footprint while slightly increasing latency.\n\nHowever, combined with bettertransformer and fp16 , we get the best of both worlds, huge latency and memory decrease!\n\nAnd here are the benchmark results but with batch_size=8 and throughput measurement.\n\nNote that since bettertransformer is a free optimization because it does exactly the same operation and has the same memory footprint as the non-optimized model while being faster, the benchmark was run with this optimization enabled by default .\n\nabsolute values Latency Memory Throghput\n\nbase case (bettertransformer)\n\nRelative value Latency Memory Throughput\n\nThis is where we can see the potential of combining all three optimization features!\n\nThe impact of fp16 on latency is less marked with batch_size = 1 , but here it is of enormous interest as it can reduce latency by almost half, and almost double throughput!\n\nThis blog post showcased a few simple optimization tricks bundled in the 🤗 ecosystem. Using anyone of these techniques, or a combination of all three, can greatly improve Bark inference speed and memory footprint.\n\nYou can use the large version of Bark without any performance degradation and a footprint of just 2GB instead of 5GB, 15% faster, using 🤗 Better Transformer and CPU offload .\n\nDo you prefer high throughput? Batch by 8 with 🤗 Better Transformer and half-precision .\n\nYou can get the best of both worlds by using fp16, 🤗 Better Transformer and CPU offload !\n\n## Models mentioned in this article 2\n\nMore Articles from our Blog\n\n## Measuring benchmark optimization in speech recognition\n\n## Introducing Real World VoiceEQ: Measuring the human quality of voice AI\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "🤗 Transformers provides many of the latest state-of-the-art (SoTA) models across domains and tasks. To get the best performance from these models, they need to be optimized for inference speed and memory usage.\n\nThe 🤗 Hugging Face ecosystem offers precisely such ready & easy to use optimization tools that can be applied across the board to all the models in the library. This makes it easy to reduce memory footprint and improve inference with just a few extra lines of code.\n\nIn this hands-on tutorial, I'll demonstrate how you can optimize Bark, a Text-To-Speech (TTS) model supported by 🤗 Transformers, based on three simple optimizations. These optimizations rely solely on the Transformers, Optimum and Accelerate libraries from the 🤗 ecosystem.\n\nThis tutorial is also a demonstration of how one can benchmark a non-optimized model and its varying optimizations.\n\nFor a more streamlined version of the tutorial with fewer explanations but all the code, see the accompanying Google Colab.\n\nThis blog post is organized as follows:\n\n## Table of Contents\n\n- A reminder of Bark architecture\n\n- An overview of different optimization techniques and their advantages\n\n- A presentation of benchmark results\n\n## Bark Architecture\n\nBark is a transformer-based text-to-speech model proposed by Suno AI in suno-ai/bark. It is capable of generating a wide range of audio outputs, including speech, music, background noise, and simple sound effects. Additionally, it can produce nonverbal communication sounds such as laughter, sighs, and sobs.\n\nBark has been available in 🤗 Transformers since v4.31.0 onwards!\n\nYou can play around with Bark and discover it's abilities here.\n\nBark is made of 4 main models:\n\n- BarkSemanticModel (also referred to as the 'text' model): a causal auto-regressive transformer model that takes as input tokenized text, and predicts semantic text tokens that capture the meaning of the text.\n\n- BarkCoarseModel (also referred to as the 'coarse acoustics' model): a causal autoregressive transformer, that takes as input the results of the BarkSemanticModel model. It aims at predicting the first two audio codebooks necessary for EnCodec.\n\n- BarkFineModel (the 'fine acoustics' model), this time a non-causal autoencoder transformer, which iteratively predicts the last codebooks based on the sum of the previous codebooks embeddings.\n\n- having predicted all the codebook channels from the EncodecModel, Bark uses it to decode the output audio array.\n\nAt the time of writing, two Bark checkpoints are available, a smaller and a larger version.\n\n### Load the Model and its Processor\n\nThe pre-trained Bark small and large checkpoints can be loaded from the pre-trained weights on the Hugging Face Hub. You can change the repo-id with the checkpoint size that you wish to use.\n\nWe'll default to the small checkpoint, to keep it fast. But you can try the large checkpoint by using \"suno/bark\" instead of \"suno/bark-small\".\n\n```\nfrom transformers import BarkModel\n\nmodel = BarkModel.from_pretrained(\"suno/bark-small\")\n```\n\nPlace the model to an accelerator device to get the most of the optimization techniques:\n\n```\nimport torch\n\ndevice = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\nmodel = model.to(device)\n```\n\nLoad the processor, which will take care of tokenization and optional speaker embeddings.\n\n```\nfrom transformers import AutoProcessor\n\nprocessor = AutoProcessor.from_pretrained(\"suno/bark-small\")\n```\n\n## Optimization techniques\n\nIn this section, we'll explore how to use off-the-shelf features from the 🤗 Optimum and 🤗 Accelerate libraries to optimize the Bark model, with minimal changes to the code.\n\n### Some set-ups\n\nLet's prepare the inputs and define a function to measure the latency and GPU memory footprint of the Bark generation method.\n\n```\ntext_prompt = \"Let's try generating speech, with Bark, a text-to-speech model\"\ninputs = processor(text_prompt).to(device)\n```\n\nMeasuring the latency and GPU memory footprint requires the use of specific CUDA methods. We define a utility function that measures both the latency and GPU memory footprint of the model at inference time. To ensure we get an accurate picture of these metrics, we average over a specified number of runs nb_loops:\n\n```\nimport torch\nfrom transformers import set_seed\n\n\ndef measure_latency_and_memory_use(model, inputs, nb_loops = 5):\n\n  # define Events that measure start and end of the generate pass\n  start_event = torch.cuda.Event(enable_timing=True)\n  end_event = torch.cuda.Event(enable_timing=True)\n\n  # reset cuda memory stats and empty cache\n  torch.cuda.reset_peak_memory_stats(device)\n  torch.cuda.empty_cache()\n  torch.cuda.synchronize()\n\n  # get the start time\n  start_event.record()\n\n  # actually generate\n  for _ in range(nb_loops):\n        # set seed for reproducibility\n        set_seed(0)\n        output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)\n\n  # get the end time\n  end_event.record()\n  torch.cuda.synchronize()\n\n  # measure memory footprint and elapsed time\n  max_memory = torch.cuda.max_memory_allocated(device)\n  elapsed_time = start_event.elapsed_time(end_event) * 1.0e-3\n\n  print('Execution time:', elapsed_time/nb_loops, 'seconds')\n  print('Max memory footprint', max_memory*1e-9, ' GB')\n\n  return output\n```\n\n### Base case\n\nBefore incorporating any optimizations, let's measure the performance of the baseline model and listen to a generated example. We'll benchmark the model over five iterations and report an average of the metrics:\n\n```\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\nOutput:\n\n```\nExecution time: 9.3841625 seconds\nMax memory footprint 1.914612224  GB\n```\n\nNow, listen to the output:\n\n```\nfrom IPython.display import Audio\n\n# now, listen to the output\nsampling_rate = model.generation_config.sample_rate\nAudio(speech_output[0].cpu().numpy(), rate=sampling_rate)\n```\n\nThe output sounds like this (download audio):\n\nYour browser does not support the audio element.\n\n#### Important note:\n\nHere, the number of iterations is actually quite low. To accurately measure and compare results, one should increase it to at least 100.\n\nOne of the main reasons for the importance of increasing nb_loops is that the speech lengths generated vary greatly between different iterations, even with a fixed input.\n\nOne consequence of this is that the latency measured by measure_latency_and_memory_use may not actually reflect the actual performance of optimization techniques! The benchmark at the end of the blog post reports the results averaged over 100 iterations, which gives a true indication of the performance of the model.\n\n### 1. 🤗 Better Transformer\n\nBetter Transformer is an 🤗 Optimum feature that performs kernel fusion under the hood. This means that certain model operations will be better optimized on the GPU and that the model will ultimately be faster.\n\nTo be more specific, most models supported by 🤗 Transformers rely on attention, which allows them to selectively focus on certain parts of the input when generating output. This enables the models to effectively handle long-range dependencies and capture complex contextual relationships in the data.\n\nThe naive attention technique can be greatly optimized via a technique called Flash Attention, proposed by the authors Dao et. al. in 2022.\n\nFlash Attention is a faster and more efficient algorithm for attention computations that combines traditional methods (such as tiling and recomputation) to minimize memory usage and increase speed. Unlike previous algorithms, Flash Attention reduces memory usage from quadratic to linear in sequence length, making it particularly useful for applications where memory efficiency is important.\n\nTurns out that Flash Attention is supported by 🤗 Better Transformer out of the box! It requires one line of code to export the model to 🤗 Better Transformer and enable Flash Attention:\n\n```\nmodel =  model.to_bettertransformer()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\nOutput:\n\n```\nExecution time: 5.43284375 seconds\nMax memory footprint 1.9151841280000002  GB\n```\n\nThe output sounds like this (download audio):\n\nYour browser does not support the audio element.\n\nWhat does it bring to the table?\n\nThere's no performance degradation, which means you can get exactly the same result as without this function, while gaining 20% to 30% in speed! Want to know more? See this blog post.\n\n### 2. Half-precision\n\nMost AI models typically use a storage format called single-precision floating point, i.e. fp32. What does it mean in practice? Each number is stored using 32 bits.\n\nYou can thus choose to encode the numbers using 16 bits, with what is called half-precision floating point, i.e. fp16, and use half as much storage as before! More than that, you also get inference speed-up!\n\nOf course, it also comes with small performance degradation since operations inside the model won't be as precise as using fp32.\n\nYou can load a 🤗 Transformers model with half-precision by simpling adding torch_dtype=torch.float16 to the BarkModel.from_pretrained(...) line!\n\nIn other words:\n\n```\nmodel = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\nOutput:\n\n```\nExecution time: 7.00045390625 seconds\nMax memory footprint 2.7436124160000004  GB\n```\n\nThe output sounds like this (download audio):\n\nYour browser does not support the audio element.\n\nWhat does it bring to the table?\n\nWith a slight degradation in performance, you benefit from a memory footprint reduced by 50% and a speed gain of 5%.\n\n### 3. CPU offload\n\nAs mentioned in the first section of this booklet, Bark comprises 4 sub-models, which are called up sequentially during audio generation. In other words, while one sub-model is in use, the other sub-models are idle.\n\nWhy is this a problem? GPU memory is precious in AI, because it's where operations are fastest, and it's often a bottleneck.\n\nA simple solution is to unload sub-models from the GPU when inactive. This operation is called CPU offload.\n\nGood news: CPU offload for Bark was integrated into 🤗 Transformers and you can use it with only one line of code.\n\nYou only need to make sure 🤗 Accelerate is installed!\n\n```\nmodel = BarkModel.from_pretrained(\"suno/bark-small\")\n\n# Enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\nOutput:\n\n```\nExecution time: 8.97633828125 seconds\nMax memory footprint 1.3231160320000002  GB\n```\n\nThe output sounds like this (download audio):\n\nYour browser does not support the audio element.\n\nWhat does it bring to the table?\n\nWith a slight degradation in speed (10%), you benefit from a huge memory footprint reduction (60% 🤯).\n\nWith this feature enabled, bark-large footprint is now only 2GB instead of 5GB. That's the same memory footprint as bark-small!\n\nWant more? With fp16 enabled, it's even down to 1GB. We'll see this in practice in the next section!\n\n### 4. Combine\n\nLet's bring it all together. The good news is that you can combine optimization techniques, which means you can use CPU offload, as well as half-precision and 🤗 Better Transformer!\n\n```\n# load in fp16\nmodel = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\n# convert to bettertransformer\nmodel = BetterTransformer.transform(model, keep_original_model=False)\n\n# enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)\n```\n\nOutput:\n\n```\nExecution time: 7.4496484375000005 seconds\nMax memory footprint 0.46871091200000004  GB\n```\n\nThe output sounds like this (download audio):\n\nYour browser does not support the audio element.\n\nWhat does it bring to the table?\n\nUltimately, you get a 23% speed-up and a huge 80% memory saving!\n\n### Using batching\n\nWant more?\n\nAltogether, the 3 optimization techniques bring even better results when batching. Batching means combining operations for multiple samples to bring the overall time spent generating the samples lower than generating sample per sample.\n\nHere is a quick example of how you can use it:\n\n```\ntext_prompt = [\n    \"Let's try generating speech, with Bark, a text-to-speech model\",\n    \"Wow, batching is so great!\",\n    \"I love Hugging Face, it's so cool.\"]\n\ninputs = processor(text_prompt).to(device)\n\n\nwith torch.inference_mode():\n  # samples are generated all at once\n  speech_output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)\n```\n\nThe output sounds like this (download first, second, and last audio):\n\nYour browser does not support the audio element. Your browser does not support the audio element. Your browser does not support the audio element.\n\n## Benchmark results\n\nAs mentioned above, the little experiment we've carried out is an exercise in thinking and needs to be extended for a better measure of performance. One also needs to warm up the GPU with a few blank iterations before properly measuring performance.\n\nHere are the results of a 100-sample benchmark extending the measurements, using the large version of Bark.\n\nThe benchmark was run on an NVIDIA TITAN RTX 24GB with a maximum of 256 new tokens.\n\n### How to read the results?\n\n#### Latency\n\nIt measures the duration of a single call to the generation method, regardless of batch size.\n\nIn other words, it's equal to elapsedTimenbLoops\\frac{elapsedTime}{nbLoops}nbLoopselapsedTime​.\n\nA lower latency is preferred.\n\n#### Maximum memory footprint\n\nIt measures the maximum memory used during a single call to the generation method.\n\nA lower footprint is preferred.\n\n#### Throughput\n\nIt measures the number of samples generated per second. This time, the batch size is taken into account.\n\nIn other words, it's equal to nbLoops∗batchSizeelapsedTime\\frac{nbLoops*batchSize}{elapsedTime}elapsedTimenbLoops∗batchSize​.\n\nA higher throughput is preferred.\n\n### No batching\n\nHere are the results with batch_size=1.\n\nAbsolute values\n\nLatency\n\nMemory\n\nno optimization\n\n10.48\n\n5025.0M\n\nbettertransformer only\n\n7.70\n\n4974.3M\n\noffload + bettertransformer\n\n8.90\n\n2040.7M\n\noffload + bettertransformer + fp16\n\n8.10\n\n1010.4M\n\nRelative value\n\nLatency\n\nMemory\n\nno optimization\n\n0%\n\n0%\n\nbettertransformer only\n\n\\-27%\n\n\\-1%\n\noffload + bettertransformer\n\n\\-15%\n\n\\-59%\n\noffload + bettertransformer + fp16\n\n\\-23%\n\n\\-80%\n\n#### Comment\n\nAs expected, CPU offload greatly reduces memory footprint while slightly increasing latency.\n\nHowever, combined with bettertransformer and fp16, we get the best of both worlds, huge latency and memory decrease!\n\n### Batch size set to 8\n\nAnd here are the benchmark results but with batch_size=8 and throughput measurement.\n\nNote that since bettertransformer is a free optimization because it does exactly the same operation and has the same memory footprint as the non-optimized model while being faster, the benchmark was run with this optimization enabled by default.\n\nabsolute values\n\nLatency\n\nMemory\n\nThroghput\n\nbase case (bettertransformer)\n\n19.26\n\n8329.2M\n\n0.42\n\n\\+ fp16\n\n10.32\n\n4198.8M\n\n0.78\n\n\\+ offload\n\n20.46\n\n5172.1M\n\n0.39\n\n\\+ offload + fp16\n\n10.91\n\n2619.5M\n\n0.73\n\nRelative value\n\nLatency\n\nMemory\n\nThroughput\n\n\\+ base case (bettertransformer)\n\n0%\n\n0%\n\n0%\n\n\\+ fp16\n\n\\-46%\n\n\\-50%\n\n87%\n\n\\+ offload\n\n6%\n\n\\-38%\n\n\\-6%\n\n\\+ offload + fp16\n\n\\-43%\n\n\\-69%\n\n77%\n\n#### Comment\n\nThis is where we can see the potential of combining all three optimization features!\n\nThe impact of fp16 on latency is less marked with batch_size = 1, but here it is of enormous interest as it can reduce latency by almost half, and almost double throughput!\n\n## Concluding remarks\n\nThis blog post showcased a few simple optimization tricks bundled in the 🤗 ecosystem. Using anyone of these techniques, or a combination of all three, can greatly improve Bark inference speed and memory footprint.\n\nYou can use the large version of Bark without any performance degradation and a footprint of just 2GB instead of 5GB, 15% faster, using 🤗 Better Transformer and CPU offload.\n\nDo you prefer high throughput? Batch by 8 with 🤗 Better Transformer and half-precision.\n\nYou can get the best of both worlds by using fp16, 🤗 Better Transformer and CPU offload!",
   "summaryZh": "本文介绍了如何使用Hugging Face的Transformers、Optimum和Accelerate库对Suno AI开发的文本转语音模型Bark进行推理优化。通过实际的代码教程，展示了如何减少内存占用、提高推理速度并进行基准测试。",
   "summaryGeneratedAt": "2026-09-06T02:29:40.616334Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "",
+      "id": "image_dfb4615ac36cf94c"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "🤗 Transformers provides many of the latest state-of-the-art (SoTA) models across domains and tasks. To get the best performance from these models, they need to be optimized for inference speed and memory usage.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "The 🤗 Hugging Face ecosystem offers precisely such ready & easy to use optimization tools that can be applied across the board to all the models in the library. This makes it easy to reduce memory footprint and improve inference with just a few extra lines of code.",
+      "spans": [
+        {
+          "start": 183,
+          "end": 206,
+          "kind": "strong"
+        },
+        {
+          "start": 211,
+          "end": 228,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "In this hands-on tutorial, I'll demonstrate how you can optimize Bark, a Text-To-Speech (TTS) model supported by 🤗 Transformers, based on three simple optimizations. These optimizations rely solely on the Transformers, Optimum and Accelerate libraries from the 🤗 ecosystem.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/bark#overview"
+        },
+        {
+          "start": 205,
+          "end": 217,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers"
+        },
+        {
+          "start": 219,
+          "end": 226,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum"
+        },
+        {
+          "start": 231,
+          "end": 241,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This tutorial is also a demonstration of how one can benchmark a non-optimized model and its varying optimizations.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "For a more streamlined version of the tutorial with fewer explanations but all the code, see the accompanying Google Colab.",
+      "spans": [
+        {
+          "start": 110,
+          "end": 122,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/ylacombe/notebooks/blob/main/Benchmark_Bark_HuggingFace.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "This blog post is organized as follows:",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "A reminder of Bark architecture",
+      "spans": [
+        {
+          "start": 2,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/optimizing-bark#bark-architecture"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "An overview of different optimization techniques and their advantages",
+      "spans": [
+        {
+          "start": 3,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/optimizing-bark#optimization-techniques"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "A presentation of benchmark results",
+      "spans": [
+        {
+          "start": 2,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/optimizing-bark#benchmark-results"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Bark Architecture",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Bark is a transformer-based text-to-speech model proposed by Suno AI in suno-ai/bark. It is capable of generating a wide range of audio outputs, including speech, music, background noise, and simple sound effects. Additionally, it can produce nonverbal communication sounds such as laughter, sighs, and sobs.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 72,
+          "end": 84,
+          "kind": "a",
+          "href": "https://github.com/suno-ai/bark"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Bark has been available in 🤗 Transformers since v4.31.0 onwards!",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "You can play around with Bark and discover it's abilities here.",
+      "spans": [
+        {
+          "start": 58,
+          "end": 62,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/ylacombe/notebooks/blob/main/Bark_HuggingFace_Demo.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Bark is made of 4 main models:",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "BarkSemanticModel (also referred to as the 'text' model): a causal auto-regressive transformer model that takes as input tokenized text, and predicts semantic text tokens that capture the meaning of the text.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "BarkCoarseModel (also referred to as the 'coarse acoustics' model): a causal autoregressive transformer, that takes as input the results of the BarkSemanticModel model. It aims at predicting the first two audio codebooks necessary for EnCodec.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        },
+        {
+          "start": 144,
+          "end": 161,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "BarkFineModel (the 'fine acoustics' model), this time a non-causal autoencoder transformer, which iteratively predicts the last codebooks based on the sum of the previous codebooks embeddings.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "having predicted all the codebook channels from the EncodecModel, Bark uses it to decode the output audio array.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 64,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/v4.31.0/model_doc/encodec"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "At the time of writing, two Bark checkpoints are available, a smaller and a larger version.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/suno/bark-small"
+        },
+        {
+          "start": 76,
+          "end": 82,
+          "kind": "a",
+          "href": "https://huggingface.co/suno/bark"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Load the Model and its Processor",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "The pre-trained Bark small and large checkpoints can be loaded from the pre-trained weights on the Hugging Face Hub. You can change the repo-id with the checkpoint size that you wish to use.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 91,
+          "kind": "a",
+          "href": "https://huggingface.co/suno/bark"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "We'll default to the small checkpoint, to keep it fast. But you can try the large checkpoint by using \"suno/bark\" instead of \"suno/bark-small\".",
+      "spans": [
+        {
+          "start": 102,
+          "end": 113,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 142,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Place the model to an accelerator device to get the most of the optimization techniques:",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Load the processor, which will take care of tokenization and optional speaker embeddings.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Optimization techniques",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "In this section, we'll explore how to use off-the-shelf features from the 🤗 Optimum and 🤗 Accelerate libraries to optimize the Bark model, with minimal changes to the code.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Some set-ups",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Let's prepare the inputs and define a function to measure the latency and GPU memory footprint of the Bark generation method.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Measuring the latency and GPU memory footprint requires the use of specific CUDA methods. We define a utility function that measures both the latency and GPU memory footprint of the model at inference time. To ensure we get an accurate picture of these metrics, we average over a specified number of runs nb_loops:",
+      "spans": [
+        {
+          "start": 305,
+          "end": 313,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Base case",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Before incorporating any optimizations, let's measure the performance of the baseline model and listen to a generated example. We'll benchmark the model over five iterations and report an average of the metrics:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Now, listen to the output:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "The output sounds like this (download audio):",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_base.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Important note:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Here, the number of iterations is actually quite low. To accurately measure and compare results, one should increase it to at least 100.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "One of the main reasons for the importance of increasing nb_loops is that the speech lengths generated vary greatly between different iterations, even with a fixed input.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "One consequence of this is that the latency measured by measure_latency_and_memory_use may not actually reflect the actual performance of optimization techniques! The benchmark at the end of the blog post reports the results averaged over 100 iterations, which gives a true indication of the performance of the model.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 86,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "1. 🤗 Better Transformer",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Better Transformer is an 🤗 Optimum feature that performs kernel fusion under the hood. This means that certain model operations will be better optimized on the GPU and that the model will ultimately be faster.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "To be more specific, most models supported by 🤗 Transformers rely on attention, which allows them to selectively focus on certain parts of the input when generating output. This enables the models to effectively handle long-range dependencies and capture complex contextual relationships in the data.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "The naive attention technique can be greatly optimized via a technique called Flash Attention, proposed by the authors Dao et. al. in 2022.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 93,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2205.14135"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Flash Attention is a faster and more efficient algorithm for attention computations that combines traditional methods (such as tiling and recomputation) to minimize memory usage and increase speed. Unlike previous algorithms, Flash Attention reduces memory usage from quadratic to linear in sequence length, making it particularly useful for applications where memory efficiency is important.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Turns out that Flash Attention is supported by 🤗 Better Transformer out of the box! It requires one line of code to export the model to 🤗 Better Transformer and enable Flash Attention:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "The output sounds like this (download audio):",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_bettertransformer.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "What does it bring to the table?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "There's no performance degradation, which means you can get exactly the same result as without this function, while gaining 20% to 30% in speed! Want to know more? See this blog post.",
+      "spans": [
+        {
+          "start": 173,
+          "end": 182,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/out-of-the-box-acceleration/"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "2. Half-precision",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Most AI models typically use a storage format called single-precision floating point, i.e. fp32. What does it mean in practice? Each number is stored using 32 bits.",
+      "spans": [
+        {
+          "start": 91,
+          "end": 95,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "You can thus choose to encode the numbers using 16 bits, with what is called half-precision floating point, i.e. fp16, and use half as much storage as before! More than that, you also get inference speed-up!",
+      "spans": [
+        {
+          "start": 113,
+          "end": 117,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Of course, it also comes with small performance degradation since operations inside the model won't be as precise as using fp32.",
+      "spans": [
+        {
+          "start": 123,
+          "end": 127,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "You can load a 🤗 Transformers model with half-precision by simpling adding torch_dtype=torch.float16 to the BarkModel.from_pretrained(...) line!",
+      "spans": [
+        {
+          "start": 75,
+          "end": 100,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 138,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "In other words:",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "The output sounds like this (download audio):",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_fp16.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "What does it bring to the table?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "With a slight degradation in performance, you benefit from a memory footprint reduced by 50% and a speed gain of 5%.",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "3. CPU offload",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "As mentioned in the first section of this booklet, Bark comprises 4 sub-models, which are called up sequentially during audio generation. In other words, while one sub-model is in use, the other sub-models are idle.",
+      "spans": [
+        {
+          "start": 138,
+          "end": 215,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "Why is this a problem? GPU memory is precious in AI, because it's where operations are fastest, and it's often a bottleneck.",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "A simple solution is to unload sub-models from the GPU when inactive. This operation is called CPU offload.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Good news: CPU offload for Bark was integrated into 🤗 Transformers and you can use it with only one line of code.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "You only need to make sure 🤗 Accelerate is installed!",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "The output sounds like this (download audio):",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_cpu_offload.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "What does it bring to the table?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "With a slight degradation in speed (10%), you benefit from a huge memory footprint reduction (60% 🤯).",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "With this feature enabled, bark-large footprint is now only 2GB instead of 5GB. That's the same memory footprint as bark-small!",
+      "spans": [
+        {
+          "start": 27,
+          "end": 37,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 126,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "Want more? With fp16 enabled, it's even down to 1GB. We'll see this in practice in the next section!",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "4. Combine",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Let's bring it all together. The good news is that you can combine optimization techniques, which means you can use CPU offload, as well as half-precision and 🤗 Better Transformer!",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "The output sounds like this (download audio):",
+      "spans": [
+        {
+          "start": 29,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_cpu_offload.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "What does it bring to the table?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "Ultimately, you get a 23% speed-up and a huge 80% memory saving!",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "Using batching",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Want more?",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Altogether, the 3 optimization techniques bring even better results when batching. Batching means combining operations for multiple samples to bring the overall time spent generating the samples lower than generating sample per sample.",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "Here is a quick example of how you can use it:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "The output sounds like this (download first, second, and last audio):",
+      "spans": [
+        {
+          "start": 38,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_batch_0.wav"
+        },
+        {
+          "start": 45,
+          "end": 51,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_batch_1.wav"
+        },
+        {
+          "start": 57,
+          "end": 61,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/bark_optimization/audio_sample_batch_2.wav"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "Your browser does not support the audio element. Your browser does not support the audio element. Your browser does not support the audio element.",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Benchmark results",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "As mentioned above, the little experiment we've carried out is an exercise in thinking and needs to be extended for a better measure of performance. One also needs to warm up the GPU with a few blank iterations before properly measuring performance.",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Here are the results of a 100-sample benchmark extending the measurements, using the large version of Bark.",
+      "spans": [
+        {
+          "start": 75,
+          "end": 106,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "The benchmark was run on an NVIDIA TITAN RTX 24GB with a maximum of 256 new tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "How to read the results?",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "Latency",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "It measures the duration of a single call to the generation method, regardless of batch size.",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "In other words, it's equal to elapsedTimenbLoops\\frac{elapsedTime}{nbLoops}nbLoopselapsedTime​.",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "A lower latency is preferred.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Maximum memory footprint",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "It measures the maximum memory used during a single call to the generation method.",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "A lower footprint is preferred.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "Throughput",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "It measures the number of samples generated per second. This time, the batch size is taken into account.",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "In other words, it's equal to nbLoops∗batchSizeelapsedTime\\frac{nbLoops*batchSize}{elapsedTime}elapsedTimenbLoops∗batchSize​.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "A higher throughput is preferred.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "No batching",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "Here are the results with batch_size=1.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 38,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "Absolute values",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "Latency",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "Memory",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "no optimization",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "10.48",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "5025.0M",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "bettertransformer only",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "7.70",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "4974.3M",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "offload + bettertransformer",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "8.90",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "2040.7M",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "offload + bettertransformer + fp16",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "8.10",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "1010.4M",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "Relative value",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "Latency",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "Memory",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "no optimization",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "0%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "0%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "bettertransformer only",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "-27%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "-1%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "offload + bettertransformer",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "-15%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "-59%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "offload + bettertransformer + fp16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "-23%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "-80%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Comment",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "As expected, CPU offload greatly reduces memory footprint while slightly increasing latency.",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "However, combined with bettertransformer and fp16, we get the best of both worlds, huge latency and memory decrease!",
+      "spans": [
+        {
+          "start": 45,
+          "end": 49,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "Batch size set to 8",
+      "spans": []
+    },
+    {
+      "id": "b0141",
+      "source": "And here are the benchmark results but with batch_size=8 and throughput measurement.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 56,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0142",
+      "source": "Note that since bettertransformer is a free optimization because it does exactly the same operation and has the same memory footprint as the non-optimized model while being faster, the benchmark was run with this optimization enabled by default.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 33,
+          "kind": "code"
+        },
+        {
+          "start": 208,
+          "end": 244,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0143",
+      "source": "absolute values",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "Latency",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "Memory",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "Throghput",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "base case (bettertransformer)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "19.26",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "8329.2M",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "0.42",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "+ fp16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "10.32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "4198.8M",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "0.78",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "+ offload",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "20.46",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "5172.1M",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "0.39",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "+ offload + fp16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "10.91",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "2619.5M",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "0.73",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "Relative value",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "Latency",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "Memory",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "Throughput",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "+ base case (bettertransformer)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "0%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "0%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "0%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "+ fp16",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "-46%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "-50%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "87%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "+ offload",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "6%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "-38%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "-6%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "+ offload + fp16",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "-43%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "-69%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "77%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "Comment",
+      "spans": []
+    },
+    {
+      "id": "b0184",
+      "source": "This is where we can see the potential of combining all three optimization features!",
+      "spans": []
+    },
+    {
+      "id": "b0185",
+      "source": "The impact of fp16 on latency is less marked with batch_size = 1, but here it is of enormous interest as it can reduce latency by almost half, and almost double throughput!",
+      "spans": [
+        {
+          "start": 14,
+          "end": 18,
+          "kind": "code"
+        },
+        {
+          "start": 50,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0186",
+      "source": "Concluding remarks",
+      "spans": []
+    },
+    {
+      "id": "b0187",
+      "source": "This blog post showcased a few simple optimization tricks bundled in the 🤗 ecosystem. Using anyone of these techniques, or a combination of all three, can greatly improve Bark inference speed and memory footprint.",
+      "spans": []
+    },
+    {
+      "id": "b0188",
+      "source": "You can use the large version of Bark without any performance degradation and a footprint of just 2GB instead of 5GB, 15% faster, using 🤗 Better Transformer and CPU offload.",
+      "spans": [
+        {
+          "start": 130,
+          "end": 172,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0189",
+      "source": "Do you prefer high throughput? Batch by 8 with 🤗 Better Transformer and half-precision.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 86,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0190",
+      "source": "You can get the best of both worlds by using fp16, 🤗 Better Transformer and CPU offload!",
+      "spans": [
+        {
+          "start": 45,
+          "end": 87,
+          "kind": "strong"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "7b38db976f816e85b5313941fd93a5a611e1889b24bff740385fed8b60dee813",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from transformers import BarkModel\n\nmodel = BarkModel.from_pretrained(\"suno/bark-small\")"
+    },
+    {
+      "id": "c0002",
+      "source": "import torch\n\ndevice = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\nmodel = model.to(device)"
+    },
+    {
+      "id": "c0003",
+      "source": "from transformers import AutoProcessor\n\nprocessor = AutoProcessor.from_pretrained(\"suno/bark-small\")"
+    },
+    {
+      "id": "c0004",
+      "source": "text_prompt = \"Let's try generating speech, with Bark, a text-to-speech model\"\ninputs = processor(text_prompt).to(device)"
+    },
+    {
+      "id": "c0005",
+      "source": "import torch\nfrom transformers import set_seed\n\n\ndef measure_latency_and_memory_use(model, inputs, nb_loops = 5):\n\n  # define Events that measure start and end of the generate pass\n  start_event = torch.cuda.Event(enable_timing=True)\n  end_event = torch.cuda.Event(enable_timing=True)\n\n  # reset cuda memory stats and empty cache\n  torch.cuda.reset_peak_memory_stats(device)\n  torch.cuda.empty_cache()\n  torch.cuda.synchronize()\n\n  # get the start time\n  start_event.record()\n\n  # actually generate\n  for _ in range(nb_loops):\n        # set seed for reproducibility\n        set_seed(0)\n        output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)\n\n  # get the end time\n  end_event.record()\n  torch.cuda.synchronize()\n\n  # measure memory footprint and elapsed time\n  max_memory = torch.cuda.max_memory_allocated(device)\n  elapsed_time = start_event.elapsed_time(end_event) * 1.0e-3\n\n  print('Execution time:', elapsed_time/nb_loops, 'seconds')\n  print('Max memory footprint', max_memory*1e-9, ' GB')\n\n  return output"
+    },
+    {
+      "id": "c0006",
+      "source": "with torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)"
+    },
+    {
+      "id": "c0007",
+      "source": "Execution time: 9.3841625 seconds\nMax memory footprint 1.914612224  GB"
+    },
+    {
+      "id": "c0008",
+      "source": "from IPython.display import Audio\n\n# now, listen to the output\nsampling_rate = model.generation_config.sample_rate\nAudio(speech_output[0].cpu().numpy(), rate=sampling_rate)"
+    },
+    {
+      "id": "c0009",
+      "source": "model =  model.to_bettertransformer()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)"
+    },
+    {
+      "id": "c0010",
+      "source": "Execution time: 5.43284375 seconds\nMax memory footprint 1.9151841280000002  GB"
+    },
+    {
+      "id": "c0011",
+      "source": "model = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)"
+    },
+    {
+      "id": "c0012",
+      "source": "Execution time: 7.00045390625 seconds\nMax memory footprint 2.7436124160000004  GB"
+    },
+    {
+      "id": "c0013",
+      "source": "model = BarkModel.from_pretrained(\"suno/bark-small\")\n\n# Enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)"
+    },
+    {
+      "id": "c0014",
+      "source": "Execution time: 8.97633828125 seconds\nMax memory footprint 1.3231160320000002  GB"
+    },
+    {
+      "id": "c0015",
+      "source": "# load in fp16\nmodel = BarkModel.from_pretrained(\"suno/bark-small\", torch_dtype=torch.float16).to(device)\n\n# convert to bettertransformer\nmodel = BetterTransformer.transform(model, keep_original_model=False)\n\n# enable CPU offload\nmodel.enable_cpu_offload()\n\nwith torch.inference_mode():\n  speech_output = measure_latency_and_memory_use(model, inputs, nb_loops = 5)"
+    },
+    {
+      "id": "c0016",
+      "source": "Execution time: 7.4496484375000005 seconds\nMax memory footprint 0.46871091200000004  GB"
+    },
+    {
+      "id": "c0017",
+      "source": "text_prompt = [\n    \"Let's try generating speech, with Bark, a text-to-speech model\",\n    \"Wow, batching is so great!\",\n    \"I love Hugging Face, it's so cool.\"]\n\ninputs = processor(text_prompt).to(device)\n\n\nwith torch.inference_mode():\n  # samples are generated all at once\n  speech_output = model.generate(**inputs, do_sample = True, fine_temperature = 0.4, coarse_temperature = 0.8)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "7b38db976f816e85b5313941fd93a5a611e1889b24bff740385fed8b60dee813",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-04T15:32:05.894657Z",
+  "mediaLayoutCheckedAt": "2026-10-04T15:32:05.894671Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",

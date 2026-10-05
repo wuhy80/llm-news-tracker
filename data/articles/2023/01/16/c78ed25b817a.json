@@ -16,13 +16,721 @@
   "originalUrl": "https://huggingface.co/blog/image-similarity",
   "resolvedUrl": "https://huggingface.co/blog/image-similarity",
   "fetchedAt": "2026-08-27T03:10:35.332693Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "In this post, you'll learn to build an image similarity system with 🤗 Transformers. Finding out the similarity between a query image and potential candidates is an important use case for information retrieval systems, such as reverse image search, for example. All the system is trying to answer is that, given a query image and a set of candidate images, which images are the most similar to the query image.\n\nWe'll leverage the 🤗 datasets library as it seamlessly supports parallel processing which will come in handy when building this system.\n\nAlthough the post uses a ViT-based model (nateraw/vit-base-beans) and a particular dataset (Beans), it can be extended to use other models supporting vision modality and other image datasets. Some notable models you could try:\n\n- Swin Transformer\n\n- ConvNeXT\n\n- RegNet\n\nAlso, the approach presented in the post can potentially be extended to other modalities as well.\n\nTo study the fully working image-similarity system, you can refer to the Colab Notebook linked at the beginning.\n\n## How do we define similarity?\n\nTo build this system, we first need to define how we want to compute the similarity between two images. One widely popular practice is to compute dense representations (embeddings) of the given images and then use the cosine similarity metric to determine how similar the two images are.\n\nFor this post, we'll use “embeddings” to represent images in vector space. This gives us a nice way to meaningfully compress the high-dimensional pixel space of images (224 x 224 x 3, for example) to something much lower dimensional (768, for example). The primary advantage of doing this is the reduced computation time in the subsequent steps.\n\n## Computing embeddings\n\nTo compute the embeddings from the images, we'll use a vision model that has some understanding of how to represent the input images in the vector space. This type of model is also commonly referred to as image encoder.\n\nFor loading the model, we leverage the AutoModel class. It provides an interface for us to load any compatible model checkpoint from the Hugging Face Hub. Alongside the model, we also load the processor associated with the model for data preprocessing.\n\n```\nfrom transformers import AutoImageProcessor, AutoModel\n\n\nmodel_ckpt = \"nateraw/vit-base-beans\"\nprocessor = AutoImageProcessor.from_pretrained(model_ckpt)\nmodel = AutoModel.from_pretrained(model_ckpt)\n```\n\nIn this case, the checkpoint was obtained by fine-tuning a Vision Transformer based model on the beans dataset.\n\nSome questions that might arise here:\n\nQ1: Why did we not use AutoModelForImageClassification?\n\nThis is because we want to obtain dense representations of the images and not discrete categories, which are what AutoModelForImageClassification would have provided.\n\nQ2: Why this checkpoint in particular?\n\nAs mentioned earlier, we're using a specific dataset to build the system. So, instead of using a generalist model (like the ones trained on the ImageNet-1k dataset, for example), it's better to use a model that has been fine-tuned on the dataset being used. That way, the underlying model better understands the input images.\n\nNote that you can also use a checkpoint that was obtained through self-supervised pre-training. The checkpoint doesn't necessarily have to come from supervised learning. In fact, if pre-trained well, self-supervised models can yield impressive retrieval performance.\n\nNow that we have a model for computing the embeddings, we need some candidate images to query against.\n\n## Loading a dataset for candidate images\n\nIn some time, we'll be building hash tables mapping the candidate images to hashes. During the query time, we'll use these hash tables. We'll talk more about hash tables in the respective section but for now, to have a set of candidate images, we will use the train split of the beans dataset.\n\n```\nfrom datasets import load_dataset\n\n\ndataset = load_dataset(\"beans\")\n```\n\nThis is how a single sample from the training split looks like:\n\nThe dataset has three features:\n\n```\ndataset[\"train\"].features\n>>> {'image_file_path': Value(dtype='string', id=None),\n 'image': Image(decode=True, id=None),\n 'labels': ClassLabel(names=['angular_leaf_spot', 'bean_rust', 'healthy'], id=None)}\n```\n\nTo demonstrate the image similarity system, we'll use 100 samples from the candidate image dataset to keep the overall runtime short.\n\n```\nnum_samples = 100\nseed = 42\ncandidate_subset = dataset[\"train\"].shuffle(seed=seed).select(range(num_samples))\n```\n\n## The process of finding similar images\n\nBelow, you can find a pictorial overview of the process underlying fetching similar images.\n\nBreaking down the above figure a bit, we have:\n\n- Extract the embeddings from the candidate images (candidate_subset), storing them in a matrix.\n\n- Take a query image and extract its embeddings.\n\n- Iterate over the embedding matrix (computed in step 1) and compute the similarity score between the query embedding and the current candidate embeddings. We usually maintain a dictionary-like mapping maintaining a correspondence between some identifier of the candidate image and the similarity scores.\n\n- Sort the mapping structure w.r.t the similarity scores and return the underlying identifiers. We use these identifiers to fetch the candidate samples.\n\nWe can write a simple utility and map() it to our dataset of candidate images to compute the embeddings efficiently.\n\n```\nimport torch \n\ndef extract_embeddings(model: torch.nn.Module):\n    \"\"\"Utility to compute embeddings.\"\"\"\n    device = model.device\n\n    def pp(batch):\n        images = batch[\"image\"]\n        # `transformation_chain` is a compostion of preprocessing\n        # transformations we apply to the input images to prepare them\n        # for the model. For more details, check out the accompanying Colab Notebook.\n        image_batch_transformed = torch.stack(\n            [transformation_chain(image) for image in images]\n        )\n        new_batch = {\"pixel_values\": image_batch_transformed.to(device)}\n        with torch.no_grad():\n            embeddings = model(**new_batch).last_hidden_state[:, 0].cpu()\n        return {\"embeddings\": embeddings}\n\n    return pp\n```\n\nAnd we can map extract_embeddings() like so:\n\n```\ndevice = \"cuda\" if torch.cuda.is_available() else \"cpu\"\nextract_fn = extract_embeddings(model.to(device))\ncandidate_subset_emb = candidate_subset.map(extract_fn, batched=True, batch_size=batch_size)\n```\n\nNext, for convenience, we create a list containing the identifiers of the candidate images.\n\n```\ncandidate_ids = []\n\nfor id in tqdm(range(len(candidate_subset_emb))):\n    label = candidate_subset_emb[id][\"labels\"]\n\n    # Create a unique indentifier.\n    entry = str(id) + \"_\" + str(label)\n\n    candidate_ids.append(entry)\n```\n\nWe'll use the matrix of the embeddings of all the candidate images for computing the similarity scores with a query image. We have already computed the candidate image embeddings. In the next cell, we just gather them together in a matrix.\n\n```\nall_candidate_embeddings = np.array(candidate_subset_emb[\"embeddings\"])\nall_candidate_embeddings = torch.from_numpy(all_candidate_embeddings)\n```\n\nWe'll use cosine similarity to compute the similarity score in between two embedding vectors. We'll then use it to fetch similar candidate samples given a query sample.\n\n```\ndef compute_scores(emb_one, emb_two):\n    \"\"\"Computes cosine similarity between two vectors.\"\"\"\n    scores = torch.nn.functional.cosine_similarity(emb_one, emb_two)\n    return scores.numpy().tolist()\n\n\ndef fetch_similar(image, top_k=5):\n    \"\"\"Fetches the `top_k` similar images with `image` as the query.\"\"\"\n    # Prepare the input query image for embedding computation.\n    image_transformed = transformation_chain(image).unsqueeze(0)\n    new_batch = {\"pixel_values\": image_transformed.to(device)}\n\n    # Comute the embedding.\n    with torch.no_grad():\n        query_embeddings = model(**new_batch).last_hidden_state[:, 0].cpu()\n\n    # Compute similarity scores with all the candidate images at one go.\n    # We also create a mapping between the candidate image identifiers\n    # and their similarity scores with the query image.\n    sim_scores = compute_scores(all_candidate_embeddings, query_embeddings)\n    similarity_mapping = dict(zip(candidate_ids, sim_scores))\n \n    # Sort the mapping dictionary and return `top_k` candidates.\n    similarity_mapping_sorted = dict(\n        sorted(similarity_mapping.items(), key=lambda x: x[1], reverse=True)\n    )\n    id_entries = list(similarity_mapping_sorted.keys())[:top_k]\n\n    ids = list(map(lambda x: int(x.split(\"_\")[0]), id_entries))\n    labels = list(map(lambda x: int(x.split(\"_\")[-1]), id_entries))\n    return ids, labels\n```\n\n## Perform a query\n\nGiven all the utilities, we're equipped to do a similarity search. Let's have a query image from the test split of the beans dataset:\n\n```\ntest_idx = np.random.choice(len(dataset[\"test\"]))\ntest_sample = dataset[\"test\"][test_idx][\"image\"]\ntest_label = dataset[\"test\"][test_idx][\"labels\"]\n\nsim_ids, sim_labels = fetch_similar(test_sample)\nprint(f\"Query label: {test_label}\")\nprint(f\"Top 5 candidate labels: {sim_labels}\")\n```\n\nLeads to:\n\n```\nQuery label: 0\nTop 5 candidate labels: [0, 0, 0, 0, 0]\n```\n\nSeems like our system got the right set of similar images. When visualized, we'd get:\n\n## Further extensions and conclusions\n\nWe now have a working image similarity system. But in reality, you'll be dealing with a lot more candidate images. Taking that into consideration, our current procedure has got multiple drawbacks:\n\n- If we store the embeddings as is, the memory requirements can shoot up quickly, especially when dealing with millions of candidate images. The embeddings are 768-d in our case, which can still be relatively high in the large-scale regime.\n\n- Having high-dimensional embeddings have a direct effect on the subsequent computations involved in the retrieval part.\n\nIf we can somehow reduce the dimensionality of the embeddings without disturbing their meaning, we can still maintain a good trade-off between speed and retrieval quality. The accompanying Colab Notebook of this post implements and demonstrates utilities for achieving this with random projection and locality-sensitive hashing.\n\n🤗 Datasets offers direct integrations with FAISS which further simplifies the process of building similarity systems. Let's say you've already extracted the embeddings of the candidate images (the beans dataset) and stored them inside a feature called embeddings. You can now easily use the add_faiss_index() of the dataset to build a dense index:\n\n```\ndataset_with_embeddings.add_faiss_index(column=\"embeddings\")\n```\n\nOnce the index is built, dataset_with_embeddings can be used to retrieve the nearest examples given query embeddings with get_nearest_examples():\n\n```\nscores, retrieved_examples = dataset_with_embeddings.get_nearest_examples(\n    \"embeddings\", qi_embedding, k=top_k\n)\n```\n\nThe method returns scores and corresponding candidate examples. To know more, you can check out the official documentation and this notebook.\n\nFinally, you can try out the following Space that builds a mini image similarity application:\n\nIn this post, we ran through a quickstart for building image similarity systems. If you found this post interesting, we highly recommend building on top of the concepts we discussed here so you can get more comfortable with the inner workings.\n\nStill looking to learn more? Here are some additional resources that might be useful for you:\n\n- Faiss: A library for efficient similarity search\n\n- ScaNN: Efficient Vector Similarity Search\n\n- Integrating Image Searchers within Mobile Applications",
   "summaryZh": "介绍如何结合Hugging Face Datasets和Transformers进行图像相似度计算。",
   "summaryGeneratedAt": "2026-09-06T02:37:54.514462Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/embeddings.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/embeddings.png",
+      "alt": "",
+      "id": "image_37de053dc8f395bc"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/beans.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/beans.png",
+      "alt": "",
+      "id": "image_6249a8010a8b6b9a"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/fetch-similar-process.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/fetch-similar-process.png",
+      "alt": "",
+      "id": "image_37c3517a392ba31b"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/results_one.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/image_similarity/results_one.png",
+      "alt": "",
+      "id": "image_03b70b60adc713e4"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In this post, you'll learn to build an image similarity system with 🤗 Transformers. Finding out the similarity between a query image and potential candidates is an important use case for information retrieval systems, such as reverse image search, for example. All the system is trying to answer is that, given a query image and a set of candidate images, which images are the most similar to the query image.",
+      "spans": [
+        {
+          "start": 313,
+          "end": 318,
+          "kind": "em"
+        },
+        {
+          "start": 338,
+          "end": 347,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "We'll leverage the 🤗 datasets library as it seamlessly supports parallel processing which will come in handy when building this system.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 19,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Although the post uses a ViT-based model (nateraw/vit-base-beans) and a particular dataset (Beans), it can be extended to use other models supporting vision modality and other image datasets. Some notable models you could try:",
+      "spans": [
+        {
+          "start": 42,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 42,
+          "end": 64,
+          "kind": "a",
+          "href": "https://huggingface.co/nateraw/vit-base-beans"
+        },
+        {
+          "start": 92,
+          "end": 97,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/beans"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Swin Transformer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/swin"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "ConvNeXT",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/convnext"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "RegNet",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/regnet"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Also, the approach presented in the post can potentially be extended to other modalities as well.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "To study the fully working image-similarity system, you can refer to the Colab Notebook linked at the beginning.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "How do we define similarity?",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "To build this system, we first need to define how we want to compute the similarity between two images. One widely popular practice is to compute dense representations (embeddings) of the given images and then use the cosine similarity metric to determine how similar the two images are.",
+      "spans": [
+        {
+          "start": 218,
+          "end": 242,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Cosine_similarity"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "For this post, we'll use “embeddings” to represent images in vector space. This gives us a nice way to meaningfully compress the high-dimensional pixel space of images (224 x 224 x 3, for example) to something much lower dimensional (768, for example). The primary advantage of doing this is the reduced computation time in the subsequent steps.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Computing embeddings",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "To compute the embeddings from the images, we'll use a vision model that has some understanding of how to represent the input images in the vector space. This type of model is also commonly referred to as image encoder.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "For loading the model, we leverage the AutoModel class. It provides an interface for us to load any compatible model checkpoint from the Hugging Face Hub. Alongside the model, we also load the processor associated with the model for data preprocessing.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 39,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/auto#transformers.AutoModel"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "In this case, the checkpoint was obtained by fine-tuning a Vision Transformer based model on the beans dataset.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 89,
+          "kind": "a",
+          "href": "https://huggingface.co/google/vit-base-patch16-224-in21k"
+        },
+        {
+          "start": 97,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 97,
+          "end": 110,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/beans"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Some questions that might arise here:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Q1: Why did we not use AutoModelForImageClassification?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        },
+        {
+          "start": 23,
+          "end": 54,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "This is because we want to obtain dense representations of the images and not discrete categories, which are what AutoModelForImageClassification would have provided.",
+      "spans": [
+        {
+          "start": 114,
+          "end": 145,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Q2: Why this checkpoint in particular?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "As mentioned earlier, we're using a specific dataset to build the system. So, instead of using a generalist model (like the ones trained on the ImageNet-1k dataset, for example), it's better to use a model that has been fine-tuned on the dataset being used. That way, the underlying model better understands the input images.",
+      "spans": [
+        {
+          "start": 124,
+          "end": 163,
+          "kind": "a",
+          "href": "https://huggingface.co/models?dataset=dataset:imagenet-1k&sort=downloads"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Note that you can also use a checkpoint that was obtained through self-supervised pre-training. The checkpoint doesn't necessarily have to come from supervised learning. In fact, if pre-trained well, self-supervised models can yield impressive retrieval performance.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 227,
+          "end": 232,
+          "kind": "a",
+          "href": "https://ai.facebook.com/blog/dino-paws-computer-vision-with-self-supervised-transformers-and-10x-more-efficient-training/"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Now that we have a model for computing the embeddings, we need some candidate images to query against.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Loading a dataset for candidate images",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "In some time, we'll be building hash tables mapping the candidate images to hashes. During the query time, we'll use these hash tables. We'll talk more about hash tables in the respective section but for now, to have a set of candidate images, we will use the train split of the beans dataset.",
+      "spans": [
+        {
+          "start": 260,
+          "end": 265,
+          "kind": "code"
+        },
+        {
+          "start": 279,
+          "end": 284,
+          "kind": "code"
+        },
+        {
+          "start": 279,
+          "end": 292,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/beans"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "This is how a single sample from the training split looks like:",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "The dataset has three features:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "To demonstrate the image similarity system, we'll use 100 samples from the candidate image dataset to keep the overall runtime short.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "The process of finding similar images",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Below, you can find a pictorial overview of the process underlying fetching similar images.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Breaking down the above figure a bit, we have:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Extract the embeddings from the candidate images (candidate_subset), storing them in a matrix.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 66,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Take a query image and extract its embeddings.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Iterate over the embedding matrix (computed in step 1) and compute the similarity score between the query embedding and the current candidate embeddings. We usually maintain a dictionary-like mapping maintaining a correspondence between some identifier of the candidate image and the similarity scores.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Sort the mapping structure w.r.t the similarity scores and return the underlying identifiers. We use these identifiers to fetch the candidate samples.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "We can write a simple utility and map() it to our dataset of candidate images to compute the embeddings efficiently.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 39,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "And we can map extract_embeddings() like so:",
+      "spans": [
+        {
+          "start": 15,
+          "end": 35,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Next, for convenience, we create a list containing the identifiers of the candidate images.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "We'll use the matrix of the embeddings of all the candidate images for computing the similarity scores with a query image. We have already computed the candidate image embeddings. In the next cell, we just gather them together in a matrix.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "We'll use cosine similarity to compute the similarity score in between two embedding vectors. We'll then use it to fetch similar candidate samples given a query sample.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 27,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Cosine_similarity"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Perform a query",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Given all the utilities, we're equipped to do a similarity search. Let's have a query image from the test split of the beans dataset:",
+      "spans": [
+        {
+          "start": 101,
+          "end": 105,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 124,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Leads to:",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Seems like our system got the right set of similar images. When visualized, we'd get:",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Further extensions and conclusions",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "We now have a working image similarity system. But in reality, you'll be dealing with a lot more candidate images. Taking that into consideration, our current procedure has got multiple drawbacks:",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "If we store the embeddings as is, the memory requirements can shoot up quickly, especially when dealing with millions of candidate images. The embeddings are 768-d in our case, which can still be relatively high in the large-scale regime.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Having high-dimensional embeddings have a direct effect on the subsequent computations involved in the retrieval part.",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "If we can somehow reduce the dimensionality of the embeddings without disturbing their meaning, we can still maintain a good trade-off between speed and retrieval quality. The accompanying Colab Notebook of this post implements and demonstrates utilities for achieving this with random projection and locality-sensitive hashing.",
+      "spans": [
+        {
+          "start": 176,
+          "end": 203,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/examples/image_similarity.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "🤗 Datasets offers direct integrations with FAISS which further simplifies the process of building similarity systems. Let's say you've already extracted the embeddings of the candidate images (the beans dataset) and stored them inside a feature called embeddings. You can now easily use the add_faiss_index() of the dataset to build a dense index:",
+      "spans": [
+        {
+          "start": 43,
+          "end": 48,
+          "kind": "a",
+          "href": "https://github.com/facebookresearch/faiss"
+        },
+        {
+          "start": 197,
+          "end": 202,
+          "kind": "code"
+        },
+        {
+          "start": 252,
+          "end": 262,
+          "kind": "code"
+        },
+        {
+          "start": 291,
+          "end": 308,
+          "kind": "code"
+        },
+        {
+          "start": 291,
+          "end": 308,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/v2.7.1/en/package_reference/main_classes#datasets.Dataset.add_faiss_index"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Once the index is built, dataset_with_embeddings can be used to retrieve the nearest examples given query embeddings with get_nearest_examples():",
+      "spans": [
+        {
+          "start": 25,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 144,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/v2.7.1/en/package_reference/main_classes#datasets.Dataset.get_nearest_examples"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "The method returns scores and corresponding candidate examples. To know more, you can check out the official documentation and this notebook.",
+      "spans": [
+        {
+          "start": 100,
+          "end": 122,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/faiss_es"
+        },
+        {
+          "start": 127,
+          "end": 140,
+          "kind": "a",
+          "href": "https://colab.research.google.com/gist/sayakpaul/5b5b5a9deabd3c5d8cb5ef8c7b4bb536/image_similarity_faiss.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Finally, you can try out the following Space that builds a mini image similarity application:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "In this post, we ran through a quickstart for building image similarity systems. If you found this post interesting, we highly recommend building on top of the concepts we discussed here so you can get more comfortable with the inner workings.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Still looking to learn more? Here are some additional resources that might be useful for you:",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Faiss: A library for efficient similarity search",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "a",
+          "href": "https://engineering.fb.com/2017/03/29/data-infrastructure/faiss-a-library-for-efficient-similarity-search/"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "ScaNN: Efficient Vector Similarity Search",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "a",
+          "href": "http://ai.googleblog.com/2020/07/announcing-scann-efficient-vector.html"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Integrating Image Searchers within Mobile Applications",
+      "spans": [
+        {
+          "start": 0,
+          "end": 54,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/lite/inference_with_metadata/task_library/image_searcher"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "26397282fac46b4e64e6b869b232d9a6e95dc80eb8619d14b81d40d6f5ea2d40",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from transformers import AutoImageProcessor, AutoModel\n\n\nmodel_ckpt = \"nateraw/vit-base-beans\"\nprocessor = AutoImageProcessor.from_pretrained(model_ckpt)\nmodel = AutoModel.from_pretrained(model_ckpt)"
+    },
+    {
+      "id": "c0002",
+      "source": "from datasets import load_dataset\n\n\ndataset = load_dataset(\"beans\")"
+    },
+    {
+      "id": "c0003",
+      "source": "dataset[\"train\"].features\n>>> {'image_file_path': Value(dtype='string', id=None),\n 'image': Image(decode=True, id=None),\n 'labels': ClassLabel(names=['angular_leaf_spot', 'bean_rust', 'healthy'], id=None)}"
+    },
+    {
+      "id": "c0004",
+      "source": "num_samples = 100\nseed = 42\ncandidate_subset = dataset[\"train\"].shuffle(seed=seed).select(range(num_samples))"
+    },
+    {
+      "id": "c0005",
+      "source": "import torch \n\ndef extract_embeddings(model: torch.nn.Module):\n    \"\"\"Utility to compute embeddings.\"\"\"\n    device = model.device\n\n    def pp(batch):\n        images = batch[\"image\"]\n        # `transformation_chain` is a compostion of preprocessing\n        # transformations we apply to the input images to prepare them\n        # for the model. For more details, check out the accompanying Colab Notebook.\n        image_batch_transformed = torch.stack(\n            [transformation_chain(image) for image in images]\n        )\n        new_batch = {\"pixel_values\": image_batch_transformed.to(device)}\n        with torch.no_grad():\n            embeddings = model(**new_batch).last_hidden_state[:, 0].cpu()\n        return {\"embeddings\": embeddings}\n\n    return pp"
+    },
+    {
+      "id": "c0006",
+      "source": "device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\nextract_fn = extract_embeddings(model.to(device))\ncandidate_subset_emb = candidate_subset.map(extract_fn, batched=True, batch_size=batch_size)"
+    },
+    {
+      "id": "c0007",
+      "source": "candidate_ids = []\n\nfor id in tqdm(range(len(candidate_subset_emb))):\n    label = candidate_subset_emb[id][\"labels\"]\n\n    # Create a unique indentifier.\n    entry = str(id) + \"_\" + str(label)\n\n    candidate_ids.append(entry)"
+    },
+    {
+      "id": "c0008",
+      "source": "all_candidate_embeddings = np.array(candidate_subset_emb[\"embeddings\"])\nall_candidate_embeddings = torch.from_numpy(all_candidate_embeddings)"
+    },
+    {
+      "id": "c0009",
+      "source": "def compute_scores(emb_one, emb_two):\n    \"\"\"Computes cosine similarity between two vectors.\"\"\"\n    scores = torch.nn.functional.cosine_similarity(emb_one, emb_two)\n    return scores.numpy().tolist()\n\n\ndef fetch_similar(image, top_k=5):\n    \"\"\"Fetches the `top_k` similar images with `image` as the query.\"\"\"\n    # Prepare the input query image for embedding computation.\n    image_transformed = transformation_chain(image).unsqueeze(0)\n    new_batch = {\"pixel_values\": image_transformed.to(device)}\n\n    # Comute the embedding.\n    with torch.no_grad():\n        query_embeddings = model(**new_batch).last_hidden_state[:, 0].cpu()\n\n    # Compute similarity scores with all the candidate images at one go.\n    # We also create a mapping between the candidate image identifiers\n    # and their similarity scores with the query image.\n    sim_scores = compute_scores(all_candidate_embeddings, query_embeddings)\n    similarity_mapping = dict(zip(candidate_ids, sim_scores))\n \n    # Sort the mapping dictionary and return `top_k` candidates.\n    similarity_mapping_sorted = dict(\n        sorted(similarity_mapping.items(), key=lambda x: x[1], reverse=True)\n    )\n    id_entries = list(similarity_mapping_sorted.keys())[:top_k]\n\n    ids = list(map(lambda x: int(x.split(\"_\")[0]), id_entries))\n    labels = list(map(lambda x: int(x.split(\"_\")[-1]), id_entries))\n    return ids, labels"
+    },
+    {
+      "id": "c0010",
+      "source": "test_idx = np.random.choice(len(dataset[\"test\"]))\ntest_sample = dataset[\"test\"][test_idx][\"image\"]\ntest_label = dataset[\"test\"][test_idx][\"labels\"]\n\nsim_ids, sim_labels = fetch_similar(test_sample)\nprint(f\"Query label: {test_label}\")\nprint(f\"Top 5 candidate labels: {sim_labels}\")"
+    },
+    {
+      "id": "c0011",
+      "source": "Query label: 0\nTop 5 candidate labels: [0, 0, 0, 0, 0]"
+    },
+    {
+      "id": "c0012",
+      "source": "dataset_with_embeddings.add_faiss_index(column=\"embeddings\")"
+    },
+    {
+      "id": "c0013",
+      "source": "scores, retrieved_examples = dataset_with_embeddings.get_nearest_examples(\n    \"embeddings\", qi_embedding, k=top_k\n)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "26397282fac46b4e64e6b869b232d9a6e95dc80eb8619d14b81d40d6f5ea2d40",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_37de053dc8f395bc",
+      "type": "image",
+      "afterBlockId": "b0011",
+      "order": 1
+    },
+    {
+      "mediaId": "image_6249a8010a8b6b9a",
+      "type": "image",
+      "afterBlockId": "b0025",
+      "order": 2
+    },
+    {
+      "mediaId": "image_37c3517a392ba31b",
+      "type": "image",
+      "afterBlockId": "b0029",
+      "order": 3
+    },
+    {
+      "mediaId": "image_03b70b60adc713e4",
+      "type": "image",
+      "afterBlockId": "b0043",
+      "order": 4
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 5,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 5,
+    "savedImages": 5,
+    "sourceImageOccurrences": 5,
+    "placedImageOccurrences": 5,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:20:01.053392Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:20:01.053409Z",
+  "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
     "provider": "gemini",
