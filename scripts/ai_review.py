@@ -240,7 +240,10 @@ def normalize_review(raw: dict, item: dict, provider: str, model: str, reviewed_
     if dimensions["impact"] < 20 or evidence_level != "clear":
         score_ceiling = min(score_ceiling, 84)
     if is_community_item(item) and evidence_level != "clear":
-        score_ceiling = min(score_ceiling, 69)
+        # Forum posts carry no editorial review and one forum was supplying about
+        # a third of the feed, so they rank below official posts of similar
+        # quality. Still level three: worth reading, below the important tier.
+        score_ceiling = min(score_ceiling, 59)
     dimensions = cap_dimensions(dimensions, score_ceiling)
     score = sum(dimensions.values())
     importance_level = level_for_score(score)
