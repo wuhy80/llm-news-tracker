@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/informer",
   "resolvedUrl": "https://huggingface.co/blog/informer",
   "fetchedAt": "2026-08-27T03:10:34.555612Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "## Introduction\n\nA few months ago we introduced the Time Series Transformer, which is the vanilla Transformer (Vaswani et al., 2017) applied to forecasting, and showed an example for the univariate probabilistic forecasting task (i.e. predicting each time series' 1-d distribution individually). In this post we introduce the Informer model (Zhou, Haoyi, et al., 2021), AAAI21 best paper which is now available in 🤗 Transformers. We will show how to use the Informer model for the multivariate probabilistic forecasting task, i.e., predicting the distribution of a future vector of time-series target values. Note that this will also work for the vanilla Time Series Transformer model.\n\n## Multivariate Probabilistic Time Series Forecasting\n\nAs far as the modeling aspect of probabilistic forecasting is concerned, the Transformer/Informer will require no change when dealing with multivariate time series. In both the univariate and multivariate setting, the model will receive a sequence of vectors and thus the only change is on the output or emission side.\n\nModeling the full joint conditional distribution of high dimensional data can get computationally expensive and thus methods resort to some approximation of the distribution, the easiest being to model the data as an independent distribution from the same family, or some low-rank approximation to the full covariance, etc. Here we will just resort to the independent (or diagonal) emissions which are supported for the families of distributions we have implemented here.\n\n## Informer - Under The Hood\n\nBased on the vanilla Transformer (Vaswani et al., 2017), Informer employs two major improvements. To understand these improvements, let's recall the drawbacks of the vanilla Transformer:\n\n- Quadratic computation of canonical self-attention: The vanilla Transformer has a computational complexity of O(T2D)O(T^2 D)O(T2D) where TTT is the time series length and DDD is the dimension of the hidden states. For long sequence time-series forecasting (also known as the LSTF problem), this might be really computationally expensive. To solve this problem, Informer employs a new self-attention mechanism called ProbSparse attention, which has O(Tlog⁡T)O(T \\log T)O(TlogT) time and space complexity.\n\n- Memory bottleneck when stacking layers: When stacking NNN encoder/decoder layers, the vanilla Transformer has a memory usage of O(NT2)O(N T^2)O(NT2), which limits the model's capacity for long sequences. Informer uses a Distilling operation, for reducing the input size between layers into its half slice. By doing so, it reduces the whole memory usage to be O(N⋅Tlog⁡T)O(N\\cdot T \\log T)O(N⋅TlogT).\n\nAs you can see, the motivation for the Informer model is similar to Longformer (Beltagy et el., 2020), Sparse Transformer (Child et al., 2019) and other NLP papers for reducing the quadratic complexity of the self-attention mechanism when the input sequence is long. Now, let's dive into ProbSparse attention and the Distilling operation with code examples.\n\n### ProbSparse Attention\n\nThe main idea of ProbSparse is that the canonical self-attention scores form a long-tail distribution, where the \"active\" queries lie in the \"head\" scores and \"lazy\" queries lie in the \"tail\" area. By \"active\" query we mean a query qiq_iqi​ such that the dot-product ⟨qi,ki⟩\\langle q_i,k_i \\rangle⟨qi​,ki​⟩ contributes to the major attention, whereas a \"lazy\" query forms a dot-product which generates trivial attention. Here, qiq_iqi​ and kik_iki​ are the iii-th rows in QQQ and KKK attention matrices respectively.\n\n—\n\nVanilla self attention vs ProbSparse attention from Autoformer (Wu, Haixu, et al., 2021)\n\nGiven the idea of \"active\" and \"lazy\" queries, the ProbSparse attention selects the \"active\" queries, and creates a reduced query matrix QreducedQ_{reduced}Qreduced​ which is used to calculate the attention weights in O(Tlog⁡T)O(T \\log T)O(TlogT). Let's see this more in detail with a code example.\n\nRecall the canonical self-attention formula:\n\nAttention(Q,K,V)=softmax(QKTdk)V \\textrm{Attention}(Q, K, V) = \\textrm{softmax}(\\frac{QK^T}{\\sqrt{d_k}} )V Attention(Q,K,V)=softmax(dk​​QKT​)V\n\nWhere Q∈RLQ×dQ\\in \\mathbb{R}^{L_Q \\times d}Q∈RLQ​×d, K∈RLK×dK\\in \\mathbb{R}^{L_K \\times d}K∈RLK​×d and V∈RLV×dV\\in \\mathbb{R}^{L_V \\times d}V∈RLV​×d. Note that in practice, the input length of queries and keys are typically equivalent in the self-attention computation, i.e. LQ=LK=TL_Q = L_K = TLQ​=LK​=T where TTT is the time series length. Therefore, the QKTQK^TQKT multiplication takes O(T2⋅d)O(T^2 \\cdot d)O(T2⋅d) computational complexity. In ProbSparse attention, our goal is to create a new QreduceQ_{reduce}Qreduce​ matrix and define:\n\nProbSparseAttention(Q,K,V)=softmax(QreduceKTdk)V \\textrm{ProbSparseAttention}(Q, K, V) = \\textrm{softmax}(\\frac{Q_{reduce}K^T}{\\sqrt{d_k}} )V ProbSparseAttention(Q,K,V)=softmax(dk​​Qreduce​KT​)V\n\nwhere the QreduceQ_{reduce}Qreduce​ matrix only selects the Top uuu \"active\" queries. Here, u=c⋅log⁡LQu = c \\cdot \\log L_Qu=c⋅logLQ​ and ccc called the sampling factor hyperparameter for the ProbSparse attention. Since QreduceQ_{reduce}Qreduce​ selects only the Top uuu queries, its size is c⋅log⁡LQ×dc\\cdot \\log L_Q \\times dc⋅logLQ​×d, so the multiplication QreduceKTQ_{reduce}K^TQreduce​KT takes only O(LKlog⁡LQ)=O(Tlog⁡T)O(L_K \\log L_Q) = O(T \\log T)O(LK​logLQ​)=O(TlogT).\n\nThis is good! But how can we select the uuu \"active\" queries to create QreduceQ_{reduce}Qreduce​? Let's define the Query Sparsity Measurement.\n\n#### Query Sparsity Measurement\n\nQuery Sparsity Measurement M(qi,K)M(q_i, K)M(qi​,K) is used for selecting the uuu \"active\" queries qiq_iqi​ in QQQ to create QreduceQ_{reduce}Qreduce​. In theory, the dominant ⟨qi,kj⟩\\langle q_i,k_j \\rangle⟨qi​,kj​⟩ pairs encourage the \"active\" qiq_iqi​'s probability distribution away from the uniform distribution as can be seen in the figure below. Hence, the KL divergence between the actual queries distribution and the uniform distribution is used to define the sparsity measurement.\n\n—\n\nThe illustration of ProbSparse Attention from official repository\n\nIn practice, the measurement is defined as:\n\nM(qi,K)=max⁡jqikjTd−1Lk∑j=1LkqikjTd M(q_i, K) = \\max_j \\frac{q_ik_j^T}{\\sqrt{d}}-\\frac{1}{L_k} \\sum_{j=1}^{L_k}\\frac{q_ik_j^T}{\\sqrt{d}} M(qi​,K)=jmax​d​qi​kjT​​−Lk​1​j=1∑Lk​​d​qi​kjT​​\n\nThe important thing to understand here is when M(qi,K)M(q_i, K)M(qi​,K) is larger, the query qiq_iqi​ should be in QreduceQ_{reduce}Qreduce​ and vice versa.\n\nBut how can we calculate the term qikjTq_ik_j^Tqi​kjT​ in non-quadratic time? Recall that most of the dot-product ⟨qi,ki⟩\\langle q_i,k_i \\rangle⟨qi​,ki​⟩ generate either way the trivial attention (i.e. long-tail distribution property), so it is enough to randomly sample a subset of keys from KKK, which will be called K_sample in the code.\n\nNow, we are ready to see the code of probsparse_attention:\n\n```\nfrom torch import nn\nimport math\n\n\ndef probsparse_attention(query_states, key_states, value_states, sampling_factor=5):\n    \"\"\"\n    Compute the probsparse self-attention.\n    Input shape: Batch x Time x Channel\n\n    Note the additional `sampling_factor` input.\n    \"\"\"\n    # get input sizes with logs\n    L_K = key_states.size(1)\n    L_Q = query_states.size(1)\n    log_L_K = np.ceil(np.log1p(L_K)).astype(\"int\").item()\n    log_L_Q = np.ceil(np.log1p(L_Q)).astype(\"int\").item()\n\n    # calculate a subset of samples to slice from K and create Q_K_sample\n    U_part = min(sampling_factor * L_Q * log_L_K, L_K)\n\n    # create Q_K_sample (the q_i * k_j^T term in the sparsity measurement)\n    index_sample = torch.randint(0, L_K, (U_part,))\n    K_sample = key_states[:, index_sample, :]\n    Q_K_sample = torch.bmm(query_states, K_sample.transpose(1, 2))\n\n    # calculate the query sparsity measurement with Q_K_sample\n    M = Q_K_sample.max(dim=-1)[0] - torch.div(Q_K_sample.sum(dim=-1), L_K)\n\n    # calculate u to find the Top-u queries under the sparsity measurement\n    u = min(sampling_factor * log_L_Q, L_Q)\n    M_top = M.topk(u, sorted=False)[1]\n\n    # calculate Q_reduce as query_states[:, M_top]\n    dim_for_slice = torch.arange(query_states.size(0)).unsqueeze(-1)\n    Q_reduce = query_states[dim_for_slice, M_top]  # size: c*log_L_Q x channel\n\n    # and now, same as the canonical\n    d_k = query_states.size(-1)\n    attn_scores = torch.bmm(Q_reduce, key_states.transpose(-2, -1))  # Q_reduce x K^T\n    attn_scores = attn_scores / math.sqrt(d_k)\n    attn_probs = nn.functional.softmax(attn_scores, dim=-1)\n    attn_output = torch.bmm(attn_probs, value_states)\n\n    return attn_output, attn_scores\n```\n\nNote that in the implementation, UpartU_{part}Upart​ contain LQL_QLQ​ in the calculation, for stability issues (see this disccusion for more information).\n\nWe did it! Please be aware that this is only a partial implementation of the probsparse_attention, and the full implementation can be found in 🤗 Transformers.\n\n### Distilling\n\nBecause of the ProbSparse self-attention, the encoder’s feature map has some redundancy that can be removed. Therefore, the distilling operation is used to reduce the input size between encoder layers into its half slice, thus in theory removing this redundancy. In practice, Informer's \"distilling\" operation just adds 1D convolution layers with max pooling between each of the encoder layers. Let XnX_nXn​ be the output of the nnn-th encoder layer, the distilling operation is then defined as:\n\nXn+1=MaxPool(ELU(Conv1d(Xn)) X_{n+1} = \\textrm{MaxPool} ( \\textrm{ELU}(\\textrm{Conv1d}(X_n)) Xn+1​=MaxPool(ELU(Conv1d(Xn​))\n\nLet's see this in code:\n\n```\nfrom torch import nn\n\n# ConvLayer is a class with forward pass applying ELU and MaxPool1d\ndef informer_encoder_forward(x_input, num_encoder_layers=3, distil=True):\n    # Initialize the convolution layers\n    if distil:\n        conv_layers = nn.ModuleList([ConvLayer() for _ in range(num_encoder_layers - 1)])\n        conv_layers.append(None)\n    else:\n        conv_layers = [None] * num_encoder_layers\n    \n    # Apply conv_layer between each encoder_layer\n    for encoder_layer, conv_layer in zip(encoder_layers, conv_layers):\n        output = encoder_layer(x_input)\n        if conv_layer is not None:\n            output = conv_layer(loutput)\n    \n    return output\n```\n\nBy reducing the input of each layer by two, we get a memory usage of O(N⋅Tlog⁡T)O(N\\cdot T \\log T)O(N⋅TlogT) instead of O(N⋅T2)O(N\\cdot T^2)O(N⋅T2) where NNN is the number of encoder/decoder layers. This is what we wanted!\n\nThe Informer model in now available in the 🤗 Transformers library, and simply called InformerModel. In the sections below, we will show how to train this model on a custom multivariate time-series dataset.\n\n## Set-up Environment\n\nFirst, let's install the necessary libraries: 🤗 Transformers, 🤗 Datasets, 🤗 Evaluate, 🤗 Accelerate and GluonTS.\n\nAs we will show, GluonTS will be used for transforming the data to create features as well as for creating appropriate training, validation and test batches.\n\n```\n!pip install -q transformers datasets evaluate accelerate gluonts ujson\n```\n\n## Load Dataset\n\nIn this blog post, we'll use the traffic_hourly dataset, which is available on the Hugging Face Hub. This dataset contains the San Francisco Traffic dataset used by Lai et al. (2017). It contains 862 hourly time series showing the road occupancy rates in the range [0,1][0, 1][0,1] on the San Francisco Bay area freeways from 2015 to 2016.\n\nThis dataset is part of the Monash Time Series Forecasting repository, a collection of time series datasets from a number of domains. It can be viewed as the GLUE benchmark of time series forecasting.\n\n```\nfrom datasets import load_dataset\n\ndataset = load_dataset(\"monash_tsf\", \"traffic_hourly\")\n```\n\nAs can be seen, the dataset contains 3 splits: train, validation and test.\n\n```\ndataset\n\n>>> DatasetDict({\n        train: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n        test: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n        validation: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n    })\n```\n\nEach example contains a few keys, of which start and target are the most important ones. Let us have a look at the first time series in the dataset:\n\n```\ntrain_example = dataset[\"train\"][0]\ntrain_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])\n```\n\nThe start simply indicates the start of the time series (as a datetime), and the target contains the actual values of the time series.\n\nThe start will be useful to add time related features to the time series values, as extra input to the model (such as \"month of year\"). Since we know the frequency of the data is hourly, we know for instance that the second value has the timestamp 2015-01-01 01:00:01, 2015-01-01 02:00:01, etc.\n\n```\nprint(train_example[\"start\"])\nprint(len(train_example[\"target\"]))\n\n>>> 2015-01-01 00:00:01\n    17448\n```\n\nThe validation set contains the same data as the training set, just for a prediction_length longer amount of time. This allows us to validate the model's predictions against the ground truth.\n\nThe test set is again one prediction_length longer data compared to the validation set (or some multiple of prediction_length longer data compared to the training set for testing on multiple rolling windows).\n\n```\nvalidation_example = dataset[\"validation\"][0]\nvalidation_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])\n```\n\nThe initial values are exactly the same as the corresponding training example. However, this example has prediction_length=48 (48 hours, or 2 days) additional values compared to the training example. Let us verify it.\n\n```\nfreq = \"1H\"\nprediction_length = 48\n\nassert len(train_example[\"target\"]) + prediction_length == len(\n    dataset[\"validation\"][0][\"target\"]\n)\n```\n\nLet's visualize this:\n\n```\nimport matplotlib.pyplot as plt\n\nnum_of_samples = 150\n\nfigure, axes = plt.subplots()\naxes.plot(train_example[\"target\"][-num_of_samples:], color=\"blue\")\naxes.plot(\n    validation_example[\"target\"][-num_of_samples - prediction_length :],\n    color=\"red\",\n    alpha=0.5,\n)\n\nplt.show()\n```\n\nLet's split up the data:\n\n```\ntrain_dataset = dataset[\"train\"]\ntest_dataset = dataset[\"test\"]\n```\n\n## Update start to pd.Period\n\nThe first thing we'll do is convert the start feature of each time series to a pandas Period index using the data's freq:\n\n```\nfrom functools import lru_cache\n\nimport pandas as pd\nimport numpy as np\n\n\n@lru_cache(10_000)\ndef convert_to_pandas_period(date, freq):\n    return pd.Period(date, freq)\n\n\ndef transform_start_field(batch, freq):\n    batch[\"start\"] = [convert_to_pandas_period(date, freq) for date in batch[\"start\"]]\n    return batch\n```\n\nWe now use datasets' set_transform functionality to do this on-the-fly in place:\n\n```\nfrom functools import partial\n\ntrain_dataset.set_transform(partial(transform_start_field, freq=freq))\ntest_dataset.set_transform(partial(transform_start_field, freq=freq))\n```\n\nNow, let's convert the dataset into a multivariate time series using the MultivariateGrouper from GluonTS. This grouper will convert the individual 1-dimensional time series into a single 2D matrix.\n\n```\nfrom gluonts.dataset.multivariate_grouper import MultivariateGrouper\n\nnum_of_variates = len(train_dataset)\n\ntrain_grouper = MultivariateGrouper(max_target_dim=num_of_variates)\ntest_grouper = MultivariateGrouper(\n    max_target_dim=num_of_variates,\n    num_test_dates=len(test_dataset) // num_of_variates, # number of rolling test windows\n)\n\nmulti_variate_train_dataset = train_grouper(train_dataset)\nmulti_variate_test_dataset = test_grouper(test_dataset)\n```\n\nNote that the target is now 2-dimensional, where the first dimension is the number of variates (number of time series) and the second is the time series values (time dimension):\n\n```\nmulti_variate_train_example = multi_variate_train_dataset[0]\nprint(\"multi_variate_train_example[\"target\"].shape =\", multi_variate_train_example[\"target\"].shape)\n\n>>> multi_variate_train_example[\"target\"].shape = (862, 17448)\n```\n\n## Define the Model\n\nNext, let's instantiate a model. The model will be trained from scratch, hence we won't use the from_pretrained method here, but rather randomly initialize the model from a config.\n\nWe specify a couple of additional parameters to the model:\n\n- prediction_length (in our case, 48 hours): this is the horizon that the decoder of the Informer will learn to predict for;\n\n- context_length: the model will set the context_length (input of the encoder) equal to the prediction_length, if no context_length is specified;\n\n- lags for a given frequency: these specify an efficient \"look back\" mechanism, where we concatenate values from the past to the current values as additional features, e.g. for a Daily frequency we might consider a look back of [1, 7, 30, ...] or for Minute data we might consider [1, 30, 60, 60*24, ...] etc.;\n\n- the number of time features: in our case, this will be 5 as we'll add HourOfDay, DayOfWeek, ..., and Age features (see below).\n\nLet us check the default lags provided by GluonTS for the given frequency (\"hourly\"):\n\n```\nfrom gluonts.time_feature import get_lags_for_frequency\n\nlags_sequence = get_lags_for_frequency(freq)\nprint(lags_sequence)\n\n>>> [1, 2, 3, 4, 5, 6, 7, 23, 24, 25, 47, 48, 49, 71, 72, 73, 95, 96, 97, 119, 120, \n     121, 143, 144, 145, 167, 168, 169, 335, 336, 337, 503, 504, 505, 671, 672, 673, 719, 720, 721]\n```\n\nThis means that this would look back up to 721 hours (~30 days) for each time step, as additional features. However, the resulting feature vector would end up being of size len(lags_sequence)*num_of_variates which for our case will be 34480! This is not going to work so we will use our own sensible lags.\n\nLet us also check the default time features which GluonTS provides us:\n\n```\nfrom gluonts.time_feature import time_features_from_frequency_str\n\ntime_features = time_features_from_frequency_str(freq)\nprint(time_features)\n\n>>> [<function hour_of_day at 0x7f3809539240>, <function day_of_week at 0x7f3809539360>, <function day_of_month at 0x7f3809539480>, <function day_of_year at 0x7f38095395a0>]\n```\n\nIn this case, there are four additional features, namely \"hour of day\", \"day of week\", \"day of month\" and \"day of year\". This means that for each time step, we'll add these features as a scalar values. For example, consider the timestamp 2015-01-01 01:00:01. The four additional features will be:\n\n```\nfrom pandas.core.arrays.period import period_array\n\ntimestamp = pd.Period(\"2015-01-01 01:00:01\", freq=freq)\ntimestamp_as_index = pd.PeriodIndex(data=period_array([timestamp]))\nadditional_features = [\n    (time_feature.__name__, time_feature(timestamp_as_index))\n    for time_feature in time_features\n]\nprint(dict(additional_features))\n\n>>> {'hour_of_day': array([-0.45652174]), 'day_of_week': array([0.]), 'day_of_month': array([-0.5]), 'day_of_year': array([-0.5])}\n```\n\nNote that hours and days are encoded as values between [-0.5, 0.5] from GluonTS. For more information about time_features, please see this. Besides those 4 features, we'll also add an \"age\" feature as we'll see later on in the data transformations.\n\nWe now have everything to define the model:\n\n```\nfrom transformers import InformerConfig, InformerForPrediction\n\nconfig = InformerConfig(\n    # in the multivariate setting, input_size is the number of variates in the time series per time step\n    input_size=num_of_variates,\n    # prediction length:\n    prediction_length=prediction_length,\n    # context length:\n    context_length=prediction_length * 2,\n    # lags value copied from 1 week before:\n    lags_sequence=[1, 24 * 7],\n    # we'll add 5 time features (\"hour_of_day\", ..., and \"age\"):\n    num_time_features=len(time_features) + 1,\n    \n    # informer params:\n    dropout=0.1,\n    encoder_layers=6,\n    decoder_layers=4,\n    # project input from num_of_variates*len(lags_sequence)+num_time_features to:\n    d_model=64,\n)\n\nmodel = InformerForPrediction(config)\n```\n\nBy default, the model uses a diagonal Student-t distribution (but this is configurable):\n\n```\nmodel.config.distribution_output\n\n>>> 'student_t'\n```\n\n## Define Transformations\n\nNext, we define the transformations for the data, in particular for the creation of the time features (based on the dataset or universal ones).\n\nAgain, we'll use the GluonTS library for this. We define a Chain of transformations (which is a bit comparable to torchvision.transforms.Compose for images). It allows us to combine several transformations into a single pipeline.\n\n```\nfrom gluonts.time_feature import TimeFeature\nfrom gluonts.dataset.field_names import FieldName\nfrom gluonts.transform import (\n    AddAgeFeature,\n    AddObservedValuesIndicator,\n    AddTimeFeatures,\n    AsNumpyArray,\n    Chain,\n    ExpectedNumInstanceSampler,\n    InstanceSplitter,\n    RemoveFields,\n    SelectFields,\n    SetField,\n    TestSplitSampler,\n    Transformation,\n    ValidationSplitSampler,\n    VstackFeatures,\n    RenameFields,\n)\n```\n\nThe transformations below are annotated with comments, to explain what they do. At a high level, we will iterate over the individual time series of our dataset and add/remove fields or features:\n\n```\nfrom transformers import PretrainedConfig\n\n\ndef create_transformation(freq: str, config: PretrainedConfig) -> Transformation:\n    # create list of fields to remove later\n    remove_field_names = []\n    if config.num_static_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_REAL)\n    if config.num_dynamic_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_DYNAMIC_REAL)\n    if config.num_static_categorical_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_CAT)\n\n    return Chain(\n        # step 1: remove static/dynamic fields if not specified\n        [RemoveFields(field_names=remove_field_names)]\n        # step 2: convert the data to NumPy (potentially not needed)\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_CAT,\n                    expected_ndim=1,\n                    dtype=int,\n                )\n            ]\n            if config.num_static_categorical_features > 0\n            else []\n        )\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_REAL,\n                    expected_ndim=1,\n                )\n            ]\n            if config.num_static_real_features > 0\n            else []\n        )\n        + [\n            AsNumpyArray(\n                field=FieldName.TARGET,\n                # we expect an extra dim for the multivariate case:\n                expected_ndim=1 if config.input_size == 1 else 2,\n            ),\n            # step 3: handle the NaN's by filling in the target with zero\n            # and return the mask (which is in the observed values)\n            # true for observed values, false for nan's\n            # the decoder uses this mask (no loss is incurred for unobserved values)\n            # see loss_weights inside the xxxForPrediction model\n            AddObservedValuesIndicator(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.OBSERVED_VALUES,\n            ),\n            # step 4: add temporal features based on freq of the dataset\n            # these serve as positional encodings\n            AddTimeFeatures(\n                start_field=FieldName.START,\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_TIME,\n                time_features=time_features_from_frequency_str(freq),\n                pred_length=config.prediction_length,\n            ),\n            # step 5: add another temporal feature (just a single number)\n            # tells the model where in the life the value of the time series is\n            # sort of running counter\n            AddAgeFeature(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_AGE,\n                pred_length=config.prediction_length,\n                log_scale=True,\n            ),\n            # step 6: vertically stack all the temporal features into the key FEAT_TIME\n            VstackFeatures(\n                output_field=FieldName.FEAT_TIME,\n                input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]\n                + (\n                    [FieldName.FEAT_DYNAMIC_REAL]\n                    if config.num_dynamic_real_features > 0\n                    else []\n                ),\n            ),\n            # step 7: rename to match HuggingFace names\n            RenameFields(\n                mapping={\n                    FieldName.FEAT_STATIC_CAT: \"static_categorical_features\",\n                    FieldName.FEAT_STATIC_REAL: \"static_real_features\",\n                    FieldName.FEAT_TIME: \"time_features\",\n                    FieldName.TARGET: \"values\",\n                    FieldName.OBSERVED_VALUES: \"observed_mask\",\n                }\n            ),\n        ]\n    )\n```\n\n## Define InstanceSplitter\n\nFor training/validation/testing we next create an InstanceSplitter which is used to sample windows from the dataset (as, remember, we can't pass the entire history of values to the model due to time- and memory constraints).\n\nThe instance splitter samples random context_length sized and subsequent prediction_length sized windows from the data, and appends a past_ or future_ key to any temporal keys in time_series_fields for the respective windows. The instance splitter can be configured into three different modes:\n\n- mode=\"train\": Here we sample the context and prediction length windows randomly from the dataset given to it (the training dataset)\n\n- mode=\"validation\": Here we sample the very last context length window and prediction window from the dataset given to it (for the back-testing or validation likelihood calculations)\n\n- mode=\"test\": Here we sample the very last context length window only (for the prediction use case)\n\n```\nfrom gluonts.transform.sampler import InstanceSampler\nfrom typing import Optional\n\n\ndef create_instance_splitter(\n    config: PretrainedConfig,\n    mode: str,\n    train_sampler: Optional[InstanceSampler] = None,\n    validation_sampler: Optional[InstanceSampler] = None,\n) -> Transformation:\n    assert mode in [\"train\", \"validation\", \"test\"]\n\n    instance_sampler = {\n        \"train\": train_sampler\n        or ExpectedNumInstanceSampler(\n            num_instances=1.0, min_future=config.prediction_length\n        ),\n        \"validation\": validation_sampler\n        or ValidationSplitSampler(min_future=config.prediction_length),\n        \"test\": TestSplitSampler(),\n    }[mode]\n\n    return InstanceSplitter(\n        target_field=\"values\",\n        is_pad_field=FieldName.IS_PAD,\n        start_field=FieldName.START,\n        forecast_start_field=FieldName.FORECAST_START,\n        instance_sampler=instance_sampler,\n        past_length=config.context_length + max(config.lags_sequence),\n        future_length=config.prediction_length,\n        time_series_fields=[\"time_features\", \"observed_mask\"],\n    )\n```\n\n## Create DataLoaders\n\nNext, it's time to create the DataLoaders, which allow us to have batches of (input, output) pairs - or in other words (past_values, future_values).\n\n```\nfrom typing import Iterable\n\nimport torch\nfrom gluonts.itertools import Cached, Cyclic\nfrom gluonts.dataset.loader import as_stacked_batches\n\n\ndef create_train_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    num_batches_per_epoch: int,\n    shuffle_buffer_length: Optional[int] = None,\n    cache_data: bool = True,\n    **kwargs,\n) -> Iterable:\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [\n        \"future_values\",\n        \"future_observed_mask\",\n    ]\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=True)\n    if cache_data:\n        transformed_data = Cached(transformed_data)\n\n    # we initialize a Training instance\n    instance_splitter = create_instance_splitter(config, \"train\")\n\n    # the instance splitter will sample a window of\n    # context length + lags + prediction length (from all the possible transformed time series, 1 in our case)\n    # randomly from within the target time series and return an iterator.\n    stream = Cyclic(transformed_data).stream()\n    training_instances = instance_splitter.apply(stream)\n    \n    return as_stacked_batches(\n        training_instances,\n        batch_size=batch_size,\n        shuffle_buffer_length=shuffle_buffer_length,\n        field_names=TRAINING_INPUT_NAMES,\n        output_type=torch.tensor,\n        num_batches_per_epoch=num_batches_per_epoch,\n    )\n```\n\n```\ndef create_backtest_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data)\n\n    # we create a Validation Instance splitter which will sample the very last\n    # context window seen during training only for the encoder.\n    instance_sampler = create_instance_splitter(config, \"validation\")\n\n    # we apply the transformations in train mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=True)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )\n\ndef create_test_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=False)\n\n    # We create a test Instance splitter to sample the very last\n    # context window from the dataset provided.\n    instance_sampler = create_instance_splitter(config, \"test\")\n\n    # We apply the transformations in test mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=False)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )\n```\n\n```\ntrain_dataloader = create_train_dataloader(\n    config=config,\n    freq=freq,\n    data=multi_variate_train_dataset,\n    batch_size=256,\n    num_batches_per_epoch=100,\n    num_workers=2,\n)\n\ntest_dataloader = create_backtest_dataloader(\n    config=config,\n    freq=freq,\n    data=multi_variate_test_dataset,\n    batch_size=32,\n)\n```\n\nLet's check the first batch:\n\n```\nbatch = next(iter(train_dataloader))\nfor k, v in batch.items():\n    print(k, v.shape, v.type())\n\n>>> past_time_features torch.Size([256, 264, 5]) torch.FloatTensor\n    past_values torch.Size([256, 264, 862]) torch.FloatTensor\n    past_observed_mask torch.Size([256, 264, 862]) torch.FloatTensor\n    future_time_features torch.Size([256, 48, 5]) torch.FloatTensor\n    future_values torch.Size([256, 48, 862]) torch.FloatTensor\n    future_observed_mask torch.Size([256, 48, 862]) torch.FloatTensor\n```\n\nAs can be seen, we don't feed input_ids and attention_mask to the encoder (as would be the case for NLP models), but rather past_values, along with past_observed_mask, past_time_features and static_real_features.\n\nThe decoder inputs consist of future_values, future_observed_mask and future_time_features. The future_values can be seen as the equivalent of decoder_input_ids in NLP.\n\nWe refer to the docs for a detailed explanation for each of them.\n\n## Forward Pass\n\nLet's perform a single forward pass with the batch we just created:\n\n```\n# perform forward pass\noutputs = model(\n    past_values=batch[\"past_values\"],\n    past_time_features=batch[\"past_time_features\"],\n    past_observed_mask=batch[\"past_observed_mask\"],\n    static_categorical_features=batch[\"static_categorical_features\"]\n    if config.num_static_categorical_features > 0\n    else None,\n    static_real_features=batch[\"static_real_features\"]\n    if config.num_static_real_features > 0\n    else None,\n    future_values=batch[\"future_values\"],\n    future_time_features=batch[\"future_time_features\"],\n    future_observed_mask=batch[\"future_observed_mask\"],\n    output_hidden_states=True,\n)\n```\n\n```\nprint(\"Loss:\", outputs.loss.item())\n\n>>> Loss: -1071.5718994140625\n```\n\nNote that the model is returning a loss. This is possible as the decoder automatically shifts the future_values one position to the right in order to have the labels. This allows computing a loss between the predicted values and the labels. The loss is the negative log-likelihood of the predicted distribution with respect to the ground truth values and tends to negative infinity.\n\nAlso note that the decoder uses a causal mask to not look into the future as the values it needs to predict are in the future_values tensor.\n\n## Train the Model\n\nIt's time to train the model! We'll use a standard PyTorch training loop.\n\nWe will use the 🤗 Accelerate library here, which automatically places the model, optimizer and dataloader on the appropriate device.\n\n```\nfrom accelerate import Accelerator\nfrom torch.optim import AdamW\n\nepochs = 25\nloss_history = []\n\naccelerator = Accelerator()\ndevice = accelerator.device\n\nmodel.to(device)\noptimizer = AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), weight_decay=1e-1)\n\nmodel, optimizer, train_dataloader = accelerator.prepare(\n    model,\n    optimizer,\n    train_dataloader,\n)\n\nmodel.train()\nfor epoch in range(epochs):\n    for idx, batch in enumerate(train_dataloader):\n        optimizer.zero_grad()\n        outputs = model(\n            static_categorical_features=batch[\"static_categorical_features\"].to(device)\n            if config.num_static_categorical_features > 0\n            else None,\n            static_real_features=batch[\"static_real_features\"].to(device)\n            if config.num_static_real_features > 0\n            else None,\n            past_time_features=batch[\"past_time_features\"].to(device),\n            past_values=batch[\"past_values\"].to(device),\n            future_time_features=batch[\"future_time_features\"].to(device),\n            future_values=batch[\"future_values\"].to(device),\n            past_observed_mask=batch[\"past_observed_mask\"].to(device),\n            future_observed_mask=batch[\"future_observed_mask\"].to(device),\n        )\n        loss = outputs.loss\n\n        # Backpropagation\n        accelerator.backward(loss)\n        optimizer.step()\n\n        loss_history.append(loss.item())\n        if idx % 100 == 0:\n            print(loss.item())\n\n>>> -1081.978515625\n    ...\n    -2877.723876953125\n```\n\n```\n# view training\nloss_history = np.array(loss_history).reshape(-1)\nx = range(loss_history.shape[0])\nplt.figure(figsize=(10, 5))\nplt.plot(x, loss_history, label=\"train\")\nplt.title(\"Loss\", fontsize=15)\nplt.legend(loc=\"upper right\")\nplt.xlabel(\"iteration\")\nplt.ylabel(\"nll\")\nplt.show()\n```\n\n## Inference\n\nAt inference time, it's recommended to use the generate() method for autoregressive generation, similar to NLP models.\n\nForecasting involves getting data from the test instance sampler, which will sample the very last context_length sized window of values from each time series in the dataset, and pass it to the model. Note that we pass future_time_features, which are known ahead of time, to the decoder.\n\nThe model will autoregressively sample a certain number of values from the predicted distribution and pass them back to the decoder to return the prediction outputs:\n\n```\nmodel.eval()\n\nforecasts_ = []\n\nfor batch in test_dataloader:\n    outputs = model.generate(\n        static_categorical_features=batch[\"static_categorical_features\"].to(device)\n        if config.num_static_categorical_features > 0\n        else None,\n        static_real_features=batch[\"static_real_features\"].to(device)\n        if config.num_static_real_features > 0\n        else None,\n        past_time_features=batch[\"past_time_features\"].to(device),\n        past_values=batch[\"past_values\"].to(device),\n        future_time_features=batch[\"future_time_features\"].to(device),\n        past_observed_mask=batch[\"past_observed_mask\"].to(device),\n    )\n    forecasts_.append(outputs.sequences.cpu().numpy())\n```\n\nThe model outputs a tensor of shape (batch_size, number of samples, prediction length, input_size).\n\nIn this case, we get 100 possible values for the next 48 hours for each of the 862 time series (for each example in the batch which is of size 1 since we only have a single multivariate time series):\n\n```\nforecasts_[0].shape\n\n>>> (1, 100, 48, 862)\n```\n\nWe'll stack them vertically, to get forecasts for all time-series in the test dataset (just in case there are more time series in the test set):\n\n```\nforecasts = np.vstack(forecasts_)\nprint(forecasts.shape)\n\n>>> (1, 100, 48, 862)\n```\n\nWe can evaluate the resulting forecast with respect to the ground truth out of sample values present in the test set. For that, we'll use the 🤗 Evaluate library, which includes the MASE and sMAPE metrics.\n\nWe calculate both metrics for each time series variate in the dataset:\n\n```\nfrom evaluate import load\nfrom gluonts.time_feature import get_seasonality\n\nmase_metric = load(\"evaluate-metric/mase\")\nsmape_metric = load(\"evaluate-metric/smape\")\n\nforecast_median = np.median(forecasts, 1).squeeze(0).T\n\nmase_metrics = []\nsmape_metrics = []\n\nfor item_id, ts in enumerate(test_dataset):\n    training_data = ts[\"target\"][:-prediction_length]\n    ground_truth = ts[\"target\"][-prediction_length:]\n    mase = mase_metric.compute(\n        predictions=forecast_median[item_id],\n        references=np.array(ground_truth),\n        training=np.array(training_data),\n        periodicity=get_seasonality(freq),\n    )\n    mase_metrics.append(mase[\"mase\"])\n\n    smape = smape_metric.compute(\n        predictions=forecast_median[item_id],\n        references=np.array(ground_truth),\n    )\n    smape_metrics.append(smape[\"smape\"])\n```\n\n```\nprint(f\"MASE: {np.mean(mase_metrics)}\")\n\n>>> MASE: 1.1913437728068093\n\nprint(f\"sMAPE: {np.mean(smape_metrics)}\")\n\n>>> sMAPE: 0.5322665081607634\n```\n\n```\nplt.scatter(mase_metrics, smape_metrics, alpha=0.2)\nplt.xlabel(\"MASE\")\nplt.ylabel(\"sMAPE\")\nplt.show()\n```\n\nTo plot the prediction for any time series variate with respect the ground truth test data we define the following helper:\n\n```\nimport matplotlib.dates as mdates\n\n\ndef plot(ts_index, mv_index):\n    fig, ax = plt.subplots()\n\n    index = pd.period_range(\n        start=multi_variate_test_dataset[ts_index][FieldName.START],\n        periods=len(multi_variate_test_dataset[ts_index][FieldName.TARGET]),\n        freq=multi_variate_test_dataset[ts_index][FieldName.START].freq,\n    ).to_timestamp()\n\n    ax.xaxis.set_minor_locator(mdates.HourLocator())\n\n    ax.plot(\n        index[-2 * prediction_length :],\n        multi_variate_test_dataset[ts_index][\"target\"][mv_index, -2 * prediction_length :],\n        label=\"actual\",\n    )\n\n    ax.plot(\n        index[-prediction_length:],\n        forecasts[ts_index, ..., mv_index].mean(axis=0),\n        label=\"mean\",\n    )\n    ax.fill_between(\n        index[-prediction_length:],\n        forecasts[ts_index, ..., mv_index].mean(0)\n        - forecasts[ts_index, ..., mv_index].std(axis=0),\n        forecasts[ts_index, ..., mv_index].mean(0)\n        + forecasts[ts_index, ..., mv_index].std(axis=0),\n        alpha=0.2,\n        interpolate=True,\n        label=\"+/- 1-std\",\n    )\n    ax.legend()\n    fig.autofmt_xdate()\n```\n\nFor example:\n\n```\nplot(0, 344)\n```\n\n## Conclusion\n\nHow do we compare against other models? The Monash Time Series Repository has a comparison table of test set MASE metrics which we can add to:\n\nDataset\n\nSES\n\nTheta\n\nTBATS\n\nETS\n\n(DHR-)ARIMA\n\nPR\n\nCatBoost\n\nFFNN\n\nDeepAR\n\nN-BEATS\n\nWaveNet\n\nTransformer (uni.)\n\nInformer (mv. our)\n\nTraffic Hourly\n\n1.922\n\n1.922\n\n2.482\n\n2.294\n\n2.535\n\n1.281\n\n1.571\n\n0.892\n\n0.825\n\n1.100\n\n1.066\n\n0.821\n\n1.191\n\nAs can be seen, and perhaps surprising to some, the multivariate forecasts are typically worse than the univariate ones, the reason being the difficulty in estimating the cross-series correlations/relationships. The additional variance added by the estimates often harms the resulting forecasts or the model learns spurious correlations. We refer to this paper for further reading. Multivariate models tend to work well when trained on a lot of data.\n\nSo the vanilla Transformer still performs best here! In the future, we hope to better benchmark these models in a central place to ease reproducing the results of several papers. Stay tuned for more!\n\n## Resources\n\nWe recommend to check out the Informer docs and the example notebook linked at the top of this blog post.",
   "summaryZh": "该文章简要提及了使用Informer进行多元概率时间序列预测的动态，但缺乏足够的详细内容和实质性的大模型结合证据。",
   "summaryGeneratedAt": "2026-09-06T02:37:28.898632Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,2007 @@
     "summaryZh": "该文章简要提及了使用Informer进行多元概率时间序列预测的动态，但缺乏足够的详细内容和实质性的大模型结合证据。",
     "glossary": [],
     "duplicateKey": "multivariate-probabilistic-time-series-forecasting-informer"
-  }
+  },
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/informer_full_vs_sparse_attention.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/informer_full_vs_sparse_attention.png",
+      "alt": "informer_full_vs_sparse_attention",
+      "id": "image_2157756bafd41353"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/informer_probsparse.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/informer_probsparse.png",
+      "alt": "informer_probsparse",
+      "id": "image_cc6655379e617da0"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_22_0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_22_0.png",
+      "alt": "png",
+      "id": "image_28ac6015a7f5d8d5"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_62_0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_62_0.png",
+      "alt": "png",
+      "id": "image_6a7ded613628fd8d"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_73_0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_73_0.png",
+      "alt": "png",
+      "id": "image_29602e0de9a524ef"
+    },
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_77_0.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/informer/output_77_0.png",
+      "alt": "png",
+      "id": "image_aca59562e1fef2f3"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "A few months ago we introduced the Time Series Transformer, which is the vanilla Transformer (Vaswani et al., 2017) applied to forecasting, and showed an example for the univariate probabilistic forecasting task (i.e. predicting each time series' 1-d distribution individually). In this post we introduce the Informer model (Zhou, Haoyi, et al., 2021), AAAI21 best paper which is now available in 🤗 Transformers. We will show how to use the Informer model for the multivariate probabilistic forecasting task, i.e., predicting the distribution of a future vector of time-series target values. Note that this will also work for the vanilla Time Series Transformer model.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 58,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/time-series-transformers"
+        },
+        {
+          "start": 94,
+          "end": 114,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1706.03762"
+        },
+        {
+          "start": 170,
+          "end": 180,
+          "kind": "strong"
+        },
+        {
+          "start": 309,
+          "end": 317,
+          "kind": "em"
+        },
+        {
+          "start": 325,
+          "end": 350,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2012.07436"
+        },
+        {
+          "start": 380,
+          "end": 393,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/informer"
+        },
+        {
+          "start": 464,
+          "end": 476,
+          "kind": "strong"
+        },
+        {
+          "start": 555,
+          "end": 561,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Multivariate Probabilistic Time Series Forecasting",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "As far as the modeling aspect of probabilistic forecasting is concerned, the Transformer/Informer will require no change when dealing with multivariate time series. In both the univariate and multivariate setting, the model will receive a sequence of vectors and thus the only change is on the output or emission side.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Modeling the full joint conditional distribution of high dimensional data can get computationally expensive and thus methods resort to some approximation of the distribution, the easiest being to model the data as an independent distribution from the same family, or some low-rank approximation to the full covariance, etc. Here we will just resort to the independent (or diagonal) emissions which are supported for the families of distributions we have implemented here.",
+      "spans": [
+        {
+          "start": 466,
+          "end": 470,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/internal/time_series_utils"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Informer - Under The Hood",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Based on the vanilla Transformer (Vaswani et al., 2017), Informer employs two major improvements. To understand these improvements, let's recall the drawbacks of the vanilla Transformer:",
+      "spans": [
+        {
+          "start": 34,
+          "end": 54,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1706.03762"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Quadratic computation of canonical self-attention: The vanilla Transformer has a computational complexity of O(T2D)O(T^2 D)O(T2D) where TTT is the time series length and DDD is the dimension of the hidden states. For long sequence time-series forecasting (also known as the LSTF problem), this might be really computationally expensive. To solve this problem, Informer employs a new self-attention mechanism called ProbSparse attention, which has O(Tlog⁡T)O(T \\log T)O(TlogT) time and space complexity.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 50,
+          "kind": "strong"
+        },
+        {
+          "start": 274,
+          "end": 286,
+          "kind": "em"
+        },
+        {
+          "start": 415,
+          "end": 425,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Memory bottleneck when stacking layers: When stacking NNN encoder/decoder layers, the vanilla Transformer has a memory usage of O(NT2)O(N T^2)O(NT2), which limits the model's capacity for long sequences. Informer uses a Distilling operation, for reducing the input size between layers into its half slice. By doing so, it reduces the whole memory usage to be O(N⋅Tlog⁡T)O(N\\cdot T \\log T)O(N⋅TlogT).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "strong"
+        },
+        {
+          "start": 220,
+          "end": 230,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "As you can see, the motivation for the Informer model is similar to Longformer (Beltagy et el., 2020), Sparse Transformer (Child et al., 2019) and other NLP papers for reducing the quadratic complexity of the self-attention mechanism when the input sequence is long. Now, let's dive into ProbSparse attention and the Distilling operation with code examples.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 100,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2004.05150"
+        },
+        {
+          "start": 123,
+          "end": 141,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1904.10509"
+        },
+        {
+          "start": 234,
+          "end": 265,
+          "kind": "strong"
+        },
+        {
+          "start": 288,
+          "end": 298,
+          "kind": "em"
+        },
+        {
+          "start": 317,
+          "end": 327,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "ProbSparse Attention",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "The main idea of ProbSparse is that the canonical self-attention scores form a long-tail distribution, where the \"active\" queries lie in the \"head\" scores and \"lazy\" queries lie in the \"tail\" area. By \"active\" query we mean a query qiq_iqi​ such that the dot-product ⟨qi,ki⟩\\langle q_i,k_i \\rangle⟨qi​,ki​⟩ contributes to the major attention, whereas a \"lazy\" query forms a dot-product which generates trivial attention. Here, qiq_iqi​ and kik_iki​ are the iii-th rows in QQQ and KKK attention matrices respectively.",
+      "spans": [
+        {
+          "start": 307,
+          "end": 318,
+          "kind": "strong"
+        },
+        {
+          "start": 402,
+          "end": 409,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0014",
+      "source": "Vanilla self attention vs ProbSparse attention from Autoformer (Wu, Haixu, et al., 2021)",
+      "spans": [
+        {
+          "start": 52,
+          "end": 88,
+          "kind": "a",
+          "href": "https://wuhaixu2016.github.io/pdf/NeurIPS2021_Autoformer.pdf"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0015",
+      "source": "Given the idea of \"active\" and \"lazy\" queries, the ProbSparse attention selects the \"active\" queries, and creates a reduced query matrix QreducedQ_{reduced}Qreduced​ which is used to calculate the attention weights in O(Tlog⁡T)O(T \\log T)O(TlogT). Let's see this more in detail with a code example.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Recall the canonical self-attention formula:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Attention(Q,K,V)=softmax(QKTdk)V \\textrm{Attention}(Q, K, V) = \\textrm{softmax}(\\frac{QK^T}{\\sqrt{d_k}} )V Attention(Q,K,V)=softmax(dk​​QKT​)V",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Where Q∈RLQ×dQ\\in \\mathbb{R}^{L_Q \\times d}Q∈RLQ​×d, K∈RLK×dK\\in \\mathbb{R}^{L_K \\times d}K∈RLK​×d and V∈RLV×dV\\in \\mathbb{R}^{L_V \\times d}V∈RLV​×d. Note that in practice, the input length of queries and keys are typically equivalent in the self-attention computation, i.e. LQ=LK=TL_Q = L_K = TLQ​=LK​=T where TTT is the time series length. Therefore, the QKTQK^TQKT multiplication takes O(T2⋅d)O(T^2 \\cdot d)O(T2⋅d) computational complexity. In ProbSparse attention, our goal is to create a new QreduceQ_{reduce}Qreduce​ matrix and define:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "ProbSparseAttention(Q,K,V)=softmax(QreduceKTdk)V \\textrm{ProbSparseAttention}(Q, K, V) = \\textrm{softmax}(\\frac{Q_{reduce}K^T}{\\sqrt{d_k}} )V ProbSparseAttention(Q,K,V)=softmax(dk​​Qreduce​KT​)V",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "where the QreduceQ_{reduce}Qreduce​ matrix only selects the Top uuu \"active\" queries. Here, u=c⋅log⁡LQu = c \\cdot \\log L_Qu=c⋅logLQ​ and ccc called the sampling factor hyperparameter for the ProbSparse attention. Since QreduceQ_{reduce}Qreduce​ selects only the Top uuu queries, its size is c⋅log⁡LQ×dc\\cdot \\log L_Q \\times dc⋅logLQ​×d, so the multiplication QreduceKTQ_{reduce}K^TQreduce​KT takes only O(LKlog⁡LQ)=O(Tlog⁡T)O(L_K \\log L_Q) = O(T \\log T)O(LK​logLQ​)=O(TlogT).",
+      "spans": [
+        {
+          "start": 152,
+          "end": 167,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "This is good! But how can we select the uuu \"active\" queries to create QreduceQ_{reduce}Qreduce​? Let's define the Query Sparsity Measurement.",
+      "spans": [
+        {
+          "start": 115,
+          "end": 141,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Query Sparsity Measurement",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Query Sparsity Measurement M(qi,K)M(q_i, K)M(qi​,K) is used for selecting the uuu \"active\" queries qiq_iqi​ in QQQ to create QreduceQ_{reduce}Qreduce​. In theory, the dominant ⟨qi,kj⟩\\langle q_i,k_j \\rangle⟨qi​,kj​⟩ pairs encourage the \"active\" qiq_iqi​'s probability distribution away from the uniform distribution as can be seen in the figure below. Hence, the KL divergence between the actual queries distribution and the uniform distribution is used to define the sparsity measurement.",
+      "spans": [
+        {
+          "start": 281,
+          "end": 285,
+          "kind": "strong"
+        },
+        {
+          "start": 363,
+          "end": 376,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "The illustration of ProbSparse Attention from official repository",
+      "spans": [
+        {
+          "start": 55,
+          "end": 65,
+          "kind": "a",
+          "href": "https://github.com/zhouhaoyi/Informer2020"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "In practice, the measurement is defined as:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "M(qi,K)=max⁡jqikjTd−1Lk∑j=1LkqikjTd M(q_i, K) = \\max_j \\frac{q_ik_j^T}{\\sqrt{d}}-\\frac{1}{L_k} \\sum_{j=1}^{L_k}\\frac{q_ik_j^T}{\\sqrt{d}} M(qi​,K)=jmax​d​qi​kjT​​−Lk​1​j=1∑Lk​​d​qi​kjT​​",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "The important thing to understand here is when M(qi,K)M(q_i, K)M(qi​,K) is larger, the query qiq_iqi​ should be in QreduceQ_{reduce}Qreduce​ and vice versa.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "But how can we calculate the term qikjTq_ik_j^Tqi​kjT​ in non-quadratic time? Recall that most of the dot-product ⟨qi,ki⟩\\langle q_i,k_i \\rangle⟨qi​,ki​⟩ generate either way the trivial attention (i.e. long-tail distribution property), so it is enough to randomly sample a subset of keys from KKK, which will be called K_sample in the code.",
+      "spans": [
+        {
+          "start": 319,
+          "end": 327,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Now, we are ready to see the code of probsparse_attention:",
+      "spans": [
+        {
+          "start": 37,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Note that in the implementation, UpartU_{part}Upart​ contain LQL_QLQ​ in the calculation, for stability issues (see this disccusion for more information).",
+      "spans": [
+        {
+          "start": 116,
+          "end": 131,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/t/probsparse-attention-in-informer/34428"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "We did it! Please be aware that this is only a partial implementation of the probsparse_attention, and the full implementation can be found in 🤗 Transformers.",
+      "spans": [
+        {
+          "start": 77,
+          "end": 97,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Distilling",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Because of the ProbSparse self-attention, the encoder’s feature map has some redundancy that can be removed. Therefore, the distilling operation is used to reduce the input size between encoder layers into its half slice, thus in theory removing this redundancy. In practice, Informer's \"distilling\" operation just adds 1D convolution layers with max pooling between each of the encoder layers. Let XnX_nXn​ be the output of the nnn-th encoder layer, the distilling operation is then defined as:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Xn+1=MaxPool(ELU(Conv1d(Xn)) X_{n+1} = \\textrm{MaxPool} ( \\textrm{ELU}(\\textrm{Conv1d}(X_n)) Xn+1​=MaxPool(ELU(Conv1d(Xn​))",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Let's see this in code:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "By reducing the input of each layer by two, we get a memory usage of O(N⋅Tlog⁡T)O(N\\cdot T \\log T)O(N⋅TlogT) instead of O(N⋅T2)O(N\\cdot T^2)O(N⋅T2) where NNN is the number of encoder/decoder layers. This is what we wanted!",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "The Informer model in now available in the 🤗 Transformers library, and simply called InformerModel. In the sections below, we will show how to train this model on a custom multivariate time-series dataset.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/informer"
+        },
+        {
+          "start": 85,
+          "end": 98,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Set-up Environment",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "First, let's install the necessary libraries: 🤗 Transformers, 🤗 Datasets, 🤗 Evaluate, 🤗 Accelerate and GluonTS.",
+      "spans": [
+        {
+          "start": 103,
+          "end": 110,
+          "kind": "a",
+          "href": "https://github.com/awslabs/gluonts"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "As we will show, GluonTS will be used for transforming the data to create features as well as for creating appropriate training, validation and test batches.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Load Dataset",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "In this blog post, we'll use the traffic_hourly dataset, which is available on the Hugging Face Hub. This dataset contains the San Francisco Traffic dataset used by Lai et al. (2017). It contains 862 hourly time series showing the road occupancy rates in the range [0,1][0, 1][0,1] on the San Francisco Bay area freeways from 2015 to 2016.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 83,
+          "end": 99,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/monash_tsf"
+        },
+        {
+          "start": 165,
+          "end": 182,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1703.07015"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "This dataset is part of the Monash Time Series Forecasting repository, a collection of time series datasets from a number of domains. It can be viewed as the GLUE benchmark of time series forecasting.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 58,
+          "kind": "a",
+          "href": "https://forecastingdata.org/"
+        },
+        {
+          "start": 158,
+          "end": 172,
+          "kind": "a",
+          "href": "https://gluebenchmark.com/"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "As can be seen, the dataset contains 3 splits: train, validation and test.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Each example contains a few keys, of which start and target are the most important ones. Let us have a look at the first time series in the dataset:",
+      "spans": [
+        {
+          "start": 43,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 53,
+          "end": 59,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "The start simply indicates the start of the time series (as a datetime), and the target contains the actual values of the time series.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 81,
+          "end": 87,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "The start will be useful to add time related features to the time series values, as extra input to the model (such as \"month of year\"). Since we know the frequency of the data is hourly, we know for instance that the second value has the timestamp 2015-01-01 01:00:01, 2015-01-01 02:00:01, etc.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 9,
+          "kind": "code"
+        },
+        {
+          "start": 179,
+          "end": 185,
+          "kind": "code"
+        },
+        {
+          "start": 248,
+          "end": 267,
+          "kind": "code"
+        },
+        {
+          "start": 269,
+          "end": 288,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "The validation set contains the same data as the training set, just for a prediction_length longer amount of time. This allows us to validate the model's predictions against the ground truth.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 91,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "The test set is again one prediction_length longer data compared to the validation set (or some multiple of prediction_length longer data compared to the training set for testing on multiple rolling windows).",
+      "spans": [
+        {
+          "start": 26,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 125,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "The initial values are exactly the same as the corresponding training example. However, this example has prediction_length=48 (48 hours, or 2 days) additional values compared to the training example. Let us verify it.",
+      "spans": [
+        {
+          "start": 105,
+          "end": 125,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Let's visualize this:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Let's split up the data:",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Update start to pd.Period",
+      "spans": [
+        {
+          "start": 7,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 16,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "The first thing we'll do is convert the start feature of each time series to a pandas Period index using the data's freq:",
+      "spans": [
+        {
+          "start": 40,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 86,
+          "end": 92,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 120,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "We now use datasets' set_transform functionality to do this on-the-fly in place:",
+      "spans": [
+        {
+          "start": 11,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/v2.7.0/en/package_reference/main_classes#datasets.Dataset.set_transform"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Now, let's convert the dataset into a multivariate time series using the MultivariateGrouper from GluonTS. This grouper will convert the individual 1-dimensional time series into a single 2D matrix.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 92,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Note that the target is now 2-dimensional, where the first dimension is the number of variates (number of time series) and the second is the time series values (time dimension):",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Define the Model",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "Next, let's instantiate a model. The model will be trained from scratch, hence we won't use the from_pretrained method here, but rather randomly initialize the model from a config.",
+      "spans": [
+        {
+          "start": 96,
+          "end": 111,
+          "kind": "code"
+        },
+        {
+          "start": 173,
+          "end": 179,
+          "kind": "code"
+        },
+        {
+          "start": 173,
+          "end": 179,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/informer#transformers.InformerConfig"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "We specify a couple of additional parameters to the model:",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "prediction_length (in our case, 48 hours): this is the horizon that the decoder of the Informer will learn to predict for;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 32,
+          "end": 34,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "context_length: the model will set the context_length (input of the encoder) equal to the prediction_length, if no context_length is specified;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "code"
+        },
+        {
+          "start": 39,
+          "end": 53,
+          "kind": "code"
+        },
+        {
+          "start": 90,
+          "end": 107,
+          "kind": "code"
+        },
+        {
+          "start": 115,
+          "end": 129,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "lags for a given frequency: these specify an efficient \"look back\" mechanism, where we concatenate values from the past to the current values as additional features, e.g. for a Daily frequency we might consider a look back of [1, 7, 30, ...] or for Minute data we might consider [1, 30, 60, 60*24, ...] etc.;",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 182,
+          "kind": "code"
+        },
+        {
+          "start": 226,
+          "end": 241,
+          "kind": "code"
+        },
+        {
+          "start": 249,
+          "end": 255,
+          "kind": "code"
+        },
+        {
+          "start": 279,
+          "end": 302,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "the number of time features: in our case, this will be 5 as we'll add HourOfDay, DayOfWeek, ..., and Age features (see below).",
+      "spans": [
+        {
+          "start": 55,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 81,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 101,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Let us check the default lags provided by GluonTS for the given frequency (\"hourly\"):",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "This means that this would look back up to 721 hours (~30 days) for each time step, as additional features. However, the resulting feature vector would end up being of size len(lags_sequence)*num_of_variates which for our case will be 34480! This is not going to work so we will use our own sensible lags.",
+      "spans": [
+        {
+          "start": 173,
+          "end": 207,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "Let us also check the default time features which GluonTS provides us:",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "In this case, there are four additional features, namely \"hour of day\", \"day of week\", \"day of month\" and \"day of year\". This means that for each time step, we'll add these features as a scalar values. For example, consider the timestamp 2015-01-01 01:00:01. The four additional features will be:",
+      "spans": [
+        {
+          "start": 238,
+          "end": 257,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "Note that hours and days are encoded as values between [-0.5, 0.5] from GluonTS. For more information about time_features, please see this. Besides those 4 features, we'll also add an \"age\" feature as we'll see later on in the data transformations.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 108,
+          "end": 121,
+          "kind": "code"
+        },
+        {
+          "start": 134,
+          "end": 138,
+          "kind": "a",
+          "href": "https://github.com/awslabs/gluonts/blob/dev/src/gluonts/time_feature/_base.py"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "We now have everything to define the model:",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "By default, the model uses a diagonal Student-t distribution (but this is configurable):",
+      "spans": [
+        {
+          "start": 74,
+          "end": 86,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/internal/time_series_utils"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Define Transformations",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "Next, we define the transformations for the data, in particular for the creation of the time features (based on the dataset or universal ones).",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "Again, we'll use the GluonTS library for this. We define a Chain of transformations (which is a bit comparable to torchvision.transforms.Compose for images). It allows us to combine several transformations into a single pipeline.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 114,
+          "end": 144,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "The transformations below are annotated with comments, to explain what they do. At a high level, we will iterate over the individual time series of our dataset and add/remove fields or features:",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Define InstanceSplitter",
+      "spans": [
+        {
+          "start": 7,
+          "end": 23,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "For training/validation/testing we next create an InstanceSplitter which is used to sample windows from the dataset (as, remember, we can't pass the entire history of values to the model due to time- and memory constraints).",
+      "spans": [
+        {
+          "start": 50,
+          "end": 66,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "The instance splitter samples random context_length sized and subsequent prediction_length sized windows from the data, and appends a past_ or future_ key to any temporal keys in time_series_fields for the respective windows. The instance splitter can be configured into three different modes:",
+      "spans": [
+        {
+          "start": 37,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 134,
+          "end": 139,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 150,
+          "kind": "code"
+        },
+        {
+          "start": 179,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "mode=\"train\": Here we sample the context and prediction length windows randomly from the dataset given to it (the training dataset)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "mode=\"validation\": Here we sample the very last context length window and prediction window from the dataset given to it (for the back-testing or validation likelihood calculations)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "mode=\"test\": Here we sample the very last context length window only (for the prediction use case)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "Create DataLoaders",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Next, it's time to create the DataLoaders, which allow us to have batches of (input, output) pairs - or in other words (past_values, future_values).",
+      "spans": [
+        {
+          "start": 120,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 146,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0085",
+      "source": "Let's check the first batch:",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "As can be seen, we don't feed input_ids and attention_mask to the encoder (as would be the case for NLP models), but rather past_values, along with past_observed_mask, past_time_features and static_real_features.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 39,
+          "kind": "code"
+        },
+        {
+          "start": 44,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 148,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 186,
+          "kind": "code"
+        },
+        {
+          "start": 191,
+          "end": 211,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "The decoder inputs consist of future_values, future_observed_mask and future_time_features. The future_values can be seen as the equivalent of decoder_input_ids in NLP.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 96,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 160,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "We refer to the docs for a detailed explanation for each of them.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/informer#transformers.InformerModel.forward.past_values"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Forward Pass",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "Let's perform a single forward pass with the batch we just created:",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Note that the model is returning a loss. This is possible as the decoder automatically shifts the future_values one position to the right in order to have the labels. This allows computing a loss between the predicted values and the labels. The loss is the negative log-likelihood of the predicted distribution with respect to the ground truth values and tends to negative infinity.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 111,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "Also note that the decoder uses a causal mask to not look into the future as the values it needs to predict are in the future_values tensor.",
+      "spans": [
+        {
+          "start": 119,
+          "end": 132,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0093",
+      "source": "Train the Model",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "It's time to train the model! We'll use a standard PyTorch training loop.",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "We will use the 🤗 Accelerate library here, which automatically places the model, optimizer and dataloader on the appropriate device.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/index"
+        },
+        {
+          "start": 125,
+          "end": 131,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "At inference time, it's recommended to use the generate() method for autoregressive generation, similar to NLP models.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Forecasting involves getting data from the test instance sampler, which will sample the very last context_length sized window of values from each time series in the dataset, and pass it to the model. Note that we pass future_time_features, which are known ahead of time, to the decoder.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 112,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 238,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0099",
+      "source": "The model will autoregressively sample a certain number of values from the predicted distribution and pass them back to the decoder to return the prediction outputs:",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "The model outputs a tensor of shape (batch_size, number of samples, prediction length, input_size).",
+      "spans": [
+        {
+          "start": 37,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 49,
+          "end": 66,
+          "kind": "code"
+        },
+        {
+          "start": 68,
+          "end": 85,
+          "kind": "code"
+        },
+        {
+          "start": 87,
+          "end": 97,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0101",
+      "source": "In this case, we get 100 possible values for the next 48 hours for each of the 862 time series (for each example in the batch which is of size 1 since we only have a single multivariate time series):",
+      "spans": [
+        {
+          "start": 21,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 54,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 79,
+          "end": 82,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 144,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "We'll stack them vertically, to get forecasts for all time-series in the test dataset (just in case there are more time series in the test set):",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "We can evaluate the resulting forecast with respect to the ground truth out of sample values present in the test set. For that, we'll use the 🤗 Evaluate library, which includes the MASE and sMAPE metrics.",
+      "spans": [
+        {
+          "start": 144,
+          "end": 152,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/evaluate/index"
+        },
+        {
+          "start": 181,
+          "end": 185,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/evaluate-metric/mase"
+        },
+        {
+          "start": 190,
+          "end": 195,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/evaluate-metric/smape"
+        }
+      ]
+    },
+    {
+      "id": "b0104",
+      "source": "We calculate both metrics for each time series variate in the dataset:",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "To plot the prediction for any time series variate with respect the ground truth test data we define the following helper:",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "For example:",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "How do we compare against other models? The Monash Time Series Repository has a comparison table of test set MASE metrics which we can add to:",
+      "spans": [
+        {
+          "start": 44,
+          "end": 73,
+          "kind": "a",
+          "href": "https://forecastingdata.org/#results"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "Dataset",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "SES",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "Theta",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "TBATS",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "ETS",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "(DHR-)ARIMA",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "PR",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "CatBoost",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "FFNN",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "DeepAR",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 9,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "N-BEATS",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 10,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "WaveNet",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 11,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "Transformer (uni.)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 12,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "Informer (mv. our)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 13,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "Traffic Hourly",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "1.922",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "1.922",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "2.482",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "2.294",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "2.535",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "1.281",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "1.571",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "0.892",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "0.825",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 9,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "1.100",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 10,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "1.066",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 11,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "0.821",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 12,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "1.191",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 13,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "As can be seen, and perhaps surprising to some, the multivariate forecasts are typically worse than the univariate ones, the reason being the difficulty in estimating the cross-series correlations/relationships. The additional variance added by the estimates often harms the resulting forecasts or the model learns spurious correlations. We refer to this paper for further reading. Multivariate models tend to work well when trained on a lot of data.",
+      "spans": [
+        {
+          "start": 89,
+          "end": 94,
+          "kind": "em"
+        },
+        {
+          "start": 350,
+          "end": 360,
+          "kind": "a",
+          "href": "https://openreview.net/forum?id=GpW327gxLTF"
+        }
+      ]
+    },
+    {
+      "id": "b0138",
+      "source": "So the vanilla Transformer still performs best here! In the future, we hope to better benchmark these models in a central place to ease reproducing the results of several papers. Stay tuned for more!",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0140",
+      "source": "We recommend to check out the Informer docs and the example notebook linked at the top of this blog post.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/informer"
+        },
+        {
+          "start": 52,
+          "end": 68,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/main/examples/multivariate_informer.ipynb"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "eb23d1b4a45a7a8d555ea2b9cde802111f7b392565b04976f14d5715fa181ea8",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from torch import nn\nimport math\n\n\ndef probsparse_attention(query_states, key_states, value_states, sampling_factor=5):\n    \"\"\"\n    Compute the probsparse self-attention.\n    Input shape: Batch x Time x Channel\n\n    Note the additional `sampling_factor` input.\n    \"\"\"\n    # get input sizes with logs\n    L_K = key_states.size(1)\n    L_Q = query_states.size(1)\n    log_L_K = np.ceil(np.log1p(L_K)).astype(\"int\").item()\n    log_L_Q = np.ceil(np.log1p(L_Q)).astype(\"int\").item()\n\n    # calculate a subset of samples to slice from K and create Q_K_sample\n    U_part = min(sampling_factor * L_Q * log_L_K, L_K)\n\n    # create Q_K_sample (the q_i * k_j^T term in the sparsity measurement)\n    index_sample = torch.randint(0, L_K, (U_part,))\n    K_sample = key_states[:, index_sample, :]\n    Q_K_sample = torch.bmm(query_states, K_sample.transpose(1, 2))\n\n    # calculate the query sparsity measurement with Q_K_sample\n    M = Q_K_sample.max(dim=-1)[0] - torch.div(Q_K_sample.sum(dim=-1), L_K)\n\n    # calculate u to find the Top-u queries under the sparsity measurement\n    u = min(sampling_factor * log_L_Q, L_Q)\n    M_top = M.topk(u, sorted=False)[1]\n\n    # calculate Q_reduce as query_states[:, M_top]\n    dim_for_slice = torch.arange(query_states.size(0)).unsqueeze(-1)\n    Q_reduce = query_states[dim_for_slice, M_top]  # size: c*log_L_Q x channel\n\n    # and now, same as the canonical\n    d_k = query_states.size(-1)\n    attn_scores = torch.bmm(Q_reduce, key_states.transpose(-2, -1))  # Q_reduce x K^T\n    attn_scores = attn_scores / math.sqrt(d_k)\n    attn_probs = nn.functional.softmax(attn_scores, dim=-1)\n    attn_output = torch.bmm(attn_probs, value_states)\n\n    return attn_output, attn_scores"
+    },
+    {
+      "id": "c0002",
+      "source": "from torch import nn\n\n# ConvLayer is a class with forward pass applying ELU and MaxPool1d\ndef informer_encoder_forward(x_input, num_encoder_layers=3, distil=True):\n    # Initialize the convolution layers\n    if distil:\n        conv_layers = nn.ModuleList([ConvLayer() for _ in range(num_encoder_layers - 1)])\n        conv_layers.append(None)\n    else:\n        conv_layers = [None] * num_encoder_layers\n    \n    # Apply conv_layer between each encoder_layer\n    for encoder_layer, conv_layer in zip(encoder_layers, conv_layers):\n        output = encoder_layer(x_input)\n        if conv_layer is not None:\n            output = conv_layer(loutput)\n    \n    return output"
+    },
+    {
+      "id": "c0003",
+      "source": "!pip install -q transformers datasets evaluate accelerate gluonts ujson"
+    },
+    {
+      "id": "c0004",
+      "source": "from datasets import load_dataset\n\ndataset = load_dataset(\"monash_tsf\", \"traffic_hourly\")"
+    },
+    {
+      "id": "c0005",
+      "source": "dataset\n\n>>> DatasetDict({\n        train: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n        test: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n        validation: Dataset({\n            features: ['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'],\n            num_rows: 862\n        })\n    })"
+    },
+    {
+      "id": "c0006",
+      "source": "train_example = dataset[\"train\"][0]\ntrain_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])"
+    },
+    {
+      "id": "c0007",
+      "source": "print(train_example[\"start\"])\nprint(len(train_example[\"target\"]))\n\n>>> 2015-01-01 00:00:01\n    17448"
+    },
+    {
+      "id": "c0008",
+      "source": "validation_example = dataset[\"validation\"][0]\nvalidation_example.keys()\n\n>>> dict_keys(['start', 'target', 'feat_static_cat', 'feat_dynamic_real', 'item_id'])"
+    },
+    {
+      "id": "c0009",
+      "source": "freq = \"1H\"\nprediction_length = 48\n\nassert len(train_example[\"target\"]) + prediction_length == len(\n    dataset[\"validation\"][0][\"target\"]\n)"
+    },
+    {
+      "id": "c0010",
+      "source": "import matplotlib.pyplot as plt\n\nnum_of_samples = 150\n\nfigure, axes = plt.subplots()\naxes.plot(train_example[\"target\"][-num_of_samples:], color=\"blue\")\naxes.plot(\n    validation_example[\"target\"][-num_of_samples - prediction_length :],\n    color=\"red\",\n    alpha=0.5,\n)\n\nplt.show()"
+    },
+    {
+      "id": "c0011",
+      "source": "train_dataset = dataset[\"train\"]\ntest_dataset = dataset[\"test\"]"
+    },
+    {
+      "id": "c0012",
+      "source": "from functools import lru_cache\n\nimport pandas as pd\nimport numpy as np\n\n\n@lru_cache(10_000)\ndef convert_to_pandas_period(date, freq):\n    return pd.Period(date, freq)\n\n\ndef transform_start_field(batch, freq):\n    batch[\"start\"] = [convert_to_pandas_period(date, freq) for date in batch[\"start\"]]\n    return batch"
+    },
+    {
+      "id": "c0013",
+      "source": "from functools import partial\n\ntrain_dataset.set_transform(partial(transform_start_field, freq=freq))\ntest_dataset.set_transform(partial(transform_start_field, freq=freq))"
+    },
+    {
+      "id": "c0014",
+      "source": "from gluonts.dataset.multivariate_grouper import MultivariateGrouper\n\nnum_of_variates = len(train_dataset)\n\ntrain_grouper = MultivariateGrouper(max_target_dim=num_of_variates)\ntest_grouper = MultivariateGrouper(\n    max_target_dim=num_of_variates,\n    num_test_dates=len(test_dataset) // num_of_variates, # number of rolling test windows\n)\n\nmulti_variate_train_dataset = train_grouper(train_dataset)\nmulti_variate_test_dataset = test_grouper(test_dataset)"
+    },
+    {
+      "id": "c0015",
+      "source": "multi_variate_train_example = multi_variate_train_dataset[0]\nprint(\"multi_variate_train_example[\"target\"].shape =\", multi_variate_train_example[\"target\"].shape)\n\n>>> multi_variate_train_example[\"target\"].shape = (862, 17448)"
+    },
+    {
+      "id": "c0016",
+      "source": "from gluonts.time_feature import get_lags_for_frequency\n\nlags_sequence = get_lags_for_frequency(freq)\nprint(lags_sequence)\n\n>>> [1, 2, 3, 4, 5, 6, 7, 23, 24, 25, 47, 48, 49, 71, 72, 73, 95, 96, 97, 119, 120, \n     121, 143, 144, 145, 167, 168, 169, 335, 336, 337, 503, 504, 505, 671, 672, 673, 719, 720, 721]"
+    },
+    {
+      "id": "c0017",
+      "source": "from gluonts.time_feature import time_features_from_frequency_str\n\ntime_features = time_features_from_frequency_str(freq)\nprint(time_features)\n\n>>> [<function hour_of_day at 0x7f3809539240>, <function day_of_week at 0x7f3809539360>, <function day_of_month at 0x7f3809539480>, <function day_of_year at 0x7f38095395a0>]"
+    },
+    {
+      "id": "c0018",
+      "source": "from pandas.core.arrays.period import period_array\n\ntimestamp = pd.Period(\"2015-01-01 01:00:01\", freq=freq)\ntimestamp_as_index = pd.PeriodIndex(data=period_array([timestamp]))\nadditional_features = [\n    (time_feature.__name__, time_feature(timestamp_as_index))\n    for time_feature in time_features\n]\nprint(dict(additional_features))\n\n>>> {'hour_of_day': array([-0.45652174]), 'day_of_week': array([0.]), 'day_of_month': array([-0.5]), 'day_of_year': array([-0.5])}"
+    },
+    {
+      "id": "c0019",
+      "source": "from transformers import InformerConfig, InformerForPrediction\n\nconfig = InformerConfig(\n    # in the multivariate setting, input_size is the number of variates in the time series per time step\n    input_size=num_of_variates,\n    # prediction length:\n    prediction_length=prediction_length,\n    # context length:\n    context_length=prediction_length * 2,\n    # lags value copied from 1 week before:\n    lags_sequence=[1, 24 * 7],\n    # we'll add 5 time features (\"hour_of_day\", ..., and \"age\"):\n    num_time_features=len(time_features) + 1,\n    \n    # informer params:\n    dropout=0.1,\n    encoder_layers=6,\n    decoder_layers=4,\n    # project input from num_of_variates*len(lags_sequence)+num_time_features to:\n    d_model=64,\n)\n\nmodel = InformerForPrediction(config)"
+    },
+    {
+      "id": "c0020",
+      "source": "model.config.distribution_output\n\n>>> 'student_t'"
+    },
+    {
+      "id": "c0021",
+      "source": "from gluonts.time_feature import TimeFeature\nfrom gluonts.dataset.field_names import FieldName\nfrom gluonts.transform import (\n    AddAgeFeature,\n    AddObservedValuesIndicator,\n    AddTimeFeatures,\n    AsNumpyArray,\n    Chain,\n    ExpectedNumInstanceSampler,\n    InstanceSplitter,\n    RemoveFields,\n    SelectFields,\n    SetField,\n    TestSplitSampler,\n    Transformation,\n    ValidationSplitSampler,\n    VstackFeatures,\n    RenameFields,\n)"
+    },
+    {
+      "id": "c0022",
+      "source": "from transformers import PretrainedConfig\n\n\ndef create_transformation(freq: str, config: PretrainedConfig) -> Transformation:\n    # create list of fields to remove later\n    remove_field_names = []\n    if config.num_static_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_REAL)\n    if config.num_dynamic_real_features == 0:\n        remove_field_names.append(FieldName.FEAT_DYNAMIC_REAL)\n    if config.num_static_categorical_features == 0:\n        remove_field_names.append(FieldName.FEAT_STATIC_CAT)\n\n    return Chain(\n        # step 1: remove static/dynamic fields if not specified\n        [RemoveFields(field_names=remove_field_names)]\n        # step 2: convert the data to NumPy (potentially not needed)\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_CAT,\n                    expected_ndim=1,\n                    dtype=int,\n                )\n            ]\n            if config.num_static_categorical_features > 0\n            else []\n        )\n        + (\n            [\n                AsNumpyArray(\n                    field=FieldName.FEAT_STATIC_REAL,\n                    expected_ndim=1,\n                )\n            ]\n            if config.num_static_real_features > 0\n            else []\n        )\n        + [\n            AsNumpyArray(\n                field=FieldName.TARGET,\n                # we expect an extra dim for the multivariate case:\n                expected_ndim=1 if config.input_size == 1 else 2,\n            ),\n            # step 3: handle the NaN's by filling in the target with zero\n            # and return the mask (which is in the observed values)\n            # true for observed values, false for nan's\n            # the decoder uses this mask (no loss is incurred for unobserved values)\n            # see loss_weights inside the xxxForPrediction model\n            AddObservedValuesIndicator(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.OBSERVED_VALUES,\n            ),\n            # step 4: add temporal features based on freq of the dataset\n            # these serve as positional encodings\n            AddTimeFeatures(\n                start_field=FieldName.START,\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_TIME,\n                time_features=time_features_from_frequency_str(freq),\n                pred_length=config.prediction_length,\n            ),\n            # step 5: add another temporal feature (just a single number)\n            # tells the model where in the life the value of the time series is\n            # sort of running counter\n            AddAgeFeature(\n                target_field=FieldName.TARGET,\n                output_field=FieldName.FEAT_AGE,\n                pred_length=config.prediction_length,\n                log_scale=True,\n            ),\n            # step 6: vertically stack all the temporal features into the key FEAT_TIME\n            VstackFeatures(\n                output_field=FieldName.FEAT_TIME,\n                input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]\n                + (\n                    [FieldName.FEAT_DYNAMIC_REAL]\n                    if config.num_dynamic_real_features > 0\n                    else []\n                ),\n            ),\n            # step 7: rename to match HuggingFace names\n            RenameFields(\n                mapping={\n                    FieldName.FEAT_STATIC_CAT: \"static_categorical_features\",\n                    FieldName.FEAT_STATIC_REAL: \"static_real_features\",\n                    FieldName.FEAT_TIME: \"time_features\",\n                    FieldName.TARGET: \"values\",\n                    FieldName.OBSERVED_VALUES: \"observed_mask\",\n                }\n            ),\n        ]\n    )"
+    },
+    {
+      "id": "c0023",
+      "source": "from gluonts.transform.sampler import InstanceSampler\nfrom typing import Optional\n\n\ndef create_instance_splitter(\n    config: PretrainedConfig,\n    mode: str,\n    train_sampler: Optional[InstanceSampler] = None,\n    validation_sampler: Optional[InstanceSampler] = None,\n) -> Transformation:\n    assert mode in [\"train\", \"validation\", \"test\"]\n\n    instance_sampler = {\n        \"train\": train_sampler\n        or ExpectedNumInstanceSampler(\n            num_instances=1.0, min_future=config.prediction_length\n        ),\n        \"validation\": validation_sampler\n        or ValidationSplitSampler(min_future=config.prediction_length),\n        \"test\": TestSplitSampler(),\n    }[mode]\n\n    return InstanceSplitter(\n        target_field=\"values\",\n        is_pad_field=FieldName.IS_PAD,\n        start_field=FieldName.START,\n        forecast_start_field=FieldName.FORECAST_START,\n        instance_sampler=instance_sampler,\n        past_length=config.context_length + max(config.lags_sequence),\n        future_length=config.prediction_length,\n        time_series_fields=[\"time_features\", \"observed_mask\"],\n    )"
+    },
+    {
+      "id": "c0024",
+      "source": "from typing import Iterable\n\nimport torch\nfrom gluonts.itertools import Cached, Cyclic\nfrom gluonts.dataset.loader import as_stacked_batches\n\n\ndef create_train_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    num_batches_per_epoch: int,\n    shuffle_buffer_length: Optional[int] = None,\n    cache_data: bool = True,\n    **kwargs,\n) -> Iterable:\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [\n        \"future_values\",\n        \"future_observed_mask\",\n    ]\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=True)\n    if cache_data:\n        transformed_data = Cached(transformed_data)\n\n    # we initialize a Training instance\n    instance_splitter = create_instance_splitter(config, \"train\")\n\n    # the instance splitter will sample a window of\n    # context length + lags + prediction length (from all the possible transformed time series, 1 in our case)\n    # randomly from within the target time series and return an iterator.\n    stream = Cyclic(transformed_data).stream()\n    training_instances = instance_splitter.apply(stream)\n    \n    return as_stacked_batches(\n        training_instances,\n        batch_size=batch_size,\n        shuffle_buffer_length=shuffle_buffer_length,\n        field_names=TRAINING_INPUT_NAMES,\n        output_type=torch.tensor,\n        num_batches_per_epoch=num_batches_per_epoch,\n    )"
+    },
+    {
+      "id": "c0025",
+      "source": "def create_backtest_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data)\n\n    # we create a Validation Instance splitter which will sample the very last\n    # context window seen during training only for the encoder.\n    instance_sampler = create_instance_splitter(config, \"validation\")\n\n    # we apply the transformations in train mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=True)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )\n\ndef create_test_dataloader(\n    config: PretrainedConfig,\n    freq,\n    data,\n    batch_size: int,\n    **kwargs,\n):\n    PREDICTION_INPUT_NAMES = [\n        \"past_time_features\",\n        \"past_values\",\n        \"past_observed_mask\",\n        \"future_time_features\",\n    ]\n    if config.num_static_categorical_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_categorical_features\")\n\n    if config.num_static_real_features > 0:\n        PREDICTION_INPUT_NAMES.append(\"static_real_features\")\n\n    transformation = create_transformation(freq, config)\n    transformed_data = transformation.apply(data, is_train=False)\n\n    # We create a test Instance splitter to sample the very last\n    # context window from the dataset provided.\n    instance_sampler = create_instance_splitter(config, \"test\")\n\n    # We apply the transformations in test mode\n    testing_instances = instance_sampler.apply(transformed_data, is_train=False)\n    \n    return as_stacked_batches(\n        testing_instances,\n        batch_size=batch_size,\n        output_type=torch.tensor,\n        field_names=PREDICTION_INPUT_NAMES,\n    )"
+    },
+    {
+      "id": "c0026",
+      "source": "train_dataloader = create_train_dataloader(\n    config=config,\n    freq=freq,\n    data=multi_variate_train_dataset,\n    batch_size=256,\n    num_batches_per_epoch=100,\n    num_workers=2,\n)\n\ntest_dataloader = create_backtest_dataloader(\n    config=config,\n    freq=freq,\n    data=multi_variate_test_dataset,\n    batch_size=32,\n)"
+    },
+    {
+      "id": "c0027",
+      "source": "batch = next(iter(train_dataloader))\nfor k, v in batch.items():\n    print(k, v.shape, v.type())\n\n>>> past_time_features torch.Size([256, 264, 5]) torch.FloatTensor\n    past_values torch.Size([256, 264, 862]) torch.FloatTensor\n    past_observed_mask torch.Size([256, 264, 862]) torch.FloatTensor\n    future_time_features torch.Size([256, 48, 5]) torch.FloatTensor\n    future_values torch.Size([256, 48, 862]) torch.FloatTensor\n    future_observed_mask torch.Size([256, 48, 862]) torch.FloatTensor"
+    },
+    {
+      "id": "c0028",
+      "source": "# perform forward pass\noutputs = model(\n    past_values=batch[\"past_values\"],\n    past_time_features=batch[\"past_time_features\"],\n    past_observed_mask=batch[\"past_observed_mask\"],\n    static_categorical_features=batch[\"static_categorical_features\"]\n    if config.num_static_categorical_features > 0\n    else None,\n    static_real_features=batch[\"static_real_features\"]\n    if config.num_static_real_features > 0\n    else None,\n    future_values=batch[\"future_values\"],\n    future_time_features=batch[\"future_time_features\"],\n    future_observed_mask=batch[\"future_observed_mask\"],\n    output_hidden_states=True,\n)"
+    },
+    {
+      "id": "c0029",
+      "source": "print(\"Loss:\", outputs.loss.item())\n\n>>> Loss: -1071.5718994140625"
+    },
+    {
+      "id": "c0030",
+      "source": "from accelerate import Accelerator\nfrom torch.optim import AdamW\n\nepochs = 25\nloss_history = []\n\naccelerator = Accelerator()\ndevice = accelerator.device\n\nmodel.to(device)\noptimizer = AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.95), weight_decay=1e-1)\n\nmodel, optimizer, train_dataloader = accelerator.prepare(\n    model,\n    optimizer,\n    train_dataloader,\n)\n\nmodel.train()\nfor epoch in range(epochs):\n    for idx, batch in enumerate(train_dataloader):\n        optimizer.zero_grad()\n        outputs = model(\n            static_categorical_features=batch[\"static_categorical_features\"].to(device)\n            if config.num_static_categorical_features > 0\n            else None,\n            static_real_features=batch[\"static_real_features\"].to(device)\n            if config.num_static_real_features > 0\n            else None,\n            past_time_features=batch[\"past_time_features\"].to(device),\n            past_values=batch[\"past_values\"].to(device),\n            future_time_features=batch[\"future_time_features\"].to(device),\n            future_values=batch[\"future_values\"].to(device),\n            past_observed_mask=batch[\"past_observed_mask\"].to(device),\n            future_observed_mask=batch[\"future_observed_mask\"].to(device),\n        )\n        loss = outputs.loss\n\n        # Backpropagation\n        accelerator.backward(loss)\n        optimizer.step()\n\n        loss_history.append(loss.item())\n        if idx % 100 == 0:\n            print(loss.item())\n\n>>> -1081.978515625\n    ...\n    -2877.723876953125"
+    },
+    {
+      "id": "c0031",
+      "source": "# view training\nloss_history = np.array(loss_history).reshape(-1)\nx = range(loss_history.shape[0])\nplt.figure(figsize=(10, 5))\nplt.plot(x, loss_history, label=\"train\")\nplt.title(\"Loss\", fontsize=15)\nplt.legend(loc=\"upper right\")\nplt.xlabel(\"iteration\")\nplt.ylabel(\"nll\")\nplt.show()"
+    },
+    {
+      "id": "c0032",
+      "source": "model.eval()\n\nforecasts_ = []\n\nfor batch in test_dataloader:\n    outputs = model.generate(\n        static_categorical_features=batch[\"static_categorical_features\"].to(device)\n        if config.num_static_categorical_features > 0\n        else None,\n        static_real_features=batch[\"static_real_features\"].to(device)\n        if config.num_static_real_features > 0\n        else None,\n        past_time_features=batch[\"past_time_features\"].to(device),\n        past_values=batch[\"past_values\"].to(device),\n        future_time_features=batch[\"future_time_features\"].to(device),\n        past_observed_mask=batch[\"past_observed_mask\"].to(device),\n    )\n    forecasts_.append(outputs.sequences.cpu().numpy())"
+    },
+    {
+      "id": "c0033",
+      "source": "forecasts_[0].shape\n\n>>> (1, 100, 48, 862)"
+    },
+    {
+      "id": "c0034",
+      "source": "forecasts = np.vstack(forecasts_)\nprint(forecasts.shape)\n\n>>> (1, 100, 48, 862)"
+    },
+    {
+      "id": "c0035",
+      "source": "from evaluate import load\nfrom gluonts.time_feature import get_seasonality\n\nmase_metric = load(\"evaluate-metric/mase\")\nsmape_metric = load(\"evaluate-metric/smape\")\n\nforecast_median = np.median(forecasts, 1).squeeze(0).T\n\nmase_metrics = []\nsmape_metrics = []\n\nfor item_id, ts in enumerate(test_dataset):\n    training_data = ts[\"target\"][:-prediction_length]\n    ground_truth = ts[\"target\"][-prediction_length:]\n    mase = mase_metric.compute(\n        predictions=forecast_median[item_id],\n        references=np.array(ground_truth),\n        training=np.array(training_data),\n        periodicity=get_seasonality(freq),\n    )\n    mase_metrics.append(mase[\"mase\"])\n\n    smape = smape_metric.compute(\n        predictions=forecast_median[item_id],\n        references=np.array(ground_truth),\n    )\n    smape_metrics.append(smape[\"smape\"])"
+    },
+    {
+      "id": "c0036",
+      "source": "print(f\"MASE: {np.mean(mase_metrics)}\")\n\n>>> MASE: 1.1913437728068093\n\nprint(f\"sMAPE: {np.mean(smape_metrics)}\")\n\n>>> sMAPE: 0.5322665081607634"
+    },
+    {
+      "id": "c0037",
+      "source": "plt.scatter(mase_metrics, smape_metrics, alpha=0.2)\nplt.xlabel(\"MASE\")\nplt.ylabel(\"sMAPE\")\nplt.show()"
+    },
+    {
+      "id": "c0038",
+      "source": "import matplotlib.dates as mdates\n\n\ndef plot(ts_index, mv_index):\n    fig, ax = plt.subplots()\n\n    index = pd.period_range(\n        start=multi_variate_test_dataset[ts_index][FieldName.START],\n        periods=len(multi_variate_test_dataset[ts_index][FieldName.TARGET]),\n        freq=multi_variate_test_dataset[ts_index][FieldName.START].freq,\n    ).to_timestamp()\n\n    ax.xaxis.set_minor_locator(mdates.HourLocator())\n\n    ax.plot(\n        index[-2 * prediction_length :],\n        multi_variate_test_dataset[ts_index][\"target\"][mv_index, -2 * prediction_length :],\n        label=\"actual\",\n    )\n\n    ax.plot(\n        index[-prediction_length:],\n        forecasts[ts_index, ..., mv_index].mean(axis=0),\n        label=\"mean\",\n    )\n    ax.fill_between(\n        index[-prediction_length:],\n        forecasts[ts_index, ..., mv_index].mean(0)\n        - forecasts[ts_index, ..., mv_index].std(axis=0),\n        forecasts[ts_index, ..., mv_index].mean(0)\n        + forecasts[ts_index, ..., mv_index].std(axis=0),\n        alpha=0.2,\n        interpolate=True,\n        label=\"+/- 1-std\",\n    )\n    ax.legend()\n    fig.autofmt_xdate()"
+    },
+    {
+      "id": "c0039",
+      "source": "plot(0, 344)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "eb23d1b4a45a7a8d555ea2b9cde802111f7b392565b04976f14d5715fa181ea8",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_2157756bafd41353",
+      "type": "image",
+      "afterBlockId": "b0013",
+      "order": 1
+    },
+    {
+      "mediaId": "image_cc6655379e617da0",
+      "type": "image",
+      "afterBlockId": "b0024",
+      "order": 2
+    },
+    {
+      "mediaId": "image_28ac6015a7f5d8d5",
+      "type": "image",
+      "afterBlockId": "c0010",
+      "order": 3
+    },
+    {
+      "mediaId": "image_6a7ded613628fd8d",
+      "type": "image",
+      "afterBlockId": "c0031",
+      "order": 4
+    },
+    {
+      "mediaId": "image_29602e0de9a524ef",
+      "type": "image",
+      "afterBlockId": "c0037",
+      "order": 5
+    },
+    {
+      "mediaId": "image_aca59562e1fef2f3",
+      "type": "image",
+      "afterBlockId": "c0039",
+      "order": 6
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 7,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 7,
+    "savedImages": 7,
+    "sourceImageOccurrences": 7,
+    "placedImageOccurrences": 7,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:18:27.175928Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:18:27.175947Z"
 }

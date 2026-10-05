@@ -17,10 +17,9 @@
   "originalUrl": "https://huggingface.co/blog/stable-diffusion-inference-intel",
   "resolvedUrl": "https://huggingface.co/blog/stable-diffusion-inference-intel",
   "fetchedAt": "2026-08-27T03:10:34.329477Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Recently, we introduced the latest generation of Intel Xeon CPUs (code name Sapphire Rapids), its new hardware features for deep learning acceleration, and how to use them to accelerate distributed fine-tuning and inference for natural language processing Transformers.\n\nIn this post, we're going to show you different techniques to accelerate Stable Diffusion models on Sapphire Rapids CPUs. A follow-up post will do the same for distributed fine-tuning.\n\nAt the time of writing, the simplest way to get your hands on a Sapphire Rapids server is to use the Amazon EC2 R7iz instance family. As it's still in preview, you have to sign up to get access. Like in previous posts, I'm using an r7iz.metal-16xl instance (64 vCPU, 512GB RAM) with an Ubuntu 20.04 AMI (ami-07cd3e6c4915b2d18).\n\nLet's get started! Code samples are available on Gitlab.\n\n## The Diffusers library\n\nThe Diffusers library makes it extremely simple to generate images with Stable Diffusion models. If you're not familiar with these models, here's a great illustrated introduction.\n\nFirst, let's create a virtual environment with the required libraries: Transformers, Diffusers, Accelerate, and PyTorch.\n\n```\nvirtualenv sd_inference\nsource sd_inference/bin/activate\npip install pip --upgrade\npip install transformers diffusers accelerate torch==1.13.1\n```\n\nThen, we write a simple benchmarking function that repeatedly runs inference, and returns the average latency for a single-image generation.\n\n```\nimport time\n\ndef elapsed_time(pipeline, prompt, nb_pass=10, num_inference_steps=20):\n    # warmup\n    images = pipeline(prompt, num_inference_steps=10).images\n    start = time.time()\n    for _ in range(nb_pass):\n        _ = pipeline(prompt, num_inference_steps=num_inference_steps, output_type=\"np\")\n    end = time.time()\n    return (end - start) / nb_pass\n```\n\nNow, let's build a StableDiffusionPipeline with the default float32 data type, and measure its inference latency.\n\n```\nfrom diffusers import StableDiffusionPipeline\n\nmodel_id = \"runwayml/stable-diffusion-v1-5\"\npipe = StableDiffusionPipeline.from_pretrained(model_id)\nprompt = \"sailing ship in storm by Rembrandt\"\nlatency = elapsed_time(pipe, prompt)\nprint(latency)\n```\n\nThe average latency is 32.3 seconds. As demonstrated by this Intel Space, the same code runs on a previous generation Intel Xeon (code name Ice Lake) in about 45 seconds.\n\nOut of the box, we can see that Sapphire Rapids CPUs are quite faster without any code change!\n\nNow, let's accelerate!\n\n## Optimum Intel and OpenVINO\n\nOptimum Intel accelerates end-to-end pipelines on Intel architectures. Its API is extremely similar to the vanilla Diffusers API, making it trivial to adapt existing code.\n\nOptimum Intel supports OpenVINO, an Intel open-source toolkit for high-performance inference.\n\nOptimum Intel and OpenVINO can be installed as follows:\n\n```\npip install optimum[openvino]\n```\n\nStarting from the code above, we only need to replace StableDiffusionPipeline with OVStableDiffusionPipeline. To load a PyTorch model and convert it to the OpenVINO format on-the-fly, you can set export=True when loading your model.\n\n```\nfrom optimum.intel.openvino import OVStableDiffusionPipeline\n...\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)\nlatency = elapsed_time(ov_pipe, prompt)\nprint(latency)\n\n# Don't forget to save the exported model\nov_pipe.save_pretrained(\"./openvino\")\n```\n\nOpenVINO automatically optimizes the model for the bfloat16 format. Thanks to this, the average latency is now 16.7 seconds, a sweet 2x speedup.\n\nThe pipeline above support dynamic input shapes, with no restriction on the number of images or their resolution. With Stable Diffusion, your application is usually restricted to one (or a few) different output resolutions, such as 512x512, or 256x256. Thus, it makes a lot of sense to unlock significant acceleration by reshaping the pipeline to a fixed resolution. If you need more than one output resolution, you can simply maintain a few pipeline instances, one for each resolution.\n\n```\nov_pipe.reshape(batch_size=1, height=512, width=512, num_images_per_prompt=1)\nlatency = elapsed_time(ov_pipe, prompt)\n```\n\nWith a static shape, average latency is slashed to 4.7 seconds, an additional 3.5x speedup.\n\nAs you can see, OpenVINO is a simple and efficient way to accelerate Stable Diffusion inference. When combined with a Sapphire Rapids CPU, it delivers almost 10x speedup compared to vanilla inference on Ice Lake Xeons.\n\nIf you can't or don't want to use OpenVINO, the rest of this post will show you a series of other optimization techniques. Fasten your seatbelt!\n\n## System-level optimization\n\nDiffuser models are large multi-gigabyte models, and image generation is a memory-intensive operation. By installing a high-performance memory allocation library, we should be able to speed up memory operations and parallelize them across the Xeon cores. Please note that this will change the default memory allocation library on your system. Of course, you can go back to the default library by uninstalling the new one.\n\njemalloc and tcmalloc are equally interesting. Here, I'm installing jemalloc as my tests give it a slight performance edge. It can also be tweaked for a particular workload, for example to maximize CPU utilization. You can refer to the tuning guide for details.\n\n```\nsudo apt-get install -y libjemalloc-dev\nexport LD_PRELOAD=$LD_PRELOAD:/usr/lib/x86_64-linux-gnu/libjemalloc.so\nexport MALLOC_CONF=\"oversize_threshold:1,background_thread:true,metadata_thp:auto,dirty_decay_ms: 60000,muzzy_decay_ms:60000\"\n```\n\nNext, we install the libiomp library to optimize parallel processing. It's part of Intel OpenMP* Runtime.\n\n```\nsudo apt-get install intel-mkl\nexport LD_PRELOAD=$LD_PRELOAD:/usr/lib/x86_64-linux-gnu/libiomp5.so\nexport OMP_NUM_THREADS=32\n```\n\nFinally, we install the numactl command line tool. This lets us pin our Python process to specific cores, and avoid some of the overhead related to context switching.\n\n```\nnumactl -C 0-31 python sd_blog_1.py\n```\n\nThanks to these optimizations, our original Diffusers code now predicts in 11.8 seconds. That's almost 3x faster, without any code change. These tools are certainly working great on our 32-core Xeon.\n\nWe're far from done. Let's add the Intel Extension for PyTorch to the mix.\n\n## IPEX and BF16\n\nThe Intel Extension for Pytorch (IPEX) extends PyTorch and takes advantage of hardware acceleration features present on Intel CPUs, such as AVX-512 Vector Neural Network Instructions (AVX512 VNNI) and Advanced Matrix Extensions (AMX).\n\nLet's install it.\n\n```\npip install intel_extension_for_pytorch==1.13.100\n```\n\nWe then update our code to optimize each pipeline element with IPEX (you can list them by printing the pipe object). This requires converting them to the channels-last format.\n\n```\nimport torch\nimport intel_extension_for_pytorch as ipex\n...\npipe = StableDiffusionPipeline.from_pretrained(model_id)\n\n# to channels last\npipe.unet = pipe.unet.to(memory_format=torch.channels_last)\npipe.vae = pipe.vae.to(memory_format=torch.channels_last)\npipe.text_encoder = pipe.text_encoder.to(memory_format=torch.channels_last)\npipe.safety_checker = pipe.safety_checker.to(memory_format=torch.channels_last)\n\n# Create random input to enable JIT compilation\nsample = torch.randn(2,4,64,64)\ntimestep = torch.rand(1)*999\nencoder_hidden_status = torch.randn(2,77,768)\ninput_example = (sample, timestep, encoder_hidden_status)\n\n# optimize with IPEX\npipe.unet = ipex.optimize(pipe.unet.eval(), dtype=torch.bfloat16, inplace=True, sample_input=input_example)\npipe.vae = ipex.optimize(pipe.vae.eval(), dtype=torch.bfloat16, inplace=True)\npipe.text_encoder = ipex.optimize(pipe.text_encoder.eval(), dtype=torch.bfloat16, inplace=True)\npipe.safety_checker = ipex.optimize(pipe.safety_checker.eval(), dtype=torch.bfloat16, inplace=True)\n```\n\nWe also enable the bloat16 data format to leverage the AMX tile matrix multiply unit (TMMU) accelerator present on Sapphire Rapids CPUs.\n\n```\nwith torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):\n    latency = elapsed_time(pipe, prompt)\n    print(latency)\n```\n\nWith this updated version, inference latency is further reduced from 11.9 seconds to 5.4 seconds. That's more than 2x acceleration thanks to IPEX and AMX.\n\nCan we extract a bit more performance? Yes, with schedulers!\n\n## Schedulers\n\nThe Diffusers library lets us attach a scheduler to a Stable Diffusion pipeline. Schedulers try to find the best trade-off between denoising speed and denoising quality.\n\nAccording to the documentation: \"At the time of writing this doc DPMSolverMultistepScheduler gives arguably the best speed/quality trade-off and can be run with as little as 20 steps.\"\n\nLet's try it.\n\n```\nfrom diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler\n...\ndpm = DPMSolverMultistepScheduler.from_pretrained(model_id, subfolder=\"scheduler\")\npipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=dpm)\n```\n\nWith this final version, inference latency is now down to 5.05 seconds. Compared to our initial Sapphire Rapids baseline (32.3 seconds), this is almost 6.5x faster!\n\n\\*Environment: Amazon EC2 r7iz.metal-16xl, Ubuntu 20.04, Linux 5.15.0-1031-aws, libjemalloc-dev 5.2.1-1, intel-mkl 2020.0.166-1, PyTorch 1.13.1, Intel Extension for PyTorch 1.13.1, transformers 4.27.2, diffusers 0.14, accelerate 0.17.1, openvino 2023.0.0.dev20230217, optimum 1.7.1, optimum-intel 1.7*\n\n## Conclusion\n\nThe ability to generate high-quality images in seconds should work well for a lot of use cases, such as customer apps, content generation for marketing and media, or synthetic data for dataset augmentation.\n\nHere are some resources to help you get started:\n\n- Diffusers documentation\n\n- Optimum Intel documentation\n\n- Intel IPEX on GitHub\n\n- Developer resources from Intel and Hugging Face.\n\nIf you have questions or feedback, we'd love to read them on the Hugging Face forum.\n\nThanks for reading!",
   "summaryZh": "本文聚焦于如何在Intel CPU上加速Stable Diffusion推理，为非GPU环境下的部署提供了可行的优化方法。",
   "summaryGeneratedAt": "2026-09-06T02:37:13.986171Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -53,5 +52,634 @@
     "summaryZh": "本文聚焦于如何在Intel CPU上加速Stable Diffusion推理，为非GPU环境下的部署提供了可行的优化方法。",
     "glossary": [],
     "duplicateKey": "stable-diffusion-intel-cpu-inference"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/136_stable_diffusion_inference_intel/01.png",
+      "originalUrl": "https://huggingface.co/blog/assets/136_stable_diffusion_inference_intel/01.png",
+      "alt": "",
+      "id": "image_9c05b3cc3bcb5985"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Recently, we introduced the latest generation of Intel Xeon CPUs (code name Sapphire Rapids), its new hardware features for deep learning acceleration, and how to use them to accelerate distributed fine-tuning and inference for natural language processing Transformers.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 59,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/products/details/processors/xeon/scalable.html"
+        },
+        {
+          "start": 186,
+          "end": 209,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel-sapphire-rapids"
+        },
+        {
+          "start": 214,
+          "end": 223,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel-sapphire-rapids-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "In this post, we're going to show you different techniques to accelerate Stable Diffusion models on Sapphire Rapids CPUs. A follow-up post will do the same for distributed fine-tuning.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "At the time of writing, the simplest way to get your hands on a Sapphire Rapids server is to use the Amazon EC2 R7iz instance family. As it's still in preview, you have to sign up to get access. Like in previous posts, I'm using an r7iz.metal-16xl instance (64 vCPU, 512GB RAM) with an Ubuntu 20.04 AMI (ami-07cd3e6c4915b2d18).",
+      "spans": [
+        {
+          "start": 112,
+          "end": 116,
+          "kind": "a",
+          "href": "https://aws.amazon.com/ec2/instance-types/r7iz/"
+        },
+        {
+          "start": 172,
+          "end": 179,
+          "kind": "a",
+          "href": "https://pages.awscloud.com/R7iz-Preview.html"
+        },
+        {
+          "start": 232,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 304,
+          "end": 325,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Let's get started! Code samples are available on Gitlab.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 55,
+          "kind": "a",
+          "href": "https://gitlab.com/juliensimon/huggingface-demos/-/tree/main/optimum/stable_diffusion_intel"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "The Diffusers library",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "The Diffusers library makes it extremely simple to generate images with Stable Diffusion models. If you're not familiar with these models, here's a great illustrated introduction.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/index"
+        },
+        {
+          "start": 154,
+          "end": 178,
+          "kind": "a",
+          "href": "https://jalammar.github.io/illustrated-stable-diffusion/"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "First, let's create a virtual environment with the required libraries: Transformers, Diffusers, Accelerate, and PyTorch.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Then, we write a simple benchmarking function that repeatedly runs inference, and returns the average latency for a single-image generation.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Now, let's build a StableDiffusionPipeline with the default float32 data type, and measure its inference latency.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 60,
+          "end": 67,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "The average latency is 32.3 seconds. As demonstrated by this Intel Space, the same code runs on a previous generation Intel Xeon (code name Ice Lake) in about 45 seconds.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 35,
+          "kind": "strong"
+        },
+        {
+          "start": 61,
+          "end": 72,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/Intel/Stable-Diffusion-Side-by-Side"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Out of the box, we can see that Sapphire Rapids CPUs are quite faster without any code change!",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Now, let's accelerate!",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Optimum Intel and OpenVINO",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Optimum Intel accelerates end-to-end pipelines on Intel architectures. Its API is extremely similar to the vanilla Diffusers API, making it trivial to adapt existing code.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/intel/index"
+        },
+        {
+          "start": 115,
+          "end": 124,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/index"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Optimum Intel supports OpenVINO, an Intel open-source toolkit for high-performance inference.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 31,
+          "kind": "a",
+          "href": "https://docs.openvino.ai/latest/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Optimum Intel and OpenVINO can be installed as follows:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Starting from the code above, we only need to replace StableDiffusionPipeline with OVStableDiffusionPipeline. To load a PyTorch model and convert it to the OpenVINO format on-the-fly, you can set export=True when loading your model.",
+      "spans": [
+        {
+          "start": 54,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 83,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 196,
+          "end": 207,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "OpenVINO automatically optimizes the model for the bfloat16 format. Thanks to this, the average latency is now 16.7 seconds, a sweet 2x speedup.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 111,
+          "end": 123,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "The pipeline above support dynamic input shapes, with no restriction on the number of images or their resolution. With Stable Diffusion, your application is usually restricted to one (or a few) different output resolutions, such as 512x512, or 256x256. Thus, it makes a lot of sense to unlock significant acceleration by reshaping the pipeline to a fixed resolution. If you need more than one output resolution, you can simply maintain a few pipeline instances, one for each resolution.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "With a static shape, average latency is slashed to 4.7 seconds, an additional 3.5x speedup.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 62,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "As you can see, OpenVINO is a simple and efficient way to accelerate Stable Diffusion inference. When combined with a Sapphire Rapids CPU, it delivers almost 10x speedup compared to vanilla inference on Ice Lake Xeons.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "If you can't or don't want to use OpenVINO, the rest of this post will show you a series of other optimization techniques. Fasten your seatbelt!",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "System-level optimization",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Diffuser models are large multi-gigabyte models, and image generation is a memory-intensive operation. By installing a high-performance memory allocation library, we should be able to speed up memory operations and parallelize them across the Xeon cores. Please note that this will change the default memory allocation library on your system. Of course, you can go back to the default library by uninstalling the new one.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "jemalloc and tcmalloc are equally interesting. Here, I'm installing jemalloc as my tests give it a slight performance edge. It can also be tweaked for a particular workload, for example to maximize CPU utilization. You can refer to the tuning guide for details.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "a",
+          "href": "https://jemalloc.net/"
+        },
+        {
+          "start": 13,
+          "end": 21,
+          "kind": "a",
+          "href": "https://github.com/gperftools/gperftools"
+        },
+        {
+          "start": 68,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 236,
+          "end": 248,
+          "kind": "a",
+          "href": "https://github.com/jemalloc/jemalloc/blob/dev/TUNING.md"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Next, we install the libiomp library to optimize parallel processing. It's part of Intel OpenMP* Runtime.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 83,
+          "end": 104,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/openmp-run-time-library-routines.html"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Finally, we install the numactl command line tool. This lets us pin our Python process to specific cores, and avoid some of the overhead related to context switching.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 31,
+          "kind": "a",
+          "href": "https://github.com/numactl/numactl"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Thanks to these optimizations, our original Diffusers code now predicts in 11.8 seconds. That's almost 3x faster, without any code change. These tools are certainly working great on our 32-core Xeon.",
+      "spans": [
+        {
+          "start": 75,
+          "end": 87,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "We're far from done. Let's add the Intel Extension for PyTorch to the mix.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "IPEX and BF16",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "The Intel Extension for Pytorch (IPEX) extends PyTorch and takes advantage of hardware acceleration features present on Intel CPUs, such as AVX-512 Vector Neural Network Instructions (AVX512 VNNI) and Advanced Matrix Extensions (AMX).",
+      "spans": [
+        {
+          "start": 4,
+          "end": 31,
+          "kind": "a",
+          "href": "https://intel.github.io/intel-extension-for-pytorch/"
+        },
+        {
+          "start": 140,
+          "end": 147,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/AVX-512"
+        },
+        {
+          "start": 201,
+          "end": 227,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Advanced_Matrix_Extensions"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Let's install it.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "We then update our code to optimize each pipeline element with IPEX (you can list them by printing the pipe object). This requires converting them to the channels-last format.",
+      "spans": [
+        {
+          "start": 103,
+          "end": 107,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "We also enable the bloat16 data format to leverage the AMX tile matrix multiply unit (TMMU) accelerator present on Sapphire Rapids CPUs.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 26,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "With this updated version, inference latency is further reduced from 11.9 seconds to 5.4 seconds. That's more than 2x acceleration thanks to IPEX and AMX.",
+      "spans": [
+        {
+          "start": 85,
+          "end": 96,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Can we extract a bit more performance? Yes, with schedulers!",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Schedulers",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "The Diffusers library lets us attach a scheduler to a Stable Diffusion pipeline. Schedulers try to find the best trade-off between denoising speed and denoising quality.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 48,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/using-diffusers/schedulers"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "According to the documentation: \"At the time of writing this doc DPMSolverMultistepScheduler gives arguably the best speed/quality trade-off and can be run with as little as 20 steps.\"",
+      "spans": [
+        {
+          "start": 33,
+          "end": 183,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Let's try it.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "With this final version, inference latency is now down to 5.05 seconds. Compared to our initial Sapphire Rapids baseline (32.3 seconds), this is almost 6.5x faster!",
+      "spans": [
+        {
+          "start": 58,
+          "end": 70,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "*Environment: Amazon EC2 r7iz.metal-16xl, Ubuntu 20.04, Linux 5.15.0-1031-aws, libjemalloc-dev 5.2.1-1, intel-mkl 2020.0.166-1, PyTorch 1.13.1, Intel Extension for PyTorch 1.13.1, transformers 4.27.2, diffusers 0.14, accelerate 0.17.1, openvino 2023.0.0.dev20230217, optimum 1.7.1, optimum-intel 1.7*",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "The ability to generate high-quality images in seconds should work well for a lot of use cases, such as customer apps, content generation for marketing and media, or synthetic data for dataset augmentation.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Here are some resources to help you get started:",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Diffusers documentation",
+      "spans": [
+        {
+          "start": 10,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Optimum Intel documentation",
+      "spans": [
+        {
+          "start": 14,
+          "end": 27,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/main/en/intel/inference"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Intel IPEX on GitHub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Developer resources from Intel and Hugging Face.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/partner/hugging-face.html"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "If you have questions or feedback, we'd love to read them on the Hugging Face forum.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 83,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Thanks for reading!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "32aeaee5c7d08b72f8fd92bfb8957c263115fb9ef39aa97870bd271b1e2091dd",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "virtualenv sd_inference\nsource sd_inference/bin/activate\npip install pip --upgrade\npip install transformers diffusers accelerate torch==1.13.1"
+    },
+    {
+      "id": "c0002",
+      "source": "import time\n\ndef elapsed_time(pipeline, prompt, nb_pass=10, num_inference_steps=20):\n    # warmup\n    images = pipeline(prompt, num_inference_steps=10).images\n    start = time.time()\n    for _ in range(nb_pass):\n        _ = pipeline(prompt, num_inference_steps=num_inference_steps, output_type=\"np\")\n    end = time.time()\n    return (end - start) / nb_pass"
+    },
+    {
+      "id": "c0003",
+      "source": "from diffusers import StableDiffusionPipeline\n\nmodel_id = \"runwayml/stable-diffusion-v1-5\"\npipe = StableDiffusionPipeline.from_pretrained(model_id)\nprompt = \"sailing ship in storm by Rembrandt\"\nlatency = elapsed_time(pipe, prompt)\nprint(latency)"
+    },
+    {
+      "id": "c0004",
+      "source": "pip install optimum[openvino]"
+    },
+    {
+      "id": "c0005",
+      "source": "from optimum.intel.openvino import OVStableDiffusionPipeline\n...\nov_pipe = OVStableDiffusionPipeline.from_pretrained(model_id, export=True)\nlatency = elapsed_time(ov_pipe, prompt)\nprint(latency)\n\n# Don't forget to save the exported model\nov_pipe.save_pretrained(\"./openvino\")"
+    },
+    {
+      "id": "c0006",
+      "source": "ov_pipe.reshape(batch_size=1, height=512, width=512, num_images_per_prompt=1)\nlatency = elapsed_time(ov_pipe, prompt)"
+    },
+    {
+      "id": "c0007",
+      "source": "sudo apt-get install -y libjemalloc-dev\nexport LD_PRELOAD=$LD_PRELOAD:/usr/lib/x86_64-linux-gnu/libjemalloc.so\nexport MALLOC_CONF=\"oversize_threshold:1,background_thread:true,metadata_thp:auto,dirty_decay_ms: 60000,muzzy_decay_ms:60000\""
+    },
+    {
+      "id": "c0008",
+      "source": "sudo apt-get install intel-mkl\nexport LD_PRELOAD=$LD_PRELOAD:/usr/lib/x86_64-linux-gnu/libiomp5.so\nexport OMP_NUM_THREADS=32"
+    },
+    {
+      "id": "c0009",
+      "source": "numactl -C 0-31 python sd_blog_1.py"
+    },
+    {
+      "id": "c0010",
+      "source": "pip install intel_extension_for_pytorch==1.13.100"
+    },
+    {
+      "id": "c0011",
+      "source": "import torch\nimport intel_extension_for_pytorch as ipex\n...\npipe = StableDiffusionPipeline.from_pretrained(model_id)\n\n# to channels last\npipe.unet = pipe.unet.to(memory_format=torch.channels_last)\npipe.vae = pipe.vae.to(memory_format=torch.channels_last)\npipe.text_encoder = pipe.text_encoder.to(memory_format=torch.channels_last)\npipe.safety_checker = pipe.safety_checker.to(memory_format=torch.channels_last)\n\n# Create random input to enable JIT compilation\nsample = torch.randn(2,4,64,64)\ntimestep = torch.rand(1)*999\nencoder_hidden_status = torch.randn(2,77,768)\ninput_example = (sample, timestep, encoder_hidden_status)\n\n# optimize with IPEX\npipe.unet = ipex.optimize(pipe.unet.eval(), dtype=torch.bfloat16, inplace=True, sample_input=input_example)\npipe.vae = ipex.optimize(pipe.vae.eval(), dtype=torch.bfloat16, inplace=True)\npipe.text_encoder = ipex.optimize(pipe.text_encoder.eval(), dtype=torch.bfloat16, inplace=True)\npipe.safety_checker = ipex.optimize(pipe.safety_checker.eval(), dtype=torch.bfloat16, inplace=True)"
+    },
+    {
+      "id": "c0012",
+      "source": "with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):\n    latency = elapsed_time(pipe, prompt)\n    print(latency)"
+    },
+    {
+      "id": "c0013",
+      "source": "from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler\n...\ndpm = DPMSolverMultistepScheduler.from_pretrained(model_id, subfolder=\"scheduler\")\npipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=dpm)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "32aeaee5c7d08b72f8fd92bfb8957c263115fb9ef39aa97870bd271b1e2091dd",
+  "mediaLayout": [
+    {
+      "mediaId": "image_9c05b3cc3bcb5985",
+      "type": "image",
+      "afterBlockId": "b0042",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:18:13.269945Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:18:13.269976Z"
 }

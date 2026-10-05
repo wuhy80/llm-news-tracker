@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/sentiment-analysis-fhe",
   "resolvedUrl": "https://huggingface.co/blog/sentiment-analysis-fhe",
   "fetchedAt": "2026-08-27T03:10:36.088937Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "It is well-known that a sentiment analysis model determines whether a text is positive, negative, or neutral. However, this process typically requires access to unencrypted text, which can pose privacy concerns.\n\nHomomorphic encryption is a type of encryption that allows for computation on encrypted data without needing to decrypt it first. This makes it well-suited for applications where user's personal and potentially sensitive data is at risk (e.g. sentiment analysis of private messages).\n\nThis blog post uses the Concrete-ML library, allowing data scientists to use machine learning models in fully homomorphic encryption (FHE) settings without any prior knowledge of cryptography. We provide a practical tutorial on how to use the library to build a sentiment analysis model on encrypted data.\n\nThe post covers:\n\n- transformers\n\n- how to use transformers with XGBoost to perform sentiment analysis\n\n- how to do the training\n\n- how to use Concrete-ML to turn predictions into predictions over encrypted data\n\n- how to deploy to the cloud using a client/server protocol\n\nLast but not least, we’ll finish with a complete demo over Hugging Face Spaces to show this functionality in action.\n\n## Setup the environment\n\nFirst make sure your pip and setuptools are up to date by running:\n\n```\npip install -U pip setuptools\n```\n\nNow we can install all the required libraries for the this blog with the following command.\n\n```\npip install concrete-ml transformers datasets\n```\n\n## Using a public dataset\n\nThe dataset we use in this notebook can be found here.\n\nTo represent the text for sentiment analysis, we chose to use a transformer hidden representation as it yields high accuracy for the final model in a very efficient way. For a comparison of this representation set against a more common procedure like the TF-IDF approach, please see this full notebook.\n\nWe can start by opening the dataset and visualize some statistics.\n\n```\nfrom datasets import load_datasets\ntrain = load_dataset(\"osanseviero/twitter-airline-sentiment\")[\"train\"].to_pandas()\ntext_X = train['text']\ny = train['airline_sentiment']\ny = y.replace(['negative', 'neutral', 'positive'], [0, 1, 2])\npos_ratio = y.value_counts()[2] / y.value_counts().sum()\nneg_ratio = y.value_counts()[0] / y.value_counts().sum()\nneutral_ratio = y.value_counts()[1] / y.value_counts().sum()\nprint(f'Proportion of positive examples: {round(pos_ratio * 100, 2)}%')\nprint(f'Proportion of negative examples: {round(neg_ratio * 100, 2)}%')\nprint(f'Proportion of neutral examples: {round(neutral_ratio * 100, 2)}%')\n```\n\nThe output, then, looks like this:\n\n```\nProportion of positive examples: 16.14%\nProportion of negative examples: 62.69%\nProportion of neutral examples: 21.17%\n```\n\nThe ratio of positive and neutral examples is rather similar, though we have significantly more negative examples. Let’s keep this in mind to select the final evaluation metric.\n\nNow we can split our dataset into training and test sets. We will use a seed for this code to ensure it is perfectly reproducible.\n\n```\nfrom sklearn.model_selection import train_test_split\ntext_X_train, text_X_test, y_train, y_test = train_test_split(text_X, y,\n    test_size=0.1, random_state=42)\n```\n\n## Text representation using a transformer\n\nTransformers are neural networks often trained to predict the next words to appear in a text (this task is commonly called self-supervised learning). They can also be fine-tuned on some specific subtasks such that they specialize and get better results on a given problem.\n\nThey are powerful tools for all kinds of Natural Language Processing tasks. In fact, we can leverage their representation for any text and feed it to a more FHE-friendly machine-learning model for classification. In this notebook, we will use XGBoost.\n\nWe start by importing the requirements for transformers. Here, we use the popular library from Hugging Face to get a transformer quickly.\n\nThe model we have chosen is a BERT transformer, fine-tuned on the Stanford Sentiment Treebank dataset.\n\n```\nimport torch\nfrom transformers import AutoModelForSequenceClassification, AutoTokenizer\ndevice = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\n# Load the tokenizer (converts text to tokens)\ntokenizer = AutoTokenizer.from_pretrained(\"cardiffnlp/twitter-roberta-base-sentiment-latest\")\n\n# Load the pre-trained model\ntransformer_model = AutoModelForSequenceClassification.from_pretrained(\n   \"cardiffnlp/twitter-roberta-base-sentiment-latest\"\n)\n```\n\nThis should download the model, which is now ready to be used.\n\nUsing the hidden representation for some text can be tricky at first, mainly because we could tackle this with many different approaches. Below is the approach we chose.\n\nFirst, we tokenize the text. Tokenizing means splitting the text into tokens (a sequence of specific characters that can also be words) and replacing each with a number. Then, we send the tokenized text to the transformer model, which outputs a hidden representation (output of the self attention layers which are often used as input to the classification layers) for each word. Finally, we average the representations for each word to get a text-level representation.\n\nThe result is a matrix of shape (number of examples, hidden size). The hidden size is the number of dimensions in the hidden representation. For BERT, the hidden size is 768. The hidden representation is a vector of numbers that represents the text that can be used for many different tasks. In this case, we will use it for classification with XGBoost afterwards.\n\n```\nimport numpy as np\nimport tqdm\n# Function that transforms a list of texts to their representation\n# learned by the transformer.\ndef text_to_tensor(\n   list_text_X_train: list,\n   transformer_model: AutoModelForSequenceClassification,\n   tokenizer: AutoTokenizer,\n   device: str,\n) -> np.ndarray:\n   # Tokenize each text in the list one by one\n   tokenized_text_X_train_split = []\n   tokenized_text_X_train_split = [\n       tokenizer.encode(text_x_train, return_tensors=\"pt\")\n       for text_x_train in list_text_X_train\n   ]\n\n   # Send the model to the device\n   transformer_model = transformer_model.to(device)\n   output_hidden_states_list = [None] * len(tokenized_text_X_train_split)\n\n   for i, tokenized_x in enumerate(tqdm.tqdm(tokenized_text_X_train_split)):\n       # Pass the tokens through the transformer model and get the hidden states\n       # Only keep the last hidden layer state for now\n       output_hidden_states = transformer_model(tokenized_x.to(device), output_hidden_states=True)[\n           1\n       ][-1]\n       # Average over the tokens axis to get a representation at the text level.\n       output_hidden_states = output_hidden_states.mean(dim=1)\n       output_hidden_states = output_hidden_states.detach().cpu().numpy()\n       output_hidden_states_list[i] = output_hidden_states\n\n   return np.concatenate(output_hidden_states_list, axis=0)\n```\n\n```\n# Let's vectorize the text using the transformer\nlist_text_X_train = text_X_train.tolist()\nlist_text_X_test = text_X_test.tolist()\n\nX_train_transformer = text_to_tensor(list_text_X_train, transformer_model, tokenizer, device)\nX_test_transformer = text_to_tensor(list_text_X_test, transformer_model, tokenizer, device)\n```\n\nThis transformation of the text (text to transformer representation) would need to be executed on the client machine as the encryption is done over the transformer representation.\n\n## Classifying with XGBoost\n\nNow that we have our training and test sets properly built to train a classifier, next comes the training of our FHE model. Here it will be very straightforward, using a hyper-parameter tuning tool such as GridSearch from scikit-learn.\n\n```\nfrom concrete.ml.sklearn import XGBClassifier\nfrom sklearn.model_selection import GridSearchCV\n# Let's build our model\nmodel = XGBClassifier()\n\n# A gridsearch to find the best parameters\nparameters = {\n    \"n_bits\": [2, 3],\n    \"max_depth\": [1],\n    \"n_estimators\": [10, 30, 50],\n    \"n_jobs\": [-1],\n}\n\n# Now we have a representation for each tweet, we can train a model on these.\ngrid_search = GridSearchCV(model, parameters, cv=5, n_jobs=1, scoring=\"accuracy\")\ngrid_search.fit(X_train_transformer, y_train)\n\n# Check the accuracy of the best model\nprint(f\"Best score: {grid_search.best_score_}\")\n\n# Check best hyperparameters\nprint(f\"Best parameters: {grid_search.best_params_}\")\n\n# Extract best model\nbest_model = grid_search.best_estimator_\n```\n\nThe output is as follows:\n\n```\nBest score: 0.8378111718275654\nBest parameters: {'max_depth': 1, 'n_bits': 3, 'n_estimators': 50, 'n_jobs': -1}\n```\n\nNow, let’s see how the model performs on the test set.\n\n```\nfrom sklearn.metrics import ConfusionMatrixDisplay\n# Compute the metrics on the test set\ny_pred = best_model.predict(X_test_transformer)\ny_proba = best_model.predict_proba(X_test_transformer)\n\n# Compute and plot the confusion matrix\nmatrix = confusion_matrix(y_test, y_pred)\nConfusionMatrixDisplay(matrix).plot()\n\n# Compute the accuracy\naccuracy_transformer_xgboost = np.mean(y_pred == y_test)\nprint(f\"Accuracy: {accuracy_transformer_xgboost:.4f}\")\n```\n\nWith the following output:\n\n```\nAccuracy: 0.8504\n```\n\n## Predicting over encrypted data\n\nNow let’s predict over encrypted text. The idea here is that we will encrypt the representation given by the transformer rather than the raw text itself. In Concrete-ML, you can do this very quickly by setting the parameter execute_in_fhe=True in the predict function. This is just a developer feature (mainly used to check the running time of the FHE model). We will see how we can make this work in a deployment setting a bit further down.\n\n```\nimport time\n# Compile the model to get the FHE inference engine\n# (this may take a few minutes depending on the selected model)\nstart = time.perf_counter()\nbest_model.compile(X_train_transformer)\nend = time.perf_counter()\nprint(f\"Compilation time: {end - start:.4f} seconds\")\n\n# Let's write a custom example and predict in FHE\ntested_tweet = [\"AirFrance is awesome, almost as much as Zama!\"]\nX_tested_tweet = text_to_tensor(tested_tweet, transformer_model, tokenizer, device)\nclear_proba = best_model.predict_proba(X_tested_tweet)\n\n# Now let's predict with FHE over a single tweet and print the time it takes\nstart = time.perf_counter()\ndecrypted_proba = best_model.predict_proba(X_tested_tweet, execute_in_fhe=True)\nend = time.perf_counter()\nfhe_exec_time = end - start\nprint(f\"FHE inference time: {fhe_exec_time:.4f} seconds\")\n```\n\nThe output becomes:\n\n```\nCompilation time: 9.3354 seconds\nFHE inference time: 4.4085 seconds\n```\n\nA check that the FHE predictions are the same as the clear predictions is also necessary.\n\n```\nprint(f\"Probabilities from the FHE inference: {decrypted_proba}\")\nprint(f\"Probabilities from the clear model: {clear_proba}\")\n```\n\nThis output reads:\n\n```\nProbabilities from the FHE inference: [[0.08434131 0.05571389 0.8599448 ]]\nProbabilities from the clear model: [[0.08434131 0.05571389 0.8599448 ]]\n```\n\n## Deployment\n\nAt this point, our model is fully trained and compiled, ready to be deployed. In Concrete-ML, you can use a deployment API to do this easily:\n\n```\n# Let's save the model to be pushed to a server later\nfrom concrete.ml.deployment import FHEModelDev\nfhe_api = FHEModelDev(\"sentiment_fhe_model\", best_model)\nfhe_api.save()\n```\n\nThese few lines are enough to export all the files needed for both the client and the server. You can check out the notebook explaining this deployment API in detail here.\n\n## Full example in a Hugging Face Space\n\nYou can also have a look at the final application on Hugging Face Space. The client app was developed with Gradio while the server runs with Uvicorn and was developed with FastAPI.\n\nThe process is as follows:\n\n- User generates a new private/public key\n\n- User types a message that will be encoded, quantized, and encrypted\n\n- Server receives the encrypted data and starts the prediction over encrypted data, using the public evaluation key\n\n- Server sends back the encrypted predictions and the client can decrypt them using his private key\n\n## Conclusion\n\nWe have presented a way to leverage the power of transformers where the representation is then used to:\n\n- train a machine learning model to classify tweets, and\n\n- predict over encrypted data using this model with FHE.\n\nThe final model (Transformer representation + XGboost) has a final accuracy of 85%, which is above the transformer itself with 80% accuracy (please see this notebook for the comparisons).\n\nThe FHE execution time per example is 4.4 seconds on a 16 cores cpu.\n\nThe files for deployment are used for a sentiment analysis app that allows a client to request sentiment analysis predictions from a server while keeping its data encrypted all along the chain of communication.\n\nConcrete-ML (Don't forget to star us on Github ⭐️💛) allows straightforward ML model building and conversion to the FHE equivalent to be able to predict over encrypted data.\n\nHope you enjoyed this post and let us know your thoughts/feedback!\n\nAnd special thanks to Abubakar Abid for his previous advice on how to build our first Hugging Face Space!",
   "summaryZh": "文章探讨了同态加密在加密数据上进行情感分析的应用，与大模型主业关联较弱。",
   "summaryGeneratedAt": "2026-09-06T02:38:17.568077Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -51,5 +50,563 @@
     "summaryZh": "文章探讨了同态加密在加密数据上进行情感分析的应用，与大模型主业关联较弱。",
     "glossary": [],
     "duplicateKey": "homomorphic-encryption-sentiment-analysis"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/genkey.jpg",
+      "originalUrl": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/genkey.jpg",
+      "alt": "Alt text",
+      "id": "image_d49691c087a95220"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/encode.jpg",
+      "originalUrl": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/encode.jpg",
+      "alt": "Alt text",
+      "id": "image_d93527adb5d5291f"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/decrypt.jpg",
+      "originalUrl": "https://huggingface.co/blog/assets/sentiment-analysis-fhe/decrypt.jpg",
+      "alt": "Alt text",
+      "id": "image_c7a039c00072b364"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "It is well-known that a sentiment analysis model determines whether a text is positive, negative, or neutral. However, this process typically requires access to unencrypted text, which can pose privacy concerns.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Homomorphic encryption is a type of encryption that allows for computation on encrypted data without needing to decrypt it first. This makes it well-suited for applications where user's personal and potentially sensitive data is at risk (e.g. sentiment analysis of private messages).",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "This blog post uses the Concrete-ML library, allowing data scientists to use machine learning models in fully homomorphic encryption (FHE) settings without any prior knowledge of cryptography. We provide a practical tutorial on how to use the library to build a sentiment analysis model on encrypted data.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 43,
+          "kind": "a",
+          "href": "https://github.com/zama-ai/concrete-ml"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "The post covers:",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "transformers",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "how to use transformers with XGBoost to perform sentiment analysis",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "how to do the training",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "how to use Concrete-ML to turn predictions into predictions over encrypted data",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "how to deploy to the cloud using a client/server protocol",
+      "spans": [
+        {
+          "start": 7,
+          "end": 26,
+          "kind": "a",
+          "href": "https://docs.zama.ai/concrete-ml/getting-started/cloud"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Last but not least, we’ll finish with a complete demo over Hugging Face Spaces to show this functionality in action.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 78,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Setup the environment",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "First make sure your pip and setuptools are up to date by running:",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Now we can install all the required libraries for the this blog with the following command.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Using a public dataset",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "The dataset we use in this notebook can be found here.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 53,
+          "kind": "a",
+          "href": "https://www.kaggle.com/datasets/crowdflower/twitter-airline-sentiment"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "To represent the text for sentiment analysis, we chose to use a transformer hidden representation as it yields high accuracy for the final model in a very efficient way. For a comparison of this representation set against a more common procedure like the TF-IDF approach, please see this full notebook.",
+      "spans": [
+        {
+          "start": 288,
+          "end": 301,
+          "kind": "a",
+          "href": "https://github.com/zama-ai/concrete-ml/blob/release/0.4.x/use_case_examples/encrypted_sentiment_analysis/SentimentClassification.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "We can start by opening the dataset and visualize some statistics.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "The output, then, looks like this:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "The ratio of positive and neutral examples is rather similar, though we have significantly more negative examples. Let’s keep this in mind to select the final evaluation metric.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Now we can split our dataset into training and test sets. We will use a seed for this code to ensure it is perfectly reproducible.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Text representation using a transformer",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Transformers are neural networks often trained to predict the next words to appear in a text (this task is commonly called self-supervised learning). They can also be fine-tuned on some specific subtasks such that they specialize and get better results on a given problem.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Transformer_(machine_learning_model)"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "They are powerful tools for all kinds of Natural Language Processing tasks. In fact, we can leverage their representation for any text and feed it to a more FHE-friendly machine-learning model for classification. In this notebook, we will use XGBoost.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "We start by importing the requirements for transformers. Here, we use the popular library from Hugging Face to get a transformer quickly.",
+      "spans": [
+        {
+          "start": 95,
+          "end": 107,
+          "kind": "a",
+          "href": "https://huggingface.co"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "The model we have chosen is a BERT transformer, fine-tuned on the Stanford Sentiment Treebank dataset.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "This should download the model, which is now ready to be used.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Using the hidden representation for some text can be tricky at first, mainly because we could tackle this with many different approaches. Below is the approach we chose.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "First, we tokenize the text. Tokenizing means splitting the text into tokens (a sequence of specific characters that can also be words) and replacing each with a number. Then, we send the tokenized text to the transformer model, which outputs a hidden representation (output of the self attention layers which are often used as input to the classification layers) for each word. Finally, we average the representations for each word to get a text-level representation.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "The result is a matrix of shape (number of examples, hidden size). The hidden size is the number of dimensions in the hidden representation. For BERT, the hidden size is 768. The hidden representation is a vector of numbers that represents the text that can be used for many different tasks. In this case, we will use it for classification with XGBoost afterwards.",
+      "spans": [
+        {
+          "start": 345,
+          "end": 352,
+          "kind": "a",
+          "href": "https://github.com/dmlc/xgboost"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "This transformation of the text (text to transformer representation) would need to be executed on the client machine as the encryption is done over the transformer representation.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Classifying with XGBoost",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Now that we have our training and test sets properly built to train a classifier, next comes the training of our FHE model. Here it will be very straightforward, using a hyper-parameter tuning tool such as GridSearch from scikit-learn.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "The output is as follows:",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Now, let’s see how the model performs on the test set.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "With the following output:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Predicting over encrypted data",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Now let’s predict over encrypted text. The idea here is that we will encrypt the representation given by the transformer rather than the raw text itself. In Concrete-ML, you can do this very quickly by setting the parameter execute_in_fhe=True in the predict function. This is just a developer feature (mainly used to check the running time of the FHE model). We will see how we can make this work in a deployment setting a bit further down.",
+      "spans": [
+        {
+          "start": 224,
+          "end": 243,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "The output becomes:",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "A check that the FHE predictions are the same as the clear predictions is also necessary.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "This output reads:",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Deployment",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "At this point, our model is fully trained and compiled, ready to be deployed. In Concrete-ML, you can use a deployment API to do this easily:",
+      "spans": [
+        {
+          "start": 108,
+          "end": 122,
+          "kind": "a",
+          "href": "https://docs.zama.ai/concrete-ml/advanced-topics/client_server"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "These few lines are enough to export all the files needed for both the client and the server. You can check out the notebook explaining this deployment API in detail here.",
+      "spans": [
+        {
+          "start": 166,
+          "end": 170,
+          "kind": "a",
+          "href": "https://github.com/zama-ai/concrete-ml/blob/release/0.4.x/docs/advanced_examples/ClientServer.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Full example in a Hugging Face Space",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "You can also have a look at the final application on Hugging Face Space. The client app was developed with Gradio while the server runs with Uvicorn and was developed with FastAPI.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 71,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/zama-fhe/encrypted_sentiment_analysis"
+        },
+        {
+          "start": 107,
+          "end": 113,
+          "kind": "a",
+          "href": "https://gradio.app/"
+        },
+        {
+          "start": 141,
+          "end": 148,
+          "kind": "a",
+          "href": "https://www.uvicorn.org/"
+        },
+        {
+          "start": 172,
+          "end": 179,
+          "kind": "a",
+          "href": "https://fastapi.tiangolo.com/"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "The process is as follows:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "User generates a new private/public key",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "User types a message that will be encoded, quantized, and encrypted",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Server receives the encrypted data and starts the prediction over encrypted data, using the public evaluation key",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Server sends back the encrypted predictions and the client can decrypt them using his private key",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "We have presented a way to leverage the power of transformers where the representation is then used to:",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "train a machine learning model to classify tweets, and",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "predict over encrypted data using this model with FHE.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "The final model (Transformer representation + XGboost) has a final accuracy of 85%, which is above the transformer itself with 80% accuracy (please see this notebook for the comparisons).",
+      "spans": [
+        {
+          "start": 157,
+          "end": 165,
+          "kind": "a",
+          "href": "https://github.com/zama-ai/concrete-ml/blob/release/0.4.x/use_case_examples/encrypted_sentiment_analysis/SentimentClassification.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "The FHE execution time per example is 4.4 seconds on a 16 cores cpu.",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "The files for deployment are used for a sentiment analysis app that allows a client to request sentiment analysis predictions from a server while keeping its data encrypted all along the chain of communication.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Concrete-ML (Don't forget to star us on Github ⭐️💛) allows straightforward ML model building and conversion to the FHE equivalent to be able to predict over encrypted data.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://github.com/zama-ai/concrete-ml"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Hope you enjoyed this post and let us know your thoughts/feedback!",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "And special thanks to Abubakar Abid for his previous advice on how to build our first Hugging Face Space!",
+      "spans": [
+        {
+          "start": 22,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/abidlabs"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "e06a6ff7a569eff47ac9eb35aa519b7f153bb13c41b8b81569217e6c1c3b1664",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "pip install -U pip setuptools"
+    },
+    {
+      "id": "c0002",
+      "source": "pip install concrete-ml transformers datasets"
+    },
+    {
+      "id": "c0003",
+      "source": "from datasets import load_datasets\ntrain = load_dataset(\"osanseviero/twitter-airline-sentiment\")[\"train\"].to_pandas()\ntext_X = train['text']\ny = train['airline_sentiment']\ny = y.replace(['negative', 'neutral', 'positive'], [0, 1, 2])\npos_ratio = y.value_counts()[2] / y.value_counts().sum()\nneg_ratio = y.value_counts()[0] / y.value_counts().sum()\nneutral_ratio = y.value_counts()[1] / y.value_counts().sum()\nprint(f'Proportion of positive examples: {round(pos_ratio * 100, 2)}%')\nprint(f'Proportion of negative examples: {round(neg_ratio * 100, 2)}%')\nprint(f'Proportion of neutral examples: {round(neutral_ratio * 100, 2)}%')"
+    },
+    {
+      "id": "c0004",
+      "source": "Proportion of positive examples: 16.14%\nProportion of negative examples: 62.69%\nProportion of neutral examples: 21.17%"
+    },
+    {
+      "id": "c0005",
+      "source": "from sklearn.model_selection import train_test_split\ntext_X_train, text_X_test, y_train, y_test = train_test_split(text_X, y,\n    test_size=0.1, random_state=42)"
+    },
+    {
+      "id": "c0006",
+      "source": "import torch\nfrom transformers import AutoModelForSequenceClassification, AutoTokenizer\ndevice = \"cuda:0\" if torch.cuda.is_available() else \"cpu\"\n# Load the tokenizer (converts text to tokens)\ntokenizer = AutoTokenizer.from_pretrained(\"cardiffnlp/twitter-roberta-base-sentiment-latest\")\n\n# Load the pre-trained model\ntransformer_model = AutoModelForSequenceClassification.from_pretrained(\n   \"cardiffnlp/twitter-roberta-base-sentiment-latest\"\n)"
+    },
+    {
+      "id": "c0007",
+      "source": "import numpy as np\nimport tqdm\n# Function that transforms a list of texts to their representation\n# learned by the transformer.\ndef text_to_tensor(\n   list_text_X_train: list,\n   transformer_model: AutoModelForSequenceClassification,\n   tokenizer: AutoTokenizer,\n   device: str,\n) -> np.ndarray:\n   # Tokenize each text in the list one by one\n   tokenized_text_X_train_split = []\n   tokenized_text_X_train_split = [\n       tokenizer.encode(text_x_train, return_tensors=\"pt\")\n       for text_x_train in list_text_X_train\n   ]\n\n   # Send the model to the device\n   transformer_model = transformer_model.to(device)\n   output_hidden_states_list = [None] * len(tokenized_text_X_train_split)\n\n   for i, tokenized_x in enumerate(tqdm.tqdm(tokenized_text_X_train_split)):\n       # Pass the tokens through the transformer model and get the hidden states\n       # Only keep the last hidden layer state for now\n       output_hidden_states = transformer_model(tokenized_x.to(device), output_hidden_states=True)[\n           1\n       ][-1]\n       # Average over the tokens axis to get a representation at the text level.\n       output_hidden_states = output_hidden_states.mean(dim=1)\n       output_hidden_states = output_hidden_states.detach().cpu().numpy()\n       output_hidden_states_list[i] = output_hidden_states\n\n   return np.concatenate(output_hidden_states_list, axis=0)"
+    },
+    {
+      "id": "c0008",
+      "source": "# Let's vectorize the text using the transformer\nlist_text_X_train = text_X_train.tolist()\nlist_text_X_test = text_X_test.tolist()\n\nX_train_transformer = text_to_tensor(list_text_X_train, transformer_model, tokenizer, device)\nX_test_transformer = text_to_tensor(list_text_X_test, transformer_model, tokenizer, device)"
+    },
+    {
+      "id": "c0009",
+      "source": "from concrete.ml.sklearn import XGBClassifier\nfrom sklearn.model_selection import GridSearchCV\n# Let's build our model\nmodel = XGBClassifier()\n\n# A gridsearch to find the best parameters\nparameters = {\n    \"n_bits\": [2, 3],\n    \"max_depth\": [1],\n    \"n_estimators\": [10, 30, 50],\n    \"n_jobs\": [-1],\n}\n\n# Now we have a representation for each tweet, we can train a model on these.\ngrid_search = GridSearchCV(model, parameters, cv=5, n_jobs=1, scoring=\"accuracy\")\ngrid_search.fit(X_train_transformer, y_train)\n\n# Check the accuracy of the best model\nprint(f\"Best score: {grid_search.best_score_}\")\n\n# Check best hyperparameters\nprint(f\"Best parameters: {grid_search.best_params_}\")\n\n# Extract best model\nbest_model = grid_search.best_estimator_"
+    },
+    {
+      "id": "c0010",
+      "source": "Best score: 0.8378111718275654\nBest parameters: {'max_depth': 1, 'n_bits': 3, 'n_estimators': 50, 'n_jobs': -1}"
+    },
+    {
+      "id": "c0011",
+      "source": "from sklearn.metrics import ConfusionMatrixDisplay\n# Compute the metrics on the test set\ny_pred = best_model.predict(X_test_transformer)\ny_proba = best_model.predict_proba(X_test_transformer)\n\n# Compute and plot the confusion matrix\nmatrix = confusion_matrix(y_test, y_pred)\nConfusionMatrixDisplay(matrix).plot()\n\n# Compute the accuracy\naccuracy_transformer_xgboost = np.mean(y_pred == y_test)\nprint(f\"Accuracy: {accuracy_transformer_xgboost:.4f}\")"
+    },
+    {
+      "id": "c0012",
+      "source": "Accuracy: 0.8504"
+    },
+    {
+      "id": "c0013",
+      "source": "import time\n# Compile the model to get the FHE inference engine\n# (this may take a few minutes depending on the selected model)\nstart = time.perf_counter()\nbest_model.compile(X_train_transformer)\nend = time.perf_counter()\nprint(f\"Compilation time: {end - start:.4f} seconds\")\n\n# Let's write a custom example and predict in FHE\ntested_tweet = [\"AirFrance is awesome, almost as much as Zama!\"]\nX_tested_tweet = text_to_tensor(tested_tweet, transformer_model, tokenizer, device)\nclear_proba = best_model.predict_proba(X_tested_tweet)\n\n# Now let's predict with FHE over a single tweet and print the time it takes\nstart = time.perf_counter()\ndecrypted_proba = best_model.predict_proba(X_tested_tweet, execute_in_fhe=True)\nend = time.perf_counter()\nfhe_exec_time = end - start\nprint(f\"FHE inference time: {fhe_exec_time:.4f} seconds\")"
+    },
+    {
+      "id": "c0014",
+      "source": "Compilation time: 9.3354 seconds\nFHE inference time: 4.4085 seconds"
+    },
+    {
+      "id": "c0015",
+      "source": "print(f\"Probabilities from the FHE inference: {decrypted_proba}\")\nprint(f\"Probabilities from the clear model: {clear_proba}\")"
+    },
+    {
+      "id": "c0016",
+      "source": "Probabilities from the FHE inference: [[0.08434131 0.05571389 0.8599448 ]]\nProbabilities from the clear model: [[0.08434131 0.05571389 0.8599448 ]]"
+    },
+    {
+      "id": "c0017",
+      "source": "# Let's save the model to be pushed to a server later\nfrom concrete.ml.deployment import FHEModelDev\nfhe_api = FHEModelDev(\"sentiment_fhe_model\", best_model)\nfhe_api.save()"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "e06a6ff7a569eff47ac9eb35aa519b7f153bb13c41b8b81569217e6c1c3b1664",
+  "mediaLayout": [
+    {
+      "mediaId": "image_d49691c087a95220",
+      "type": "image",
+      "afterBlockId": "b0047",
+      "order": 0
+    },
+    {
+      "mediaId": "image_d93527adb5d5291f",
+      "type": "image",
+      "afterBlockId": "b0048",
+      "order": 1
+    },
+    {
+      "mediaId": "image_c7a039c00072b364",
+      "type": "image",
+      "afterBlockId": "b0050",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T01:21:13.631674Z",
+  "mediaLayoutCheckedAt": "2026-10-05T01:21:13.631688Z"
 }
