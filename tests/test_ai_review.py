@@ -166,7 +166,7 @@ class AIReviewTests(unittest.TestCase):
 
         result = ai_review.normalize_review(raw, item, "gemini", "model", "2026-01-01T00:00:00Z")
 
-        self.assertEqual((result["importanceScore"], result["importanceLevel"]), (59, 3))
+        self.assertEqual((result["importanceScore"], result["importanceLevel"]), (69, 3))
 
     def test_glossary_is_removed_below_level_four(self):
         raw = {

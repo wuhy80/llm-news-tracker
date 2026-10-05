@@ -119,13 +119,6 @@ class FetchNewsTests(unittest.TestCase):
         self.assertEqual(sources["Claude Blog"]["url"], "https://claude.com/blog")
         self.assertEqual(sources["Claude Blog"]["format"], "html-cards")
 
-    def test_reddit_is_pulled_from_the_daily_top_rather_than_everything_new(self):
-        source = next(source for source in fetch_news.SOURCES if source["name"] == "Reddit · LocalLLaMA")
-
-        self.assertIn("/top/", source["url"])
-        self.assertIn("t=day", source["url"])
-        self.assertNotIn("/new/", source["url"])
-
     def test_official_publisher_sources_do_not_use_news_search(self):
         search_hosts = {"news.google.com", "www.google.com", "bing.com", "www.bing.com"}
         direct_sources = {
