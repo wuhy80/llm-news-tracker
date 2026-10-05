@@ -45,6 +45,20 @@ def needs_archive(item: dict, now: datetime) -> bool:
     return published >= now - timedelta(days=30) and attempted <= now - timedelta(days=7)
 
 
+def failed_fetch(path: Path) -> bool:
+    """True when the last archive attempt recorded a fetch failure.
+
+    openai.com answers 403 to a plain fetch, so every one of its articles needs
+    the reader route. Ranking the reader budget by recency alone would leave that
+    backlog untouched forever.
+    """
+    try:
+        note = json.loads(path.read_text(encoding="utf-8")).get("note") or ""
+    except (json.JSONDecodeError, OSError):
+        return False
+    return "HTTPError" in note or "URLError" in note
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=int(os.getenv("ARTICLE_FETCH_LIMIT", "300")))
@@ -62,8 +76,13 @@ def main() -> int:
     resolved_urls = resolve_google_news_urls([item["url"] for item in candidates])
     resolved_count = sum(resolved_urls.get(item["url"]) != item["url"] for item in candidates)
     print(f"[articles] resolved {resolved_count} Google News links")
+    # Give the reader budget to the items that actually need it, then fill the
+    # rest by recency.
+    reader_limit = max(0, args.reader_limit)
+    failed = [item for item in candidates if failed_fetch(snapshot_path(item))]
+    ordered = failed + [item for item in candidates if item not in failed]
     reader_ids = {
-        item["id"] for item in candidates[:max(0, args.reader_limit)]
+        item["id"] for item in ordered[:reader_limit]
     }
     counts = {"community": 0, "page": 0, "reader": 0, "summary": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(candidates)))) as pool:
