@@ -1,0 +1,121 @@
+name: Rewrite history to drop dead media
+
+# The orphan prune removed thousands of media files from the working tree, but
+# their bytes are still referenced by every old commit, so they still occupy the
+# repository. This drops those paths from all history, which is where the
+# reclaimable space actually is.
+#
+# IRREVERSIBLE: the rewrite replaces every commit SHA and the old objects become
+# unreachable on GitHub. Run mode=report first and read the numbers.
+#
+# Runs in CI rather than locally because filter-repo needs every object, and a
+# local partial clone (blob:none) does not have them.
+#
+# Safety rails:
+#   - a live path can never enter the drop list (comm -23 against the current tree)
+#   - the run aborts if the drop list is empty or implausibly large
+#   - it shares the archive-writes group, so no writer is mid-push
+#   - mode must be the literal word "rewrite" to change anything
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "report = measure only, rewrite = rewrite history and force-push"
+        type: choice
+        options:
+          - report
+          - rewrite
+        default: report
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-writes
+  cancel-in-progress: false
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install git-filter-repo
+        run: pip install --quiet git-filter-repo && git filter-repo --version
+
+      - name: Build the drop list
+        run: |
+          set -euo pipefail
+          git ls-tree -r HEAD --name-only -- data/article-media | sort > /tmp/live.txt
+          git log --all --diff-filter=D --name-only --pretty=format: -- data/article-media \
+            | sed '/^$/d' | sort -u > /tmp/deleted.txt
+          # A live path must never be dropped.
+          comm -23 /tmp/deleted.txt /tmp/live.txt > /tmp/dead.txt
+          echo "live media files      : $(wc -l < /tmp/live.txt)"
+          echo "paths ever deleted    : $(wc -l < /tmp/deleted.txt)"
+          echo "drop list             : $(wc -l < /tmp/dead.txt)"
+          if [ ! -s /tmp/dead.txt ]; then
+            echo "::error::the drop list is empty; nothing to rewrite"
+            exit 1
+          fi
+          if [ "$(wc -l < /tmp/dead.txt)" -gt 12000 ]; then
+            echo "::error::the drop list is implausibly large; refusing"
+            exit 1
+          fi
+          if comm -12 /tmp/dead.txt /tmp/live.txt | grep -q .; then
+            echo "::error::the drop list contains a live path; refusing"
+            exit 1
+          fi
+          echo "before: $(du -sh --exclude=.git . | cut -f1) working tree, $(du -sh .git | cut -f1) .git"
+
+      - name: Report only
+        if: ${{ inputs.mode != 'rewrite' }}
+        run: |
+          echo "drop list preview (first 5):"
+          head -n 5 /tmp/dead.txt
+          echo
+          echo "This was a report run. Re-dispatch with mode=rewrite to apply it."
+          {
+            echo "### History rewrite report"
+            echo
+            echo "- live media files: $(wc -l < /tmp/live.txt)"
+            echo "- paths ever deleted: $(wc -l < /tmp/deleted.txt)"
+            echo "- drop list: $(wc -l < /tmp/dead.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rewrite history
+        if: ${{ inputs.mode == 'rewrite' }}
+        run: |
+          set -euo pipefail
+          sed 's/^/literal:/' /tmp/dead.txt > /tmp/dead-paths.txt
+          git filter-repo --force --invert-paths --paths-from-file /tmp/dead-paths.txt
+          echo "after: $(du -sh --exclude=.git . | cut -f1) working tree, $(du -sh .git | cut -f1) .git"
+          echo "HEAD is now $(git rev-parse --short HEAD)"
+          {
+            echo "### History rewrite applied"
+            echo
+            echo "- dropped paths: $(wc -l < /tmp/dead.txt)"
+            echo "- new HEAD: $(git rev-parse HEAD)"
+            echo "- .git after: $(du -sh .git | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Force-push the rewritten history
+        if: ${{ inputs.mode == 'rewrite' }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force origin HEAD:main
+          echo "force-pushed; GitHub reclaims the unreachable objects on its own schedule"
