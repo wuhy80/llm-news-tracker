@@ -222,6 +222,102 @@ SOURCES = [
         "domain": "reddit.com",
         "official": False,
     },
+    # More publisher channels. Meta was the largest lab with no source at all, and
+    # ai.meta.com exposes no reachable feed, so its newsroom AI tag and the
+    # engineering blog stand in.
+    {"name": "Meta AI", "url": "https://about.fb.com/news/tag/ai/feed/", "domain": "about.fb.com", "official": True},
+    {"name": "Meta Engineering", "url": "https://engineering.fb.com/feed/", "domain": "engineering.fb.com", "official": True},
+    {"name": "Microsoft Research", "url": "https://www.microsoft.com/en-us/research/feed/", "domain": "microsoft.com", "official": True},
+    {"name": "Apple Machine Learning", "url": "https://machinelearning.apple.com/rss.xml", "domain": "machinelearning.apple.com", "official": True},
+    {"name": "Amazon Science", "url": "https://www.amazon.science/index.rss", "domain": "amazon.science", "official": True},
+    # Independent writers, the sources an LLM news reader is most likely to
+    # forward. Simon Willison and Interconnects were already carried in this
+    # spirit; every feed below answered with entries when probed.
+    {
+        "name": "Lilian Weng",
+        "url": "https://lilianweng.github.io/index.xml",
+        "domain": "lilianweng.github.io",
+        "official": False,
+    },
+    {
+        "name": "Ahead of AI · Raschka",
+        "url": "https://magazine.sebastianraschka.com/feed",
+        "domain": "magazine.sebastianraschka.com",
+        "official": False,
+    },
+    {
+        "name": "Import AI · Jack Clark",
+        "url": "https://jack-clark.net/feed/",
+        "domain": "jack-clark.net",
+        "official": False,
+    },
+    {
+        "name": "Zvi · Don't Worry About the Vase",
+        "url": "https://thezvi.wordpress.com/feed/",
+        "domain": "thezvi.wordpress.com",
+        "official": False,
+    },
+    {
+        "name": "The Gradient",
+        "url": "https://thegradient.pub/rss/",
+        "domain": "thegradient.pub",
+        "official": False,
+    },
+    {
+        "name": "Latent Space",
+        "url": "https://www.latent.space/feed",
+        "domain": "latent.space",
+        "official": False,
+    },
+    {
+        "name": "SemiAnalysis",
+        "url": "https://semianalysis.com/feed/",
+        "domain": "semianalysis.com",
+        "official": False,
+    },
+    {
+        "name": "Chip Huyen",
+        "url": "https://huyenchip.com/feed.xml",
+        "domain": "huyenchip.com",
+        "official": False,
+    },
+    {
+        "name": "Hamel Husain",
+        "url": "https://hamel.dev/index.xml",
+        "domain": "hamel.dev",
+        "official": False,
+    },
+    {
+        "name": "Eugene Yan",
+        "url": "https://eugeneyan.com/rss/",
+        "domain": "eugeneyan.com",
+        "official": False,
+    },
+    {
+        "name": "Jay Alammar",
+        "url": "https://jalammar.github.io/feed.xml",
+        "domain": "jalammar.github.io",
+        "official": False,
+    },
+    {
+        "name": "宝玉 · baoyu.io",
+        "url": "https://baoyu.io/feed.xml",
+        "domain": "baoyu.io",
+        "official": False,
+    },
+    {
+        "name": "Alignment Forum",
+        "url": "https://www.alignmentforum.org/feed.xml",
+        "domain": "alignmentforum.org",
+        "official": False,
+    },
+    # Chinese coverage was one source wide.
+    {
+        "name": "新智元",
+        "url": "https://www.aiera.com.cn/rss",
+        "domain": "aiera.com.cn",
+        "official": False,
+    },
 ]
 
 KEYWORDS = {

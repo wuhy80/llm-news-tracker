@@ -98,6 +98,11 @@ class FetchNewsTests(unittest.TestCase):
             "DeepSeek · 深度求索": ("deepseek.com", "release"),
             "字节 Seed · 豆包": ("seed.bytedance.com", "release"),
             "面壁智能 · MiniCPM": ("github.com", "release"),
+            "Meta AI": ("about.fb.com", None),
+            "Meta Engineering": ("engineering.fb.com", None),
+            "Microsoft Research": ("microsoft.com", None),
+            "Apple Machine Learning": ("machinelearning.apple.com", None),
+            "Amazon Science": ("amazon.science", None),
         }
         for name, (domain, hint) in expected.items():
             with self.subTest(source=name):
