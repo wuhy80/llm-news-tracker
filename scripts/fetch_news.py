@@ -134,6 +134,46 @@ SOURCES = [
         "domain": "blog.cloudflare.com",
         "official": True,
     },
+    # Domestic model vendors. Each endpoint below was probed live before being
+    # added: the others publish only a rolling newsroom page, which this pipeline
+    # cannot turn into one item per release.
+    {
+        "name": "Qwen · 通义千问",
+        "url": "https://qwenlm.github.io/blog/index.xml",
+        "domain": "qwenlm.github.io",
+        "official": True,
+        "hint": "release",
+    },
+    {
+        "name": "DeepSeek · 深度求索",
+        "url": "https://www.deepseek.com/sitemap.xml",
+        "domain": "deepseek.com",
+        "official": True,
+        "hint": "release",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/news/",),
+        "sitemap_skip_urls": ("https://www.deepseek.com/news/",),
+        "sitemap_max_age_days": 120,
+        "sitemap_metadata_workers": 8,
+    },
+    {
+        "name": "字节 Seed · 豆包",
+        "url": "https://seed.bytedance.com/sitemap.xml",
+        "domain": "seed.bytedance.com",
+        "official": True,
+        "hint": "release",
+        "format": "sitemap",
+        "sitemap_prefixes": ("/blog/",),
+        "sitemap_max_age_days": 120,
+        "sitemap_metadata_workers": 8,
+    },
+    {
+        "name": "面壁智能 · MiniCPM",
+        "url": "https://github.com/OpenBMB/MiniCPM/releases.atom",
+        "domain": "github.com",
+        "official": True,
+        "hint": "release",
+    },
     search_source(
         "LMArena",
         '"LMArena" benchmark OR "Chatbot Arena" benchmark',
@@ -515,6 +555,8 @@ def sitemap_url_allowed(url: str, source: dict) -> bool:
     if hostname not in {source["domain"], f"www.{source['domain']}"}:
         return False
     path = parsed.path or "/"
+    if url in set(source.get("sitemap_skip_urls", ())):
+        return False
     prefixes = tuple(source.get("sitemap_prefixes", ()))
     exact_urls = set(source.get("sitemap_urls", ()))
     return path.startswith(prefixes) or url in exact_urls

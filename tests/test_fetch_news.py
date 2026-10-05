@@ -94,6 +94,10 @@ class FetchNewsTests(unittest.TestCase):
             "AWS Machine Learning": ("aws.amazon.com", None),
             "GitHub AI & ML": ("github.blog", "agent"),
             "Cloudflare AI": ("blog.cloudflare.com", None),
+            "Qwen · 通义千问": ("qwenlm.github.io", "release"),
+            "DeepSeek · 深度求索": ("deepseek.com", "release"),
+            "字节 Seed · 豆包": ("seed.bytedance.com", "release"),
+            "面壁智能 · MiniCPM": ("github.com", "release"),
         }
         for name, (domain, hint) in expected.items():
             with self.subTest(source=name):
@@ -133,6 +137,26 @@ class FetchNewsTests(unittest.TestCase):
             with self.subTest(source=source["name"]):
                 if source.get("official"):
                     self.assertNotIn(urllib.parse.urlparse(source["url"]).hostname, search_hosts)
+
+    def test_sitemap_skip_urls_drops_a_section_page(self):
+        source = {
+            "name": "Example",
+            "url": "https://example.com/sitemap.xml",
+            "domain": "example.com",
+            "official": True,
+            "format": "sitemap",
+            "sitemap_prefixes": ("/news/",),
+            "sitemap_skip_urls": ("https://example.com/news/",),
+        }
+        payload = b'''<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://example.com/news/</loc><lastmod>2026-09-10</lastmod></url>
+          <url><loc>https://example.com/news/v4-flash/</loc><lastmod>2026-09-10</lastmod></url>
+        </urlset>'''
+
+        items = fetch_news.parse_sitemap(
+            payload, source, now=fetch_news.parse_date("2026-10-05T00:00:00Z"))
+
+        self.assertEqual([item["url"] for item in items], ["https://example.com/news/v4-flash/"])
 
     def test_artificial_analysis_sitemap_discovers_direct_article_urls(self):
         source = next(source for source in fetch_news.SOURCES if source["name"] == "Artificial Analysis")
