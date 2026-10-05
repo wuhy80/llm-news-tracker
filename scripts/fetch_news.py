@@ -218,7 +218,10 @@ SOURCES = [
     },
     {
         "name": "Reddit · LocalLLaMA",
-        "url": "https://www.reddit.com/r/LocalLLaMA/new/.rss?limit=100",
+        # The daily top rather than every new post: the subreddit's own votes are
+        # a stricter filter than arrival order, and one forum was supplying about
+        # a third of the feed when this pulled /new.
+        "url": "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day&limit=50",
         "domain": "reddit.com",
         "official": False,
     },
