@@ -19,83 +19,47 @@
   "fetchedAt": "2026-08-30T11:51:06.624105Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# My Journey to a serverless transformers pipeline on\n\nPublished March 18, 2021\n\n##### A guest blog post by community member Maxence Dominici\n\nThis article will discuss my journey to deploy the transformers sentiment-analysis pipeline on Google Cloud . We will start with a quick introduction to transformers and then move to the technical part of the implementation. Finally, we'll summarize this implementation and review what we have achieved.\n\nI wanted to create a micro-service that automatically detects whether a customer review left in Discord is positive or negative. This would allow me to treat the comment accordingly and improve the customer experience. For instance, if the review was negative, I could create a feature which would contact the customer, apologize for the poor quality of service, and inform him/her that our support team will contact him/her as soon as possible to assist him and hopefully fix the problem. Since I don't plan to get more than 2,000 requests per month, I didn't impose any performance constraints regarding the time and the scalability.\n\n## The Transformers library\n\nI was a bit confused at the beginning when I downloaded the .h5 file. I thought it would be compatible with tensorflow.keras.models.load_model , but this wasn't the case. After a few minutes of research I was able to figure out that the file was a weights checkpoint rather than a Keras model. After that, I tried out the API that Hugging Face offers and read a bit more about the pipeline feature they offer. Since the results of the API & the pipeline were great, I decided that I could serve the model through the pipeline on my own server.\n\nBelow is the official example from the Transformers GitHub page.\n\n```\nfrom transformers import pipeline\n\n# Allocate a pipeline for sentiment-analysis\nclassifier = pipeline('sentiment-analysis')\nclassifier('We are very happy to include pipeline into the transformers repository.')\n[{'label': 'POSITIVE', 'score': 0.9978193640708923}]\n```\n\n## Deploy transformers to Google Cloud\n\nGCP is chosen as it is the cloud environment I am using in my personal organization.\n\nI already knew that I could use an API-Service like flask to serve a transformers model. I searched in the Google Cloud AI documentation and found a service to host Tensorflow models named AI-Platform Prediction . I also found App Engine and Cloud Run there, but I was concerned about the memory usage for App Engine and was not very familiar with Docker.\n\n### Step 2 - Test on AI-Platform Prediction\n\nAs the model is not a \"pure TensorFlow\" saved model but a checkpoint, and I couldn't turn it into a \"pure TensorFlow model\", I figured out that the example on this page wouldn't work. From there I saw that I could write some custom code, allowing me to load the pipeline instead of having to handle the model, which seemed is easier. I also learned that I could define a pre-prediction & post-prediction action, which could be useful in the future for pre- or post-processing the data for customers' needs. I followed Google's guide but encountered an issue as the service is still in beta and everything is not stable. This issue is detailed here .\n\n### Step 3 - Test on App Engine\n\nI moved to Google's App Engine as it's a service that I am familiar with, but encountered an installation issue with TensorFlow due to a missing system dependency file. I then tried with PyTorch which worked with an F4_1G instance, but it couldn't handle more than 2 requests on the same instance, which isn't really great performance-wise.\n\n### Step 4 - Test on Cloud Run\n\nLastly, I moved to Cloud Run with a docker image. I followed this guide to get an idea of how it works. In Cloud Run, I could configure a higher memory and more vCPUs to perform the prediction with PyTorch. I ditched Tensorflow as PyTorch seems to load the model faster.\n\n## Implementation of the serverless pipeline\n\nThe final solution consists of four different components:\n\n- main.py handling the request to the pipeline\n\n- Dockerfile used to create the image that will be deployed on Cloud Run.\n\n- Model folder having the pytorch_model.bin , config.json and vocab.txt .\n\n- Model : DistilBERT base uncased finetuned SST-2\n\n- To download the model folder, follow the instructions in the button.\n\n- You don't need to keep the rust_model.ot or the tf_model.h5 as we will use PyTorch .\n\n- requirement.txt for installing the dependencies\n\nThe content on the main.py is really simple. The idea is to receive a GET request containing two fields. First the review that needs to be analysed, second the API key to \"protect\" the service. The second parameter is optional, I used it to avoid setting up the oAuth2 of Cloud Run. After these arguments are provided, we load the pipeline which is built based on the model distilbert-base-uncased-finetuned-sst-2-english (provided above). In the end, the best match is returned to the client.\n\n```\nimport os\nfrom flask import Flask, jsonify, request\nfrom transformers import pipeline\n\napp = Flask(__name__)\n\nmodel_path = \"./model\"\n\n@app.route('/')\ndef classify_review():\n    review = request.args.get('review')\n    api_key = request.args.get('api_key')\n    if review is None or api_key != \"MyCustomerApiKey\":\n        return jsonify(code=403, message=\"bad request\")\n    classify = pipeline(\"sentiment-analysis\", model=model_path, tokenizer=model_path)\n    return classify(\"that was great\")[0]\n\n\nif __name__ == '__main__':\n    # This is used when running locally only. When deploying to Google Cloud\n    # Run, a webserver process such as Gunicorn will serve the app.\n    app.run(debug=False, host=\"0.0.0.0\", port=int(os.environ.get(\"PORT\", 8080)))\n```\n\nThen the DockerFile which will be used to create a docker image of the service. We specify that our service runs with python:3.7, plus that we need to install our requirements. Then we use gunicorn to handle our process on the port 5000 .\n\n```\n# Use Python37\nFROM python:3.7\n# Allow statements and log messages to immediately appear in the Knative logs\nENV PYTHONUNBUFFERED True\n# Copy requirements.txt to the docker image and install packages\nCOPY requirements.txt /\nRUN pip install -r requirements.txt\n# Set the WORKDIR to be the folder\nCOPY . /app\n# Expose port 5000\nEXPOSE 5000\nENV PORT 5000\nWORKDIR /app\n# Use gunicorn as the entrypoint\nCMD exec gunicorn --bind :$PORT main:app --workers 1 --threads 1 --timeout 0\n```\n\nIt is important to note the arguments --workers 1 --threads 1 which means that I want to execute my app on only one worker (= 1 process) with a single thread. This is because I don't want to have 2 instances up at once because it might increase the billing. One of the downsides is that it will take more time to process if the service receives two requests at once. After that, I put the limit to one thread due to the memory usage needed for loading the model into the pipeline. If I were using 4 threads, I might have 4 Gb / 4 = 1 Gb only to perform the full process, which is not enough and would lead to a memory error.\n\nFinally, the requirement.txt file\n\n```\nFlask==1.1.2\ntorch===1.7.1\ntransformers~=4.2.0\ngunicorn>=20.0.0\n```\n\n## Deployment instructions\n\nFirst, you will need to meet some requirements such as having a project on Google Cloud, enabling the billing and installing the gcloud cli. You can find more details about it in the Google's guide - Before you begin ,\n\nSecond, we need to build the docker image and deploy it to cloud run by selecting the correct project (replace PROJECT-ID ) and set the name of the instance such as ai-customer-review . You can find more information about the deployment on Google's guide - Deploying to .\n\n```\ngcloud builds submit --tag gcr.io/PROJECT-ID/ai-customer-review\ngcloud run deploy --image gcr.io/PROJECT-ID/ai-customer-review --platform managed\n```\n\nAfter a few minutes, you will also need to upgrade the memory allocated to your Cloud Run instance from 256 MB to 4 Gb. To do so, head over to the Cloud Run Console of your project.\n\nThere you should find your instance, click on it.\n\nAfter that you will have a blue button labelled \"edit and deploy new revision\" on top of the screen, click on it and you'll be prompt many configuration fields. At the bottom you should find a \"Capacity\" section where you can specify the memory.\n\nHandling a request takes less than five seconds from the moment you send the request including loading the model into the pipeline, and prediction. The cold start might take up an additional 10 seconds more or less.\n\nWe can improve the request handling performance by warming the model, it means loading it on start-up instead on each request (global variable for example), by doing so, we win time and memory usage.\n\nI simulated the cost based on the Cloud Run instance configuration with Google pricing simulator\n\nFor my micro-service, I am planning to near 1,000 requests per month, optimistically. 500 may more likely for my usage. That's why I considered 2,000 requests as an upper bound when designing my microservice. Due to that low number of requests, I didn't bother so much regarding the scalability but might come back into it if my billing increases.\n\nNevertheless, it's important to stress that you will pay the storage for each Gigabyte of your build image. It's roughly €0.10 per Gb per month, which is fine if you don't keep all your versions on the cloud since my version is slightly above 1 Gb (Pytorch for 700 Mb & the model for 250 Mb).\n\nBy using Transformers' sentiment analysis pipeline, I saved a non-negligible amount of time. Instead of training/fine-tuning a model, I could find one ready to be used in production and start the deployment in my system. I might fine-tune it in the future, but as shown on my test, the accuracy is already amazing! I would have liked a \"pure TensorFlow\" model, or at least a way to load it in TensorFlow without Transformers dependencies to use the AI platform. It would also be great to have a lite version.\n\nMore Articles from our Blog\n\n## Training and Finetuning Multi-Vector Embedding Models with Sentence Transformers\n\n## Multi-Vector (Late Interaction) Embedding Models with Sentence Transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "##### A guest blog post by community member Maxence Dominici\n\nThis article will discuss my journey to deploy the transformers sentiment-analysis pipeline on Google Cloud. We will start with a quick introduction to transformers and then move to the technical part of the implementation. Finally, we'll summarize this implementation and review what we have achieved.\n\n## The Goal\n\nI wanted to create a micro-service that automatically detects whether a customer review left in Discord is positive or negative. This would allow me to treat the comment accordingly and improve the customer experience. For instance, if the review was negative, I could create a feature which would contact the customer, apologize for the poor quality of service, and inform him/her that our support team will contact him/her as soon as possible to assist him and hopefully fix the problem. Since I don't plan to get more than 2,000 requests per month, I didn't impose any performance constraints regarding the time and the scalability.\n\n## The Transformers library\n\nI was a bit confused at the beginning when I downloaded the .h5 file. I thought it would be compatible with tensorflow.keras.models.load_model, but this wasn't the case. After a few minutes of research I was able to figure out that the file was a weights checkpoint rather than a Keras model. After that, I tried out the API that Hugging Face offers and read a bit more about the pipeline feature they offer. Since the results of the API & the pipeline were great, I decided that I could serve the model through the pipeline on my own server.\n\nBelow is the official example from the Transformers GitHub page.\n\n```\nfrom transformers import pipeline\n\n# Allocate a pipeline for sentiment-analysis\nclassifier = pipeline('sentiment-analysis')\nclassifier('We are very happy to include pipeline into the transformers repository.')\n[{'label': 'POSITIVE', 'score': 0.9978193640708923}]\n```\n\n## Deploy transformers to Google Cloud\n\nGCP is chosen as it is the cloud environment I am using in my personal organization.\n\n### Step 1 - Research\n\nI already knew that I could use an API-Service like flask to serve a transformers model. I searched in the Google Cloud AI documentation and found a service to host Tensorflow models named AI-Platform Prediction. I also found App Engine and Cloud Run there, but I was concerned about the memory usage for App Engine and was not very familiar with Docker.\n\n### Step 2 - Test on AI-Platform Prediction\n\nAs the model is not a \"pure TensorFlow\" saved model but a checkpoint, and I couldn't turn it into a \"pure TensorFlow model\", I figured out that the example on this page wouldn't work. From there I saw that I could write some custom code, allowing me to load the pipeline instead of having to handle the model, which seemed is easier. I also learned that I could define a pre-prediction & post-prediction action, which could be useful in the future for pre- or post-processing the data for customers' needs. I followed Google's guide but encountered an issue as the service is still in beta and everything is not stable. This issue is detailed here.\n\n### Step 3 - Test on App Engine\n\nI moved to Google's App Engine as it's a service that I am familiar with, but encountered an installation issue with TensorFlow due to a missing system dependency file. I then tried with PyTorch which worked with an F4_1G instance, but it couldn't handle more than 2 requests on the same instance, which isn't really great performance-wise.\n\n### Step 4 - Test on Cloud Run\n\nLastly, I moved to Cloud Run with a docker image. I followed this guide to get an idea of how it works. In Cloud Run, I could configure a higher memory and more vCPUs to perform the prediction with PyTorch. I ditched Tensorflow as PyTorch seems to load the model faster.\n\n## Implementation of the serverless pipeline\n\nThe final solution consists of four different components:\n\n- main.py handling the request to the pipeline\n\n- Dockerfile used to create the image that will be deployed on Cloud Run.\n\nModel folder having the pytorch_model.bin, config.json and vocab.txt.\n\n- Model : DistilBERT base uncased finetuned SST-2\n\n- To download the model folder, follow the instructions in the button.\n\n- You don't need to keep the rust_model.ot or the tf_model.h5 as we will use PyTorch.\n\n- requirement.txt for installing the dependencies\n\nThe content on the main.py is really simple. The idea is to receive a GET request containing two fields. First the review that needs to be analysed, second the API key to \"protect\" the service. The second parameter is optional, I used it to avoid setting up the oAuth2 of Cloud Run. After these arguments are provided, we load the pipeline which is built based on the model distilbert-base-uncased-finetuned-sst-2-english (provided above). In the end, the best match is returned to the client.\n\n```\nimport os\nfrom flask import Flask, jsonify, request\nfrom transformers import pipeline\n\napp = Flask(__name__)\n\nmodel_path = \"./model\"\n\n@app.route('/')\ndef classify_review():\n    review = request.args.get('review')\n    api_key = request.args.get('api_key')\n    if review is None or api_key != \"MyCustomerApiKey\":\n        return jsonify(code=403, message=\"bad request\")\n    classify = pipeline(\"sentiment-analysis\", model=model_path, tokenizer=model_path)\n    return classify(\"that was great\")[0]\n\n\nif __name__ == '__main__':\n    # This is used when running locally only. When deploying to Google Cloud\n    # Run, a webserver process such as Gunicorn will serve the app.\n    app.run(debug=False, host=\"0.0.0.0\", port=int(os.environ.get(\"PORT\", 8080)))\n```\n\nThen the DockerFile which will be used to create a docker image of the service. We specify that our service runs with python:3.7, plus that we need to install our requirements. Then we use gunicorn to handle our process on the port 5000.\n\n```\n# Use Python37\nFROM python:3.7\n# Allow statements and log messages to immediately appear in the Knative logs\nENV PYTHONUNBUFFERED True\n# Copy requirements.txt to the docker image and install packages\nCOPY requirements.txt /\nRUN pip install -r requirements.txt\n# Set the WORKDIR to be the folder\nCOPY . /app\n# Expose port 5000\nEXPOSE 5000\nENV PORT 5000\nWORKDIR /app\n# Use gunicorn as the entrypoint\nCMD exec gunicorn --bind :$PORT main:app --workers 1 --threads 1 --timeout 0\n```\n\nIt is important to note the arguments --workers 1 --threads 1 which means that I want to execute my app on only one worker (= 1 process) with a single thread. This is because I don't want to have 2 instances up at once because it might increase the billing. One of the downsides is that it will take more time to process if the service receives two requests at once. After that, I put the limit to one thread due to the memory usage needed for loading the model into the pipeline. If I were using 4 threads, I might have 4 Gb / 4 = 1 Gb only to perform the full process, which is not enough and would lead to a memory error.\n\nFinally, the requirement.txt file\n\n```\nFlask==1.1.2\ntorch===1.7.1\ntransformers~=4.2.0\ngunicorn>=20.0.0\n```\n\n## Deployment instructions\n\nFirst, you will need to meet some requirements such as having a project on Google Cloud, enabling the billing and installing the gcloud cli. You can find more details about it in the Google's guide - Before you begin,\n\nSecond, we need to build the docker image and deploy it to cloud run by selecting the correct project (replace PROJECT-ID) and set the name of the instance such as ai-customer-review. You can find more information about the deployment on Google's guide - Deploying to.\n\n```\ngcloud builds submit --tag gcr.io/PROJECT-ID/ai-customer-review\ngcloud run deploy --image gcr.io/PROJECT-ID/ai-customer-review --platform managed\n```\n\nAfter a few minutes, you will also need to upgrade the memory allocated to your Cloud Run instance from 256 MB to 4 Gb. To do so, head over to the Cloud Run Console of your project.\n\nThere you should find your instance, click on it.\n\nAfter that you will have a blue button labelled \"edit and deploy new revision\" on top of the screen, click on it and you'll be prompt many configuration fields. At the bottom you should find a \"Capacity\" section where you can specify the memory.\n\n## Performances\n\nHandling a request takes less than five seconds from the moment you send the request including loading the model into the pipeline, and prediction. The cold start might take up an additional 10 seconds more or less.\n\nWe can improve the request handling performance by warming the model, it means loading it on start-up instead on each request (global variable for example), by doing so, we win time and memory usage.\n\n## Costs\n\nI simulated the cost based on the Cloud Run instance configuration with Google pricing simulator\n\nFor my micro-service, I am planning to near 1,000 requests per month, optimistically. 500 may more likely for my usage. That's why I considered 2,000 requests as an upper bound when designing my microservice. Due to that low number of requests, I didn't bother so much regarding the scalability but might come back into it if my billing increases.\n\nNevertheless, it's important to stress that you will pay the storage for each Gigabyte of your build image. It's roughly €0.10 per Gb per month, which is fine if you don't keep all your versions on the cloud since my version is slightly above 1 Gb (Pytorch for 700 Mb & the model for 250 Mb).\n\n## Conclusion\n\nBy using Transformers' sentiment analysis pipeline, I saved a non-negligible amount of time. Instead of training/fine-tuning a model, I could find one ready to be used in production and start the deployment in my system. I might fine-tune it in the future, but as shown on my test, the accuracy is already amazing! I would have liked a \"pure TensorFlow\" model, or at least a way to load it in TensorFlow without Transformers dependencies to use the AI platform. It would also be great to have a lite version.",
   "summaryZh": "开发者分享了在Google Cloud上构建无服务器情感分析流水线的实践历程。通过使用Hugging Face的Transformers库中的pipeline功能，实现了一个微服务，用于自动检测Discord平台上的客户评论情感，以提升客户支持效率。",
   "summaryGeneratedAt": "2026-09-06T03:31:16.458546Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
-      "src": "https://huggingface.co/avatars/a7d8c7f80c20644e5b82d65187caeee7.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/a7d8c7f80c20644e5b82d65187caeee7.svg",
-      "id": "image_a832cddbb753d96a"
-    },
-    {
-      "src": "https://huggingface.co/avatars/4fcc35d6d58f1c9fec095aa6256cfe56.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/4fcc35d6d58f1c9fec095aa6256cfe56.svg",
-      "id": "image_09c3e675fcbc5f04"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1613496680893-602bfe18c4f8038e9a1e0a66.jpeg",
-      "alt": "Dominici's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1613496680893-602bfe18c4f8038e9a1e0a66.jpeg",
-      "id": "image_9bf5def2fe53b199"
-    },
-    {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Customer_review.png",
-      "alt": "img.png",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Customer_review.png",
+      "alt": "img.png",
       "id": "image_642994b149c235a1"
     },
     {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Download_instructions_button.png",
-      "alt": "img.png",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Download_instructions_button.png",
+      "alt": "img.png",
       "id": "image_3f75406c34e4e9ac"
     },
     {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Cloud_run_instance.png",
-      "alt": "img.png",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Cloud_run_instance.png",
+      "alt": "img.png",
       "id": "image_8141ccd7c6a955d5"
     },
     {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Edit_memory.png",
-      "alt": "img.png",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Edit_memory.png",
+      "alt": "img.png",
       "id": "image_5f37cdfec29fe95e"
     },
     {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Request_Result.png",
-      "alt": "img.png",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Request_Result.png",
+      "alt": "img.png",
       "id": "image_21e828952b004eb4"
     },
     {
       "src": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Estimate_of_the_monthly_cost.png",
-      "alt": "Estimate of the monthly cost",
       "originalUrl": "https://huggingface.co/blog/assets/14_how_to_deploy_a_pipeline_to_google_clouds/Estimate_of_the_monthly_cost.png",
+      "alt": "Estimate of the monthly cost",
       "id": "image_a59207c1ff78f5a9"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "id": "image_e5c56040668ba6c9"
-    },
-    {
-      "src": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "id": "image_dabb94fe94eb9c9a"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "id": "image_2f7cd9aaae2da43f"
     }
   ],
   "videos": [],
@@ -103,98 +67,49 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:21.464642Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "7fe9cd6c4ca993afe58e1bbec109a110271520ec5e4a5001dfe34e8cda7ebbb7",
+  "mediaLayoutBodyHash": "61230d28a16d36721e38cd43295f8b20cd08144e0f9dde8c22437f7950a0aa46",
   "mediaLayout": [
-    {
-      "mediaId": "image_a832cddbb753d96a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_09c3e675fcbc5f04",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_9bf5def2fe53b199",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
     {
       "mediaId": "image_642994b149c235a1",
       "type": "image",
       "afterBlockId": "b0004",
-      "order": 7
+      "order": 0
     },
     {
       "mediaId": "image_3f75406c34e4e9ac",
       "type": "image",
       "afterBlockId": "b0024",
-      "order": 29
+      "order": 1
     },
     {
       "mediaId": "image_8141ccd7c6a955d5",
       "type": "image",
       "afterBlockId": "b0035",
-      "order": 45
+      "order": 2
     },
     {
       "mediaId": "image_5f37cdfec29fe95e",
       "type": "image",
       "afterBlockId": "b0036",
-      "order": 47
+      "order": 3
     },
     {
       "mediaId": "image_21e828952b004eb4",
       "type": "image",
-      "afterBlockId": "b0036",
-      "order": 48
+      "afterBlockId": "b0037",
+      "order": 4
     },
     {
       "mediaId": "image_a59207c1ff78f5a9",
       "type": "image",
-      "afterBlockId": "b0039",
-      "order": 52
-    },
-    {
-      "mediaId": "image_a832cddbb753d96a",
-      "type": "image",
-      "afterBlockId": "b0047",
-      "order": 65
-    },
-    {
-      "mediaId": "image_09c3e675fcbc5f04",
-      "type": "image",
-      "afterBlockId": "b0047",
-      "order": 66
+      "afterBlockId": "b0041",
+      "order": 5
     }
   ],
-  "mediaLayoutUnplaced": [
-    {
-      "mediaId": "image_e5c56040668ba6c9",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 57
-    },
-    {
-      "mediaId": "image_dabb94fe94eb9c9a",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 59
-    },
-    {
-      "mediaId": "image_2f7cd9aaae2da43f",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 60
-    }
-  ],
-  "mediaLayoutMatched": 11,
-  "mediaLayoutStatus": "partial",
-  "mediaLayoutCheckedAt": "2026-09-26T16:47:45.211496Z",
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 6,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-05T16:26:39.559735Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -226,5 +141,522 @@
     "summaryZh": "开发者分享了在Google Cloud上构建无服务器情感分析流水线的实践历程。通过使用Hugging Face的Transformers库中的pipeline功能，实现了一个微服务，用于自动检测Discord平台上的客户评论情感，以提升客户支持效率。",
     "glossary": [],
     "duplicateKey": "serverless-transformers-pipeline-gcp"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "A guest blog post by community member Maxence Dominici",
+      "spans": [
+        {
+          "start": 38,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/Maxence"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This article will discuss my journey to deploy the transformers sentiment-analysis pipeline on Google Cloud. We will start with a quick introduction to transformers and then move to the technical part of the implementation. Finally, we'll summarize this implementation and review what we have achieved.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 64,
+          "end": 82,
+          "kind": "em"
+        },
+        {
+          "start": 95,
+          "end": 107,
+          "kind": "a",
+          "href": "https://cloud.google.com"
+        },
+        {
+          "start": 152,
+          "end": 164,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "The Goal",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "I wanted to create a micro-service that automatically detects whether a customer review left in Discord is positive or negative. This would allow me to treat the comment accordingly and improve the customer experience. For instance, if the review was negative, I could create a feature which would contact the customer, apologize for the poor quality of service, and inform him/her that our support team will contact him/her as soon as possible to assist him and hopefully fix the problem. Since I don't plan to get more than 2,000 requests per month, I didn't impose any performance constraints regarding the time and the scalability.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "The Transformers library",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "I was a bit confused at the beginning when I downloaded the .h5 file. I thought it would be compatible with tensorflow.keras.models.load_model, but this wasn't the case. After a few minutes of research I was able to figure out that the file was a weights checkpoint rather than a Keras model. After that, I tried out the API that Hugging Face offers and read a bit more about the pipeline feature they offer. Since the results of the API & the pipeline were great, I decided that I could serve the model through the pipeline on my own server.",
+      "spans": [
+        {
+          "start": 108,
+          "end": 142,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Below is the official example from the Transformers GitHub page.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 29,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers#quick-tour"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Deploy transformers to Google Cloud",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "GCP is chosen as it is the cloud environment I am using in my personal organization.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Step 1 - Research",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "I already knew that I could use an API-Service like flask to serve a transformers model. I searched in the Google Cloud AI documentation and found a service to host Tensorflow models named AI-Platform Prediction. I also found App Engine and Cloud Run there, but I was concerned about the memory usage for App Engine and was not very familiar with Docker.",
+      "spans": [
+        {
+          "start": 52,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 69,
+          "end": 81,
+          "kind": "code"
+        },
+        {
+          "start": 189,
+          "end": 211,
+          "kind": "a",
+          "href": "https://cloud.google.com/ai-platform/prediction/docs"
+        },
+        {
+          "start": 226,
+          "end": 236,
+          "kind": "a",
+          "href": "https://cloud.google.com/appengine"
+        },
+        {
+          "start": 241,
+          "end": 250,
+          "kind": "a",
+          "href": "https://cloud.google.com/run"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Step 2 - Test on AI-Platform Prediction",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "As the model is not a \"pure TensorFlow\" saved model but a checkpoint, and I couldn't turn it into a \"pure TensorFlow model\", I figured out that the example on this page wouldn't work. From there I saw that I could write some custom code, allowing me to load the pipeline instead of having to handle the model, which seemed is easier. I also learned that I could define a pre-prediction & post-prediction action, which could be useful in the future for pre- or post-processing the data for customers' needs. I followed Google's guide but encountered an issue as the service is still in beta and everything is not stable. This issue is detailed here.",
+      "spans": [
+        {
+          "start": 159,
+          "end": 168,
+          "kind": "a",
+          "href": "https://cloud.google.com/ai-platform/prediction/docs/deploying-models"
+        },
+        {
+          "start": 262,
+          "end": 270,
+          "kind": "code"
+        },
+        {
+          "start": 643,
+          "end": 647,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/issues/9926"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Step 3 - Test on App Engine",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "I moved to Google's App Engine as it's a service that I am familiar with, but encountered an installation issue with TensorFlow due to a missing system dependency file. I then tried with PyTorch which worked with an F4_1G instance, but it couldn't handle more than 2 requests on the same instance, which isn't really great performance-wise.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "a",
+          "href": "https://cloud.google.com/appengine"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Step 4 - Test on Cloud Run",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Lastly, I moved to Cloud Run with a docker image. I followed this guide to get an idea of how it works. In Cloud Run, I could configure a higher memory and more vCPUs to perform the prediction with PyTorch. I ditched Tensorflow as PyTorch seems to load the model faster.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 28,
+          "kind": "a",
+          "href": "https://cloud.google.com/run"
+        },
+        {
+          "start": 61,
+          "end": 71,
+          "kind": "a",
+          "href": "https://cloud.google.com/run/docs/quickstarts/build-and-deploy#python"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Implementation of the serverless pipeline",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "The final solution consists of four different components:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "main.py handling the request to the pipeline",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Dockerfile used to create the image that will be deployed on Cloud Run.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Model folder having the pytorch_model.bin, config.json and vocab.txt.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 68,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Model : DistilBERT base uncased finetuned SST-2",
+      "spans": [
+        {
+          "start": 8,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "To download the model folder, follow the instructions in the button.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "You don't need to keep the rust_model.ot or the tf_model.h5 as we will use PyTorch.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 48,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 82,
+          "kind": "a",
+          "href": "https://pytorch.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "requirement.txt for installing the dependencies",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The content on the main.py is really simple. The idea is to receive a GET request containing two fields. First the review that needs to be analysed, second the API key to \"protect\" the service. The second parameter is optional, I used it to avoid setting up the oAuth2 of Cloud Run. After these arguments are provided, we load the pipeline which is built based on the model distilbert-base-uncased-finetuned-sst-2-english (provided above). In the end, the best match is returned to the client.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 73,
+          "kind": "code"
+        },
+        {
+          "start": 374,
+          "end": 421,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Then the DockerFile which will be used to create a docker image of the service. We specify that our service runs with python:3.7, plus that we need to install our requirements. Then we use gunicorn to handle our process on the port 5000.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 19,
+          "kind": "code"
+        },
+        {
+          "start": 189,
+          "end": 197,
+          "kind": "code"
+        },
+        {
+          "start": 232,
+          "end": 236,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "It is important to note the arguments --workers 1 --threads 1 which means that I want to execute my app on only one worker (= 1 process) with a single thread. This is because I don't want to have 2 instances up at once because it might increase the billing. One of the downsides is that it will take more time to process if the service receives two requests at once. After that, I put the limit to one thread due to the memory usage needed for loading the model into the pipeline. If I were using 4 threads, I might have 4 Gb / 4 = 1 Gb only to perform the full process, which is not enough and would lead to a memory error.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 61,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Finally, the requirement.txt file",
+      "spans": [
+        {
+          "start": 13,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Deployment instructions",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "First, you will need to meet some requirements such as having a project on Google Cloud, enabling the billing and installing the gcloud cli. You can find more details about it in the Google's guide - Before you begin,",
+      "spans": [
+        {
+          "start": 129,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 183,
+          "end": 216,
+          "kind": "a",
+          "href": "https://cloud.google.com/run/docs/quickstarts/build-and-deploy#before-you-begin"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Second, we need to build the docker image and deploy it to cloud run by selecting the correct project (replace PROJECT-ID) and set the name of the instance such as ai-customer-review. You can find more information about the deployment on Google's guide - Deploying to.",
+      "spans": [
+        {
+          "start": 111,
+          "end": 121,
+          "kind": "code"
+        },
+        {
+          "start": 164,
+          "end": 182,
+          "kind": "code"
+        },
+        {
+          "start": 238,
+          "end": 267,
+          "kind": "a",
+          "href": "https://cloud.google.com/run/docs/quickstarts/build-and-deploy#deploying_to"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "After a few minutes, you will also need to upgrade the memory allocated to your Cloud Run instance from 256 MB to 4 Gb. To do so, head over to the Cloud Run Console of your project.",
+      "spans": [
+        {
+          "start": 147,
+          "end": 164,
+          "kind": "a",
+          "href": "https://console.cloud.google.com/run"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "There you should find your instance, click on it.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "After that you will have a blue button labelled \"edit and deploy new revision\" on top of the screen, click on it and you'll be prompt many configuration fields. At the bottom you should find a \"Capacity\" section where you can specify the memory.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Performances",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Handling a request takes less than five seconds from the moment you send the request including loading the model into the pipeline, and prediction. The cold start might take up an additional 10 seconds more or less.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "We can improve the request handling performance by warming the model, it means loading it on start-up instead on each request (global variable for example), by doing so, we win time and memory usage.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Costs",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "I simulated the cost based on the Cloud Run instance configuration with Google pricing simulator",
+      "spans": [
+        {
+          "start": 72,
+          "end": 96,
+          "kind": "a",
+          "href": "https://cloud.google.com/products/calculator#id=cd314cba-1d9a-4bc6-a7c0-740bbf6c8a78"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "For my micro-service, I am planning to near 1,000 requests per month, optimistically. 500 may more likely for my usage. That's why I considered 2,000 requests as an upper bound when designing my microservice. Due to that low number of requests, I didn't bother so much regarding the scalability but might come back into it if my billing increases.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Nevertheless, it's important to stress that you will pay the storage for each Gigabyte of your build image. It's roughly €0.10 per Gb per month, which is fine if you don't keep all your versions on the cloud since my version is slightly above 1 Gb (Pytorch for 700 Mb & the model for 250 Mb).",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "By using Transformers' sentiment analysis pipeline, I saved a non-negligible amount of time. Instead of training/fine-tuning a model, I could find one ready to be used in production and start the deployment in my system. I might fine-tune it in the future, but as shown on my test, the accuracy is already amazing! I would have liked a \"pure TensorFlow\" model, or at least a way to load it in TensorFlow without Transformers dependencies to use the AI platform. It would also be great to have a lite version.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "61230d28a16d36721e38cd43295f8b20cd08144e0f9dde8c22437f7950a0aa46",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from transformers import pipeline\n\n# Allocate a pipeline for sentiment-analysis\nclassifier = pipeline('sentiment-analysis')\nclassifier('We are very happy to include pipeline into the transformers repository.')\n[{'label': 'POSITIVE', 'score': 0.9978193640708923}]"
+    },
+    {
+      "id": "c0002",
+      "source": "import os\nfrom flask import Flask, jsonify, request\nfrom transformers import pipeline\n\napp = Flask(__name__)\n\nmodel_path = \"./model\"\n\n@app.route('/')\ndef classify_review():\n    review = request.args.get('review')\n    api_key = request.args.get('api_key')\n    if review is None or api_key != \"MyCustomerApiKey\":\n        return jsonify(code=403, message=\"bad request\")\n    classify = pipeline(\"sentiment-analysis\", model=model_path, tokenizer=model_path)\n    return classify(\"that was great\")[0]\n\n\nif __name__ == '__main__':\n    # This is used when running locally only. When deploying to Google Cloud\n    # Run, a webserver process such as Gunicorn will serve the app.\n    app.run(debug=False, host=\"0.0.0.0\", port=int(os.environ.get(\"PORT\", 8080)))"
+    },
+    {
+      "id": "c0003",
+      "source": "# Use Python37\nFROM python:3.7\n# Allow statements and log messages to immediately appear in the Knative logs\nENV PYTHONUNBUFFERED True\n# Copy requirements.txt to the docker image and install packages\nCOPY requirements.txt /\nRUN pip install -r requirements.txt\n# Set the WORKDIR to be the folder\nCOPY . /app\n# Expose port 5000\nEXPOSE 5000\nENV PORT 5000\nWORKDIR /app\n# Use gunicorn as the entrypoint\nCMD exec gunicorn --bind :$PORT main:app --workers 1 --threads 1 --timeout 0"
+    },
+    {
+      "id": "c0004",
+      "source": "Flask==1.1.2\ntorch===1.7.1\ntransformers~=4.2.0\ngunicorn>=20.0.0"
+    },
+    {
+      "id": "c0005",
+      "source": "gcloud builds submit --tag gcr.io/PROJECT-ID/ai-customer-review\ngcloud run deploy --image gcr.io/PROJECT-ID/ai-customer-review --platform managed"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 6,
+    "savedImages": 6,
+    "sourceImageOccurrences": 6,
+    "placedImageOccurrences": 6,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T16:26:39.559721Z"
 }

@@ -18,83 +18,35 @@
   "fetchedAt": "2026-08-30T11:51:05.186882Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Accelerating PyTorch distributed fine-tuning with Intel technologies\n\nPublished November 19, 2021\n\nFor all their amazing performance, state of the art deep learning models often take a long time to train. In order to speed up training jobs, engineering teams rely on distributed training, a divide-and-conquer technique where clustered servers each keep a copy of the model, train it on a subset of the training set, and exchange results to converge to a final model.\n\nGraphical Processing Units (GPUs) have long been the de facto choice to train deep learning models. However, the rise of transfer learning is changing the game. Models are now rarely trained from scratch on humungous datasets. Instead, they are frequently fine-tuned on specific (and smaller) datasets, in order to build specialized models that are more accurate than the base model for particular tasks. As these training jobs are much shorter, using a CPU-based cluster can prove to be an interesting option that keeps both training time and cost under control.\n\n### What this post is about\n\nIn this post, you will learn how to accelerate PyTorch training jobs by distributing them on a cluster of Intel Xeon Scalable CPU servers, powered by the Ice Lake architecture and running performance-optimized software libraries. We will build the cluster from scratch using virtual machines, and you should be able to easily replicate the demo on your own infrastructure, either in the cloud or on premise.\n\nRunning a text classification job, we will fine-tune a BERT model on the MRPC dataset (one of the tasks included in the GLUE benchmark). The MRPC dataset contains 5,800 sentence pairs extracted from news sources, with a label telling us whether the two sentences in each pair are semantically equivalent. We picked this dataset for its reasonable training time, and trying other GLUE tasks is just a parameter away.\n\nOnce the cluster is up and running, we will run a baseline job on a single server. Then, we will scale it to 2 servers and 4 servers and measure the speed-up.\n\nAlong the way, we will cover the following topics:\n\n- Listing the required infrastructure and software building blocks,\n\n- Setting up our cluster,\n\n- Installing dependencies,\n\n- Running a single-node job,\n\n- Running a distributed job.\n\nFor best performance, we will use Intel servers based on the Ice Lake architecture, which supports hardware features such as Intel AVX-512 and Intel Vector Neural Network Instructions (VNNI). These features accelerate operations typically found in deep learning training and inference. You can learn more about them in this presentation (PDF).\n\nAll three major cloud providers offer virtual machines powered by Intel Ice Lake CPUs:\n\n- Amazon Web Services: Amazon EC2 M6i and C6i instances.\n\n- Azure: Dv5/Dsv5-series , Ddv5/Ddsv5-series and Edv5/Edsv5-series virtual machines.\n\n- Google Cloud Platform: N2 Compute Engine virtual machines.\n\nOf course, you can also use your own servers. If they are based on the Cascade Lake architecture (Ice Lake's predecessor), they're good to go as Cascade Lake also includes AVX-512 and VNNI.\n\n### Using Intel performance libraries\n\nTo leverage AVX-512 and VNNI in PyTorch, Intel has designed the Intel extension for PyTorch . This software library provides out of the box speedup for training and inference, so we should definitely install it.\n\nWhen it comes to distributed training, the main performance bottleneck is often networking. Indeed, the different nodes in the cluster need to periodically exchange model state information to stay in sync. As transformers are large models with billions of parameters (sometimes much more), the volume of information is significant, and things only get worse as the number of nodes increase. Thus, it's important to use a communication library optimized for deep learning.\n\nIn fact, PyTorch includes the torch.distributed package, which supports different communication backends. Here, we'll use the Intel oneAPI Collective Communications Library (oneCCL) , an efficient implementation of communication patterns used in deep learning ( all-reduce , etc.). You can learn about the performance of oneCCL versus other backends in this PyTorch blog post .\n\nNow that we're clear on building blocks, let's talk about the overall setup of our training cluster.\n\nIn this demo, I'm using Amazon EC2 instances running Amazon Linux 2 (c6i.16xlarge, 64 vCPUs, 128GB RAM, 25Gbit/s networking). Setup will be different in other environments, but steps should be very similar.\n\nPlease keep in mind that you will need 4 identical instances, so you may want to plan for some sort of automation to avoid running the same setup 4 times. Here, I will set up one instance manually, create a new Amazon Machine Image (AMI) from this instance, and use this AMI to launch three identical instances.\n\nFrom a networking perspective, we will need the following setup:\n\n- Open port 22 for ssh access on all instances for setup and debugging.\n\n- Configure password-less ssh between the master instance (the one you'll launch training from) and all other instances ( master included ).\n\n- Open all TCP ports on all instances for oneCCL communication inside the cluster. Please make sure NOT to open these ports to the external world . AWS provides a convenient way to do this by only allowing connections from instances running a particular security group . Here's how my setup looks.\n\nNow, let's provision the first instance manually. I first create the instance itself, attach the security group above, and add 128GB of storage. To optimize costs, I have launched it as a spot instance .\n\nOnce the instance is up, I connect to it with ssh in order to install dependencies.\n\nHere are the steps we will follow:\n\n- Install Intel toolkits,\n\n- Install the Anaconda distribution,\n\n- Create a new conda environment,\n\n- Install PyTorch and the Intel extension for PyTorch,\n\n- Compile and install oneCCL,\n\n- Install the transformers library.\n\nIt looks like a lot, but there's nothing complicated. Here we go!\n\nInstalling Intel toolkits\n\nFirst, we download and install the Intel OneAPI base toolkit as well as the AI toolkit . You can learn about them on the Intel website .\n\n```\nwget https://registrationcenter-download.intel.com/akdlm/irc_nas/18236/l_BaseKit_p_2021.4.0.3422_offline.sh\nsudo bash l_BaseKit_p_2021.4.0.3422_offline.sh\n\nwget https://registrationcenter-download.intel.com/akdlm/irc_nas/18235/l_AIKit_p_2021.4.0.1460_offline.sh\nsudo bash l_AIKit_p_2021.4.0.1460_offline.sh\n```\n\nThen, we download and install the Anaconda distribution.\n\n```\nwget https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh\nsh Anaconda3-2021.05-Linux-x86_64.sh\n```\n\nCreating a new conda environment\n\nWe log out and log in again to refresh paths. Then, we create a new conda environment to keep things neat and tidy.\n\n```\nyes | conda create -n transformer python=3.7.9 -c anaconda\neval \"$(conda shell.bash hook)\"\nconda activate transformer\nyes | conda install pip cmake\n```\n\nInstalling PyTorch and the Intel extension for PyTorch\n\nNext, we install PyTorch 1.9 and the Intel extension toolkit. Versions must match .\n\n```\nyes | conda install pytorch==1.9.0 cpuonly -c pytorch\npip install torch_ipex==1.9.0 -f https://software.intel.com/ipex-whl-stable\n```\n\nCompiling and installing oneCCL\n\nThen, we install some native dependencies required to compile oneCCL.\n\n```\nsudo yum -y update\nsudo yum install -y git cmake3 gcc gcc-c++\n```\n\nNext, we clone the oneCCL repository, build the library and install it. Again, versions must match .\n\n```\nsource /opt/intel/oneapi/mkl/latest/env/vars.sh\ngit clone https://github.com/intel/torch-ccl.git\ncd torch-ccl\ngit checkout ccl_torch1.9\ngit submodule sync\ngit submodule update --init --recursive\npython setup.py install\ncd ..\n```\n\nInstalling the transformers library\n\nNext, we install the transformers library and dependencies required to run GLUE tasks.\n\n```\npip install transformers datasets\nyes | conda install scipy scikit-learn\n```\n\nFinally, we clone a fork of the transformers repository containing the example we're going to run.\n\n```\ngit clone https://github.com/kding1/transformers.git\ncd transformers\ngit checkout dist-sigopt\n```\n\nWe're done! Let's run a single-node job.\n\n### Launching a single-node job\n\nTo get a baseline, let's launch a single-node job running the run_glue.py script in transformers/examples/pytorch/text-classification . This should work on any of the instances, and it's a good sanity check before proceeding to distributed training.\n\n```\npython run_glue.py \\\n--model_name_or_path bert-base-cased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 \\\n--per_device_train_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3 \\\n--output_dir /tmp/mrpc/ --overwrite_output_dir True\n```\n\nThis job takes 7 minutes and 46 seconds . Now, let's set up distributed jobs with oneCCL and speed things up!\n\n### Setting up a distributed job with oneCCL\n\nThree steps are required to run a distributed training job:\n\n- List the nodes of the training cluster,\n\n- Define environment variables,\n\n- Modify the training script.\n\nListing the nodes of the training cluster\n\nOn the master instance, in transformers/examples/pytorch/text-classification , we create a text file named hostfile . This file stores the names of the nodes in the cluster (IP addresses would work too). The first line should point to the master instance.\n\n```\nip-172-31-28-17.ec2.internal\nip-172-31-30-87.ec2.internal\nip-172-31-29-11.ec2.internal\nip-172-31-20-77.ec2.internal\n```\n\nDefining environment variables\n\nNext, we need to set some environment variables on the master node, most notably its IP address. You can find more information on oneCCL variables in the documentation .\n\n```\nfor nic in eth0 eib0 hib0 enp94s0f0; do\n  master_addr=$(ifconfig $nic 2>/dev/null | grep netmask | awk '{print $2}'| cut -f2 -d:)\n  if [ \"$master_addr\" ]; then\n    break\n  fi\ndone\nexport MASTER_ADDR=$master_addr\n\nsource /home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/torch_ccl/env/setvars.sh\n\nexport LD_LIBRARY_PATH=/home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/:$LD_LIBRARY_PATH\nexport LD_PRELOAD=\"${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libiomp5.so\"\n\nexport CCL_WORKER_COUNT=4\nexport CCL_WORKER_AFFINITY=\"0,1,2,3,32,33,34,35\"\nexport CCL_ATL_TRANSPORT=ofi\nexport ATL_PROGRESS_MODE=0\n```\n\nModifying the training script\n\nThe following changes have already been applied to our training script ( run_glue.py ) in order to enable distributed training. You would need to apply similar changes when using your own training code.\n\n- Import the torch_ccl package.\n\n- Receive the address of the master node and the local rank of the node in the cluster.\n\n```\n+import torch_ccl\n+\n import datasets\n import numpy as np\n from datasets import load_dataset, load_metric\n@@ -47,7 +49,7 @@ from transformers.utils.versions import require_version\n\n\n # Will error if the minimal version of Transformers is not installed. Remove at your own risks.\n-check_min_version(\"4.13.0.dev0\")\n+# check_min_version(\"4.13.0.dev0\")\n\n require_version(\"datasets>=1.8.0\", \"To fix: pip install -r examples/pytorch/text-classification/requirements.txt\")\n\n@@ -191,6 +193,17 @@ def main():\n     # or by passing the --help flag to this script.\n     # We now keep distinct sets of args, for a cleaner separation of concerns.\n\n+    # add local rank for cpu-dist\n+    sys.argv.append(\"--local_rank\")\n+    sys.argv.append(str(os.environ.get(\"PMI_RANK\", -1)))\n+\n+    # ccl specific environment variables\n+    if \"ccl\" in sys.argv:\n+        os.environ[\"MASTER_ADDR\"] = os.environ.get(\"MASTER_ADDR\", \"127.0.0.1\")\n+        os.environ[\"MASTER_PORT\"] = \"29500\"\n+        os.environ[\"RANK\"] = str(os.environ.get(\"PMI_RANK\", -1))\n+        os.environ[\"WORLD_SIZE\"] = str(os.environ.get(\"PMI_SIZE\", -1))\n+\n     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))\n     if len(sys.argv) == 2 and sys.argv[1].endswith(\".json\"):\n```\n\nSetup is now complete. Let's scale our training job to 2 nodes and 4 nodes.\n\n### Running a distributed job with oneCCL\n\nOn the master node , I use mpirun to launch a 2-node job: -np (number of processes) is set to 2 and -ppn (process per node) is set to 1. Hence, the first two nodes in hostfile will be selected.\n\n```\nmpirun -f hostfile -np 2 -ppn 1 -genv I_MPI_PIN_DOMAIN=[0xfffffff0] \\\n-genv OMP_NUM_THREADS=28 python run_glue.py \\\n--model_name_or_path distilbert-base-uncased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 --per_device_train_batch_size 32 \\\n--learning_rate 2e-5 --num_train_epochs 3 --output_dir /tmp/mrpc/ \\\n--overwrite_output_dir True --xpu_backend ccl --no_cuda True\n```\n\nWithin seconds, a job starts on the first two nodes. The job completes in 4 minutes and 39 seconds , a 1.7x speedup.\n\nSetting -np to 4 and launching a new job, I now see one process running on each node of the cluster.\n\nTraining completes in 2 minutes and 36 seconds , a 3x speedup.\n\nOne last thing. Changing --task_name to qqp , I also ran the Quora Question Pairs GLUE task, which is based on a much larger dataset (over 400,000 training samples). The fine-tuning times were:\n\n- Single-node: 11 hours 22 minutes,\n\n- 2 nodes: 6 hours and 38 minutes (1.71x),\n\n- 4 nodes: 3 hours and 51 minutes (2.95x).\n\nIt looks like the speedup is pretty consistent. Feel free to keep experimenting with different learning rates, batch sizes and oneCCL settings. I'm sure you can go even faster!\n\nIn this post, you've learned how to build a distributed training cluster based on Intel CPUs and performance libraries, and how to use this cluster to speed up fine-tuning jobs. Indeed, transfer learning is putting CPU training back into the game, and you should definitely consider it when designing and building your next deep learning workflows.\n\nThanks for reading this long post. I hope you found it informative. Feedback and questions are welcome at julsimon@huggingface.co . Until next time, keep learning!\n\nMore Articles from our Blog\n\n## Training and Finetuning Multi-Vector Embedding Models with Sentence Transformers\n\n## Multi-Vector (Late Interaction) Embedding Models with Sentence Transformers\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "For all their amazing performance, state of the art deep learning models often take a long time to train. In order to speed up training jobs, engineering teams rely on distributed training, a divide-and-conquer technique where clustered servers each keep a copy of the model, train it on a subset of the training set, and exchange results to converge to a final model.\n\nGraphical Processing Units (GPUs) have long been the de facto choice to train deep learning models. However, the rise of transfer learning is changing the game. Models are now rarely trained from scratch on humungous datasets. Instead, they are frequently fine-tuned on specific (and smaller) datasets, in order to build specialized models that are more accurate than the base model for particular tasks. As these training jobs are much shorter, using a CPU-based cluster can prove to be an interesting option that keeps both training time and cost under control.\n\n### What this post is about\n\nIn this post, you will learn how to accelerate PyTorch training jobs by distributing them on a cluster of Intel Xeon Scalable CPU servers, powered by the Ice Lake architecture and running performance-optimized software libraries. We will build the cluster from scratch using virtual machines, and you should be able to easily replicate the demo on your own infrastructure, either in the cloud or on premise.\n\nRunning a text classification job, we will fine-tune a BERT model on the MRPC dataset (one of the tasks included in the GLUE benchmark). The MRPC dataset contains 5,800 sentence pairs extracted from news sources, with a label telling us whether the two sentences in each pair are semantically equivalent. We picked this dataset for its reasonable training time, and trying other GLUE tasks is just a parameter away.\n\nOnce the cluster is up and running, we will run a baseline job on a single server. Then, we will scale it to 2 servers and 4 servers and measure the speed-up.\n\nAlong the way, we will cover the following topics:\n\n- Listing the required infrastructure and software building blocks,\n\n- Setting up our cluster,\n\n- Installing dependencies,\n\n- Running a single-node job,\n\n- Running a distributed job.\n\nLet's get to work!\n\n### Using Intel servers\n\nFor best performance, we will use Intel servers based on the Ice Lake architecture, which supports hardware features such as Intel AVX-512 and Intel Vector Neural Network Instructions (VNNI). These features accelerate operations typically found in deep learning training and inference. You can learn more about them in this presentation (PDF).\n\nAll three major cloud providers offer virtual machines powered by Intel Ice Lake CPUs:\n\n- Amazon Web Services: Amazon EC2 M6i and C6i instances.\n\n- Azure: Dv5/Dsv5-series, Ddv5/Ddsv5-series and Edv5/Edsv5-series virtual machines.\n\n- Google Cloud Platform: N2 Compute Engine virtual machines.\n\nOf course, you can also use your own servers. If they are based on the Cascade Lake architecture (Ice Lake's predecessor), they're good to go as Cascade Lake also includes AVX-512 and VNNI.\n\n### Using Intel performance libraries\n\nTo leverage AVX-512 and VNNI in PyTorch, Intel has designed the Intel extension for PyTorch. This software library provides out of the box speedup for training and inference, so we should definitely install it.\n\nWhen it comes to distributed training, the main performance bottleneck is often networking. Indeed, the different nodes in the cluster need to periodically exchange model state information to stay in sync. As transformers are large models with billions of parameters (sometimes much more), the volume of information is significant, and things only get worse as the number of nodes increase. Thus, it's important to use a communication library optimized for deep learning.\n\nIn fact, PyTorch includes the torch.distributed package, which supports different communication backends. Here, we'll use the Intel oneAPI Collective Communications Library (oneCCL), an efficient implementation of communication patterns used in deep learning (all-reduce, etc.). You can learn about the performance of oneCCL versus other backends in this PyTorch blog post.\n\nNow that we're clear on building blocks, let's talk about the overall setup of our training cluster.\n\n### Setting up our cluster\n\nIn this demo, I'm using Amazon EC2 instances running Amazon Linux 2 (c6i.16xlarge, 64 vCPUs, 128GB RAM, 25Gbit/s networking). Setup will be different in other environments, but steps should be very similar.\n\nPlease keep in mind that you will need 4 identical instances, so you may want to plan for some sort of automation to avoid running the same setup 4 times. Here, I will set up one instance manually, create a new Amazon Machine Image (AMI) from this instance, and use this AMI to launch three identical instances.\n\nFrom a networking perspective, we will need the following setup:\n\n- Open port 22 for ssh access on all instances for setup and debugging.\n\n- Configure password-less ssh between the master instance (the one you'll launch training from) and all other instances (master included).\n\n- Open all TCP ports on all instances for oneCCL communication inside the cluster. Please make sure NOT to open these ports to the external world. AWS provides a convenient way to do this by only allowing connections from instances running a particular security group. Here's how my setup looks.\n\nNow, let's provision the first instance manually. I first create the instance itself, attach the security group above, and add 128GB of storage. To optimize costs, I have launched it as a spot instance.\n\nOnce the instance is up, I connect to it with ssh in order to install dependencies.\n\n### Installing dependencies\n\nHere are the steps we will follow:\n\n- Install Intel toolkits,\n\n- Install the Anaconda distribution,\n\n- Create a new conda environment,\n\n- Install PyTorch and the Intel extension for PyTorch,\n\n- Compile and install oneCCL,\n\n- Install the transformers library.\n\nIt looks like a lot, but there's nothing complicated. Here we go!\n\nInstalling Intel toolkits\n\nFirst, we download and install the Intel OneAPI base toolkit as well as the AI toolkit. You can learn about them on the Intel website.\n\n```\nwget https://registrationcenter-download.intel.com/akdlm/irc_nas/18236/l_BaseKit_p_2021.4.0.3422_offline.sh\nsudo bash l_BaseKit_p_2021.4.0.3422_offline.sh\n\nwget https://registrationcenter-download.intel.com/akdlm/irc_nas/18235/l_AIKit_p_2021.4.0.1460_offline.sh\nsudo bash l_AIKit_p_2021.4.0.1460_offline.sh \n```\n\nInstalling Anaconda\n\nThen, we download and install the Anaconda distribution.\n\n```\nwget https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh\nsh Anaconda3-2021.05-Linux-x86_64.sh\n```\n\nCreating a new conda environment\n\nWe log out and log in again to refresh paths. Then, we create a new conda environment to keep things neat and tidy.\n\n```\nyes | conda create -n transformer python=3.7.9 -c anaconda\neval \"$(conda shell.bash hook)\"\nconda activate transformer\nyes | conda install pip cmake\n```\n\nInstalling PyTorch and the Intel extension for PyTorch\n\nNext, we install PyTorch 1.9 and the Intel extension toolkit. Versions must match.\n\n```\nyes | conda install pytorch==1.9.0 cpuonly -c pytorch\npip install torch_ipex==1.9.0 -f https://software.intel.com/ipex-whl-stable\n```\n\nCompiling and installing oneCCL\n\nThen, we install some native dependencies required to compile oneCCL.\n\n```\nsudo yum -y update\nsudo yum install -y git cmake3 gcc gcc-c++\n```\n\nNext, we clone the oneCCL repository, build the library and install it. Again, versions must match.\n\n```\nsource /opt/intel/oneapi/mkl/latest/env/vars.sh\ngit clone https://github.com/intel/torch-ccl.git\ncd torch-ccl\ngit checkout ccl_torch1.9\ngit submodule sync\ngit submodule update --init --recursive\npython setup.py install\ncd ..\n```\n\nInstalling the transformers library\n\nNext, we install the transformers library and dependencies required to run GLUE tasks.\n\n```\npip install transformers datasets\nyes | conda install scipy scikit-learn\n```\n\nFinally, we clone a fork of the transformersrepository containing the example we're going to run.\n\n```\ngit clone https://github.com/kding1/transformers.git\ncd transformers\ngit checkout dist-sigopt\n```\n\nWe're done! Let's run a single-node job.\n\n### Launching a single-node job\n\nTo get a baseline, let's launch a single-node job running the run_glue.py script in transformers/examples/pytorch/text-classification. This should work on any of the instances, and it's a good sanity check before proceeding to distributed training.\n\n```\npython run_glue.py \\\n--model_name_or_path bert-base-cased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 \\\n--per_device_train_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3 \\\n--output_dir /tmp/mrpc/ --overwrite_output_dir True\n```\n\nThis job takes 7 minutes and 46 seconds. Now, let's set up distributed jobs with oneCCL and speed things up!\n\n### Setting up a distributed job with oneCCL\n\nThree steps are required to run a distributed training job:\n\n- List the nodes of the training cluster,\n\n- Define environment variables,\n\n- Modify the training script.\n\nListing the nodes of the training cluster\n\nOn the master instance, in transformers/examples/pytorch/text-classification, we create a text file named hostfile. This file stores the names of the nodes in the cluster (IP addresses would work too). The first line should point to the master instance.\n\nHere's my file:\n\n```\nip-172-31-28-17.ec2.internal\nip-172-31-30-87.ec2.internal\nip-172-31-29-11.ec2.internal\nip-172-31-20-77.ec2.internal\n```\n\nDefining environment variables\n\nNext, we need to set some environment variables on the master node, most notably its IP address. You can find more information on oneCCL variables in the documentation.\n\n```\nfor nic in eth0 eib0 hib0 enp94s0f0; do\n  master_addr=$(ifconfig $nic 2>/dev/null | grep netmask | awk '{print $2}'| cut -f2 -d:)\n  if [ \"$master_addr\" ]; then\n    break\n  fi\ndone\nexport MASTER_ADDR=$master_addr\n\nsource /home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/torch_ccl/env/setvars.sh\n\nexport LD_LIBRARY_PATH=/home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/:$LD_LIBRARY_PATH\nexport LD_PRELOAD=\"${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libiomp5.so\"\n\nexport CCL_WORKER_COUNT=4\nexport CCL_WORKER_AFFINITY=\"0,1,2,3,32,33,34,35\"\nexport CCL_ATL_TRANSPORT=ofi\nexport ATL_PROGRESS_MODE=0\n```\n\nModifying the training script\n\nThe following changes have already been applied to our training script (run_glue.py) in order to enable distributed training. You would need to apply similar changes when using your own training code.\n\n- Import the torch_cclpackage.\n\n- Receive the address of the master node and the local rank of the node in the cluster.\n\n```\n+import torch_ccl\n+\n import datasets\n import numpy as np\n from datasets import load_dataset, load_metric\n@@ -47,7 +49,7 @@ from transformers.utils.versions import require_version\n\n\n # Will error if the minimal version of Transformers is not installed. Remove at your own risks.\n-check_min_version(\"4.13.0.dev0\")\n+# check_min_version(\"4.13.0.dev0\")\n\n require_version(\"datasets>=1.8.0\", \"To fix: pip install -r examples/pytorch/text-classification/requirements.txt\")\n\n@@ -191,6 +193,17 @@ def main():\n     # or by passing the --help flag to this script.\n     # We now keep distinct sets of args, for a cleaner separation of concerns.\n\n+    # add local rank for cpu-dist\n+    sys.argv.append(\"--local_rank\")\n+    sys.argv.append(str(os.environ.get(\"PMI_RANK\", -1)))\n+\n+    # ccl specific environment variables\n+    if \"ccl\" in sys.argv:\n+        os.environ[\"MASTER_ADDR\"] = os.environ.get(\"MASTER_ADDR\", \"127.0.0.1\")\n+        os.environ[\"MASTER_PORT\"] = \"29500\"\n+        os.environ[\"RANK\"] = str(os.environ.get(\"PMI_RANK\", -1))\n+        os.environ[\"WORLD_SIZE\"] = str(os.environ.get(\"PMI_SIZE\", -1))\n+\n     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))\n     if len(sys.argv) == 2 and sys.argv[1].endswith(\".json\"):\n```\n\nSetup is now complete. Let's scale our training job to 2 nodes and 4 nodes.\n\n### Running a distributed job with oneCCL\n\nOn the master node, I use mpirunto launch a 2-node job: -np (number of processes) is set to 2 and -ppn (process per node) is set to 1. Hence, the first two nodes in hostfile will be selected.\n\n```\nmpirun -f hostfile -np 2 -ppn 1 -genv I_MPI_PIN_DOMAIN=[0xfffffff0] \\\n-genv OMP_NUM_THREADS=28 python run_glue.py \\\n--model_name_or_path distilbert-base-uncased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 --per_device_train_batch_size 32 \\\n--learning_rate 2e-5 --num_train_epochs 3 --output_dir /tmp/mrpc/ \\\n--overwrite_output_dir True --xpu_backend ccl --no_cuda True\n```\n\nWithin seconds, a job starts on the first two nodes. The job completes in 4 minutes and 39 seconds, a 1.7x speedup.\n\nSetting -np to 4 and launching a new job, I now see one process running on each node of the cluster.\n\nTraining completes in 2 minutes and 36 seconds, a 3x speedup.\n\nOne last thing. Changing --task_name to qqp, I also ran the Quora Question Pairs GLUE task, which is based on a much larger dataset (over 400,000 training samples). The fine-tuning times were:\n\n- Single-node: 11 hours 22 minutes,\n\n- 2 nodes: 6 hours and 38 minutes (1.71x),\n\n- 4 nodes: 3 hours and 51 minutes (2.95x).\n\nIt looks like the speedup is pretty consistent. Feel free to keep experimenting with different learning rates, batch sizes and oneCCL settings. I'm sure you can go even faster!\n\n### Conclusion\n\nIn this post, you've learned how to build a distributed training cluster based on Intel CPUs and performance libraries, and how to use this cluster to speed up fine-tuning jobs. Indeed, transfer learning is putting CPU training back into the game, and you should definitely consider it when designing and building your next deep learning workflows.\n\nThanks for reading this long post. I hope you found it informative. Feedback and questions are welcome at julsimon@huggingface.co. Until next time, keep learning!\n\nJulien",
   "summaryZh": "本文介绍了如何利用英特尔至可扩展处理器和优化软件库来加速PyTorch分布式微调任务。通过在CPU集群上运行文本分类任务，展示了在保持成本控制的同时进行模型微调的替代方案。",
   "summaryGeneratedAt": "2026-09-06T03:30:49.877142Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/HXKKlyDzNjei5x-6w7gL2.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/HXKKlyDzNjei5x-6w7gL2.jpeg",
-      "id": "image_793be18f70e1a3fb"
-    },
-    {
-      "src": "https://huggingface.co/avatars/129d1e86bbaf764b507501f4feb177db.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/129d1e86bbaf764b507501f4feb177db.svg",
-      "id": "image_404a70be5f5bdd71"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/615ad80355a0d1b0f2f15666/fJ0p0s2DmDkw2o8EoNURW.jpeg",
-      "alt": "Julien Simon's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/615ad80355a0d1b0f2f15666/fJ0p0s2DmDkw2o8EoNURW.jpeg",
-      "id": "image_65b2d3dc22342386"
-    },
-    {
       "src": "https://huggingface.co/blog/assets/36_accelerating_pytorch/01_security_group.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/36_accelerating_pytorch/01_security_group.png",
+      "alt": "",
       "id": "image_ef2c77ed7e6f99f5"
     },
     {
       "src": "https://huggingface.co/blog/assets/36_accelerating_pytorch/02_single_node.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/36_accelerating_pytorch/02_single_node.png",
+      "alt": "",
       "id": "image_4a9953fa445e8bcc"
     },
     {
       "src": "https://huggingface.co/blog/assets/36_accelerating_pytorch/03_two_nodes.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/36_accelerating_pytorch/03_two_nodes.png",
+      "alt": "",
       "id": "image_414f6bebebb66941"
     },
     {
       "src": "https://huggingface.co/blog/assets/36_accelerating_pytorch/04_four_nodes.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/36_accelerating_pytorch/04_four_nodes.png",
+      "alt": "",
       "id": "image_9b6333744694247f"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/grpo-with-trl-ifstruct/thumbnail.png",
-      "id": "image_e5c56040668ba6c9"
-    },
-    {
-      "src": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/33af1a607a8bf7780b98d6f70ea19999.svg",
-      "id": "image_dabb94fe94eb9c9a"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/62d648291fa3e4e7ae3fa6e8/oatOwf8Xqe5eDbCSuYqCd.png",
-      "id": "image_2f7cd9aaae2da43f"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/61929226ded356549e20c5da/ONUjP2S5fUWd07BiFXm0i.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/61929226ded356549e20c5da/ONUjP2S5fUWd07BiFXm0i.jpeg",
-      "id": "image_280c63c0d63ec397"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/funes/thumbnail.jpg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/funes/thumbnail.jpg",
-      "id": "image_81673551fc17d370"
     }
   ],
   "videos": [],
@@ -102,98 +54,37 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:23.260878Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "0d324c9ebef32d9c689fffc3f79bf0323812f48479507e5d58f5c1a24fac9e3f",
+  "mediaLayoutBodyHash": "cec1001627af5600911835580f478c242711d9d7325004c76dd6b40940185eb9",
   "mediaLayout": [
-    {
-      "mediaId": "image_793be18f70e1a3fb",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_404a70be5f5bdd71",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_65b2d3dc22342386",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
     {
       "mediaId": "image_ef2c77ed7e6f99f5",
       "type": "image",
-      "afterBlockId": "b0031",
-      "order": 34
+      "afterBlockId": "b0032",
+      "order": 0
     },
     {
       "mediaId": "image_4a9953fa445e8bcc",
       "type": "image",
       "afterBlockId": "c0009",
-      "order": 70
+      "order": 1
     },
     {
       "mediaId": "image_414f6bebebb66941",
       "type": "image",
-      "afterBlockId": "b0075",
-      "order": 93
+      "afterBlockId": "b0079",
+      "order": 2
     },
     {
       "mediaId": "image_9b6333744694247f",
       "type": "image",
-      "afterBlockId": "b0076",
-      "order": 95
-    },
-    {
-      "mediaId": "image_793be18f70e1a3fb",
-      "type": "image",
-      "afterBlockId": "b0089",
-      "order": 115
-    },
-    {
-      "mediaId": "image_404a70be5f5bdd71",
-      "type": "image",
-      "afterBlockId": "b0089",
-      "order": 116
+      "afterBlockId": "b0080",
+      "order": 3
     }
   ],
-  "mediaLayoutUnplaced": [
-    {
-      "mediaId": "image_e5c56040668ba6c9",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 105
-    },
-    {
-      "mediaId": "image_dabb94fe94eb9c9a",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 107
-    },
-    {
-      "mediaId": "image_2f7cd9aaae2da43f",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 108
-    },
-    {
-      "mediaId": "image_280c63c0d63ec397",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 109
-    },
-    {
-      "mediaId": "image_81673551fc17d370",
-      "type": "image",
-      "reason": "ambiguous_or_changed_context",
-      "order": 110
-    }
-  ],
-  "mediaLayoutMatched": 9,
-  "mediaLayoutStatus": "partial",
-  "mediaLayoutCheckedAt": "2026-09-26T16:47:32.627642Z",
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 4,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-05T16:25:13.616979Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -224,5 +115,941 @@
     "summaryZh": "本文介绍了如何利用英特尔至可扩展处理器和优化软件库来加速PyTorch分布式微调任务。通过在CPU集群上运行文本分类任务，展示了在保持成本控制的同时进行模型微调的替代方案。",
     "glossary": [],
     "duplicateKey": "accelerating-pytorch-distributed-finetuning-with-intel-technologies"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "For all their amazing performance, state of the art deep learning models often take a long time to train. In order to speed up training jobs, engineering teams rely on distributed training, a divide-and-conquer technique where clustered servers each keep a copy of the model, train it on a subset of the training set, and exchange results to converge to a final model.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Graphical Processing Units (GPUs) have long been the de facto choice to train deep learning models. However, the rise of transfer learning is changing the game. Models are now rarely trained from scratch on humungous datasets. Instead, they are frequently fine-tuned on specific (and smaller) datasets, in order to build specialized models that are more accurate than the base model for particular tasks. As these training jobs are much shorter, using a CPU-based cluster can prove to be an interesting option that keeps both training time and cost under control.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 61,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "What this post is about",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "In this post, you will learn how to accelerate PyTorch training jobs by distributing them on a cluster of Intel Xeon Scalable CPU servers, powered by the Ice Lake architecture and running performance-optimized software libraries. We will build the cluster from scratch using virtual machines, and you should be able to easily replicate the demo on your own infrastructure, either in the cloud or on premise.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 54,
+          "kind": "a",
+          "href": "https://pytorch.org"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Running a text classification job, we will fine-tune a BERT model on the MRPC dataset (one of the tasks included in the GLUE benchmark). The MRPC dataset contains 5,800 sentence pairs extracted from news sources, with a label telling us whether the two sentences in each pair are semantically equivalent. We picked this dataset for its reasonable training time, and trying other GLUE tasks is just a parameter away.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/bert-base-cased"
+        },
+        {
+          "start": 73,
+          "end": 77,
+          "kind": "a",
+          "href": "https://www.microsoft.com/en-us/download/details.aspx?id=52398"
+        },
+        {
+          "start": 120,
+          "end": 124,
+          "kind": "a",
+          "href": "https://gluebenchmark.com/"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Once the cluster is up and running, we will run a baseline job on a single server. Then, we will scale it to 2 servers and 4 servers and measure the speed-up.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Along the way, we will cover the following topics:",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Listing the required infrastructure and software building blocks,",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Setting up our cluster,",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Installing dependencies,",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Running a single-node job,",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Running a distributed job.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Let's get to work!",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Using Intel servers",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "For best performance, we will use Intel servers based on the Ice Lake architecture, which supports hardware features such as Intel AVX-512 and Intel Vector Neural Network Instructions (VNNI). These features accelerate operations typically found in deep learning training and inference. You can learn more about them in this presentation (PDF).",
+      "spans": [
+        {
+          "start": 324,
+          "end": 336,
+          "kind": "a",
+          "href": "https://www.intel.com/content/dam/www/public/us/en/documents/product-overviews/dl-boost-product-overview.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "All three major cloud providers offer virtual machines powered by Intel Ice Lake CPUs:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "Amazon Web Services: Amazon EC2 M6i and C6i instances.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 35,
+          "kind": "a",
+          "href": "https://aws.amazon.com/blogs/aws/new-amazon-ec2-m6i-instances-powered-by-the-latest-generation-intel-xeon-scalable-processors/"
+        },
+        {
+          "start": 40,
+          "end": 43,
+          "kind": "a",
+          "href": "https://aws.amazon.com/blogs/aws/new-amazon-ec2-c6i-instances-powered-by-the-latest-generation-intel-xeon-scalable-processors/"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Azure: Dv5/Dsv5-series, Ddv5/Ddsv5-series and Edv5/Edsv5-series virtual machines.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 22,
+          "kind": "a",
+          "href": "https://docs.microsoft.com/en-us/azure/virtual-machines/dv5-dsv5-series"
+        },
+        {
+          "start": 24,
+          "end": 41,
+          "kind": "a",
+          "href": "https://docs.microsoft.com/en-us/azure/virtual-machines/ddv5-ddsv5-series"
+        },
+        {
+          "start": 46,
+          "end": 63,
+          "kind": "a",
+          "href": "https://docs.microsoft.com/en-us/azure/virtual-machines/edv5-edsv5-series"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Google Cloud Platform: N2 Compute Engine virtual machines.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 25,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/products/compute/compute-engine-n2-vms-now-available-with-intel-ice-lake"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Of course, you can also use your own servers. If they are based on the Cascade Lake architecture (Ice Lake's predecessor), they're good to go as Cascade Lake also includes AVX-512 and VNNI.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "Using Intel performance libraries",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "To leverage AVX-512 and VNNI in PyTorch, Intel has designed the Intel extension for PyTorch. This software library provides out of the box speedup for training and inference, so we should definitely install it.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 91,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "When it comes to distributed training, the main performance bottleneck is often networking. Indeed, the different nodes in the cluster need to periodically exchange model state information to stay in sync. As transformers are large models with billions of parameters (sometimes much more), the volume of information is significant, and things only get worse as the number of nodes increase. Thus, it's important to use a communication library optimized for deep learning.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "In fact, PyTorch includes the torch.distributed package, which supports different communication backends. Here, we'll use the Intel oneAPI Collective Communications Library (oneCCL), an efficient implementation of communication patterns used in deep learning (all-reduce, etc.). You can learn about the performance of oneCCL versus other backends in this PyTorch blog post.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 30,
+          "end": 47,
+          "kind": "a",
+          "href": "https://pytorch.org/tutorials/intermediate/dist_tuto.html"
+        },
+        {
+          "start": 173,
+          "end": 181,
+          "kind": "a",
+          "href": "https://github.com/oneapi-src/oneCCL"
+        },
+        {
+          "start": 260,
+          "end": 270,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Collective_operation"
+        },
+        {
+          "start": 363,
+          "end": 372,
+          "kind": "a",
+          "href": "https://pytorch.medium.com/optimizing-dlrm-by-using-pytorch-with-oneccl-backend-9f85b8ef6929"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Now that we're clear on building blocks, let's talk about the overall setup of our training cluster.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Setting up our cluster",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "In this demo, I'm using Amazon EC2 instances running Amazon Linux 2 (c6i.16xlarge, 64 vCPUs, 128GB RAM, 25Gbit/s networking). Setup will be different in other environments, but steps should be very similar.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Please keep in mind that you will need 4 identical instances, so you may want to plan for some sort of automation to avoid running the same setup 4 times. Here, I will set up one instance manually, create a new Amazon Machine Image (AMI) from this instance, and use this AMI to launch three identical instances.",
+      "spans": [
+        {
+          "start": 232,
+          "end": 237,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AMIs.html"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "From a networking perspective, we will need the following setup:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Open port 22 for ssh access on all instances for setup and debugging.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Configure password-less ssh between the master instance (the one you'll launch training from) and all other instances (master included).",
+      "spans": [
+        {
+          "start": 10,
+          "end": 23,
+          "kind": "a",
+          "href": "https://www.redhat.com/sysadmin/passwordless-ssh"
+        },
+        {
+          "start": 24,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 119,
+          "end": 134,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Open all TCP ports on all instances for oneCCL communication inside the cluster. Please make sure NOT to open these ports to the external world. AWS provides a convenient way to do this by only allowing connections from instances running a particular security group. Here's how my setup looks.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 143,
+          "kind": "strong"
+        },
+        {
+          "start": 251,
+          "end": 265,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/vpc/latest/userguide/VPC_SecurityGroups.html"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Now, let's provision the first instance manually. I first create the instance itself, attach the security group above, and add 128GB of storage. To optimize costs, I have launched it as a spot instance.",
+      "spans": [
+        {
+          "start": 188,
+          "end": 201,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-instances.html"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Once the instance is up, I connect to it with ssh in order to install dependencies.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 49,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Installing dependencies",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Here are the steps we will follow:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Install Intel toolkits,",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Install the Anaconda distribution,",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Create a new conda environment,",
+      "spans": [
+        {
+          "start": 13,
+          "end": 18,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Install PyTorch and the Intel extension for PyTorch,",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Compile and install oneCCL,",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Install the transformers library.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 24,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "It looks like a lot, but there's nothing complicated. Here we go!",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Installing Intel toolkits",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "First, we download and install the Intel OneAPI base toolkit as well as the AI toolkit. You can learn about them on the Intel website.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 60,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html?operatingsystem=linux&distributions=webdownload&options=offline"
+        },
+        {
+          "start": 76,
+          "end": 86,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/oneapi/ai-analytics-toolkit-download.html?operatingsystem=linux&distributions=webdownload&options=offline"
+        },
+        {
+          "start": 126,
+          "end": 133,
+          "kind": "a",
+          "href": "https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html#gs.gmojrp"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Installing Anaconda",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Then, we download and install the Anaconda distribution.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 17,
+          "kind": "a",
+          "href": "https://www.anaconda.com/products/individual"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Creating a new conda environment",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "We log out and log in again to refresh paths. Then, we create a new conda environment to keep things neat and tidy.",
+      "spans": [
+        {
+          "start": 68,
+          "end": 73,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Installing PyTorch and the Intel extension for PyTorch",
+      "spans": [
+        {
+          "start": 0,
+          "end": 54,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Next, we install PyTorch 1.9 and the Intel extension toolkit. Versions must match.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 81,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Compiling and installing oneCCL",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Then, we install some native dependencies required to compile oneCCL.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Next, we clone the oneCCL repository, build the library and install it. Again, versions must match.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 98,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Installing the transformers library",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Next, we install the transformers library and dependencies required to run GLUE tasks.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 33,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Finally, we clone a fork of the transformersrepository containing the example we're going to run.",
+      "spans": [
+        {
+          "start": 32,
+          "end": 44,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "We're done! Let's run a single-node job.",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "Launching a single-node job",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "To get a baseline, let's launch a single-node job running the run_glue.py script in transformers/examples/pytorch/text-classification. This should work on any of the instances, and it's a good sanity check before proceeding to distributed training.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 73,
+          "kind": "code"
+        },
+        {
+          "start": 84,
+          "end": 133,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "This job takes 7 minutes and 46 seconds. Now, let's set up distributed jobs with oneCCL and speed things up!",
+      "spans": [
+        {
+          "start": 15,
+          "end": 39,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Setting up a distributed job with oneCCL",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Three steps are required to run a distributed training job:",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "List the nodes of the training cluster,",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Define environment variables,",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "Modify the training script.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Listing the nodes of the training cluster",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "On the master instance, in transformers/examples/pytorch/text-classification, we create a text file named hostfile. This file stores the names of the nodes in the cluster (IP addresses would work too). The first line should point to the master instance.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 114,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Here's my file:",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Defining environment variables",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "Next, we need to set some environment variables on the master node, most notably its IP address. You can find more information on oneCCL variables in the documentation.",
+      "spans": [
+        {
+          "start": 154,
+          "end": 167,
+          "kind": "a",
+          "href": "https://oneapi-src.github.io/oneCCL/env-variables.html"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Modifying the training script",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "The following changes have already been applied to our training script (run_glue.py) in order to enable distributed training. You would need to apply similar changes when using your own training code.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 83,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Import the torch_cclpackage.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 20,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "Receive the address of the master node and the local rank of the node in the cluster.",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Setup is now complete. Let's scale our training job to 2 nodes and 4 nodes.",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Running a distributed job with oneCCL",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "On the master node, I use mpirunto launch a 2-node job: -np (number of processes) is set to 2 and -ppn (process per node) is set to 1. Hence, the first two nodes in hostfile will be selected.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 18,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 56,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 98,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 165,
+          "end": 173,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "Within seconds, a job starts on the first two nodes. The job completes in 4 minutes and 39 seconds, a 1.7x speedup.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 98,
+          "kind": "strong"
+        },
+        {
+          "start": 102,
+          "end": 106,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Setting -np to 4 and launching a new job, I now see one process running on each node of the cluster.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 11,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Training completes in 2 minutes and 36 seconds, a 3x speedup.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 46,
+          "kind": "strong"
+        },
+        {
+          "start": 50,
+          "end": 52,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "One last thing. Changing --task_name to qqp, I also ran the Quora Question Pairs GLUE task, which is based on a much larger dataset (over 400,000 training samples). The fine-tuning times were:",
+      "spans": [
+        {
+          "start": 25,
+          "end": 36,
+          "kind": "code"
+        },
+        {
+          "start": 40,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 131,
+          "kind": "a",
+          "href": "https://quoradata.quora.com/First-Quora-Dataset-Release-Question-Pairs"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "Single-node: 11 hours 22 minutes,",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "2 nodes: 6 hours and 38 minutes (1.71x),",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "4 nodes: 3 hours and 51 minutes (2.95x).",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "It looks like the speedup is pretty consistent. Feel free to keep experimenting with different learning rates, batch sizes and oneCCL settings. I'm sure you can go even faster!",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "In this post, you've learned how to build a distributed training cluster based on Intel CPUs and performance libraries, and how to use this cluster to speed up fine-tuning jobs. Indeed, transfer learning is putting CPU training back into the game, and you should definitely consider it when designing and building your next deep learning workflows.",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "Thanks for reading this long post. I hope you found it informative. Feedback and questions are welcome at julsimon@huggingface.co. Until next time, keep learning!",
+      "spans": [
+        {
+          "start": 106,
+          "end": 129,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "Julien",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "cec1001627af5600911835580f478c242711d9d7325004c76dd6b40940185eb9",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "wget https://registrationcenter-download.intel.com/akdlm/irc_nas/18236/l_BaseKit_p_2021.4.0.3422_offline.sh\nsudo bash l_BaseKit_p_2021.4.0.3422_offline.sh\n\nwget https://registrationcenter-download.intel.com/akdlm/irc_nas/18235/l_AIKit_p_2021.4.0.1460_offline.sh\nsudo bash l_AIKit_p_2021.4.0.1460_offline.sh "
+    },
+    {
+      "id": "c0002",
+      "source": "wget https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh\nsh Anaconda3-2021.05-Linux-x86_64.sh"
+    },
+    {
+      "id": "c0003",
+      "source": "yes | conda create -n transformer python=3.7.9 -c anaconda\neval \"$(conda shell.bash hook)\"\nconda activate transformer\nyes | conda install pip cmake"
+    },
+    {
+      "id": "c0004",
+      "source": "yes | conda install pytorch==1.9.0 cpuonly -c pytorch\npip install torch_ipex==1.9.0 -f https://software.intel.com/ipex-whl-stable"
+    },
+    {
+      "id": "c0005",
+      "source": "sudo yum -y update\nsudo yum install -y git cmake3 gcc gcc-c++"
+    },
+    {
+      "id": "c0006",
+      "source": "source /opt/intel/oneapi/mkl/latest/env/vars.sh\ngit clone https://github.com/intel/torch-ccl.git\ncd torch-ccl\ngit checkout ccl_torch1.9\ngit submodule sync\ngit submodule update --init --recursive\npython setup.py install\ncd .."
+    },
+    {
+      "id": "c0007",
+      "source": "pip install transformers datasets\nyes | conda install scipy scikit-learn"
+    },
+    {
+      "id": "c0008",
+      "source": "git clone https://github.com/kding1/transformers.git\ncd transformers\ngit checkout dist-sigopt"
+    },
+    {
+      "id": "c0009",
+      "source": "python run_glue.py \\\n--model_name_or_path bert-base-cased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 \\\n--per_device_train_batch_size 32 --learning_rate 2e-5 --num_train_epochs 3 \\\n--output_dir /tmp/mrpc/ --overwrite_output_dir True"
+    },
+    {
+      "id": "c0010",
+      "source": "ip-172-31-28-17.ec2.internal\nip-172-31-30-87.ec2.internal\nip-172-31-29-11.ec2.internal\nip-172-31-20-77.ec2.internal"
+    },
+    {
+      "id": "c0011",
+      "source": "for nic in eth0 eib0 hib0 enp94s0f0; do\n  master_addr=$(ifconfig $nic 2>/dev/null | grep netmask | awk '{print $2}'| cut -f2 -d:)\n  if [ \"$master_addr\" ]; then\n    break\n  fi\ndone\nexport MASTER_ADDR=$master_addr\n\nsource /home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/torch_ccl/env/setvars.sh\n\nexport LD_LIBRARY_PATH=/home/ec2-user/anaconda3/envs/transformer/lib/python3.7/site-packages/torch_ccl-1.3.0+43f48a1-py3.7-linux-x86_64.egg/:$LD_LIBRARY_PATH\nexport LD_PRELOAD=\"${CONDA_PREFIX}/lib/libtcmalloc.so:${CONDA_PREFIX}/lib/libiomp5.so\"\n\nexport CCL_WORKER_COUNT=4\nexport CCL_WORKER_AFFINITY=\"0,1,2,3,32,33,34,35\"\nexport CCL_ATL_TRANSPORT=ofi\nexport ATL_PROGRESS_MODE=0"
+    },
+    {
+      "id": "c0012",
+      "source": "+import torch_ccl\n+\n import datasets\n import numpy as np\n from datasets import load_dataset, load_metric\n@@ -47,7 +49,7 @@ from transformers.utils.versions import require_version\n\n\n # Will error if the minimal version of Transformers is not installed. Remove at your own risks.\n-check_min_version(\"4.13.0.dev0\")\n+# check_min_version(\"4.13.0.dev0\")\n\n require_version(\"datasets>=1.8.0\", \"To fix: pip install -r examples/pytorch/text-classification/requirements.txt\")\n\n@@ -191,6 +193,17 @@ def main():\n     # or by passing the --help flag to this script.\n     # We now keep distinct sets of args, for a cleaner separation of concerns.\n\n+    # add local rank for cpu-dist\n+    sys.argv.append(\"--local_rank\")\n+    sys.argv.append(str(os.environ.get(\"PMI_RANK\", -1)))\n+\n+    # ccl specific environment variables\n+    if \"ccl\" in sys.argv:\n+        os.environ[\"MASTER_ADDR\"] = os.environ.get(\"MASTER_ADDR\", \"127.0.0.1\")\n+        os.environ[\"MASTER_PORT\"] = \"29500\"\n+        os.environ[\"RANK\"] = str(os.environ.get(\"PMI_RANK\", -1))\n+        os.environ[\"WORLD_SIZE\"] = str(os.environ.get(\"PMI_SIZE\", -1))\n+\n     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))\n     if len(sys.argv) == 2 and sys.argv[1].endswith(\".json\"):"
+    },
+    {
+      "id": "c0013",
+      "source": "mpirun -f hostfile -np 2 -ppn 1 -genv I_MPI_PIN_DOMAIN=[0xfffffff0] \\\n-genv OMP_NUM_THREADS=28 python run_glue.py \\\n--model_name_or_path distilbert-base-uncased --task_name mrpc \\\n--do_train --do_eval --max_seq_length 128 --per_device_train_batch_size 32 \\\n--learning_rate 2e-5 --num_train_epochs 3 --output_dir /tmp/mrpc/ \\\n--overwrite_output_dir True --xpu_backend ccl --no_cuda True"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 4,
+    "savedImages": 4,
+    "sourceImageOccurrences": 4,
+    "placedImageOccurrences": 4,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T16:25:13.616965Z"
 }

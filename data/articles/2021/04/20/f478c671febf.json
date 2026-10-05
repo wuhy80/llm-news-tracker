@@ -19,83 +19,65 @@
   "fetchedAt": "2026-08-30T11:51:06.225601Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Scaling up BERT-like model Inference on modern CPU - Part 1\n\nPublished April 20, 2021\n\n1. Context and Motivations\n\nBack in October 2019, my colleague Lysandre Debut published a comprehensive (at the time) inference performance benchmarking blog (1) .\n\nSince then, 🤗 transformers (2) welcomed a tremendous number of new architectures and thousands of new models were added to the 🤗 hub (3) which now counts more than 9,000 of them as of first quarter of 2021.\n\nAs the NLP landscape keeps trending towards more and more BERT-like models being used in production, it remains challenging to efficiently deploy and run these architectures at scale.\n\nThis is why we recently introduced our 🤗 Inference API : to let you focus on building value for your users and customers, rather than digging into all the highly technical aspects of running such models.\n\nThis blog post is the first part of a series which will cover most of the hardware and software optimizations to better leverage CPUs for BERT model inference.\n\nFor this initial blog post, we will cover the hardware part:\n\n- Setting up a baseline - Out of the box results\n\n- Practical & technical considerations when leveraging modern CPUs for CPU-bound tasks\n\n- Core count scaling - Does increasing the number of cores actually give better performance?\n\n- Batch size scaling - Increasing throughput with multiple parallel & independent model instances\n\nWe decided to focus on the most famous Transformer model architecture, BERT (Delvin & al. 2018) (4) . While we focus this blog post on BERT-like models to keep the article concise, all the described techniques can be applied to any architecture on the Hugging Face model hub.\n\nIn this blog post we will not describe in detail the Transformer architecture - to learn about that I can't recommend enough the Illustrated Transformer blogpost from Jay Alammar (5) .\n\nToday's goals are to give you an idea of where we are from an Open Source perspective using BERT-like models for inference on PyTorch and TensorFlow, and also what you can easily leverage to speedup inference.\n\n## 2. Benchmarking methodology\n\nWhen it comes to leveraging BERT-like models from Hugging Face's model hub, there are many knobs which can be tuned to make things faster.\n\nAlso, in order to quantify what \"faster\" means, we will rely on widely adopted metrics:\n\n- Latency : Time it takes for a single execution of the model (i.e. forward call)\n\n- Throughput : Number of executions performed in a fixed amount of time\n\nThese two metrics will help us understand the benefits and tradeoffs along this blog post.\n\nThe benchmarking methodology was reimplemented from scratch in order to integrate the latest features provided by transformers and also to let the community run and share benchmarks in an hopefully easier way.\n\nThe whole framework is now based on Facebook AI & Research's Hydra configuration library allowing us to easily report and track all the items involved while running the benchmark, hence increasing the overall reproducibility.\n\nYou can find the whole structure of the project here\n\nOn the 2021 version, we kept the ability to run inference workloads through PyTorch and Tensorflow as in the previous blog (1) along with their traced counterpart TorchScript (6) , Google Accelerated Linear Algebra (XLA) (7) .\n\nAlso, we decided to include support for ONNX Runtime (8) as it provides many optimizations specifically targeting transformers based models which makes it a strong candidate to consider when discussing performance.\n\nLast but not least, this new unified benchmarking environment will allow us to easily run inference for different scenarios such as Quantized Models (Zafrir & al.) (9) using less precise number representations ( float16 , int8 , int4 ).\n\nThis method known as quantization has seen an increased adoption among all major hardware providers. In the near future, we would like to integrate additional methods we are actively working on at Hugging Face, namely Distillation, Pruning & Sparsificaton.\n\nAll the results below were run on Amazon Web Services (AWS) c5.metal instance leveraging an Intel Xeon Platinum 8275 CPU (48 cores/96 threads). The choice of this instance provides all the useful CPU features to speedup Deep Learning workloads such as:\n\n- AVX512 instructions set ( which might not be leveraged out-of-the-box by the various frameworks )\n\n- Intel Deep Learning Boost (also known as Vector Neural Network Instruction - VNNI) which provides specialized CPU instructions for running quantized networks ( using int8 data type )\n\nThe choice of using metal instance is to avoid any virtualization issue which can arise when using cloud providers. This gives us full control of the hardware, especially while targeting the NUMA (Non-Unified Memory Architecture) controller, which we will cover later in this post.\n\nThe operating system was Ubuntu 20.04 (LTS) and all the experiments were conducted using Hugging Face transformers version 4.5.0, PyTorch 1.8.1 & Google TensorFlow 2.4.0\n\n## 4. Out of the box results\n\nFigure 1. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box\n\nFigure 2. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box - (Bigger Batch Size)\n\nStraigh to the point, out-of-the-box, PyTorch shows better inference results over TensorFlow for all the configurations tested here.\n\nIt is important to note the results out-of-the-box might not reflect the \"optimal\" setup for both PyTorch and TensorFlow and thus it can look deceiving here.\n\nOne possible way to explain such difference between the two frameworks might be the underlying technology to execute parallel sections within operators.\n\nPyTorch internally uses OpenMP (10) along with Intel MKL (now oneDNN) (11) for efficient linear algebra computations whereas TensorFlow relies on Eigen and its own threading implementation.\n\n## 5. Scaling BERT Inference to increase overall throughput on modern CPU\n\nThere are multiple ways to improve the latency and throughput for tasks such as BERT inference. Improvements and tuning can be performed at various levels from enabling Operating System features, swapping dependent libraries with more performant ones, carefully tuning framework properties and, last but not least, using parallelization logic leveraging all the cores on the CPU(s).\n\nFor the remainder of this blog post we will focus on the latter, also known as Multiple Inference Stream .\n\nThe idea is simple: Allocate multiple instances of the same model and assign the execution of each instance to a dedicated, non-overlapping subset of the CPU cores in order to have truly parallel instances.\n\n### 5.2. Cores and Threads on Modern CPUs\n\nOn our way towards optimizing CPU inference for better usage of the CPU cores you might have already seen - at least for the past 20 years - modern CPUs specifications report \"cores\" and \"hardware threads\" or \"physical\" and \"logical\" numbers. These notions refer to a mechanism called Simultaneous Multi-Threading (SMT) or Hyper-Threading on Intel's platforms.\n\nTo illustrate this, imagine two tasks A and B , executing in parallel, each on its own software thread.\n\nAt some point, there is a high probability these two tasks will have to wait for some resources to be fetched from main memory, SSD, HDD or even the network.\n\nIf the threads are scheduled on different physical cores, with no hyper-threading, during these periods the core executing the task is in an Idle state waiting for the resources to arrive, and effectively doing nothing... and hence not getting fully utilized\n\nNow, with SMT , the two software threads for task A and B can be scheduled on the same physical core , such that their execution is interleaved on that physical core:\n\nTask A and Task B will execute simultaneously on the physical core and when one task is halted, the other task can still continue execution on the core thereby increasing the utilization of that core.\n\nFigure 3. Illustration of Intel Hyper Threading technology (SMT)\n\nThe figure 3. above simplifies the situation by assuming single core setup. If you want some more details on how SMT works on multi-cores CPUs, please refer to these two articles with very deep technical explanations of the behavior:\n\n- Intel® Hyper-Threading Technology - Technical User Guide (12)\n\n- Introduction to Hyper-Threading Technology (13)\n\nBack to our model inference workload... If you think about it, in a perfect world with a fully optimized setup, computations take the majority of time.\n\nIn this context, using the logical cores shouldn't bring us any performance benefit because both logical cores (hardware threads) compete for the core’s execution resources.\n\nAs a result, the tasks being a majority of general matrix multiplications ( gemms (14) ), they are inherently CPU bounds and does not benefits from SMT.\n\n### 5.3. Leveraging Multi-Socket servers and CPU affinity\n\nNowadays servers bring many cores, some of them even support multi-socket setups ( i.e. multiple CPUs on the motherboard ).\n\nOn Linux, the command lscpu reports all the specifications and topology of the CPUs present on the system:\n\n```\nubuntu@some-ec2-machine:~$ lscpu\nArchitecture:                    x86_64\nCPU op-mode(s):                  32-bit, 64-bit\nByte Order:                      Little Endian\nAddress sizes:                   46 bits physical, 48 bits virtual\nCPU(s):                          96\nOn-line CPU(s) list:             0-95\nThread(s) per core:              2\nCore(s) per socket:              24\nSocket(s):                       2\nNUMA node(s):                    2\nVendor ID:                       GenuineIntel\nCPU family:                      6\nModel:                           85\nModel name:                      Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nStepping:                        7\nCPU MHz:                         1200.577\nCPU max MHz:                     3900.0000\nCPU min MHz:                     1200.0000\nBogoMIPS:                        6000.00\nVirtualization:                  VT-x\nL1d cache:                       1.5 MiB\nL1i cache:                       1.5 MiB\nL2 cache:                        48 MiB\nL3 cache:                        71.5 MiB\nNUMA node0 CPU(s):               0-23,48-71\nNUMA node1 CPU(s):               24-47,72-95\n```\n\nIn our case we have a machine with 2 sockets , each socket providing 24 physical cores with 2 threads per cores (SMT).\n\nAnother interesting characteristic is the notion of NUMA node (0, 1) which represents how cores and memory are being mapped on the system.\n\nNon-Uniform Memory Access ( NUMA ) is the opposite of Uniform Memory Access ( UMA ) where the whole memory pool is accessible by all the cores through a single unified bus between sockets and the main memory. NUMA on the other hand splits the memory pool and each CPU socket is responsible to address a subset of the memory, reducing the congestion on the bus.\n\nFigure 5. Difference illustration of UMA and NUMA architectures (source (15))\n\nIn order to fully utilize the potential of such a beefy machine, we need to ensure our model instances are correctly dispatched across all the physical cores on all sockets along with enforcing memory allocation to be \"NUMA-aware\".\n\nOn Linux, NUMA's process configuration can be tuned through numactl which provides an interface to bind a process to a set of CPU cores (referred as Thread Affinity ).\n\nAlso, it allows tuning the memory allocation policy, making sure the memory allocated for the process is as close as possible to the cores' memory pool (referred as Explicit Memory Allocation Directives ).\n\nNote: Setting both cores and memory affinities is important here. Having computations done on socket 0 and memory allocated on socket 1 would ask the system to go over the sockets shared bus to exchange memory, thus leading to an undesired overhead.\n\n### 5.4. Tuning Thread Affinity & Memory Allocation Policy\n\nNow that we have all the knobs required to control the resources' allocation of our model instances we go further and see how to effectively deploy those and see the impact on latency and throughput.\n\nLet's go gradually to get a sense of what is the impact of each command and parameter.\n\nFirst, we start by launching our inference model without any tuning, and we observe how the computations are being dispatched on CPU cores ( Left ).\n\n```\npython3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128\n```\n\nThen we specify the core and memory affinity through numactl using all the physical cores and only a single thread (thread 0) per core ( Right ):\n\n```\nnumactl -C 0-47 -m 0,1 python3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128\n```\n\nFigure 6. Linux htop command side-by-side results without & with Thread Affinity set\n\nAs you can see, without any specific tuning, PyTorch and TensorFlow dispatch the work on a single socket, using all the logical cores in that socket (both threads on 24 cores).\n\nAlso, as we highlighted earlier, we do not want to leverage the SMT feature in our case, so we set the process' thread affinity to target only 1 hardware thread.\n\nNote, this is specific to this run and can vary depending on individual setups. Hence, it is recommended to check thread affinity settings for each specific use-case.\n\nLet's take sometime from here to highlight what we did with numactl :\n\n- -C 0-47 indicates to numactl what is the thread affinity (cores 0 to 47).\n\n- -m 0,1 indicates to numactl to allocate memory on both CPU sockets\n\nIf you wonder why we are binding the process to cores [0...47], you need to go back to look at the output of lscpu .\n\nFrom there you will find the section NUMA node0 and NUMA node1 which has the form NUMA node<X> <logical ids>\n\nIn our case, each socket is one NUMA node and there are 2 NUMA nodes. Each socket or each NUMA node has 24 physical cores and 2 hardware threads per core, so 48 logical cores. For NUMA node 0, 0-23 are hardware thread 0 and 24-47 are hardware thread 1 on the 24 physical cores in socket 0. Likewise, for NUMA node 1, 48-71 are hardware thread 0 and 72-95 are hardware thread 1 on the 24 physical cores in socket 1.\n\nAs we are targeting just 1 thread per physical core, as explained earlier, we pick only thread 0 on each core and hence logical processors 0-47. Since we are using both sockets, we need to also bind the memory allocations accordingly (0,1).\n\nPlease note that using both sockets may not always give the best results, particularly for small problem sizes. The benefit of using compute resources across both sockets might be reduced or even negated by cross-socket communication overhead.\n\n## 6. Core count scaling - Does using more cores actually improve performance?\n\nWhen thinking about possible ways to improve our model inference performances, the first rational solution might be to throw some more resources to do the same amount of work.\n\nThrough the rest of this blog series, we will refer to this setup as Core Count Scaling meaning, only the number of cores used on the system to achieve the task will vary. This is also often referred as Strong Scaling in the HPC world.\n\nAt this stage, you may wonder what is the point of allocating only a subset of the cores rather than throwing all the horses at the task to achieve minimum latency.\n\nIndeed, depending on the problem-size, throwing more resources to the task might give better results. It is also possible that for small problems putting more CPU cores at work doesn't improve the final latency.\n\nIn order to illustrate this, the figure 6. below takes different problem sizes ( batch_size = 1, sequence length = {32, 128, 512} ) and reports the latencies with respect to the number of CPU cores used for running computations for both PyTorch and TensorFlow.\n\nLimiting the number of resources involved in computation is done by limiting the CPU cores involved in intra operations ( intra here means inside an operator doing computation, also known as \"kernel\" ).\n\nThis is achieved through the following APIs:\n\n- PyTorch: torch.set_num_threads(x)\n\n- TensorFlow: tf.config.threading.set_intra_op_parallelism_threads(x)\n\nFigure 7. Latency measurements\n\nAs you can see, depending on the problem size, the number of threads involved in the computations has a positive impact on the latency measurements.\n\nFor small-sized problems & medium-sized problems using only one socket would give the best performance. For large-sized problems, the overhead of the cross-socket communication is covered by the computations cost, thus benefiting from using all the cores available on the both sockets.\n\n## 7. Multi-Stream Inference - Using multiple instances in parallel\n\nIf you're still reading this, you should now be in good shape to set up parallel inference workloads on CPU.\n\nNow, we are going to highlight some possibilities offered by the powerful hardware we have, and tuning the knobs described before, to scale our inference as linearly as possible.\n\nIn the following section we will explore another possible scaling solution Batch Size Scaling , but before diving into this, let's take a look at how we can leverage Linux tools in order to assign Thread Affinity allowing effective model instance parallelism.\n\nInstead of throwing more cores to the task as you would do in the core count scaling setup, now we will be using more model instances. Each instance will run independently on its own subset of the hardware resources in a truly parallel fashion on a subset of the CPU cores.\n\n### 7.1. How-to allocate multiple independent instances\n\nLet's start simple, if we want to spawn 2 instances, one on each socket with 24 cores assigned:\n\n```\nnumactl -C 0-23 -m 0 \npython3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24\nnumactl -C 24-47 -m 1 \npython3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24\n```\n\nStarting from here, each instance does not share any resource with the other, and everything is operating at maximum efficiency from a hardware perspective.\n\nThe latency measurements are identical to what a single instance would achieve, but throughput is actually 2x higher as the two instances operate in a truly parallel way.\n\nWe can further increase the number of instances, lowering the number of cores assigned for each instance.\n\nLet's run 4 independent instances, each of them effectively bound to 12 CPU cores.\n\n```\nnumactl -C 0-11 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 12-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 24-35 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 36-47 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\n```\n\nThe outcomes remain the same, our 4 instances are effectively running in a truly parallel manner.\n\nThe latency will be slightly higher than the example before (2x less cores being used), but the throughput will be again 2x higher.\n\n### 7.2. Smart dispatching - Allocating different model instances for different problem sizes\n\nOne another possibility offered by this setup is to have multiple instances carefully tuned for various problem sizes.\n\nWith a smart dispatching approach, one can redirect incoming requests to the right configuration giving the best latency depending on the request workload.\n\n```\n# Small-sized problems (sequence length <= 32) use only 8 cores (on socket 0 - 8/24 cores used)\nnumactl -C 0-7 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=32 backend.name=pytorch backend.num_threads=8\n\n# Medium-sized problems (32 > sequence <= 384) use remaining 16 cores (on socket 0 - (8+16)/24 cores used)\nnumactl -C 8-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=16\n\n# Large sized problems (sequence >= 384) use the entire CPU (on socket 1 - 24/24 cores used)\nnumactl -C 24-37 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=384 backend.name=pytorch backend.num_threads=24\n```\n\n## 8. Batch size scaling - Improving throughput and latency with multiple parallel & independent model instances\n\nOne another very interesting direction for scaling up inference is to actually put some more model instances into the pool along with reducing the actual workload each instance receives proportionally.\n\nThis method actually changes both the size of the problem ( batch size ), and the resources involved in the computation ( cores ).\n\nTo illustrate, imagine you have a server with C CPU cores, and you want to run a workload containing B samples with S tokens.\n\nYou can represent this workload as a tensor of shape [B, S] , B being the size of the batch and S being the maximum sequence length within the B samples.\n\nFor all the instances ( N ), each of them executes on C / N cores and would receive a subset of the task [B / N, S] .\n\nEach instance doesn't receive the global batch but instead, they all receive a subset of it [B / N, S] thus the name Batch Size Scaling .\n\nIn order to highlight the benefits of such scaling method, the charts below reports both the latencies when scaling up model instances along with the effects on the throughput.\n\nWhen looking at the results, let's focus on the latency and the throughput aspects:\n\nOn one hand, we are taking the maximum latency over the pool of instances to reflect the time it takes to process all the samples in the batch. Putting it differently, as instances operate in a truly parallel fashion, the time it takes to gather all the batch chunks from all the instances is driven by the longest time it takes for individual instance in the pool to get their chunk done.\n\nAs you can see below on Figure 7., the actual latency gain when increasing the number of instances is really dependent of the problem size. In all cases, we can find an optimal resource allocation (batch size & number of instances) to minimize our latency but, there is no specific pattern on the number of cores to involve in the computation.\n\nAlso, it is important to notice the results might look totally different on another system (i.e. Operating System, Kernel Version, Framework version, etc.)\n\nFigure 8. sums up the best multi-instance configuration when targeting minimum latency by taking the minimum over the number of instances involved.\n\nFor instance, for {batch = 8, sequence length = 128} using 4 instances (each with {batch = 2} and 12 cores) gives the best latency measurements.\n\nThe Figure 9. reports all the setups minimizing latency for both PyTorch and TensorFlow for various problem-sizes.\n\nSpoiler : There are numerous other optimizations we will discuss in a follow-up blog post which will substantially impact this chart.\n\nFigure 8. Max latency evolution with respect to number of instances for a total batch size of 8\n\nFigure 9. Optimal number of instance minimizing overall latency for a total batch size of 8\n\nOn a second hand, we observe the throughput as the sum of all the model instance executing in parallel. It allows us to visualize the scalability of the system when adding more and more instances each of them with fewer resources but also proportional workload.\n\nHere, the results show almost linear scalability and thus an optimal hardware usage.\n\nFigure 10. Sum throughput with respect to number of instances for a total batch size of 8\n\nThrough this blog post, we covered out-of-box BERT inference performance one can expect for PyTorch and TensorFlow, from a simple PyPi install and without further tuning.\n\nIt is important to highlight results provided here reflects out-of-the-box framework setup hence, they might not provide the absolute best performances.\n\nWe decided to not include optimizations as part of this blog post to focus on hardware and efficiency. Optimizations will be discussed in the second part! 🚀\n\nThen, we covered and detailed the impact, and the importance of setting the thread affinity along with the trade-off between the target problem size, and the number of cores required for achieving the task.\n\nAlso, it is important to define which criteria (i.e. latency vs throughput) to use when optimizing your deployment as the resulting setups might be totally different.\n\nOn a more general note, small problem sizes ( short sequences and/or small batches ) might require much fewer cores to achieve the best possible latency than big problems ( very long sequences and/or big batches ).\n\nIt is interesting to cover all these aspects when thinking about the final deployment platform as it might cut the cost of the infrastructure drastically.\n\nFor instance, our 48 cores machine charges 4.848$/h whereas a smaller instances with only 8 cores lowers the cost to 0.808$/h , leading to a 6x cost reduction .\n\nLast but not least, many of the knobs discussed along this blog post can be automatically tuned through a launcher script highly inspired from the original script made by Intel and available here .\n\nThe launcher script is able to automatically starts your python process(es) with the correct thread affinity, effectively splitting resources across instances along with many other performances tips! We will detail many of this tips in the second part 🧐.\n\nIn the follow-up blog post, more advanced settings and tuning techniques to decrease model latency even further will be involved, such as:\n\n- Launcher script walk-through\n\n- Tuning the memory allocation library\n\n- Using Linux's Transparent Huge Pages mechanisms\n\n- Using vendor-specific Math/Parallel libraries\n\n- Omry Yadan (Facebook FAIR) - Author of OmegaConf & Hydra for all the tips setting up Hydra correctly.\n\n- All Intel & Intel Labs' NLP colleagues - For the ongoing optimizations and research efforts they are putting into transformers and more generally in the NLP field.\n\n- Hugging Face colleagues - For all the comments and improvements in the reviewing process.\n\n- Benchmarking Transformers: PyTorch and TensorFlow\n\n- HuggingFace's Transformers: State-of-the-art Natural Language Processing\n\n- HuggingFace's Model Hub\n\n- BERT - Pre-training of Deep Bidirectional Transformers for Language Understanding (Devlin & al. 2018)\n\n- Illustrated Transformer blogpost from Jay Alammar\n\n- Google Accelerated Linear Algebra (XLA)\n\n- ONNX Runtime - Optimize and Accelerate Machine Learning Inferencing and Training\n\n- Q8BERT - Quantized 8Bit BERT (Zafrir & al. 2019)\n\n- Intel® Hyper-Threading Technology - Technical User Guide\n\n- Introduction to Hyper-Threading Technology\n\n- BLAS (Basic Linear Algebra Subprogram) - Wikipedia\n\n- Optimizing Applications for NUMA\n\nMore Articles from our Blog\n\npartnerships intel guide\n\n## Scaling up BERT-like model Inference on modern CPU - Part 2\n\n## Accelerating Qwen3-8B Agent on Intel® Core™ Ultra with Depth-Pruned Draft Models\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "## 1. Context and Motivations\n\nBack in October 2019, my colleague Lysandre Debut published a comprehensive (at the time) inference performance benchmarking blog (1).\n\nSince then, 🤗 transformers (2) welcomed a tremendous number of new architectures and thousands of new models were added to the 🤗 hub (3) which now counts more than 9,000 of them as of first quarter of 2021.\n\nAs the NLP landscape keeps trending towards more and more BERT-like models being used in production, it remains challenging to efficiently deploy and run these architectures at scale. This is why we recently introduced our 🤗 Inference API: to let you focus on building value for your users and customers, rather than digging into all the highly technical aspects of running such models.\n\nThis blog post is the first part of a series which will cover most of the hardware and software optimizations to better leverage CPUs for BERT model inference.\n\nFor this initial blog post, we will cover the hardware part:\n\n- Setting up a baseline - Out of the box results\n\n- Practical & technical considerations when leveraging modern CPUs for CPU-bound tasks\n\n- Core count scaling - Does increasing the number of cores actually give better performance?\n\n- Batch size scaling - Increasing throughput with multiple parallel & independent model instances\n\nWe decided to focus on the most famous Transformer model architecture, BERT (Delvin & al. 2018) (4). While we focus this blog post on BERT-like models to keep the article concise, all the described techniques can be applied to any architecture on the Hugging Face model hub. In this blog post we will not describe in detail the Transformer architecture - to learn about that I can't recommend enough the Illustrated Transformer blogpost from Jay Alammar (5).\n\nToday's goals are to give you an idea of where we are from an Open Source perspective using BERT-like models for inference on PyTorch and TensorFlow, and also what you can easily leverage to speedup inference.\n\n## 2. Benchmarking methodology\n\nWhen it comes to leveraging BERT-like models from Hugging Face's model hub, there are many knobs which can be tuned to make things faster. Also, in order to quantify what \"faster\" means, we will rely on widely adopted metrics:\n\n- Latency: Time it takes for a single execution of the model (i.e. forward call)\n\n- Throughput: Number of executions performed in a fixed amount of time\n\nThese two metrics will help us understand the benefits and tradeoffs along this blog post.\n\nThe benchmarking methodology was reimplemented from scratch in order to integrate the latest features provided by transformers and also to let the community run and share benchmarks in an hopefully easier way. The whole framework is now based on Facebook AI & Research's Hydra configuration library allowing us to easily report and track all the items involved while running the benchmark, hence increasing the overall reproducibility. You can find the whole structure of the project here\n\nOn the 2021 version, we kept the ability to run inference workloads through PyTorch and Tensorflow as in the previous blog (1) along with their traced counterpart TorchScript (6), Google Accelerated Linear Algebra (XLA) (7). Also, we decided to include support for ONNX Runtime (8) as it provides many optimizations specifically targeting transformers based models which makes it a strong candidate to consider when discussing performance.\n\nLast but not least, this new unified benchmarking environment will allow us to easily run inference for different scenarios such as Quantized Models (Zafrir & al.) (9) using less precise number representations (float16, int8, int4). This method known as quantization has seen an increased adoption among all major hardware providers. In the near future, we would like to integrate additional methods we are actively working on at Hugging Face, namely Distillation, Pruning & Sparsificaton.\n\n## 3. Baselines\n\nAll the results below were run on Amazon Web Services (AWS) c5.metal instance leveraging an Intel Xeon Platinum 8275 CPU (48 cores/96 threads). The choice of this instance provides all the useful CPU features to speedup Deep Learning workloads such as:\n\n- AVX512 instructions set (which might not be leveraged out-of-the-box by the various frameworks)\n\n- Intel Deep Learning Boost (also known as Vector Neural Network Instruction - VNNI) which provides specialized CPU instructions for running quantized networks (using int8 data type)\n\nThe choice of using metal instance is to avoid any virtualization issue which can arise when using cloud providers. This gives us full control of the hardware, especially while targeting the NUMA (Non-Unified Memory Architecture) controller, which we will cover later in this post.\n\nThe operating system was Ubuntu 20.04 (LTS) and all the experiments were conducted using Hugging Face transformers version 4.5.0, PyTorch 1.8.1 & Google TensorFlow 2.4.0\n\n## 4. Out of the box results\n\nFigure 1. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box\n\nFigure 2. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box - (Bigger Batch Size)\n\nStraigh to the point, out-of-the-box, PyTorch shows better inference results over TensorFlow for all the configurations tested here. It is important to note the results out-of-the-box might not reflect the \"optimal\" setup for both PyTorch and TensorFlow and thus it can look deceiving here.\n\nOne possible way to explain such difference between the two frameworks might be the underlying technology to execute parallel sections within operators. PyTorch internally uses OpenMP (10) along with Intel MKL (now oneDNN) (11) for efficient linear algebra computations whereas TensorFlow relies on Eigen and its own threading implementation.\n\n## 5. Scaling BERT Inference to increase overall throughput on modern CPU\n\n### 5.1. Introduction\n\nThere are multiple ways to improve the latency and throughput for tasks such as BERT inference. Improvements and tuning can be performed at various levels from enabling Operating System features, swapping dependent libraries with more performant ones, carefully tuning framework properties and, last but not least, using parallelization logic leveraging all the cores on the CPU(s).\n\nFor the remainder of this blog post we will focus on the latter, also known as Multiple Inference Stream.\n\nThe idea is simple: Allocate multiple instances of the same model and assign the execution of each instance to a dedicated, non-overlapping subset of the CPU cores in order to have truly parallel instances.\n\n### 5.2. Cores and Threads on Modern CPUs\n\nOn our way towards optimizing CPU inference for better usage of the CPU cores you might have already seen -at least for the past 20 years- modern CPUs specifications report \"cores\" and \"hardware threads\" or \"physical\" and \"logical\" numbers. These notions refer to a mechanism called Simultaneous Multi-Threading (SMT) or Hyper-Threading on Intel's platforms.\n\nTo illustrate this, imagine two tasks A and B, executing in parallel, each on its own software thread. At some point, there is a high probability these two tasks will have to wait for some resources to be fetched from main memory, SSD, HDD or even the network. If the threads are scheduled on different physical cores, with no hyper-threading, during these periods the core executing the task is in an Idle state waiting for the resources to arrive, and effectively doing nothing... and hence not getting fully utilized\n\nNow, with SMT, the two software threads for task A and B can be scheduled on the same physical core, such that their execution is interleaved on that physical core:\n\nTask A and Task B will execute simultaneously on the physical core and when one task is halted, the other task can still continue execution on the core thereby increasing the utilization of that core.\n\nFigure 3. Illustration of Intel Hyper Threading technology (SMT)\n\nThe figure 3. above simplifies the situation by assuming single core setup. If you want some more details on how SMT works on multi-cores CPUs, please refer to these two articles with very deep technical explanations of the behavior:\n\n- Intel® Hyper-Threading Technology - Technical User Guide (12)\n\n- Introduction to Hyper-Threading Technology (13)\n\nBack to our model inference workload... If you think about it, in a perfect world with a fully optimized setup, computations take the majority of time. In this context, using the logical cores shouldn't bring us any performance benefit because both logical cores (hardware threads) compete for the core’s execution resources. As a result, the tasks being a majority of general matrix multiplications (gemms (14)), they are inherently CPU bounds and does not benefits from SMT.\n\n### 5.3. Leveraging Multi-Socket servers and CPU affinity\n\nNowadays servers bring many cores, some of them even support multi-socket setups (i.e. multiple CPUs on the motherboard). On Linux, the command lscpu reports all the specifications and topology of the CPUs present on the system:\n\n```\nubuntu@some-ec2-machine:~$ lscpu\nArchitecture:                    x86_64\nCPU op-mode(s):                  32-bit, 64-bit\nByte Order:                      Little Endian\nAddress sizes:                   46 bits physical, 48 bits virtual\nCPU(s):                          96\nOn-line CPU(s) list:             0-95\nThread(s) per core:              2\nCore(s) per socket:              24\nSocket(s):                       2\nNUMA node(s):                    2\nVendor ID:                       GenuineIntel\nCPU family:                      6\nModel:                           85\nModel name:                      Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nStepping:                        7\nCPU MHz:                         1200.577\nCPU max MHz:                     3900.0000\nCPU min MHz:                     1200.0000\nBogoMIPS:                        6000.00\nVirtualization:                  VT-x\nL1d cache:                       1.5 MiB\nL1i cache:                       1.5 MiB\nL2 cache:                        48 MiB\nL3 cache:                        71.5 MiB\nNUMA node0 CPU(s):               0-23,48-71\nNUMA node1 CPU(s):               24-47,72-95\n```\n\nIn our case we have a machine with 2 sockets, each socket providing 24 physical cores with 2 threads per cores (SMT). Another interesting characteristic is the notion of NUMA node (0, 1) which represents how cores and memory are being mapped on the system.\n\nNon-Uniform Memory Access (NUMA) is the opposite of Uniform Memory Access (UMA) where the whole memory pool is accessible by all the cores through a single unified bus between sockets and the main memory. NUMA on the other hand splits the memory pool and each CPU socket is responsible to address a subset of the memory, reducing the congestion on the bus.\n\nFigure 5. Difference illustration of UMA and NUMA architectures (source (15))\n\nIn order to fully utilize the potential of such a beefy machine, we need to ensure our model instances are correctly dispatched across all the physical cores on all sockets along with enforcing memory allocation to be \"NUMA-aware\".\n\nOn Linux, NUMA's process configuration can be tuned through numactl which provides an interface to bind a process to a set of CPU cores (referred as Thread Affinity). Also, it allows tuning the memory allocation policy, making sure the memory allocated for the process is as close as possible to the cores' memory pool (referred as Explicit Memory Allocation Directives).\n\nNote: Setting both cores and memory affinities is important here. Having computations done on socket 0 and memory allocated on socket 1 would ask the system to go over the sockets shared bus to exchange memory, thus leading to an undesired overhead.\n\n### 5.4. Tuning Thread Affinity & Memory Allocation Policy\n\nNow that we have all the knobs required to control the resources' allocation of our model instances we go further and see how to effectively deploy those and see the impact on latency and throughput. Let's go gradually to get a sense of what is the impact of each command and parameter.\n\nFirst, we start by launching our inference model without any tuning, and we observe how the computations are being dispatched on CPU cores (Left).\n\n```\npython3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128\n```\n\nThen we specify the core and memory affinity through numactl using all the physical cores and only a single thread (thread 0) per core (Right):\n\n```\nnumactl -C 0-47 -m 0,1 python3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128\n```\n\nFigure 6. Linux htop command side-by-side results without & with Thread Affinity set\n\nAs you can see, without any specific tuning, PyTorch and TensorFlow dispatch the work on a single socket, using all the logical cores in that socket (both threads on 24 cores). Also, as we highlighted earlier, we do not want to leverage the SMT feature in our case, so we set the process' thread affinity to target only 1 hardware thread.\n\nNote, this is specific to this run and can vary depending on individual setups. Hence, it is recommended to check thread affinity settings for each specific use-case.\n\nLet's take sometime from here to highlight what we did with numactl:\n\n- -C 0-47 indicates to numactl what is the thread affinity (cores 0 to 47).\n\n- -m 0,1 indicates to numactl to allocate memory on both CPU sockets\n\nIf you wonder why we are binding the process to cores [0...47], you need to go back to look at the output of lscpu. From there you will find the section NUMA node0 and NUMA node1 which has the form NUMA node<X> <logical ids>\n\nIn our case, each socket is one NUMA node and there are 2 NUMA nodes. Each socket or each NUMA node has 24 physical cores and 2 hardware threads per core, so 48 logical cores. For NUMA node 0, 0-23 are hardware thread 0 and 24-47 are hardware thread 1 on the 24 physical cores in socket 0. Likewise, for NUMA node 1, 48-71 are hardware thread 0 and 72-95 are hardware thread 1 on the 24 physical cores in socket 1.\n\nAs we are targeting just 1 thread per physical core, as explained earlier, we pick only thread 0 on each core and hence logical processors 0-47. Since we are using both sockets, we need to also bind the memory allocations accordingly (0,1).\n\nPlease note that using both sockets may not always give the best results, particularly for small problem sizes. The benefit of using compute resources across both sockets might be reduced or even negated by cross-socket communication overhead.\n\n## 6. Core count scaling - Does using more cores actually improve performance?\n\nWhen thinking about possible ways to improve our model inference performances, the first rational solution might be to throw some more resources to do the same amount of work. Through the rest of this blog series, we will refer to this setup as Core Count Scaling meaning, only the number of cores used on the system to achieve the task will vary. This is also often referred as Strong Scaling in the HPC world.\n\nAt this stage, you may wonder what is the point of allocating only a subset of the cores rather than throwing all the horses at the task to achieve minimum latency.\n\nIndeed, depending on the problem-size, throwing more resources to the task might give better results. It is also possible that for small problems putting more CPU cores at work doesn't improve the final latency.\n\nIn order to illustrate this, the figure 6. below takes different problem sizes (batch_size = 1, sequence length = {32, 128, 512}) and reports the latencies with respect to the number of CPU cores used for running computations for both PyTorch and TensorFlow.\n\nLimiting the number of resources involved in computation is done by limiting the CPU cores involved in intra operations (intra here means inside an operator doing computation, also known as \"kernel\").\n\nThis is achieved through the following APIs:\n\n- PyTorch: torch.set_num_threads(x)\n\n- TensorFlow: tf.config.threading.set_intra_op_parallelism_threads(x)\n\nFigure 7. Latency measurements\n\nAs you can see, depending on the problem size, the number of threads involved in the computations has a positive impact on the latency measurements.\n\nFor small-sized problems & medium-sized problems using only one socket would give the best performance. For large-sized problems, the overhead of the cross-socket communication is covered by the computations cost, thus benefiting from using all the cores available on the both sockets.\n\n## 7. Multi-Stream Inference - Using multiple instances in parallel\n\nIf you're still reading this, you should now be in good shape to set up parallel inference workloads on CPU. Now, we are going to highlight some possibilities offered by the powerful hardware we have, and tuning the knobs described before, to scale our inference as linearly as possible.\n\nIn the following section we will explore another possible scaling solution Batch Size Scaling, but before diving into this, let's take a look at how we can leverage Linux tools in order to assign Thread Affinity allowing effective model instance parallelism.\n\nInstead of throwing more cores to the task as you would do in the core count scaling setup, now we will be using more model instances. Each instance will run independently on its own subset of the hardware resources in a truly parallel fashion on a subset of the CPU cores.\n\n### 7.1. How-to allocate multiple independent instances\n\nLet's start simple, if we want to spawn 2 instances, one on each socket with 24 cores assigned:\n\n```\nnumactl -C 0-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24\nnumactl -C 24-47 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24\n```\n\nStarting from here, each instance does not share any resource with the other, and everything is operating at maximum efficiency from a hardware perspective. The latency measurements are identical to what a single instance would achieve, but throughput is actually 2x higher as the two instances operate in a truly parallel way.\n\nWe can further increase the number of instances, lowering the number of cores assigned for each instance. Let's run 4 independent instances, each of them effectively bound to 12 CPU cores.\n\n```\nnumactl -C 0-11 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 12-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 24-35 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 36-47 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\n```\n\nThe outcomes remain the same, our 4 instances are effectively running in a truly parallel manner. The latency will be slightly higher than the example before (2x less cores being used), but the throughput will be again 2x higher.\n\n### 7.2. Smart dispatching - Allocating different model instances for different problem sizes\n\nOne another possibility offered by this setup is to have multiple instances carefully tuned for various problem sizes. With a smart dispatching approach, one can redirect incoming requests to the right configuration giving the best latency depending on the request workload.\n\n```\n# Small-sized problems (sequence length <= 32) use only 8 cores (on socket 0 - 8/24 cores used)\nnumactl -C 0-7 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=32 backend.name=pytorch backend.num_threads=8\n\n# Medium-sized problems (32 > sequence <= 384) use remaining 16 cores (on socket 0 - (8+16)/24 cores used)\nnumactl -C 8-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=16\n\n# Large sized problems (sequence >= 384) use the entire CPU (on socket 1 - 24/24 cores used)\nnumactl -C 24-37 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=384 backend.name=pytorch backend.num_threads=24\n```\n\n## 8. Batch size scaling - Improving throughput and latency with multiple parallel & independent model instances\n\nOne another very interesting direction for scaling up inference is to actually put some more model instances into the pool along with reducing the actual workload each instance receives proportionally.\n\nThis method actually changes both the size of the problem (batch size), and the resources involved in the computation (cores).\n\nTo illustrate, imagine you have a server with C CPU cores, and you want to run a workload containing B samples with S tokens. You can represent this workload as a tensor of shape [B, S], B being the size of the batch and S being the maximum sequence length within the B samples.\n\nFor all the instances (N), each of them executes on C / N cores and would receive a subset of the task [B / N, S].\n\nEach instance doesn't receive the global batch but instead, they all receive a subset of it [B / N, S] thus the name Batch Size Scaling. In order to highlight the benefits of such scaling method, the charts below reports both the latencies when scaling up model instances along with the effects on the throughput.\n\nWhen looking at the results, let's focus on the latency and the throughput aspects:\n\nOn one hand, we are taking the maximum latency over the pool of instances to reflect the time it takes to process all the samples in the batch. Putting it differently, as instances operate in a truly parallel fashion, the time it takes to gather all the batch chunks from all the instances is driven by the longest time it takes for individual instance in the pool to get their chunk done.\n\nAs you can see below on Figure 7., the actual latency gain when increasing the number of instances is really dependent of the problem size. In all cases, we can find an optimal resource allocation (batch size & number of instances) to minimize our latency but, there is no specific pattern on the number of cores to involve in the computation.\n\nAlso, it is important to notice the results might look totally different on another system (i.e. Operating System, Kernel Version, Framework version, etc.)\n\nFigure 8. sums up the best multi-instance configuration when targeting minimum latency by taking the minimum over the number of instances involved. For instance, for {batch = 8, sequence length = 128} using 4 instances (each with {batch = 2} and 12 cores) gives the best latency measurements.\n\nThe Figure 9. reports all the setups minimizing latency for both PyTorch and TensorFlow for various problem-sizes.\n\nSpoiler: There are numerous other optimizations we will discuss in a follow-up blog post which will substantially impact this chart.\n\nFigure 8. Max latency evolution with respect to number of instances for a total batch size of 8\n\nFigure 9. Optimal number of instance minimizing overall latency for a total batch size of 8\n\nOn a second hand, we observe the throughput as the sum of all the model instance executing in parallel. It allows us to visualize the scalability of the system when adding more and more instances each of them with fewer resources but also proportional workload. Here, the results show almost linear scalability and thus an optimal hardware usage.\n\nFigure 10. Sum throughput with respect to number of instances for a total batch size of 8\n\n## 9. Conclusion\n\nThrough this blog post, we covered out-of-box BERT inference performance one can expect for PyTorch and TensorFlow, from a simple PyPi install and without further tuning. It is important to highlight results provided here reflects out-of-the-box framework setup hence, they might not provide the absolute best performances. We decided to not include optimizations as part of this blog post to focus on hardware and efficiency. Optimizations will be discussed in the second part! 🚀\n\nThen, we covered and detailed the impact, and the importance of setting the thread affinity along with the trade-off between the target problem size, and the number of cores required for achieving the task. Also, it is important to define which criteria (i.e. latency vs throughput) to use when optimizing your deployment as the resulting setups might be totally different.\n\nOn a more general note, small problem sizes (short sequences and/or small batches) might require much fewer cores to achieve the best possible latency than big problems (very long sequences and/or big batches).\n\nIt is interesting to cover all these aspects when thinking about the final deployment platform as it might cut the cost of the infrastructure drastically. For instance, our 48 cores machine charges 4.848$/h whereas a smaller instances with only 8 cores lowers the cost to 0.808$/h, leading to a 6x cost reduction.\n\nLast but not least, many of the knobs discussed along this blog post can be automatically tuned through a launcher script highly inspired from the original script made by Intel and available here. The launcher script is able to automatically starts your python process(es) with the correct thread affinity, effectively splitting resources across instances along with many other performances tips! We will detail many of this tips in the second part 🧐.\n\nIn the follow-up blog post, more advanced settings and tuning techniques to decrease model latency even further will be involved, such as:\n\n- Launcher script walk-through\n\n- Tuning the memory allocation library\n\n- Using Linux's Transparent Huge Pages mechanisms\n\n- Using vendor-specific Math/Parallel libraries\n\nStay tuned! 🤗\n\n## Acknowledgments\n\n- Omry Yadan (Facebook FAIR) - Author of OmegaConf & Hydra for all the tips setting up Hydra correctly.\n\n- All Intel & Intel Labs' NLP colleagues - For the ongoing optimizations and research efforts they are putting into transformers and more generally in the NLP field.\n\n- Hugging Face colleagues - For all the comments and improvements in the reviewing process.\n\n## References\n\n- Benchmarking Transformers: PyTorch and TensorFlow\n\n- HuggingFace's Transformers: State-of-the-art Natural Language Processing\n\n- HuggingFace's Model Hub\n\n- BERT - Pre-training of Deep Bidirectional Transformers for Language Understanding (Devlin & al. 2018)\n\n- Illustrated Transformer blogpost from Jay Alammar\n\n- PyTorch - TorchScript\n\n- Google Accelerated Linear Algebra (XLA)\n\n- ONNX Runtime - Optimize and Accelerate Machine Learning Inferencing and Training\n\n- Q8BERT - Quantized 8Bit BERT (Zafrir & al. 2019)\n\n- OpenMP\n\n- Intel oneDNN\n\n- Intel® Hyper-Threading Technology - Technical User Guide\n\n- Introduction to Hyper-Threading Technology\n\n- BLAS (Basic Linear Algebra Subprogram) - Wikipedia\n\n- Optimizing Applications for NUMA",
   "summaryZh": "Hugging Face发布了关于在现代CPU上高效扩展BERT类模型推理性能系列博客的第一部分，重点探讨了硬件层面的基准测试、多核心扩展以及批处理优化。",
   "summaryGeneratedAt": "2026-09-06T03:31:09.237375Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
-      "src": "https://huggingface.co/avatars/7e2c00ed2ed8838cfb5948c384f006ea.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/7e2c00ed2ed8838cfb5948c384f006ea.svg",
-      "id": "image_78f4ffdad864e630"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/HXKKlyDzNjei5x-6w7gL2.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/HXKKlyDzNjei5x-6w7gL2.jpeg",
-      "id": "image_793be18f70e1a3fb"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/65100e27dcfa9d24c532d5a7/i64FrkFWkuGgv78YLAHXi.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/65100e27dcfa9d24c532d5a7/i64FrkFWkuGgv78YLAHXi.jpeg",
-      "id": "image_0e4866d9d7affb1a"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/orjTWFUrtB4ZD1orM8xA7.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/noauth/orjTWFUrtB4ZD1orM8xA7.jpeg",
-      "id": "image_52546e14e2b7251f"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/kHDT4YYuEb0lyAExR0K8b.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/kHDT4YYuEb0lyAExR0K8b.png",
-      "id": "image_65c7d8b6016ca935"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1583858935715-5e67c47c100906368940747e.jpeg",
-      "alt": "Morgan Funtowicz's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1583858935715-5e67c47c100906368940747e.jpeg",
-      "id": "image_fd05c09fb3f20cc9"
-    },
-    {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/pytorch_vs_tf_oob.svg",
-      "alt": "pytorch versus tensorflow out of the box",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/pytorch_vs_tf_oob.svg",
+      "alt": "pytorch versus tensorflow out of the box",
       "id": "image_9732cbfcc45c9b45"
     },
     {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/pytorch_vs_tf_oob_big_batch.svg",
-      "alt": "pytorch versus tensorflow out of the box bigger batch sizes",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/pytorch_vs_tf_oob_big_batch.svg",
+      "alt": "pytorch versus tensorflow out of the box bigger batch sizes",
       "id": "image_6dc8629c431c922e"
     },
     {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/hyper_threading_explained.png",
-      "alt": "Intel Hyper Threading technology",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/hyper_threading_explained.png",
+      "alt": "Intel Hyper Threading technology",
       "id": "image_2d7f896d117b349c"
     },
     {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/UMA_NUMA.png",
-      "alt": "Non-Uniform Memory Access and Uniform Memory Access architectures",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/UMA_NUMA.png",
+      "alt": "Non-Uniform Memory Access and Uniform Memory Access architectures",
       "id": "image_c5e9117be976a191"
     },
     {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/numa_combined.svg",
-      "alt": "htop CPU usage without and with numactl thread affinity set",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/numa_combined.svg",
+      "alt": "htop CPU usage without and with numactl thread affinity set",
       "id": "image_a4d0e9a0dd8d62d2"
     },
     {
       "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/core_count_scaling.svg",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/core_count_scaling.svg",
+      "alt": "",
       "id": "image_403b030dbc2b72ac"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_scaling_exp.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_scaling_exp.svg",
+      "alt": "Batch scaling experiment for PyTorch and Tensorflow",
+      "id": "image_a6dc798c465447f6"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_size_scaling_latency_optimal_nb_instances.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_size_scaling_latency_optimal_nb_instances.svg",
+      "alt": "Optimal number of instance minimizing overall latency for a total batch size of 8",
+      "id": "image_2b3f8e9d463b9b73"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_scaling_exp_throughput.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/21_bert_cpu_scaling_part_1/imgs/batch_scaling_exp_throughput.svg",
+      "alt": "Batch scaling experiment for PyTorch and Tensorflow",
+      "id": "image_2a7d12aa0a2156c4"
     }
   ],
   "videos": [],
@@ -103,121 +85,67 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:21.853699Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "9d8a728d54d394bd994063c1b067e304f1de06312f45520e06fce68a8f2a3e86",
+  "mediaLayoutBodyHash": "bc375599b85bb344d81a22b1fb8d662e05be76204234efcfb72c3eacb506025a",
   "mediaLayout": [
-    {
-      "mediaId": "image_78f4ffdad864e630",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_793be18f70e1a3fb",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_0e4866d9d7affb1a",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_52546e14e2b7251f",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
-    {
-      "mediaId": "image_65c7d8b6016ca935",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 6
-    },
-    {
-      "mediaId": "image_fd05c09fb3f20cc9",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 7
-    },
     {
       "mediaId": "image_9732cbfcc45c9b45",
       "type": "image",
-      "afterBlockId": "b0035",
-      "order": 41
+      "afterBlockId": "b0027",
+      "order": 0
     },
     {
       "mediaId": "image_6dc8629c431c922e",
       "type": "image",
-      "afterBlockId": "b0036",
-      "order": 43
+      "afterBlockId": "b0028",
+      "order": 1
     },
     {
       "mediaId": "image_2d7f896d117b349c",
       "type": "image",
-      "afterBlockId": "b0052",
-      "order": 60
+      "afterBlockId": "b0041",
+      "order": 2
     },
     {
       "mediaId": "image_c5e9117be976a191",
       "type": "image",
-      "afterBlockId": "b0065",
-      "order": 75
+      "afterBlockId": "b0050",
+      "order": 3
     },
     {
       "mediaId": "image_a4d0e9a0dd8d62d2",
       "type": "image",
       "afterBlockId": "c0003",
-      "order": 88
+      "order": 4
     },
     {
       "mediaId": "image_403b030dbc2b72ac",
       "type": "image",
-      "afterBlockId": "b0097",
-      "order": 111
+      "afterBlockId": "b0077",
+      "order": 5
     },
     {
-      "mediaId": "image_fd05c09fb3f20cc9",
+      "mediaId": "image_a6dc798c465447f6",
       "type": "image",
-      "afterBlockId": "b0170",
-      "order": 188
+      "afterBlockId": "b0104",
+      "order": 6
     },
     {
-      "mediaId": "image_78f4ffdad864e630",
+      "mediaId": "image_2b3f8e9d463b9b73",
       "type": "image",
-      "afterBlockId": "b0173",
-      "order": 192
+      "afterBlockId": "b0105",
+      "order": 7
     },
     {
-      "mediaId": "image_793be18f70e1a3fb",
+      "mediaId": "image_2a7d12aa0a2156c4",
       "type": "image",
-      "afterBlockId": "b0173",
-      "order": 193
-    },
-    {
-      "mediaId": "image_0e4866d9d7affb1a",
-      "type": "image",
-      "afterBlockId": "b0173",
-      "order": 194
-    },
-    {
-      "mediaId": "image_52546e14e2b7251f",
-      "type": "image",
-      "afterBlockId": "b0173",
-      "order": 195
-    },
-    {
-      "mediaId": "image_65c7d8b6016ca935",
-      "type": "image",
-      "afterBlockId": "b0173",
-      "order": 196
+      "afterBlockId": "b0107",
+      "order": 8
     }
   ],
   "mediaLayoutUnplaced": [],
-  "mediaLayoutMatched": 18,
+  "mediaLayoutMatched": 9,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-09-26T16:47:29.461115Z",
+  "mediaLayoutCheckedAt": "2026-10-05T16:26:21.911557Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -249,5 +177,1490 @@
     "summaryZh": "Hugging Face发布了关于在现代CPU上高效扩展BERT类模型推理性能系列博客的第一部分，重点探讨了硬件层面的基准测试、多核心扩展以及批处理优化。",
     "glossary": [],
     "duplicateKey": "hf-bert-cpu-inference-part1"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "1. Context and Motivations",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Back in October 2019, my colleague Lysandre Debut published a comprehensive (at the time) inference performance benchmarking blog (1).",
+      "spans": [
+        {
+          "start": 76,
+          "end": 89,
+          "kind": "em"
+        },
+        {
+          "start": 90,
+          "end": 133,
+          "kind": "a",
+          "href": "https://medium.com/huggingface/benchmarking-transformers-pytorch-and-tensorflow-e2917fb891c2"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Since then, 🤗 transformers (2) welcomed a tremendous number of new architectures and thousands of new models were added to the 🤗 hub (3) which now counts more than 9,000 of them as of first quarter of 2021.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 30,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers"
+        },
+        {
+          "start": 127,
+          "end": 136,
+          "kind": "a",
+          "href": "https://huggingface.co/models"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "As the NLP landscape keeps trending towards more and more BERT-like models being used in production, it remains challenging to efficiently deploy and run these architectures at scale. This is why we recently introduced our 🤗 Inference API: to let you focus on building value for your users and customers, rather than digging into all the highly technical aspects of running such models.",
+      "spans": [
+        {
+          "start": 223,
+          "end": 238,
+          "kind": "a",
+          "href": "https://api-inference.huggingface.co/docs/python/html/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "This blog post is the first part of a series which will cover most of the hardware and software optimizations to better leverage CPUs for BERT model inference.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "For this initial blog post, we will cover the hardware part:",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Setting up a baseline - Out of the box results",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Practical & technical considerations when leveraging modern CPUs for CPU-bound tasks",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Core count scaling - Does increasing the number of cores actually give better performance?",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Batch size scaling - Increasing throughput with multiple parallel & independent model instances",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "We decided to focus on the most famous Transformer model architecture, BERT (Delvin & al. 2018) (4). While we focus this blog post on BERT-like models to keep the article concise, all the described techniques can be applied to any architecture on the Hugging Face model hub. In this blog post we will not describe in detail the Transformer architecture - to learn about that I can't recommend enough the Illustrated Transformer blogpost from Jay Alammar (5).",
+      "spans": [
+        {
+          "start": 71,
+          "end": 99,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1810.04805v1"
+        },
+        {
+          "start": 404,
+          "end": 457,
+          "kind": "a",
+          "href": "https://jalammar.github.io/illustrated-transformer/"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Today's goals are to give you an idea of where we are from an Open Source perspective using BERT-like models for inference on PyTorch and TensorFlow, and also what you can easily leverage to speedup inference.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "2. Benchmarking methodology",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "When it comes to leveraging BERT-like models from Hugging Face's model hub, there are many knobs which can be tuned to make things faster. Also, in order to quantify what \"faster\" means, we will rely on widely adopted metrics:",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Latency: Time it takes for a single execution of the model (i.e. forward call)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Throughput: Number of executions performed in a fixed amount of time",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "These two metrics will help us understand the benefits and tradeoffs along this blog post.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "The benchmarking methodology was reimplemented from scratch in order to integrate the latest features provided by transformers and also to let the community run and share benchmarks in an hopefully easier way. The whole framework is now based on Facebook AI & Research's Hydra configuration library allowing us to easily report and track all the items involved while running the benchmark, hence increasing the overall reproducibility. You can find the whole structure of the project here",
+      "spans": [
+        {
+          "start": 188,
+          "end": 204,
+          "kind": "strong"
+        },
+        {
+          "start": 246,
+          "end": 298,
+          "kind": "a",
+          "href": "https://hydra.cc/"
+        },
+        {
+          "start": 484,
+          "end": 488,
+          "kind": "a",
+          "href": "https://github.com/huggingface/tune"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "On the 2021 version, we kept the ability to run inference workloads through PyTorch and Tensorflow as in the previous blog (1) along with their traced counterpart TorchScript (6), Google Accelerated Linear Algebra (XLA) (7). Also, we decided to include support for ONNX Runtime (8) as it provides many optimizations specifically targeting transformers based models which makes it a strong candidate to consider when discussing performance.",
+      "spans": [
+        {
+          "start": 123,
+          "end": 126,
+          "kind": "a",
+          "href": "https://medium.com/huggingface/benchmarking-transformers-pytorch-and-tensorflow-e2917fb891c2"
+        },
+        {
+          "start": 163,
+          "end": 178,
+          "kind": "a",
+          "href": "https://pytorch.org/docs/stable/jit.html"
+        },
+        {
+          "start": 180,
+          "end": 223,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/xla"
+        },
+        {
+          "start": 265,
+          "end": 281,
+          "kind": "a",
+          "href": "https://www.onnxruntime.ai/"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Last but not least, this new unified benchmarking environment will allow us to easily run inference for different scenarios such as Quantized Models (Zafrir & al.) (9) using less precise number representations (float16, int8, int4). This method known as quantization has seen an increased adoption among all major hardware providers. In the near future, we would like to integrate additional methods we are actively working on at Hugging Face, namely Distillation, Pruning & Sparsificaton.",
+      "spans": [
+        {
+          "start": 132,
+          "end": 167,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1910.06188"
+        },
+        {
+          "start": 211,
+          "end": 218,
+          "kind": "code"
+        },
+        {
+          "start": 220,
+          "end": 224,
+          "kind": "code"
+        },
+        {
+          "start": 226,
+          "end": 230,
+          "kind": "code"
+        },
+        {
+          "start": 254,
+          "end": 266,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "3. Baselines",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "All the results below were run on Amazon Web Services (AWS) c5.metal instance leveraging an Intel Xeon Platinum 8275 CPU (48 cores/96 threads). The choice of this instance provides all the useful CPU features to speedup Deep Learning workloads such as:",
+      "spans": [
+        {
+          "start": 34,
+          "end": 77,
+          "kind": "a",
+          "href": "https://aws.amazon.com/ec2/instance-types/c5"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "AVX512 instructions set (which might not be leveraged out-of-the-box by the various frameworks)",
+      "spans": [
+        {
+          "start": 25,
+          "end": 94,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Intel Deep Learning Boost (also known as Vector Neural Network Instruction - VNNI) which provides specialized CPU instructions for running quantized networks (using int8 data type)",
+      "spans": [
+        {
+          "start": 159,
+          "end": 179,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "The choice of using metal instance is to avoid any virtualization issue which can arise when using cloud providers. This gives us full control of the hardware, especially while targeting the NUMA (Non-Unified Memory Architecture) controller, which we will cover later in this post.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 25,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "The operating system was Ubuntu 20.04 (LTS) and all the experiments were conducted using Hugging Face transformers version 4.5.0, PyTorch 1.8.1 & Google TensorFlow 2.4.0",
+      "spans": [
+        {
+          "start": 0,
+          "end": 169,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "4. Out of the box results",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Figure 1. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Figure 2. PyTorch (1.8.1) vs Google TensorFlow (2.4.1) out of the box - (Bigger Batch Size)",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Straigh to the point, out-of-the-box, PyTorch shows better inference results over TensorFlow for all the configurations tested here. It is important to note the results out-of-the-box might not reflect the \"optimal\" setup for both PyTorch and TensorFlow and thus it can look deceiving here.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "One possible way to explain such difference between the two frameworks might be the underlying technology to execute parallel sections within operators. PyTorch internally uses OpenMP (10) along with Intel MKL (now oneDNN) (11) for efficient linear algebra computations whereas TensorFlow relies on Eigen and its own threading implementation.",
+      "spans": [
+        {
+          "start": 177,
+          "end": 188,
+          "kind": "a",
+          "href": "https://www.openmp.org/"
+        },
+        {
+          "start": 200,
+          "end": 227,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/documentation/oneapi-programming-guide/top/api-based-programming/intel-oneapi-deep-neural-network-library-onednn.html"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "5. Scaling BERT Inference to increase overall throughput on modern CPU",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "5.1. Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "There are multiple ways to improve the latency and throughput for tasks such as BERT inference. Improvements and tuning can be performed at various levels from enabling Operating System features, swapping dependent libraries with more performant ones, carefully tuning framework properties and, last but not least, using parallelization logic leveraging all the cores on the CPU(s).",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "For the remainder of this blog post we will focus on the latter, also known as Multiple Inference Stream.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 104,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "The idea is simple: Allocate multiple instances of the same model and assign the execution of each instance to a dedicated, non-overlapping subset of the CPU cores in order to have truly parallel instances.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 47,
+          "kind": "strong"
+        },
+        {
+          "start": 113,
+          "end": 163,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "5.2. Cores and Threads on Modern CPUs",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "On our way towards optimizing CPU inference for better usage of the CPU cores you might have already seen -at least for the past 20 years- modern CPUs specifications report \"cores\" and \"hardware threads\" or \"physical\" and \"logical\" numbers. These notions refer to a mechanism called Simultaneous Multi-Threading (SMT) or Hyper-Threading on Intel's platforms.",
+      "spans": [
+        {
+          "start": 107,
+          "end": 137,
+          "kind": "em"
+        },
+        {
+          "start": 283,
+          "end": 311,
+          "kind": "strong"
+        },
+        {
+          "start": 321,
+          "end": 336,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "To illustrate this, imagine two tasks A and B, executing in parallel, each on its own software thread. At some point, there is a high probability these two tasks will have to wait for some resources to be fetched from main memory, SSD, HDD or even the network. If the threads are scheduled on different physical cores, with no hyper-threading, during these periods the core executing the task is in an Idle state waiting for the resources to arrive, and effectively doing nothing... and hence not getting fully utilized",
+      "spans": [
+        {
+          "start": 38,
+          "end": 39,
+          "kind": "strong"
+        },
+        {
+          "start": 44,
+          "end": 45,
+          "kind": "strong"
+        },
+        {
+          "start": 402,
+          "end": 406,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Now, with SMT, the two software threads for task A and B can be scheduled on the same physical core, such that their execution is interleaved on that physical core:",
+      "spans": [
+        {
+          "start": 10,
+          "end": 13,
+          "kind": "strong"
+        },
+        {
+          "start": 19,
+          "end": 56,
+          "kind": "strong"
+        },
+        {
+          "start": 86,
+          "end": 99,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Task A and Task B will execute simultaneously on the physical core and when one task is halted, the other task can still continue execution on the core thereby increasing the utilization of that core.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Figure 3. Illustration of Intel Hyper Threading technology (SMT)",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "The figure 3. above simplifies the situation by assuming single core setup. If you want some more details on how SMT works on multi-cores CPUs, please refer to these two articles with very deep technical explanations of the behavior:",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Intel® Hyper-Threading Technology - Technical User Guide (12)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 61,
+          "kind": "a",
+          "href": "http://www.cslab.ece.ntua.gr/courses/advcomparch/2007/material/readings/Intel%20Hyper-Threading%20Technology.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Introduction to Hyper-Threading Technology (13)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 47,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/articles/introduction-to-hyper-threading-technology.html"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Back to our model inference workload... If you think about it, in a perfect world with a fully optimized setup, computations take the majority of time. In this context, using the logical cores shouldn't bring us any performance benefit because both logical cores (hardware threads) compete for the core’s execution resources. As a result, the tasks being a majority of general matrix multiplications (gemms (14)), they are inherently CPU bounds and does not benefits from SMT.",
+      "spans": [
+        {
+          "start": 401,
+          "end": 411,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Basic_Linear_Algebra_Subprograms#Level_3"
+        },
+        {
+          "start": 401,
+          "end": 411,
+          "kind": "em"
+        },
+        {
+          "start": 449,
+          "end": 466,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "5.3. Leveraging Multi-Socket servers and CPU affinity",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Nowadays servers bring many cores, some of them even support multi-socket setups (i.e. multiple CPUs on the motherboard). On Linux, the command lscpu reports all the specifications and topology of the CPUs present on the system:",
+      "spans": [
+        {
+          "start": 82,
+          "end": 119,
+          "kind": "em"
+        },
+        {
+          "start": 144,
+          "end": 149,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "In our case we have a machine with 2 sockets, each socket providing 24 physical cores with 2 threads per cores (SMT). Another interesting characteristic is the notion of NUMA node (0, 1) which represents how cores and memory are being mapped on the system.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 44,
+          "kind": "strong"
+        },
+        {
+          "start": 68,
+          "end": 85,
+          "kind": "strong"
+        },
+        {
+          "start": 91,
+          "end": 110,
+          "kind": "strong"
+        },
+        {
+          "start": 170,
+          "end": 174,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Non-Uniform Memory Access (NUMA) is the opposite of Uniform Memory Access (UMA) where the whole memory pool is accessible by all the cores through a single unified bus between sockets and the main memory. NUMA on the other hand splits the memory pool and each CPU socket is responsible to address a subset of the memory, reducing the congestion on the bus.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 31,
+          "kind": "strong"
+        },
+        {
+          "start": 75,
+          "end": 78,
+          "kind": "strong"
+        },
+        {
+          "start": 205,
+          "end": 209,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Figure 5. Difference illustration of UMA and NUMA architectures (source (15))",
+      "spans": [
+        {
+          "start": 64,
+          "end": 77,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/articles/optimizing-applications-for-numa.html"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "In order to fully utilize the potential of such a beefy machine, we need to ensure our model instances are correctly dispatched across all the physical cores on all sockets along with enforcing memory allocation to be \"NUMA-aware\".",
+      "spans": [
+        {
+          "start": 143,
+          "end": 151,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "On Linux, NUMA's process configuration can be tuned through numactl which provides an interface to bind a process to a set of CPU cores (referred as Thread Affinity). Also, it allows tuning the memory allocation policy, making sure the memory allocated for the process is as close as possible to the cores' memory pool (referred as Explicit Memory Allocation Directives).",
+      "spans": [
+        {
+          "start": 60,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 60,
+          "end": 67,
+          "kind": "a",
+          "href": "https://linux.die.net/man/8/numactl"
+        },
+        {
+          "start": 149,
+          "end": 164,
+          "kind": "strong"
+        },
+        {
+          "start": 332,
+          "end": 369,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Note: Setting both cores and memory affinities is important here. Having computations done on socket 0 and memory allocated on socket 1 would ask the system to go over the sockets shared bus to exchange memory, thus leading to an undesired overhead.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 249,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "5.4. Tuning Thread Affinity & Memory Allocation Policy",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Now that we have all the knobs required to control the resources' allocation of our model instances we go further and see how to effectively deploy those and see the impact on latency and throughput. Let's go gradually to get a sense of what is the impact of each command and parameter.",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "First, we start by launching our inference model without any tuning, and we observe how the computations are being dispatched on CPU cores (Left).",
+      "spans": [
+        {
+          "start": 140,
+          "end": 144,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Then we specify the core and memory affinity through numactl using all the physical cores and only a single thread (thread 0) per core (Right):",
+      "spans": [
+        {
+          "start": 53,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 83,
+          "kind": "strong"
+        },
+        {
+          "start": 136,
+          "end": 141,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Figure 6. Linux htop command side-by-side results without & with Thread Affinity set",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "As you can see, without any specific tuning, PyTorch and TensorFlow dispatch the work on a single socket, using all the logical cores in that socket (both threads on 24 cores). Also, as we highlighted earlier, we do not want to leverage the SMT feature in our case, so we set the process' thread affinity to target only 1 hardware thread.",
+      "spans": [
+        {
+          "start": 241,
+          "end": 244,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Note, this is specific to this run and can vary depending on individual setups. Hence, it is recommended to check thread affinity settings for each specific use-case.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 166,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Let's take sometime from here to highlight what we did with numactl:",
+      "spans": [
+        {
+          "start": 60,
+          "end": 67,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "-C 0-47 indicates to numactl what is the thread affinity (cores 0 to 47).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 21,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "-m 0,1 indicates to numactl to allocate memory on both CPU sockets",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "If you wonder why we are binding the process to cores [0...47], you need to go back to look at the output of lscpu. From there you will find the section NUMA node0 and NUMA node1 which has the form NUMA node<X> <logical ids>",
+      "spans": [
+        {
+          "start": 109,
+          "end": 114,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 163,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 178,
+          "kind": "code"
+        },
+        {
+          "start": 198,
+          "end": 224,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "In our case, each socket is one NUMA node and there are 2 NUMA nodes. Each socket or each NUMA node has 24 physical cores and 2 hardware threads per core, so 48 logical cores. For NUMA node 0, 0-23 are hardware thread 0 and 24-47 are hardware thread 1 on the 24 physical cores in socket 0. Likewise, for NUMA node 1, 48-71 are hardware thread 0 and 72-95 are hardware thread 1 on the 24 physical cores in socket 1.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "As we are targeting just 1 thread per physical core, as explained earlier, we pick only thread 0 on each core and hence logical processors 0-47. Since we are using both sockets, we need to also bind the memory allocations accordingly (0,1).",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Please note that using both sockets may not always give the best results, particularly for small problem sizes. The benefit of using compute resources across both sockets might be reduced or even negated by cross-socket communication overhead.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 243,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "6. Core count scaling - Does using more cores actually improve performance?",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "When thinking about possible ways to improve our model inference performances, the first rational solution might be to throw some more resources to do the same amount of work. Through the rest of this blog series, we will refer to this setup as Core Count Scaling meaning, only the number of cores used on the system to achieve the task will vary. This is also often referred as Strong Scaling in the HPC world.",
+      "spans": [
+        {
+          "start": 245,
+          "end": 263,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "At this stage, you may wonder what is the point of allocating only a subset of the cores rather than throwing all the horses at the task to achieve minimum latency.",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "Indeed, depending on the problem-size, throwing more resources to the task might give better results. It is also possible that for small problems putting more CPU cores at work doesn't improve the final latency.",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "In order to illustrate this, the figure 6. below takes different problem sizes (batch_size = 1, sequence length = {32, 128, 512}) and reports the latencies with respect to the number of CPU cores used for running computations for both PyTorch and TensorFlow.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 128,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "Limiting the number of resources involved in computation is done by limiting the CPU cores involved in intra operations (intra here means inside an operator doing computation, also known as \"kernel\").",
+      "spans": [
+        {
+          "start": 103,
+          "end": 108,
+          "kind": "strong"
+        },
+        {
+          "start": 121,
+          "end": 126,
+          "kind": "strong"
+        },
+        {
+          "start": 121,
+          "end": 198,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "This is achieved through the following APIs:",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "PyTorch: torch.set_num_threads(x)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 33,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0077",
+      "source": "TensorFlow: tf.config.threading.set_intra_op_parallelism_threads(x)",
+      "spans": [
+        {
+          "start": 12,
+          "end": 67,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "Figure 7. Latency measurements",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "As you can see, depending on the problem size, the number of threads involved in the computations has a positive impact on the latency measurements.",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "For small-sized problems & medium-sized problems using only one socket would give the best performance. For large-sized problems, the overhead of the cross-socket communication is covered by the computations cost, thus benefiting from using all the cores available on the both sockets.",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "7. Multi-Stream Inference - Using multiple instances in parallel",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "If you're still reading this, you should now be in good shape to set up parallel inference workloads on CPU. Now, we are going to highlight some possibilities offered by the powerful hardware we have, and tuning the knobs described before, to scale our inference as linearly as possible.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "In the following section we will explore another possible scaling solution Batch Size Scaling, but before diving into this, let's take a look at how we can leverage Linux tools in order to assign Thread Affinity allowing effective model instance parallelism.",
+      "spans": [
+        {
+          "start": 75,
+          "end": 93,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "Instead of throwing more cores to the task as you would do in the core count scaling setup, now we will be using more model instances. Each instance will run independently on its own subset of the hardware resources in a truly parallel fashion on a subset of the CPU cores.",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "7.1. How-to allocate multiple independent instances",
+      "spans": []
+    },
+    {
+      "id": "b0086",
+      "source": "Let's start simple, if we want to spawn 2 instances, one on each socket with 24 cores assigned:",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Starting from here, each instance does not share any resource with the other, and everything is operating at maximum efficiency from a hardware perspective. The latency measurements are identical to what a single instance would achieve, but throughput is actually 2x higher as the two instances operate in a truly parallel way.",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "We can further increase the number of instances, lowering the number of cores assigned for each instance. Let's run 4 independent instances, each of them effectively bound to 12 CPU cores.",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "The outcomes remain the same, our 4 instances are effectively running in a truly parallel manner. The latency will be slightly higher than the example before (2x less cores being used), but the throughput will be again 2x higher.",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "7.2. Smart dispatching - Allocating different model instances for different problem sizes",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "One another possibility offered by this setup is to have multiple instances carefully tuned for various problem sizes. With a smart dispatching approach, one can redirect incoming requests to the right configuration giving the best latency depending on the request workload.",
+      "spans": []
+    },
+    {
+      "id": "b0092",
+      "source": "8. Batch size scaling - Improving throughput and latency with multiple parallel & independent model instances",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "One another very interesting direction for scaling up inference is to actually put some more model instances into the pool along with reducing the actual workload each instance receives proportionally.",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "This method actually changes both the size of the problem (batch size), and the resources involved in the computation (cores).",
+      "spans": [
+        {
+          "start": 59,
+          "end": 69,
+          "kind": "em"
+        },
+        {
+          "start": 119,
+          "end": 124,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0095",
+      "source": "To illustrate, imagine you have a server with C CPU cores, and you want to run a workload containing B samples with S tokens. You can represent this workload as a tensor of shape [B, S], B being the size of the batch and S being the maximum sequence length within the B samples.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 179,
+          "end": 185,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0096",
+      "source": "For all the instances (N), each of them executes on C / N cores and would receive a subset of the task [B / N, S].",
+      "spans": [
+        {
+          "start": 23,
+          "end": 24,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 57,
+          "kind": "code"
+        },
+        {
+          "start": 103,
+          "end": 113,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "Each instance doesn't receive the global batch but instead, they all receive a subset of it [B / N, S] thus the name Batch Size Scaling. In order to highlight the benefits of such scaling method, the charts below reports both the latencies when scaling up model instances along with the effects on the throughput.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 135,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "When looking at the results, let's focus on the latency and the throughput aspects:",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "On one hand, we are taking the maximum latency over the pool of instances to reflect the time it takes to process all the samples in the batch. Putting it differently, as instances operate in a truly parallel fashion, the time it takes to gather all the batch chunks from all the instances is driven by the longest time it takes for individual instance in the pool to get their chunk done.",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "As you can see below on Figure 7., the actual latency gain when increasing the number of instances is really dependent of the problem size. In all cases, we can find an optimal resource allocation (batch size & number of instances) to minimize our latency but, there is no specific pattern on the number of cores to involve in the computation.",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "Also, it is important to notice the results might look totally different on another system (i.e. Operating System, Kernel Version, Framework version, etc.)",
+      "spans": [
+        {
+          "start": 91,
+          "end": 155,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "Figure 8. sums up the best multi-instance configuration when targeting minimum latency by taking the minimum over the number of instances involved. For instance, for {batch = 8, sequence length = 128} using 4 instances (each with {batch = 2} and 12 cores) gives the best latency measurements.",
+      "spans": [
+        {
+          "start": 166,
+          "end": 200,
+          "kind": "code"
+        },
+        {
+          "start": 230,
+          "end": 241,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0103",
+      "source": "The Figure 9. reports all the setups minimizing latency for both PyTorch and TensorFlow for various problem-sizes.",
+      "spans": []
+    },
+    {
+      "id": "b0104",
+      "source": "Spoiler: There are numerous other optimizations we will discuss in a follow-up blog post which will substantially impact this chart.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 132,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0105",
+      "source": "Figure 8. Max latency evolution with respect to number of instances for a total batch size of 8",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "Figure 9. Optimal number of instance minimizing overall latency for a total batch size of 8",
+      "spans": []
+    },
+    {
+      "id": "b0107",
+      "source": "On a second hand, we observe the throughput as the sum of all the model instance executing in parallel. It allows us to visualize the scalability of the system when adding more and more instances each of them with fewer resources but also proportional workload. Here, the results show almost linear scalability and thus an optimal hardware usage.",
+      "spans": []
+    },
+    {
+      "id": "b0108",
+      "source": "Figure 10. Sum throughput with respect to number of instances for a total batch size of 8",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "9. Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0110",
+      "source": "Through this blog post, we covered out-of-box BERT inference performance one can expect for PyTorch and TensorFlow, from a simple PyPi install and without further tuning. It is important to highlight results provided here reflects out-of-the-box framework setup hence, they might not provide the absolute best performances. We decided to not include optimizations as part of this blog post to focus on hardware and efficiency. Optimizations will be discussed in the second part! 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "Then, we covered and detailed the impact, and the importance of setting the thread affinity along with the trade-off between the target problem size, and the number of cores required for achieving the task. Also, it is important to define which criteria (i.e. latency vs throughput) to use when optimizing your deployment as the resulting setups might be totally different.",
+      "spans": [
+        {
+          "start": 239,
+          "end": 253,
+          "kind": "strong"
+        },
+        {
+          "start": 254,
+          "end": 282,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0112",
+      "source": "On a more general note, small problem sizes (short sequences and/or small batches) might require much fewer cores to achieve the best possible latency than big problems (very long sequences and/or big batches).",
+      "spans": [
+        {
+          "start": 45,
+          "end": 81,
+          "kind": "em"
+        },
+        {
+          "start": 170,
+          "end": 208,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0113",
+      "source": "It is interesting to cover all these aspects when thinking about the final deployment platform as it might cut the cost of the infrastructure drastically. For instance, our 48 cores machine charges 4.848$/h whereas a smaller instances with only 8 cores lowers the cost to 0.808$/h, leading to a 6x cost reduction.",
+      "spans": [
+        {
+          "start": 198,
+          "end": 206,
+          "kind": "strong"
+        },
+        {
+          "start": 272,
+          "end": 280,
+          "kind": "strong"
+        },
+        {
+          "start": 295,
+          "end": 312,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "Last but not least, many of the knobs discussed along this blog post can be automatically tuned through a launcher script highly inspired from the original script made by Intel and available here. The launcher script is able to automatically starts your python process(es) with the correct thread affinity, effectively splitting resources across instances along with many other performances tips! We will detail many of this tips in the second part 🧐.",
+      "spans": [
+        {
+          "start": 106,
+          "end": 121,
+          "kind": "a",
+          "href": "https://github.com/huggingface/tune/blob/main/launcher.py"
+        },
+        {
+          "start": 191,
+          "end": 195,
+          "kind": "a",
+          "href": "https://github.com/intel/intel-extension-for-pytorch/blob/master/intel_pytorch_extension_py/launch.py"
+        }
+      ]
+    },
+    {
+      "id": "b0115",
+      "source": "In the follow-up blog post, more advanced settings and tuning techniques to decrease model latency even further will be involved, such as:",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "Launcher script walk-through",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "Tuning the memory allocation library",
+      "spans": []
+    },
+    {
+      "id": "b0118",
+      "source": "Using Linux's Transparent Huge Pages mechanisms",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "Using vendor-specific Math/Parallel libraries",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Stay tuned! 🤗",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "Acknowledgments",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "Omry Yadan (Facebook FAIR) - Author of OmegaConf & Hydra for all the tips setting up Hydra correctly.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/omry"
+        },
+        {
+          "start": 39,
+          "end": 48,
+          "kind": "a",
+          "href": "https://github.com/omry/omegaconf"
+        },
+        {
+          "start": 51,
+          "end": 56,
+          "kind": "a",
+          "href": "https://github.com/facebookresearch/hydra"
+        }
+      ]
+    },
+    {
+      "id": "b0123",
+      "source": "All Intel & Intel Labs' NLP colleagues - For the ongoing optimizations and research efforts they are putting into transformers and more generally in the NLP field.",
+      "spans": []
+    },
+    {
+      "id": "b0124",
+      "source": "Hugging Face colleagues - For all the comments and improvements in the reviewing process.",
+      "spans": []
+    },
+    {
+      "id": "b0125",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0126",
+      "source": "Benchmarking Transformers: PyTorch and TensorFlow",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://medium.com/huggingface/benchmarking-transformers-pytorch-and-tensorflow-e2917fb891c2"
+        }
+      ]
+    },
+    {
+      "id": "b0127",
+      "source": "HuggingFace's Transformers: State-of-the-art Natural Language Processing",
+      "spans": [
+        {
+          "start": 0,
+          "end": 72,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1910.03771v2"
+        }
+      ]
+    },
+    {
+      "id": "b0128",
+      "source": "HuggingFace's Model Hub",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/models"
+        }
+      ]
+    },
+    {
+      "id": "b0129",
+      "source": "BERT - Pre-training of Deep Bidirectional Transformers for Language Understanding (Devlin & al. 2018)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 101,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1810.04805v1"
+        }
+      ]
+    },
+    {
+      "id": "b0130",
+      "source": "Illustrated Transformer blogpost from Jay Alammar",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://jalammar.github.io/illustrated-transformer/"
+        }
+      ]
+    },
+    {
+      "id": "b0131",
+      "source": "PyTorch - TorchScript",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "a",
+          "href": "https://pytorch.org/docs/stable/jit.html"
+        }
+      ]
+    },
+    {
+      "id": "b0132",
+      "source": "Google Accelerated Linear Algebra (XLA)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "a",
+          "href": "https://www.tensorflow.org/xla"
+        }
+      ]
+    },
+    {
+      "id": "b0133",
+      "source": "ONNX Runtime - Optimize and Accelerate Machine Learning Inferencing and Training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 80,
+          "kind": "a",
+          "href": "https://www.onnxruntime.ai/"
+        }
+      ]
+    },
+    {
+      "id": "b0134",
+      "source": "Q8BERT - Quantized 8Bit BERT (Zafrir & al. 2019)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/1910.06188"
+        }
+      ]
+    },
+    {
+      "id": "b0135",
+      "source": "OpenMP",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "a",
+          "href": "https://www.openmp.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0136",
+      "source": "Intel oneDNN",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/documentation/oneapi-programming-guide/top/api-based-programming/intel-oneapi-deep-neural-network-library-onednn.html"
+        }
+      ]
+    },
+    {
+      "id": "b0137",
+      "source": "Intel® Hyper-Threading Technology - Technical User Guide",
+      "spans": [
+        {
+          "start": 0,
+          "end": 56,
+          "kind": "a",
+          "href": "http://www.cslab.ece.ntua.gr/courses/advcomparch/2007/material/readings/Intel%20Hyper-Threading%20Technology.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0138",
+      "source": "Introduction to Hyper-Threading Technology",
+      "spans": [
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/articles/introduction-to-hyper-threading-technology.html"
+        }
+      ]
+    },
+    {
+      "id": "b0139",
+      "source": "BLAS (Basic Linear Algebra Subprogram) - Wikipedia",
+      "spans": [
+        {
+          "start": 0,
+          "end": 50,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Basic_Linear_Algebra_Subprograms#Level_3"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "Optimizing Applications for NUMA",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://software.intel.com/content/www/us/en/develop/articles/optimizing-applications-for-numa.html"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "bc375599b85bb344d81a22b1fb8d662e05be76204234efcfb72c3eacb506025a",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "ubuntu@some-ec2-machine:~$ lscpu\nArchitecture:                    x86_64\nCPU op-mode(s):                  32-bit, 64-bit\nByte Order:                      Little Endian\nAddress sizes:                   46 bits physical, 48 bits virtual\nCPU(s):                          96\nOn-line CPU(s) list:             0-95\nThread(s) per core:              2\nCore(s) per socket:              24\nSocket(s):                       2\nNUMA node(s):                    2\nVendor ID:                       GenuineIntel\nCPU family:                      6\nModel:                           85\nModel name:                      Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz\nStepping:                        7\nCPU MHz:                         1200.577\nCPU max MHz:                     3900.0000\nCPU min MHz:                     1200.0000\nBogoMIPS:                        6000.00\nVirtualization:                  VT-x\nL1d cache:                       1.5 MiB\nL1i cache:                       1.5 MiB\nL2 cache:                        48 MiB\nL3 cache:                        71.5 MiB\nNUMA node0 CPU(s):               0-23,48-71\nNUMA node1 CPU(s):               24-47,72-95"
+    },
+    {
+      "id": "c0002",
+      "source": "python3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128"
+    },
+    {
+      "id": "c0003",
+      "source": "numactl -C 0-47 -m 0,1 python3 src/main.py model=bert-base-cased backend.name=pytorch batch_size=1 sequence_length=128"
+    },
+    {
+      "id": "c0004",
+      "source": "numactl -C 0-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24\nnumactl -C 24-47 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=24"
+    },
+    {
+      "id": "c0005",
+      "source": "numactl -C 0-11 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 12-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 24-35 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12\nnumactl -C 36-47 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=12"
+    },
+    {
+      "id": "c0006",
+      "source": "# Small-sized problems (sequence length <= 32) use only 8 cores (on socket 0 - 8/24 cores used)\nnumactl -C 0-7 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=32 backend.name=pytorch backend.num_threads=8\n\n# Medium-sized problems (32 > sequence <= 384) use remaining 16 cores (on socket 0 - (8+16)/24 cores used)\nnumactl -C 8-23 -m 0 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=128 backend.name=pytorch backend.num_threads=16\n\n# Large sized problems (sequence >= 384) use the entire CPU (on socket 1 - 24/24 cores used)\nnumactl -C 24-37 -m 1 python3 src/main.py model=bert-base-cased batch_size=1 sequence_length=384 backend.name=pytorch backend.num_threads=24"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 9,
+    "savedImages": 9,
+    "sourceImageOccurrences": 9,
+    "placedImageOccurrences": 9,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T16:26:21.911542Z"
 }

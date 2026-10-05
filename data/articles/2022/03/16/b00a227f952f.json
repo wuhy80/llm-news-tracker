@@ -19,73 +19,23 @@
   "fetchedAt": "2026-08-30T11:51:03.646190Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Accelerate BERT inference with Hugging Face Transformers and AWS Inferentia\n\nPublished March 16, 2022\n\nnotebook: sagemaker/18_inferentia_inference\n\nThe adoption of BERT and Transformers continues to grow. Transformer-based models are now not only achieving state-of-the-art performance in Natural Language Processing but also for Computer Vision , Speech , and Time-Series . 💬 🖼 🎤 ⏳\n\nCompanies are now slowly moving from the experimentation and research phase to the production phase in order to use transformer models for large-scale workloads. But by default BERT and its friends are relatively slow, big, and complex models compared to the traditional Machine Learning algorithms. Accelerating Transformers and BERT is and will become an interesting challenge to solve in the future.\n\nAWS's take to solve this challenge was to design a custom machine learning chip designed for optimized inference workload called AWS Inferentia . AWS says that AWS Inferentia “delivers up to 80% lower cost per inference and up to 2.3X higher throughput than comparable current generation GPU-based Amazon EC2 instances.”\n\nThe real value of AWS Inferentia instances compared to GPU comes through the multiple Neuron Cores available on each device. A Neuron Core is the custom accelerator inside AWS Inferentia. Each Inferentia chip comes with 4x Neuron Cores. This enables you to either load 1 model on each core (for high throughput) or 1 model across all cores (for lower latency).\n\nIn this end-to-end tutorial, you will learn how to speed up BERT inference for text classification with Hugging Face Transformers, Amazon SageMaker, and AWS Inferentia.\n\nYou can find the notebook here: sagemaker/18_inferentia_inference\n\n- 1. Convert your Hugging Face Transformer to AWS Neuron\n\n- 2. Create a custom inference.py script for text-classification\n\n- 3. Create and upload the neuron model and inference script to Amazon S3\n\n- 4. Deploy a Real-time Inference Endpoint on Amazon SageMaker\n\n- 5. Run and evaluate Inference performance of BERT on Inferentia\n\nIf you are going to use Sagemaker in a local environment (not SageMaker Studio or Notebook Instances), you need access to an IAM Role with the required permissions for Sagemaker. You can find here more about it.\n\nWe are going to use the AWS Neuron SDK for AWS Inferentia . The Neuron SDK includes a deep learning compiler, runtime, and tools for converting and compiling PyTorch and TensorFlow models to neuron compatible models, which can be run on EC2 Inf1 instances .\n\nAs a first step, we need to install the Neuron SDK and the required packages.\n\nTip: If you are using Amazon SageMaker Notebook Instances or Studio you can go with the conda_python3 conda kernel.\n\n```\n# Set Pip repository to point to the Neuron repository\n!pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com\n\n# Install Neuron PyTorch\n!pip install torch-neuron==1.9.1.* neuron-cc[tensorflow] sagemaker>=2.79.0 transformers==4.12.3 --upgrade\n```\n\nAfter we have installed the Neuron SDK we can load and convert our model. Neuron models are converted using torch_neuron with its trace method similar to torchscript . You can find more information in our documentation .\n\nTo be able to convert our model we first need to select the model we want to use for our text classification pipeline from hf.co/models . For this example, let's go with distilbert-base-uncased-finetuned-sst-2-english but this can be easily adjusted with other BERT-like models.\n\n```\nmodel_id = \"distilbert-base-uncased-finetuned-sst-2-english\"\n```\n\nAt the time of writing, the AWS Neuron SDK does not support dynamic shapes , which means that the input size needs to be static for compiling and inference.\n\nIn simpler terms, this means that when the model is compiled with e.g. an input of batch size 1 and sequence length of 16, the model can only run inference on inputs with that same shape.\n\nWhen using a t2.medium instance the compilation takes around 3 minutes\n\n```\nimport os\nimport tensorflow  # to workaround a protobuf version conflict issue\nimport torch\nimport torch.neuron\nfrom transformers import AutoTokenizer, AutoModelForSequenceClassification\n\n# load tokenizer and model\ntokenizer = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForSequenceClassification.from_pretrained(model_id, torchscript=True)\n\n# create dummy input for max length 128\ndummy_input = \"dummy input which will be padded later\"\nmax_length = 128\nembeddings = tokenizer(dummy_input, max_length=max_length, padding=\"max_length\",return_tensors=\"pt\")\nneuron_inputs = tuple(embeddings.values())\n\n# compile model with torch.neuron.trace and update config\nmodel_neuron = torch.neuron.trace(model, neuron_inputs)\nmodel.config.update({\"traced_sequence_length\": max_length})\n\n# save tokenizer, neuron model and config for later use\nsave_dir=\"tmp\"\nos.makedirs(\"tmp\",exist_ok=True)\nmodel_neuron.save(os.path.join(save_dir,\"neuron_model.pt\"))\ntokenizer.save_pretrained(save_dir)\nmodel.config.save_pretrained(save_dir)\n```\n\nThe Hugging Face Inference Toolkit supports zero-code deployments on top of the pipeline feature from 🤗 Transformers. This allows users to deploy Hugging Face transformers without an inference script [ Example ].\n\nCurrently, this feature is not supported with AWS Inferentia, which means we need to provide an inference.py script for running inference.\n\nIf you would be interested in support for zero-code deployments for Inferentia let us know on the forum .\n\nTo use the inference script, we need to create an inference.py script. In our example, we are going to overwrite the model_fn to load our neuron model and the predict_fn to create a text-classification pipeline.\n\nIf you want to know more about the inference.py script check out this example . It explains amongst other things what model_fn and predict_fn are.\n\n```\n!mkdir code\n```\n\nWe are using the NEURON_RT_NUM_CORES=1 to make sure that each HTTP worker uses 1 Neuron core to maximize throughput.\n\n```\n%%writefile code/inference.py\n\nimport os\nfrom transformers import AutoConfig, AutoTokenizer\nimport torch\nimport torch.neuron\n\n# To use one neuron core per worker\nos.environ[\"NEURON_RT_NUM_CORES\"] = \"1\"\n\n# saved weights name\nAWS_NEURON_TRACED_WEIGHTS_NAME = \"neuron_model.pt\"\n\ndef model_fn(model_dir):\n    # load tokenizer and neuron model from model_dir\n    tokenizer = AutoTokenizer.from_pretrained(model_dir)\n    model = torch.jit.load(os.path.join(model_dir, AWS_NEURON_TRACED_WEIGHTS_NAME))\n    model_config = AutoConfig.from_pretrained(model_dir)\n\n    return model, tokenizer, model_config\n\ndef predict_fn(data, model_tokenizer_model_config):\n    # destruct model, tokenizer and model config\n    model, tokenizer, model_config = model_tokenizer_model_config\n\n    # create embeddings for inputs\n    inputs = data.pop(\"inputs\", data)\n    embeddings = tokenizer(\n        inputs,\n        return_tensors=\"pt\",\n        max_length=model_config.traced_sequence_length,\n        padding=\"max_length\",\n        truncation=True,\n    )\n    # convert to tuple for neuron model\n    neuron_inputs = tuple(embeddings.values())\n\n    # run prediciton\n    with torch.no_grad():\n        predictions = model(*neuron_inputs)[0]\n        scores = torch.nn.Softmax(dim=1)(predictions)\n\n    # return dictonary, which will be json serializable\n    return [{\"label\": model_config.id2label[item.argmax().item()], \"score\": item.max().item()} for item in scores]\n```\n\nBefore we can deploy our neuron model to Amazon SageMaker we need to create a model.tar.gz archive with all our model artifacts saved into tmp/ , e.g. neuron_model.pt and upload this to Amazon S3.\n\nTo do this we need to set up our permissions.\n\n```\nimport sagemaker\nimport boto3\nsess = sagemaker.Session()\n# sagemaker session bucket -> used for uploading data, models and logs\n# sagemaker will automatically create this bucket if it not exists\nsagemaker_session_bucket=None\nif sagemaker_session_bucket is None and sess is not None:\n    # set to default bucket if a bucket name is not given\n    sagemaker_session_bucket = sess.default_bucket()\n\ntry:\n    role = sagemaker.get_execution_role()\nexcept ValueError:\n    iam = boto3.client('iam')\n    role = iam.get_role(RoleName='sagemaker_execution_role')['Role']['Arn']\n\nsess = sagemaker.Session(default_bucket=sagemaker_session_bucket)\n\nprint(f\"sagemaker role arn: {role}\")\nprint(f\"sagemaker bucket: {sess.default_bucket()}\")\nprint(f\"sagemaker session region: {sess.boto_region_name}\")\n```\n\nNext, we create our model.tar.gz . The inference.py script will be placed into a code/ folder.\n\n```\n# copy inference.py into the code/ directory of the model directory.\n!cp -r code/ tmp/code/\n# create a model.tar.gz archive with all the model artifacts and the inference.py script.\n%cd tmp\n!tar zcvf model.tar.gz *\n%cd ..\n```\n\nNow we can upload our model.tar.gz to our session S3 bucket with sagemaker .\n\n```\nfrom sagemaker.s3 import S3Uploader\n\n# create s3 uri\ns3_model_path = f\"s3://{sess.default_bucket()}/{model_id}\"\n\n# upload model.tar.gz\ns3_model_uri = S3Uploader.upload(local_path=\"tmp/model.tar.gz\",desired_s3_uri=s3_model_path)\nprint(f\"model artifcats uploaded to {s3_model_uri}\")\n```\n\nAfter we have uploaded our model.tar.gz to Amazon S3 can we create a custom HuggingfaceModel . This class will be used to create and deploy our real-time inference endpoint on Amazon SageMaker.\n\n```\nfrom sagemaker.huggingface.model import HuggingFaceModel\n\n# create Hugging Face Model Class\nhuggingface_model = HuggingFaceModel(\n   model_data=s3_model_uri,       # path to your model and script\n   role=role,                    # iam role with permissions to create an Endpoint\n   transformers_version=\"4.12\",  # transformers version used\n   pytorch_version=\"1.9\",        # pytorch version used\n   py_version='py37',            # python version used\n)\n\n# Let SageMaker know that we've already compiled the model via neuron-cc\nhuggingface_model._is_compiled_model = True\n\n# deploy the endpoint endpoint\npredictor = huggingface_model.deploy(\n    initial_instance_count=1,      # number of instances\n    instance_type=\"ml.inf1.xlarge\" # AWS Inferentia Instance\n)\n```\n\nThe .deploy() returns an HuggingFacePredictor object which can be used to request inference.\n\n```\ndata = {\n  \"inputs\": \"the mesmerizing performances of the leads keep the film grounded and keep the audience riveted .\",\n}\n\nres = predictor.predict(data=data)\nres\n```\n\nWe managed to deploy our neuron compiled BERT to AWS Inferentia on Amazon SageMaker. Now, let's test its performance. As a dummy load test, we will loop and send 10,000 synchronous requests to our endpoint.\n\n```\n# send 10000 requests\nfor i in range(10000):\n    resp = predictor.predict(\n        data={\"inputs\": \"it 's a charming and often affecting journey .\"}\n    )\n```\n\nLet's inspect the performance in cloudwatch.\n\n```\nprint(f\"https://console.aws.amazon.com/cloudwatch/home?region={sess.boto_region_name}#metricsV2:graph=~(metrics~(~(~'AWS*2fSageMaker~'ModelLatency~'EndpointName~'{predictor.endpoint_name}~'VariantName~'AllTraffic))~view~'timeSeries~stacked~false~region~'{sess.boto_region_name}~start~'-PT5M~end~'P0D~stat~'Average~period~30);query=~'*7bAWS*2fSageMaker*2cEndpointName*2cVariantName*7d*20{predictor.endpoint_name}\")\n```\n\nThe average latency for our BERT model is 5-6ms for a sequence length of 128.\n\n### Delete model and endpoint\n\nTo clean up, we can delete the model and endpoint.\n\n```\npredictor.delete_model()\npredictor.delete_endpoint()\n```\n\nWe successfully managed to compile a vanilla Hugging Face Transformers model to an AWS Inferentia compatible Neuron Model. After that we deployed our Neuron model to Amazon SageMaker using the new Hugging Face Inference DLC. We managed to achieve 5-6ms latency per neuron core, which is faster than CPU in terms of latency, and achieves a higher throughput than GPUs since we ran 4 models in parallel.\n\nIf you or you company are currently using a BERT-like Transformer for encoder tasks (text-classification, token-classification, question-answering etc.), and the latency meets your requirements you should switch to AWS Inferentia. This will not only save costs, but can also increase efficiency and performance for your models.\n\nWe are planning to do a more detailed case study on cost-performance of transformers in the future, so stay tuned!\n\nAlso if you want to learn more about accelerating transformers you should also check out Hugging Face optimum .\n\nThanks for reading! If you have any questions, feel free to contact me, through Github , or on the forum . You can also connect with me on Twitter or LinkedIn .\n\nMore Articles from our Blog\n\n## Deploy GPT-J 6B for inference using Hugging Face Transformers and Amazon SageMaker\n\n## Distributed Training: Train BART/T5 for Summarization using 🤗 Transformers and Amazon SageMaker\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "notebook: sagemaker/18_inferentia_inference\n\nThe adoption of BERT and Transformers continues to grow. Transformer-based models are now not only achieving state-of-the-art performance in Natural Language Processing but also for Computer Vision, Speech, and Time-Series. 💬 🖼 🎤 ⏳\n\nCompanies are now slowly moving from the experimentation and research phase to the production phase in order to use transformer models for large-scale workloads. But by default BERT and its friends are relatively slow, big, and complex models compared to the traditional Machine Learning algorithms. Accelerating Transformers and BERT is and will become an interesting challenge to solve in the future.\n\nAWS's take to solve this challenge was to design a custom machine learning chip designed for optimized inference workload called AWS Inferentia. AWS says that AWS Inferentia “delivers up to 80% lower cost per inference and up to 2.3X higher throughput than comparable current generation GPU-based Amazon EC2 instances.”\n\nThe real value of AWS Inferentia instances compared to GPU comes through the multiple Neuron Cores available on each device. A Neuron Core is the custom accelerator inside AWS Inferentia. Each Inferentia chip comes with 4x Neuron Cores. This enables you to either load 1 model on each core (for high throughput) or 1 model across all cores (for lower latency).\n\n## Tutorial\n\nIn this end-to-end tutorial, you will learn how to speed up BERT inference for text classification with Hugging Face Transformers, Amazon SageMaker, and AWS Inferentia.\n\nYou can find the notebook here: sagemaker/18_inferentia_inference\n\nYou will learn how to:\n\n- 1. Convert your Hugging Face Transformer to AWS Neuron\n\n- 2. Create a custom inference.py script for text-classification\n\n- 3. Create and upload the neuron model and inference script to Amazon S3\n\n- 4. Deploy a Real-time Inference Endpoint on Amazon SageMaker\n\n- 5. Run and evaluate Inference performance of BERT on Inferentia\n\nLet's get started! 🚀\n\nIf you are going to use Sagemaker in a local environment (not SageMaker Studio or Notebook Instances), you need access to an IAM Role with the required permissions for Sagemaker. You can find here more about it.\n\n## 1. Convert your Hugging Face Transformer to AWS Neuron\n\nWe are going to use the AWS Neuron SDK for AWS Inferentia. The Neuron SDK includes a deep learning compiler, runtime, and tools for converting and compiling PyTorch and TensorFlow models to neuron compatible models, which can be run on EC2 Inf1 instances.\n\nAs a first step, we need to install the Neuron SDK and the required packages.\n\nTip: If you are using Amazon SageMaker Notebook Instances or Studio you can go with the conda_python3 conda kernel.\n\n```\n# Set Pip repository to point to the Neuron repository\n!pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com\n\n# Install Neuron PyTorch\n!pip install torch-neuron==1.9.1.* neuron-cc[tensorflow] sagemaker>=2.79.0 transformers==4.12.3 --upgrade\n```\n\nAfter we have installed the Neuron SDK we can load and convert our model. Neuron models are converted using torch_neuron with its trace method similar to torchscript. You can find more information in our documentation.\n\nTo be able to convert our model we first need to select the model we want to use for our text classification pipeline from hf.co/models. For this example, let's go with distilbert-base-uncased-finetuned-sst-2-english but this can be easily adjusted with other BERT-like models.\n\n```\nmodel_id = \"distilbert-base-uncased-finetuned-sst-2-english\"\n```\n\nAt the time of writing, the AWS Neuron SDK does not support dynamic shapes, which means that the input size needs to be static for compiling and inference.\n\nIn simpler terms, this means that when the model is compiled with e.g. an input of batch size 1 and sequence length of 16, the model can only run inference on inputs with that same shape.\n\nWhen using a t2.medium instance the compilation takes around 3 minutes\n\n```\nimport os\nimport tensorflow  # to workaround a protobuf version conflict issue\nimport torch\nimport torch.neuron\nfrom transformers import AutoTokenizer, AutoModelForSequenceClassification\n\n# load tokenizer and model\ntokenizer = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForSequenceClassification.from_pretrained(model_id, torchscript=True)\n\n# create dummy input for max length 128\ndummy_input = \"dummy input which will be padded later\"\nmax_length = 128\nembeddings = tokenizer(dummy_input, max_length=max_length, padding=\"max_length\",return_tensors=\"pt\")\nneuron_inputs = tuple(embeddings.values())\n\n# compile model with torch.neuron.trace and update config\nmodel_neuron = torch.neuron.trace(model, neuron_inputs)\nmodel.config.update({\"traced_sequence_length\": max_length})\n\n# save tokenizer, neuron model and config for later use\nsave_dir=\"tmp\"\nos.makedirs(\"tmp\",exist_ok=True)\nmodel_neuron.save(os.path.join(save_dir,\"neuron_model.pt\"))\ntokenizer.save_pretrained(save_dir)\nmodel.config.save_pretrained(save_dir)\n```\n\n## 2. Create a custom inference.py script for text-classification\n\nThe Hugging Face Inference Toolkit supports zero-code deployments on top of the pipeline feature from 🤗 Transformers. This allows users to deploy Hugging Face transformers without an inference script [Example].\n\nCurrently, this feature is not supported with AWS Inferentia, which means we need to provide an inference.py script for running inference.\n\nIf you would be interested in support for zero-code deployments for Inferentia let us know on the forum.\n\nTo use the inference script, we need to create an inference.py script. In our example, we are going to overwrite the model_fn to load our neuron model and the predict_fn to create a text-classification pipeline.\n\nIf you want to know more about the inference.py script check out this example. It explains amongst other things what model_fn and predict_fn are.\n\n```\n!mkdir code\n```\n\nWe are using the NEURON_RT_NUM_CORES=1 to make sure that each HTTP worker uses 1 Neuron core to maximize throughput.\n\n```\n%%writefile code/inference.py\n\nimport os\nfrom transformers import AutoConfig, AutoTokenizer\nimport torch\nimport torch.neuron\n\n# To use one neuron core per worker\nos.environ[\"NEURON_RT_NUM_CORES\"] = \"1\"\n\n# saved weights name\nAWS_NEURON_TRACED_WEIGHTS_NAME = \"neuron_model.pt\"\n\ndef model_fn(model_dir):\n    # load tokenizer and neuron model from model_dir\n    tokenizer = AutoTokenizer.from_pretrained(model_dir)\n    model = torch.jit.load(os.path.join(model_dir, AWS_NEURON_TRACED_WEIGHTS_NAME))\n    model_config = AutoConfig.from_pretrained(model_dir)\n\n    return model, tokenizer, model_config\n\ndef predict_fn(data, model_tokenizer_model_config):\n    # destruct model, tokenizer and model config\n    model, tokenizer, model_config = model_tokenizer_model_config\n\n    # create embeddings for inputs\n    inputs = data.pop(\"inputs\", data)\n    embeddings = tokenizer(\n        inputs,\n        return_tensors=\"pt\",\n        max_length=model_config.traced_sequence_length,\n        padding=\"max_length\",\n        truncation=True,\n    )\n    # convert to tuple for neuron model\n    neuron_inputs = tuple(embeddings.values())\n\n    # run prediciton\n    with torch.no_grad():\n        predictions = model(*neuron_inputs)[0]\n        scores = torch.nn.Softmax(dim=1)(predictions)\n\n    # return dictonary, which will be json serializable\n    return [{\"label\": model_config.id2label[item.argmax().item()], \"score\": item.max().item()} for item in scores]\n```\n\n## 3. Create and upload the neuron model and inference script to Amazon S3\n\nBefore we can deploy our neuron model to Amazon SageMaker we need to create a model.tar.gz archive with all our model artifacts saved into tmp/, e.g. neuron_model.pt and upload this to Amazon S3.\n\nTo do this we need to set up our permissions.\n\n```\nimport sagemaker\nimport boto3\nsess = sagemaker.Session()\n# sagemaker session bucket -> used for uploading data, models and logs\n# sagemaker will automatically create this bucket if it not exists\nsagemaker_session_bucket=None\nif sagemaker_session_bucket is None and sess is not None:\n    # set to default bucket if a bucket name is not given\n    sagemaker_session_bucket = sess.default_bucket()\n\ntry:\n    role = sagemaker.get_execution_role()\nexcept ValueError:\n    iam = boto3.client('iam')\n    role = iam.get_role(RoleName='sagemaker_execution_role')['Role']['Arn']\n\nsess = sagemaker.Session(default_bucket=sagemaker_session_bucket)\n\nprint(f\"sagemaker role arn: {role}\")\nprint(f\"sagemaker bucket: {sess.default_bucket()}\")\nprint(f\"sagemaker session region: {sess.boto_region_name}\")\n```\n\nNext, we create our model.tar.gz. The inference.py script will be placed into a code/ folder.\n\n```\n# copy inference.py into the code/ directory of the model directory.\n!cp -r code/ tmp/code/\n# create a model.tar.gz archive with all the model artifacts and the inference.py script.\n%cd tmp\n!tar zcvf model.tar.gz *\n%cd ..\n```\n\nNow we can upload our model.tar.gz to our session S3 bucket with sagemaker.\n\n```\nfrom sagemaker.s3 import S3Uploader\n\n# create s3 uri\ns3_model_path = f\"s3://{sess.default_bucket()}/{model_id}\"\n\n# upload model.tar.gz\ns3_model_uri = S3Uploader.upload(local_path=\"tmp/model.tar.gz\",desired_s3_uri=s3_model_path)\nprint(f\"model artifcats uploaded to {s3_model_uri}\")\n```\n\n## 4. Deploy a Real-time Inference Endpoint on Amazon SageMaker\n\nAfter we have uploaded our model.tar.gz to Amazon S3 can we create a custom HuggingfaceModel. This class will be used to create and deploy our real-time inference endpoint on Amazon SageMaker.\n\n```\nfrom sagemaker.huggingface.model import HuggingFaceModel\n\n# create Hugging Face Model Class\nhuggingface_model = HuggingFaceModel(\n   model_data=s3_model_uri,       # path to your model and script\n   role=role,                    # iam role with permissions to create an Endpoint\n   transformers_version=\"4.12\",  # transformers version used\n   pytorch_version=\"1.9\",        # pytorch version used\n   py_version='py37',            # python version used\n)\n\n# Let SageMaker know that we've already compiled the model via neuron-cc\nhuggingface_model._is_compiled_model = True\n\n# deploy the endpoint endpoint\npredictor = huggingface_model.deploy(\n    initial_instance_count=1,      # number of instances\n    instance_type=\"ml.inf1.xlarge\" # AWS Inferentia Instance\n)\n```\n\n## 5. Run and evaluate Inference performance of BERT on Inferentia\n\nThe .deploy() returns an HuggingFacePredictor object which can be used to request inference.\n\n```\ndata = {\n  \"inputs\": \"the mesmerizing performances of the leads keep the film grounded and keep the audience riveted .\",\n}\n\nres = predictor.predict(data=data)\nres\n```\n\nWe managed to deploy our neuron compiled BERT to AWS Inferentia on Amazon SageMaker. Now, let's test its performance. As a dummy load test, we will loop and send 10,000 synchronous requests to our endpoint.\n\n```\n# send 10000 requests\nfor i in range(10000):\n    resp = predictor.predict(\n        data={\"inputs\": \"it 's a charming and often affecting journey .\"}\n    )\n```\n\nLet's inspect the performance in cloudwatch.\n\n```\nprint(f\"https://console.aws.amazon.com/cloudwatch/home?region={sess.boto_region_name}#metricsV2:graph=~(metrics~(~(~'AWS*2fSageMaker~'ModelLatency~'EndpointName~'{predictor.endpoint_name}~'VariantName~'AllTraffic))~view~'timeSeries~stacked~false~region~'{sess.boto_region_name}~start~'-PT5M~end~'P0D~stat~'Average~period~30);query=~'*7bAWS*2fSageMaker*2cEndpointName*2cVariantName*7d*20{predictor.endpoint_name}\")\n```\n\nThe average latency for our BERT model is 5-6ms for a sequence length of 128.\n\nFigure 1. Model Latency\n\n### Delete model and endpoint\n\nTo clean up, we can delete the model and endpoint.\n\n```\npredictor.delete_model()\npredictor.delete_endpoint()\n```\n\n## Conclusion\n\nWe successfully managed to compile a vanilla Hugging Face Transformers model to an AWS Inferentia compatible Neuron Model. After that we deployed our Neuron model to Amazon SageMaker using the new Hugging Face Inference DLC. We managed to achieve 5-6ms latency per neuron core, which is faster than CPU in terms of latency, and achieves a higher throughput than GPUs since we ran 4 models in parallel.\n\nIf you or you company are currently using a BERT-like Transformer for encoder tasks (text-classification, token-classification, question-answering etc.), and the latency meets your requirements you should switch to AWS Inferentia. This will not only save costs, but can also increase efficiency and performance for your models.\n\nWe are planning to do a more detailed case study on cost-performance of transformers in the future, so stay tuned!\n\nAlso if you want to learn more about accelerating transformers you should also check out Hugging Face optimum.\n\nThanks for reading! If you have any questions, feel free to contact me, through Github, or on the forum. You can also connect with me on Twitter or LinkedIn.",
   "summaryZh": "本文介绍了如何利用Hugging Face Transformers与AWS定制芯片AWS Inferentia来加速BERT模型的推理过程。通过将模型转换为AWS Neuron格式并在多Neuron Core架构上运行，开发者能够显著降低大语言模型和Transformer系列模型在生产环境中的推理成本并提升吞吐量，同时文章提供了完整的SageMaker部署教程。",
   "summaryGeneratedAt": "2026-09-06T03:12:56.015593Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
-  "images": [
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/1624629516652-5ff5d596f244529b3ec0fb89.png",
-      "alt": "Philipp Schmid's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/1624629516652-5ff5d596f244529b3ec0fb89.png",
-      "id": "image_6f3805fa6eacd16f"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/45_gptj_sagemaker/thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/45_gptj_sagemaker/thumbnail.png",
-      "id": "image_b57389cab2145996"
-    },
-    {
-      "src": "https://huggingface.co/blog/assets/19_sagemaker_distributed_training_seq2seq/thumbnail.png",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/blog/assets/19_sagemaker_distributed_training_seq2seq/thumbnail.png",
-      "id": "image_1f5904a337af12d2"
-    }
-  ],
+  "images": [],
   "videos": [],
   "mediaCheckedAt": "2026-09-26T06:13:24.157277Z",
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:24.157291Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "d210a722fd108407e53f4298f1d6b71b88eba7338ecb6f44213a61aab2973469",
-  "mediaLayout": [
-    {
-      "mediaId": "image_6f3805fa6eacd16f",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_b57389cab2145996",
-      "type": "image",
-      "afterBlockId": "b0046",
-      "order": 60
-    },
-    {
-      "mediaId": "image_6f3805fa6eacd16f",
-      "type": "image",
-      "afterBlockId": "b0047",
-      "order": 62
-    },
-    {
-      "mediaId": "image_1f5904a337af12d2",
-      "type": "image",
-      "afterBlockId": "b0047",
-      "order": 63
-    },
-    {
-      "mediaId": "image_6f3805fa6eacd16f",
-      "type": "image",
-      "afterBlockId": "b0048",
-      "order": 65
-    }
-  ],
+  "mediaLayoutBodyHash": "bc34c62f1112f1076048a8f959dc54c376864291a32de760630497435f43f82d",
+  "mediaLayout": [],
   "mediaLayoutUnplaced": [],
-  "mediaLayoutMatched": 5,
+  "mediaLayoutMatched": 0,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-09-26T16:47:36.021794Z",
+  "mediaLayoutCheckedAt": "2026-10-05T16:24:08.915385Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -135,5 +85,739 @@
       }
     ],
     "duplicateKey": "accelerate-bert-inference-aws-inferentia"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "notebook: sagemaker/18_inferentia_inference",
+      "spans": [
+        {
+          "start": 10,
+          "end": 43,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/master/sagemaker/18_inferentia_inference/sagemaker-notebook.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "The adoption of BERT and Transformers continues to grow. Transformer-based models are now not only achieving state-of-the-art performance in Natural Language Processing but also for Computer Vision, Speech, and Time-Series. 💬 🖼 🎤 ⏳",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-101"
+        },
+        {
+          "start": 25,
+          "end": 37,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/index"
+        },
+        {
+          "start": 182,
+          "end": 197,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2010.11929"
+        },
+        {
+          "start": 199,
+          "end": 205,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2006.11477"
+        },
+        {
+          "start": 211,
+          "end": 222,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2002.06103"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Companies are now slowly moving from the experimentation and research phase to the production phase in order to use transformer models for large-scale workloads. But by default BERT and its friends are relatively slow, big, and complex models compared to the traditional Machine Learning algorithms. Accelerating Transformers and BERT is and will become an interesting challenge to solve in the future.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "AWS's take to solve this challenge was to design a custom machine learning chip designed for optimized inference workload called AWS Inferentia. AWS says that AWS Inferentia “delivers up to 80% lower cost per inference and up to 2.3X higher throughput than comparable current generation GPU-based Amazon EC2 instances.”",
+      "spans": [
+        {
+          "start": 129,
+          "end": 143,
+          "kind": "a",
+          "href": "https://aws.amazon.com/machine-learning/inferentia/?nc1=h_ls"
+        },
+        {
+          "start": 174,
+          "end": 319,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "The real value of AWS Inferentia instances compared to GPU comes through the multiple Neuron Cores available on each device. A Neuron Core is the custom accelerator inside AWS Inferentia. Each Inferentia chip comes with 4x Neuron Cores. This enables you to either load 1 model on each core (for high throughput) or 1 model across all cores (for lower latency).",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Tutorial",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "In this end-to-end tutorial, you will learn how to speed up BERT inference for text classification with Hugging Face Transformers, Amazon SageMaker, and AWS Inferentia.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "You can find the notebook here: sagemaker/18_inferentia_inference",
+      "spans": [
+        {
+          "start": 32,
+          "end": 65,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/master/sagemaker/18_inferentia_inference/sagemaker-notebook.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "You will learn how to:",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "1. Convert your Hugging Face Transformer to AWS Neuron",
+      "spans": [
+        {
+          "start": 0,
+          "end": 54,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-inferentia-sagemaker#1-convert-your-hugging-face-transformer-to-aws-neuron"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "2. Create a custom inference.py script for text-classification",
+      "spans": [
+        {
+          "start": 19,
+          "end": 31,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 62,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-inferentia-sagemaker#2-create-a-custom-inferencepy-script-for-text-classification"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "3. Create and upload the neuron model and inference script to Amazon S3",
+      "spans": [
+        {
+          "start": 0,
+          "end": 71,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-inferentia-sagemaker#3-create-and-upload-the-neuron-model-and-inference-script-to-amazon-s3"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "4. Deploy a Real-time Inference Endpoint on Amazon SageMaker",
+      "spans": [
+        {
+          "start": 0,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-inferentia-sagemaker#4-deploy-a-real-time-inference-endpoint-on-amazon-sagemaker"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "5. Run and evaluate Inference performance of BERT on Inferentia",
+      "spans": [
+        {
+          "start": 0,
+          "end": 63,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bert-inferentia-sagemaker#5-run-and-evaluate-inference-performance-of-bert-on-inferentia"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Let's get started! 🚀",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "If you are going to use Sagemaker in a local environment (not SageMaker Studio or Notebook Instances), you need access to an IAM Role with the required permissions for Sagemaker. You can find here more about it.",
+      "spans": [
+        {
+          "start": 192,
+          "end": 196,
+          "kind": "a",
+          "href": "https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-roles.html"
+        },
+        {
+          "start": 0,
+          "end": 211,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "1. Convert your Hugging Face Transformer to AWS Neuron",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "We are going to use the AWS Neuron SDK for AWS Inferentia. The Neuron SDK includes a deep learning compiler, runtime, and tools for converting and compiling PyTorch and TensorFlow models to neuron compatible models, which can be run on EC2 Inf1 instances.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 57,
+          "kind": "a",
+          "href": "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/index.html"
+        },
+        {
+          "start": 236,
+          "end": 254,
+          "kind": "a",
+          "href": "https://aws.amazon.com/ec2/instance-types/inf1/"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "As a first step, we need to install the Neuron SDK and the required packages.",
+      "spans": [
+        {
+          "start": 40,
+          "end": 50,
+          "kind": "a",
+          "href": "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-intro/neuron-install-guide.html"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Tip: If you are using Amazon SageMaker Notebook Instances or Studio you can go with the conda_python3 conda kernel.",
+      "spans": [
+        {
+          "start": 88,
+          "end": 101,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 115,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "After we have installed the Neuron SDK we can load and convert our model. Neuron models are converted using torch_neuron with its trace method similar to torchscript. You can find more information in our documentation.",
+      "spans": [
+        {
+          "start": 108,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 154,
+          "end": 165,
+          "kind": "code"
+        },
+        {
+          "start": 204,
+          "end": 217,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/serialization#torchscript"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "To be able to convert our model we first need to select the model we want to use for our text classification pipeline from hf.co/models. For this example, let's go with distilbert-base-uncased-finetuned-sst-2-english but this can be easily adjusted with other BERT-like models.",
+      "spans": [
+        {
+          "start": 123,
+          "end": 135,
+          "kind": "a",
+          "href": "http://hf.co/models"
+        },
+        {
+          "start": 169,
+          "end": 216,
+          "kind": "a",
+          "href": "https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "At the time of writing, the AWS Neuron SDK does not support dynamic shapes, which means that the input size needs to be static for compiling and inference.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 74,
+          "kind": "a",
+          "href": "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-guide/models/models-inferentia.html#dynamic-shapes"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "In simpler terms, this means that when the model is compiled with e.g. an input of batch size 1 and sequence length of 16, the model can only run inference on inputs with that same shape.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "When using a t2.medium instance the compilation takes around 3 minutes",
+      "spans": [
+        {
+          "start": 13,
+          "end": 22,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 70,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "2. Create a custom inference.py script for text-classification",
+      "spans": [
+        {
+          "start": 19,
+          "end": 31,
+          "kind": "code"
+        },
+        {
+          "start": 43,
+          "end": 62,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The Hugging Face Inference Toolkit supports zero-code deployments on top of the pipeline feature from 🤗 Transformers. This allows users to deploy Hugging Face transformers without an inference script [Example].",
+      "spans": [
+        {
+          "start": 4,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/aws/sagemaker-huggingface-inference-toolkit"
+        },
+        {
+          "start": 80,
+          "end": 96,
+          "kind": "a",
+          "href": "https://huggingface.co/transformers/main_classes/pipelines.html"
+        },
+        {
+          "start": 201,
+          "end": 208,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/master/sagemaker/11_deploy_model_from_hf_hub/deploy_transformer_model_from_hf_hub.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Currently, this feature is not supported with AWS Inferentia, which means we need to provide an inference.py script for running inference.",
+      "spans": [
+        {
+          "start": 96,
+          "end": 108,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "If you would be interested in support for zero-code deployments for Inferentia let us know on the forum.",
+      "spans": [
+        {
+          "start": 98,
+          "end": 103,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/c/sagemaker/17"
+        },
+        {
+          "start": 0,
+          "end": 104,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "To use the inference script, we need to create an inference.py script. In our example, we are going to overwrite the model_fn to load our neuron model and the predict_fn to create a text-classification pipeline.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 117,
+          "end": 125,
+          "kind": "code"
+        },
+        {
+          "start": 159,
+          "end": 169,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "If you want to know more about the inference.py script check out this example. It explains amongst other things what model_fn and predict_fn are.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 47,
+          "kind": "code"
+        },
+        {
+          "start": 70,
+          "end": 77,
+          "kind": "a",
+          "href": "https://github.com/huggingface/notebooks/blob/master/sagemaker/17_custom_inference_script/sagemaker-notebook.ipynb"
+        },
+        {
+          "start": 117,
+          "end": 125,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 140,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "We are using the NEURON_RT_NUM_CORES=1 to make sure that each HTTP worker uses 1 Neuron core to maximize throughput.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 38,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "3. Create and upload the neuron model and inference script to Amazon S3",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Before we can deploy our neuron model to Amazon SageMaker we need to create a model.tar.gz archive with all our model artifacts saved into tmp/, e.g. neuron_model.pt and upload this to Amazon S3.",
+      "spans": [
+        {
+          "start": 78,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 139,
+          "end": 143,
+          "kind": "code"
+        },
+        {
+          "start": 150,
+          "end": 165,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "To do this we need to set up our permissions.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Next, we create our model.tar.gz. The inference.py script will be placed into a code/ folder.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 80,
+          "end": 85,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Now we can upload our model.tar.gz to our session S3 bucket with sagemaker.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 34,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "4. Deploy a Real-time Inference Endpoint on Amazon SageMaker",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "After we have uploaded our model.tar.gz to Amazon S3 can we create a custom HuggingfaceModel. This class will be used to create and deploy our real-time inference endpoint on Amazon SageMaker.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 39,
+          "kind": "code"
+        },
+        {
+          "start": 76,
+          "end": 92,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "5. Run and evaluate Inference performance of BERT on Inferentia",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "The .deploy() returns an HuggingFacePredictor object which can be used to request inference.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 25,
+          "end": 45,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "We managed to deploy our neuron compiled BERT to AWS Inferentia on Amazon SageMaker. Now, let's test its performance. As a dummy load test, we will loop and send 10,000 synchronous requests to our endpoint.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Let's inspect the performance in cloudwatch.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "The average latency for our BERT model is 5-6ms for a sequence length of 128.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 47,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Figure 1. Model Latency",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Delete model and endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "To clean up, we can delete the model and endpoint.",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "We successfully managed to compile a vanilla Hugging Face Transformers model to an AWS Inferentia compatible Neuron Model. After that we deployed our Neuron model to Amazon SageMaker using the new Hugging Face Inference DLC. We managed to achieve 5-6ms latency per neuron core, which is faster than CPU in terms of latency, and achieves a higher throughput than GPUs since we ran 4 models in parallel.",
+      "spans": [
+        {
+          "start": 247,
+          "end": 252,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "If you or you company are currently using a BERT-like Transformer for encoder tasks (text-classification, token-classification, question-answering etc.), and the latency meets your requirements you should switch to AWS Inferentia. This will not only save costs, but can also increase efficiency and performance for your models.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "We are planning to do a more detailed case study on cost-performance of transformers in the future, so stay tuned!",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Also if you want to learn more about accelerating transformers you should also check out Hugging Face optimum.",
+      "spans": [
+        {
+          "start": 102,
+          "end": 109,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Thanks for reading! If you have any questions, feel free to contact me, through Github, or on the forum. You can also connect with me on Twitter or LinkedIn.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 86,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers"
+        },
+        {
+          "start": 98,
+          "end": 103,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/c/sagemaker/17"
+        },
+        {
+          "start": 137,
+          "end": 144,
+          "kind": "a",
+          "href": "https://twitter.com/_philschmid"
+        },
+        {
+          "start": 148,
+          "end": 156,
+          "kind": "a",
+          "href": "https://www.linkedin.com/in/philipp-schmid-a6a2bb196/"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "bc34c62f1112f1076048a8f959dc54c376864291a32de760630497435f43f82d",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "# Set Pip repository to point to the Neuron repository\n!pip config set global.extra-index-url https://pip.repos.neuron.amazonaws.com\n\n# Install Neuron PyTorch\n!pip install torch-neuron==1.9.1.* neuron-cc[tensorflow] sagemaker>=2.79.0 transformers==4.12.3 --upgrade"
+    },
+    {
+      "id": "c0002",
+      "source": "model_id = \"distilbert-base-uncased-finetuned-sst-2-english\""
+    },
+    {
+      "id": "c0003",
+      "source": "import os\nimport tensorflow  # to workaround a protobuf version conflict issue\nimport torch\nimport torch.neuron\nfrom transformers import AutoTokenizer, AutoModelForSequenceClassification\n\n# load tokenizer and model\ntokenizer = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForSequenceClassification.from_pretrained(model_id, torchscript=True)\n\n# create dummy input for max length 128\ndummy_input = \"dummy input which will be padded later\"\nmax_length = 128\nembeddings = tokenizer(dummy_input, max_length=max_length, padding=\"max_length\",return_tensors=\"pt\")\nneuron_inputs = tuple(embeddings.values())\n\n# compile model with torch.neuron.trace and update config\nmodel_neuron = torch.neuron.trace(model, neuron_inputs)\nmodel.config.update({\"traced_sequence_length\": max_length})\n\n# save tokenizer, neuron model and config for later use\nsave_dir=\"tmp\"\nos.makedirs(\"tmp\",exist_ok=True)\nmodel_neuron.save(os.path.join(save_dir,\"neuron_model.pt\"))\ntokenizer.save_pretrained(save_dir)\nmodel.config.save_pretrained(save_dir)"
+    },
+    {
+      "id": "c0004",
+      "source": "!mkdir code"
+    },
+    {
+      "id": "c0005",
+      "source": "%%writefile code/inference.py\n\nimport os\nfrom transformers import AutoConfig, AutoTokenizer\nimport torch\nimport torch.neuron\n\n# To use one neuron core per worker\nos.environ[\"NEURON_RT_NUM_CORES\"] = \"1\"\n\n# saved weights name\nAWS_NEURON_TRACED_WEIGHTS_NAME = \"neuron_model.pt\"\n\ndef model_fn(model_dir):\n    # load tokenizer and neuron model from model_dir\n    tokenizer = AutoTokenizer.from_pretrained(model_dir)\n    model = torch.jit.load(os.path.join(model_dir, AWS_NEURON_TRACED_WEIGHTS_NAME))\n    model_config = AutoConfig.from_pretrained(model_dir)\n\n    return model, tokenizer, model_config\n\ndef predict_fn(data, model_tokenizer_model_config):\n    # destruct model, tokenizer and model config\n    model, tokenizer, model_config = model_tokenizer_model_config\n\n    # create embeddings for inputs\n    inputs = data.pop(\"inputs\", data)\n    embeddings = tokenizer(\n        inputs,\n        return_tensors=\"pt\",\n        max_length=model_config.traced_sequence_length,\n        padding=\"max_length\",\n        truncation=True,\n    )\n    # convert to tuple for neuron model\n    neuron_inputs = tuple(embeddings.values())\n\n    # run prediciton\n    with torch.no_grad():\n        predictions = model(*neuron_inputs)[0]\n        scores = torch.nn.Softmax(dim=1)(predictions)\n\n    # return dictonary, which will be json serializable\n    return [{\"label\": model_config.id2label[item.argmax().item()], \"score\": item.max().item()} for item in scores]"
+    },
+    {
+      "id": "c0006",
+      "source": "import sagemaker\nimport boto3\nsess = sagemaker.Session()\n# sagemaker session bucket -> used for uploading data, models and logs\n# sagemaker will automatically create this bucket if it not exists\nsagemaker_session_bucket=None\nif sagemaker_session_bucket is None and sess is not None:\n    # set to default bucket if a bucket name is not given\n    sagemaker_session_bucket = sess.default_bucket()\n\ntry:\n    role = sagemaker.get_execution_role()\nexcept ValueError:\n    iam = boto3.client('iam')\n    role = iam.get_role(RoleName='sagemaker_execution_role')['Role']['Arn']\n\nsess = sagemaker.Session(default_bucket=sagemaker_session_bucket)\n\nprint(f\"sagemaker role arn: {role}\")\nprint(f\"sagemaker bucket: {sess.default_bucket()}\")\nprint(f\"sagemaker session region: {sess.boto_region_name}\")"
+    },
+    {
+      "id": "c0007",
+      "source": "# copy inference.py into the code/ directory of the model directory.\n!cp -r code/ tmp/code/\n# create a model.tar.gz archive with all the model artifacts and the inference.py script.\n%cd tmp\n!tar zcvf model.tar.gz *\n%cd .."
+    },
+    {
+      "id": "c0008",
+      "source": "from sagemaker.s3 import S3Uploader\n\n# create s3 uri\ns3_model_path = f\"s3://{sess.default_bucket()}/{model_id}\"\n\n# upload model.tar.gz\ns3_model_uri = S3Uploader.upload(local_path=\"tmp/model.tar.gz\",desired_s3_uri=s3_model_path)\nprint(f\"model artifcats uploaded to {s3_model_uri}\")"
+    },
+    {
+      "id": "c0009",
+      "source": "from sagemaker.huggingface.model import HuggingFaceModel\n\n# create Hugging Face Model Class\nhuggingface_model = HuggingFaceModel(\n   model_data=s3_model_uri,       # path to your model and script\n   role=role,                    # iam role with permissions to create an Endpoint\n   transformers_version=\"4.12\",  # transformers version used\n   pytorch_version=\"1.9\",        # pytorch version used\n   py_version='py37',            # python version used\n)\n\n# Let SageMaker know that we've already compiled the model via neuron-cc\nhuggingface_model._is_compiled_model = True\n\n# deploy the endpoint endpoint\npredictor = huggingface_model.deploy(\n    initial_instance_count=1,      # number of instances\n    instance_type=\"ml.inf1.xlarge\" # AWS Inferentia Instance\n)"
+    },
+    {
+      "id": "c0010",
+      "source": "data = {\n  \"inputs\": \"the mesmerizing performances of the leads keep the film grounded and keep the audience riveted .\",\n}\n\nres = predictor.predict(data=data)\nres"
+    },
+    {
+      "id": "c0011",
+      "source": "# send 10000 requests\nfor i in range(10000):\n    resp = predictor.predict(\n        data={\"inputs\": \"it 's a charming and often affecting journey .\"}\n    )"
+    },
+    {
+      "id": "c0012",
+      "source": "print(f\"https://console.aws.amazon.com/cloudwatch/home?region={sess.boto_region_name}#metricsV2:graph=~(metrics~(~(~'AWS*2fSageMaker~'ModelLatency~'EndpointName~'{predictor.endpoint_name}~'VariantName~'AllTraffic))~view~'timeSeries~stacked~false~region~'{sess.boto_region_name}~start~'-PT5M~end~'P0D~stat~'Average~period~30);query=~'*7bAWS*2fSageMaker*2cEndpointName*2cVariantName*7d*20{predictor.endpoint_name}\")"
+    },
+    {
+      "id": "c0013",
+      "source": "predictor.delete_model()\npredictor.delete_endpoint()"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T16:24:08.915370Z"
 }

@@ -18,83 +18,89 @@
   "fetchedAt": "2026-08-30T11:51:06.584943Z",
   "contentKind": "page",
   "archiveVersion": 2,
-  "bodyFormatVersion": 2,
-  "body": "# Understanding BigBird's Block Sparse Attention\n\nPublished March 31, 2021\n\nThis article is also available in Chinese 简体中文 .\n\nTransformer-based models have shown to be very useful for many NLP tasks. However, a major limitation of transformers-based models is its O ( n 2 ) O(n^2) O ( n 2 ) time & memory complexity (where n n n is sequence length). Hence, it's computationally very expensive to apply transformer-based models on long sequences n > 512 n > 512 n > 512 . Several recent papers, e.g. Longformer , Performer , Reformer , Clustered attention try to remedy this problem by approximating the full attention matrix. You can checkout 🤗's recent blog post in case you are unfamiliar with these models.\n\nBigBird (introduced in paper ) is one of such recent models to address this issue. BigBird relies on block sparse attention instead of normal attention ( i.e. BERT's attention) and can handle sequences up to a length of 4096 at a much lower computational cost compared to BERT. It has achieved SOTA on various tasks involving very long sequences such as long documents summarization, question-answering with long contexts.\n\nBigBird RoBERTa-like model is now available in 🤗Transformers. The goal of this post is to give the reader an in-depth understanding of big bird implementation & ease one's life in using BigBird with 🤗Transformers. But, before going into more depth, it is important to remember that the BigBird's attention is an approximation of BERT 's full attention and therefore does not strive to be better than BERT's full attention, but rather to be more efficient. It simply allows to apply transformer-based models to much longer sequences since BERT's quadratic memory requirement quickly becomes unbearable. Simply put, if we would have ∞ \\infty ∞ compute & ∞ \\infty ∞ time, BERT's attention would be preferred over block sparse attention (which we are going to discuss in this post).\n\nIf you wonder why we need more compute when working with longer sequences, this blog post is just right for you!\n\nSome of the main questions one might have when working with standard BERT -like attention include:\n\n- Do all tokens really have to attend to all other tokens?\n\n- Why not compute attention only over important tokens?\n\n- How to decide what tokens are important?\n\n- How to attend to just a few tokens in a very efficient way?\n\nIn this blog post, we will try to answer those questions.\n\n### What tokens should be attended to?\n\nWe will give a practical example of how attention works by considering the sentence \"BigBird is now available in HuggingFace for extractive question answering\". In BERT -like attention, every word would simply attend to all other tokens. Put mathematically, this would mean that each queried token query-token ∈ { BigBird , is , now , available , in , HuggingFace , for , extractive , question , answering } \\text{query-token} \\in \\{\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering}\\} query-token ∈ { BigBird , is , now , available , in , HuggingFace , for , extractive , question , answering } , would attend to the full list of key-tokens = [ BigBird , is , now , available , in , HuggingFace , for , extractive , question , answering ] \\text{key-tokens} = \\left[\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering} \\right] key-tokens = [ BigBird , is , now , available , in , HuggingFace , for , extractive , question , answering ] .\n\nLet's think about a sensible choice of key tokens that a queried token actually only should attend to by writing some pseudo-code. Will will assume that the token available is queried and build a sensible list of key tokens to attend to.\n\n```\n>>> # let's consider following sentence as an example\n>>> example = ['BigBird', 'is', 'now', 'available', 'in', 'HuggingFace', 'for', 'extractive', 'question', 'answering']\n\n>>> # further let's assume, we're trying to understand the representation of 'available' i.e. \n>>> query_token = 'available'\n\n>>> # We will initialize an empty `set` and fill up the tokens of our interest as we proceed in this section.\n>>> key_tokens = [] # => currently 'available' token doesn't have anything to attend\n```\n\nNearby tokens should be important because, in a sentence (sequence of words), the current word is highly dependent on neighboring past & future tokens. This intuition is the idea behind the concept of sliding attention .\n\n```\n>>> # considering `window_size = 3`, we will consider 1 token to left & 1 to right of 'available'\n>>> # left token: 'now' ; right token: 'in'\n>>> sliding_tokens = [\"now\", \"available\", \"in\"]\n\n>>> # let's update our collection with the above tokens\n>>> key_tokens.append(sliding_tokens)\n```\n\nLong-range dependencies: For some tasks, it is crucial to capture long-range relationships between tokens. E.g. , in `question-answering the model needs to compare each token of the context to the whole question to be able to figure out which part of the context is useful for a correct answer. If most of the context tokens would just attend to other context tokens, but not to the question, it becomes much harder for the model to filter important context tokens from less important context tokens.\n\nNow, BigBird proposes two ways of allowing long-term attention dependencies while staying computationally efficient.\n\n- Global tokens: Introduce some tokens which will attend to every token and which are attended by every token. Eg: \"HuggingFace is building nice libraries for easy NLP\" . Now, let's say 'building' is defined as a global token, and the model needs to know the relation among 'NLP' & 'HuggingFace' for some task (Note: these 2 tokens are at two extremes); Now having 'building' attend globally to all other tokens will probably help the model to associate 'NLP' with 'HuggingFace' .\n\n```\n>>> # let's assume 1st & last token to be `global`, then\n>>> global_tokens = [\"BigBird\", \"answering\"]\n\n>>> # fill up global tokens in our key tokens collection\n>>> key_tokens.append(global_tokens)\n```\n\n- Random tokens: Select some tokens randomly which will transfer information by transferring to other tokens which in turn can transfer to other tokens. This may reduce the cost of information travel from one token to other.\n\n```\n>>> # now we can choose `r` token randomly from our example sentence\n>>> # let's choose 'is' assuming `r=1`\n>>> random_tokens = [\"is\"] # Note: it is chosen compleletly randomly; so it can be anything else also.\n\n>>> # fill random tokens to our collection\n>>> key_tokens.append(random_tokens)\n\n>>> # it's time to see what tokens are in our `key_tokens` list\n>>> key_tokens\n{'now', 'is', 'in', 'answering', 'available', 'BigBird'}\n\n# Now, 'available' (query we choose in our 1st step) will attend only these tokens instead of attending the complete sequence\n```\n\nThis way, the query token attends only to a subset of all possible tokens while yielding a good approximation of full attention. The same approach will is used for all other queried tokens. But remember, the whole point here is to approximate BERT 's full attention as efficiently as possible. Simply making each queried token attend all key tokens as it's done for BERT can be computed very effectively as a sequence of matrix multiplication on modern hardware, like GPUs. However, a combination of sliding, global & random attention appears to imply sparse matrix multiplication, which is harder to implement efficiently on modern hardware. One of the major contributions of BigBird is the proposition of a block sparse attention mechanism that allows computing sliding, global & random attention effectively. Let's look into it!\n\n### Understanding the need for global, sliding, random keys with Graphs\n\nFirst, let's get a better understanding of global , sliding & random attention using graphs and try to understand how the combination of these three attention mechanisms yields a very good approximation of standard Bert-like attention.\n\nThe above figure shows global (left), sliding (middle) & random (right) connections respectively as a graph. Each node corresponds to a token and each line represents an attention score. If no connection is made between 2 tokens, then an attention score is assumed to 0.\n\nBigBird block sparse attention is a combination of sliding, global & random connections (total 10 connections) as shown in gif in left. While a graph of normal attention (right) will have all 15 connections (note: total 6 nodes are present). You can simply think of normal attention as all the tokens attending globally 1 {}^1 1 .\n\nNormal attention: Model can transfer information from one token to another token directly in a single layer since each token is queried over every other token and is attended by every other token. Let's consider an example similar to what is shown in the above figures. If the model needs to associate 'going' with 'now' , it can simply do that in a single layer since there is a direct connection joining both the tokens.\n\nBlock sparse attention: If the model needs to share information between two nodes (or tokens), information will have to travel across various other nodes in the path for some of the tokens; since all the nodes are not directly connected in a single layer. Eg. , assuming model needs to associate 'going' with 'now' , then if only sliding attention is present the flow of information among those 2 tokens, is defined by the path: going -> am -> i -> now (i.e. it will have to travel over 2 other tokens). Hence, we may need multiple layers to capture the entire information of the sequence. Normal attention can capture this in a single layer. In an extreme case, this could mean that as many layers as input tokens are needed. If, however, we introduce some global tokens information can travel via the path: going -> i -> now (which is shorter). If we in addition introduce random connections it can travel via: going -> am -> now . With the help of random connections & global connections, information can travel very rapidly (with just a few layers) from one token to the next.\n\nIn case, we have many global tokens, then we may not need random connections since there will be multiple short paths through which information can travel. This is the idea behind keeping num_random_tokens = 0 when working with a variant of BigBird, called ETC (more on this in later sections).\n\n1 {}^1 1 In these graphics, we are assuming that the attention matrix is symmetric i.e. A i j = A j i \\mathbf{A}_{ij} = \\mathbf{A}_{ji} A ij ​ = A ji ​ since in a graph if some token A attends B , then B will also attend A . You can see from the figure of the attention matrix shown in the next section that this assumption holds for most tokens in BigBird\n\nAttention Type global_tokens sliding_tokens random_tokens\n\nnum_random_blocks x block_size\n\noriginal_full represents BERT 's attention while block_sparse represents BigBird 's attention. Wondering what the block_size is? We will cover that in later sections. For now, consider it to be 1 for simplicity\n\n## BigBird block sparse attention\n\nBigBird block sparse attention is just an efficient implementation of what we discussed above. Each token is attending some global tokens , sliding tokens , & random tokens instead of attending to all other tokens. The authors hardcoded the attention matrix for multiple query components separately; and used a cool trick to speed up training/inference on GPU and TPU.\n\nNote: on the top, we have 2 extra sentences. As you can notice, every token is just switched by one place in both sentences. This is how sliding attention is implemented. When q[i] is multiplied with k[i,0:3] , we will get a sliding attention score for q[i] (where i is index of element in sequence).\n\nYou can find the actual implementation of block_sparse attention here . This may look very scary 😨😨 now. But this article will surely ease your life in understanding the code.\n\nFor global attention, each query is simply attending to all the other tokens in the sequence & is attended by every other token. Let's assume Vasudev (1st token) & them (last token) to be global (in the above figure). You can see that these tokens are directly connected to all other tokens (blue boxes).\n\n```\n# pseudo code\n\nQ -> Query martix (seq_length, head_dim)\nK -> Key matrix (seq_length, head_dim)\n\n# 1st & last token attends all other tokens\nQ[0] x [K[0], K[1], K[2], ......, K[n-1]]\nQ[n-1] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# 1st & last token getting attended by all other tokens\nK[0] x [Q[0], Q[1], Q[2], ......, Q[n-1]]\nK[n-1] x [Q[0], Q[1], Q[2], ......, Q[n-1]]\n```\n\nThe sequence of key tokens is copied 2 times with each element shifted to the right in one of the copies and to the left in the other copy. Now if we multiply query sequence vectors by these 3 sequence vectors, we will cover all the sliding tokens. Computational complexity is simply O(3xn) = O(n) . Referring to the above picture, the orange boxes represent the sliding attention. You can see 3 sequences at the top of the figure with 2 of them shifted by one token (1 to the left, 1 to the right).\n\n```\n# what we want to do\nQ[i] x [K[i-1], K[i], K[i+1]] for i = 1:-1\n\n# efficient implementation in code (assume dot product multiplication 👇)\n[Q[0], Q[1], Q[2], ......, Q[n-2], Q[n-1]] x [K[1], K[2], K[3], ......, K[n-1], K[0]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[n-1], K[0], K[1], ......, K[n-2]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# Each sequence is getting multiplied by only 3 sequences to keep `window_size = 3`.\n# Some computations might be missing; this is just a rough idea.\n```\n\nRandom attention is ensuring that each query token will attend a few random tokens as well. For the actual implementation, this means that the model gathers some tokens randomly and computes their attention score.\n\n```\n# r1, r2, r are some random indices; Note: r1, r2, r3 are different for each row 👇\nQ[1] x [K[r1], K[r2], ......, K[r]]\n.\n.\n.\nQ[n-2] x [K[r1], K[r2], ......, K[r]]\n\n# leaving 0th & (n-1)th token since they are already global\n```\n\nNote: The current implementation further divides sequence into blocks & each notation is defined w.r.to block instead of tokens. Let's discuss this in more detail in the next section.\n\nRecap: In regular BERT attention, a sequence of tokens i.e. X = x 1 , x 2 , . . . . , x n X = x_1, x_2, ...., x_n X = x 1 ​ , x 2 ​ , .... , x n ​ is projected through a dense layer into Q , K , V Q,K,V Q , K , V and the attention score Z Z Z is calculated as Z = S o f t m a x ( Q K T ) Z=Softmax(QK^T) Z = S o f t ma x ( Q K T ) . In the case of BigBird block sparse attention, the same algorithm is used but only with some selected query & key vectors.\n\nLet's have a look at how bigbird block sparse attention is implemented. To begin with, let's assume b , r , s , g b, r, s, g b , r , s , g represent block_size , num_random_blocks , num_sliding_blocks , num_global_blocks , respectively. Visually, we can illustrate the components of big bird's block sparse attention with b = 4 , r = 1 , g = 2 , s = 3 , d = 5 b=4, r=1, g=2, s=3, d=5 b = 4 , r = 1 , g = 2 , s = 3 , d = 5 as follows:\n\nAttention scores for q 1 , q 2 , q 3 : n − 2 , q n − 1 , q n {q}_{1}, {q}_{2}, {q}_{3:n-2}, {q}_{n-1}, {q}_{n} q 1 ​ , q 2 ​ , q 3 : n − 2 ​ , q n − 1 ​ , q n ​ are calculated separately as described below:\n\nAttention score for q 1 \\mathbf{q}_{1} q 1 ​ represented by a 1 a_1 a 1 ​ where a 1 = S o f t m a x ( q 1 ∗ K T ) a_1=Softmax(q_1 * K^T) a 1 ​ = S o f t ma x ( q 1 ​ ∗ K T ) , is nothing but attention score between all the tokens in 1st block with all the other tokens in the sequence.\n\nq 1 q_1 q 1 ​ represents 1st block, g i g_i g i ​ represents i i i block. We are simply performing normal attention operation between q 1 q_1 q 1 ​ & g g g (i.e. all the keys).\n\nFor calculating attention score for tokens in second block, we are gathering the first three blocks, the last block, and the fifth block. Then we can compute a 2 = S o f t m a x ( q 2 ∗ c o n c a t ( k 1 , k 2 , k 3 , k 5 , k 7 ) a_2 = Softmax(q_2 * concat(k_1, k_2, k_3, k_5, k_7) a 2 ​ = S o f t ma x ( q 2 ​ ∗ co n c a t ( k 1 ​ , k 2 ​ , k 3 ​ , k 5 ​ , k 7 ​ ) .\n\nI am representing tokens by g , r , s g, r, s g , r , s just to represent their nature explicitly (i.e. showing global, random, sliding tokens), else they are k k k only.\n\nFor calculating attention score for q 3 : n − 2 {q}_{3:n-2} q 3 : n − 2 ​ , we will gather global, sliding, random keys & will compute the normal attention operation over q 3 : n − 2 {q}_{3:n-2} q 3 : n − 2 ​ and the gathered keys. Note that sliding keys are gathered using the special shifting trick as discussed earlier in the sliding attention section.\n\nFor calculating attention score for tokens in previous to last block (i.e. q n − 1 {q}_{n-1} q n − 1 ​ ), we are gathering the first block, last three blocks, and the third block. Then we can apply the formula a n − 1 = S o f t m a x ( q n − 1 ∗ c o n c a t ( k 1 , k 3 , k 5 , k 6 , k 7 ) ) {a}_{n-1} = Softmax({q}_{n-1} * concat(k_1, k_3, k_5, k_6, k_7)) a n − 1 ​ = S o f t ma x ( q n − 1 ​ ∗ co n c a t ( k 1 ​ , k 3 ​ , k 5 ​ , k 6 ​ , k 7 ​ )) . This is very similar to what we did for q 2 q_2 q 2 ​ .\n\nAttention score for q n \\mathbf{q}_{n} q n ​ is represented by a n a_n a n ​ where a n = S o f t m a x ( q n ∗ K T ) a_n=Softmax(q_n * K^T) a n ​ = S o f t ma x ( q n ​ ∗ K T ) , and is nothing but attention score between all the tokens in the last block with all the other tokens in sequence. This is very similar to what we did for q 1 q_1 q 1 ​ .\n\nLet's combine the above matrices to get the final attention matrix. This attention matrix can be used to get a representation of all the tokens.\n\nblue -> global blocks , red -> random blocks , orange -> sliding blocks This attention matrix is just for illustration. During the forward pass, we aren't storing white blocks, but are computing a weighted value matrix (i.e. representation of each token) directly for each separated components as discussed above.\n\nNow, we have covered the hardest part of block sparse attention, i.e. its implementation. Hopefully, you now have a better background to understand the actual code. Feel free to dive into it and to connect each part of the code with one of the components above.\n\n## Time & Memory complexity\n\nAttention Type Sequence length Time & Memory Complexity\n\nComparison of time & space complexity of BERT attention and BigBird block sparse attention.\n\nExpand this snippet in case you wanna see the calculations\n\n```\nBigBird time complexity = O(w x n + r x n + g x n)\nBERT time complexity = O(n^2)\n\nAssumptions:\n    w = 3 x 64\n    r = 3 x 64\n    g = 2 x 64\n\nWhen seqlen = 512\n=> **time complexity in BERT = 512^2**\n\nWhen seqlen = 1024\n=> time complexity in BERT = (2 x 512)^2\n=> **time complexity in BERT = 4 x 512^2**\n\n=> time complexity in BigBird = (8 x 64) x (2 x 512)\n=> **time complexity in BigBird = 2 x 512^2**\n\nWhen seqlen = 4096\n=> time complexity in BERT = (8 x 512)^2\n=> **time complexity in BERT = 64 x 512^2**\n\n=> compute in BigBird = (8 x 64) x (8 x 512)\n=> compute in BigBird = 8 x (512 x 512)\n=> **time complexity in BigBird = 8 x 512^2**\n```\n\nThe BigBird model can be trained using 2 different strategies: ITC & ETC . ITC (internal transformer construction) is simply what we discussed above. In ETC (extended transformer construction), some additional tokens are made global such that they will attend to / will be attended by all tokens.\n\nITC requires less compute since very few tokens are global while at the same time the model can capture sufficient global information (also with the help of random attention). On the other hand, ETC can be very helpful for tasks in which we need a lot of global tokens such as `question-answering for which the entire question should be attended to globally by the context to be able to relate the context correctly to the question.\n\nNote: It is shown in the Big Bird paper that in many ETC experiments, the number of random blocks is set to 0. This is reasonable given our discussions above in the graph section.\n\nThe table below summarizes ITC & ETC:\n\nAttention Matrix with global attention\n\nA = [ 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 ] A = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} A = ​ 1 1 1 1 1 1 1 ​ 1 1 ​ 1 1 ​ 1 1 ​ 1 1 ​ 1 1 ​ 1 1 1 1 1 1 1 ​ ​\n\nB = [ 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 ] B = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} B = ​ 1 1 1 1 1 1 1 1 1 ​ 1 1 1 1 1 1 1 1 1 ​ 1 1 1 1 1 1 1 1 1 ​ 1 1 1 1 ​ 1 1 1 1 ​ 1 1 1 1 ​ 1 1 1 1 ​ 1 1 1 1 ​ 1 1 1 1 1 1 1 1 1 ​ ​\n\nextra_tokens + 2 x block_size\n\n## Using BigBird with 🤗Transformers\n\nYou can use BigBirdModel just like any other 🤗 model. Let's see some code below:\n\n```\nfrom transformers import BigBirdModel\n\n# loading bigbird from its pretrained checkpoint\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\")\n# This will init the model with default configuration i.e. attention_type = \"block_sparse\" num_random_blocks = 3, block_size = 64.\n# But You can freely change these arguments with any checkpoint. These 3 arguments will just change the number of tokens each query token is going to attend.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", num_random_blocks=2, block_size=16)\n\n# By setting attention_type to `original_full`, BigBird will be relying on the full attention of n^2 complexity. This way BigBird is 99.9 % similar to BERT.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", attention_type=\"original_full\")\n```\n\nThere are total 3 checkpoints available in 🤗Hub (at the point of writing this article): bigbird-roberta-base , bigbird-roberta-large , bigbird-base-trivia-itc . The first two checkpoints come from pretraining BigBirdForPretraining with masked_lm loss ; while the last one corresponds to the checkpoint after finetuning BigBirdForQuestionAnswering on trivia-qa dataset.\n\nLet's have a look at minimal code you can write (in case you like to use your PyTorch trainer), to use 🤗's BigBird model for fine-tuning your tasks.\n\n```\n# let's consider our task to be question-answering as an example\n\nfrom transformers import BigBirdForQuestionAnswering, BigBirdTokenizer\nimport torch\n\ndevice = torch.device(\"cpu\")\nif torch.cuda.is_available():\n    device = torch.device(\"cuda\")\n\n# lets initialize bigbird model from pretrained weights with randomly initialized head on its top\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"google/bigbird-roberta-base\", block_size=64, num_random_blocks=3)\ntokenizer = BigBirdTokenizer.from_pretrained(\"google/bigbird-roberta-base\")\nmodel.to(device)\n\ndataset = \"torch.utils.data.DataLoader object\"\noptimizer = \"torch.optim object\"\nepochs = ...\n\n# very minimal training loop\nfor e in range(epochs):\n    for batch in dataset:\n        model.train()\n        batch = {k: batch[k].to(device) for k in batch}\n\n        # forward pass\n        output = model(**batch)\n\n        # back-propogation\n        output[\"loss\"].backward()\n        optimizer.step()\n        optimizer.zero_grad()\n\n# let's save final weights in a local directory\nmodel.save_pretrained(\"<YOUR-WEIGHTS-DIR>\")\n\n# let's push our weights to 🤗Hub\nfrom huggingface_hub import ModelHubMixin\nModelHubMixin.push_to_hub(\"<YOUR-WEIGHTS-DIR>\", model_id=\"<YOUR-FINETUNED-ID>\")\n\n# using finetuned model for inference\nquestion = [\"How are you doing?\", \"How is life going?\"]\ncontext = [\"<some big context having ans-1>\", \"<some big context having ans-2>\"]\nbatch = tokenizer(question, context, return_tensors=\"pt\")\nbatch = {k: batch[k].to(device) for k in batch}\n\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"<YOUR-FINETUNED-ID>\")\nmodel.to(device)\nwith torch.no_grad():\n    start_logits, end_logits = model(**batch).to_tuple()\n    # now decode start_logits, end_logits with what ever strategy you want.\n\n# Note:\n# This was very minimal code (in case you want to use raw PyTorch) just for showing how BigBird can be used very easily\n# I would suggest using 🤗Trainer to have access for a lot of features\n```\n\nIt's important to keep the following points in mind while working with big bird:\n\n- Sequence length must be a multiple of block size i.e. seqlen % block_size = 0 . You need not worry since 🤗Transformers will automatically <pad> (to smallest multiple of block size which is greater than sequence length) if batch sequence length is not a multiple of block_size .\n\n- Currently, HuggingFace version doesn't support ETC and hence only 1st & last block will be global.\n\n- Current implementation doesn't support num_random_blocks = 0 .\n\n- It's recommended by authors to set attention_type = \"original_full\" when sequence length < 1024.\n\n- This must hold: seq_length > global_token + random_tokens + sliding_tokens + buffer_tokens where global_tokens = 2 x block_size , sliding_tokens = 3 x block_size , random_tokens = num_random_blocks x block_size & buffer_tokens = num_random_blocks x block_size . In case you fail to do that, 🤗Transformers will automatically switch attention_type to original_full with a warning.\n\n- When using big bird as decoder (or using BigBirdForCasualLM ), attention_type should be original_full . But you need not worry, 🤗Transformers will automatically switch attention_type to original_full in case you forget to do that.\n\n@patrickvonplaten has made a really cool notebook on how to evaluate BigBirdForQuestionAnswering on the trivia-qa dataset. Feel free to play with BigBird using that notebook.\n\nYou will soon find BigBird Pegasus-like model in the library for long document summarization 💥.\n\nThe original implementation of block sparse attention matrix can be found here . You can find 🤗's version here .\n\n## Models mentioned in this article 3\n\nMore Articles from our Blog\n\n## Introducing the Ettin Reranker Family\n\nnlp evaluation retrieval\n\n## Introducing RTEB: A New Standard for Retrieval Evaluation\n\nUpload images, audio, and videos by dragging in the text input, pasting, or clicking here .\n\nTap or paste here to upload images",
+  "bodyFormatVersion": 3,
+  "body": "## Introduction\n\nTransformer-based models have shown to be very useful for many NLP tasks. However, a major limitation of transformers-based models is its O(n2)O(n^2)O(n2) time & memory complexity (where nnn is sequence length). Hence, it's computationally very expensive to apply transformer-based models on long sequences n>512n > 512n>512. Several recent papers, e.g. Longformer, Performer, Reformer, Clustered attention try to remedy this problem by approximating the full attention matrix. You can checkout 🤗's recent blog post in case you are unfamiliar with these models.\n\nBigBird (introduced in paper) is one of such recent models to address this issue. BigBird relies on block sparse attention instead of normal attention (i.e. BERT's attention) and can handle sequences up to a length of 4096 at a much lower computational cost compared to BERT. It has achieved SOTA on various tasks involving very long sequences such as long documents summarization, question-answering with long contexts.\n\nBigBird RoBERTa-like model is now available in 🤗Transformers. The goal of this post is to give the reader an in-depth understanding of big bird implementation & ease one's life in using BigBird with 🤗Transformers. But, before going into more depth, it is important to remember that the BigBird's attention is an approximation of BERT's full attention and therefore does not strive to be better than BERT's full attention, but rather to be more efficient. It simply allows to apply transformer-based models to much longer sequences since BERT's quadratic memory requirement quickly becomes unbearable. Simply put, if we would have ∞\\infty∞ compute & ∞\\infty∞ time, BERT's attention would be preferred over block sparse attention (which we are going to discuss in this post).\n\nIf you wonder why we need more compute when working with longer sequences, this blog post is just right for you!\n\nSome of the main questions one might have when working with standard BERT-like attention include:\n\n- Do all tokens really have to attend to all other tokens?\n\n- Why not compute attention only over important tokens?\n\n- How to decide what tokens are important?\n\n- How to attend to just a few tokens in a very efficient way?\n\nIn this blog post, we will try to answer those questions.\n\n### What tokens should be attended to?\n\nWe will give a practical example of how attention works by considering the sentence \"BigBird is now available in HuggingFace for extractive question answering\". In BERT-like attention, every word would simply attend to all other tokens. Put mathematically, this would mean that each queried token query-token∈{BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering} \\text{query-token} \\in \\{\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering}\\} query-token∈{BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering}, would attend to the full list of key-tokens=[BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering] \\text{key-tokens} = \\left[\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering} \\right]key-tokens=[BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering].\n\nLet's think about a sensible choice of key tokens that a queried token actually only should attend to by writing some pseudo-code. Will will assume that the token available is queried and build a sensible list of key tokens to attend to.\n\n```\n>>> # let's consider following sentence as an example\n>>> example = ['BigBird', 'is', 'now', 'available', 'in', 'HuggingFace', 'for', 'extractive', 'question', 'answering']\n\n>>> # further let's assume, we're trying to understand the representation of 'available' i.e. \n>>> query_token = 'available'\n\n>>> # We will initialize an empty `set` and fill up the tokens of our interest as we proceed in this section.\n>>> key_tokens = [] # => currently 'available' token doesn't have anything to attend\n```\n\nNearby tokens should be important because, in a sentence (sequence of words), the current word is highly dependent on neighboring past & future tokens. This intuition is the idea behind the concept of sliding attention.\n\n```\n>>> # considering `window_size = 3`, we will consider 1 token to left & 1 to right of 'available'\n>>> # left token: 'now' ; right token: 'in'\n>>> sliding_tokens = [\"now\", \"available\", \"in\"]\n\n>>> # let's update our collection with the above tokens\n>>> key_tokens.append(sliding_tokens)\n```\n\nLong-range dependencies: For some tasks, it is crucial to capture long-range relationships between tokens. E.g., in `question-answering the model needs to compare each token of the context to the whole question to be able to figure out which part of the context is useful for a correct answer. If most of the context tokens would just attend to other context tokens, but not to the question, it becomes much harder for the model to filter important context tokens from less important context tokens.\n\nNow, BigBird proposes two ways of allowing long-term attention dependencies while staying computationally efficient.\n\n- Global tokens: Introduce some tokens which will attend to every token and which are attended by every token. Eg: \"HuggingFace is building nice libraries for easy NLP\". Now, let's say 'building' is defined as a global token, and the model needs to know the relation among 'NLP' & 'HuggingFace' for some task (Note: these 2 tokens are at two extremes); Now having 'building' attend globally to all other tokens will probably help the model to associate 'NLP' with 'HuggingFace'.\n\n```\n>>> # let's assume 1st & last token to be `global`, then\n>>> global_tokens = [\"BigBird\", \"answering\"]\n\n>>> # fill up global tokens in our key tokens collection\n>>> key_tokens.append(global_tokens)\n```\n\n- Random tokens: Select some tokens randomly which will transfer information by transferring to other tokens which in turn can transfer to other tokens. This may reduce the cost of information travel from one token to other.\n\n```\n>>> # now we can choose `r` token randomly from our example sentence\n>>> # let's choose 'is' assuming `r=1`\n>>> random_tokens = [\"is\"] # Note: it is chosen compleletly randomly; so it can be anything else also.\n\n>>> # fill random tokens to our collection\n>>> key_tokens.append(random_tokens)\n\n>>> # it's time to see what tokens are in our `key_tokens` list\n>>> key_tokens\n{'now', 'is', 'in', 'answering', 'available', 'BigBird'}\n\n# Now, 'available' (query we choose in our 1st step) will attend only these tokens instead of attending the complete sequence\n```\n\nThis way, the query token attends only to a subset of all possible tokens while yielding a good approximation of full attention. The same approach will is used for all other queried tokens. But remember, the whole point here is to approximate BERT's full attention as efficiently as possible. Simply making each queried token attend all key tokens as it's done for BERT can be computed very effectively as a sequence of matrix multiplication on modern hardware, like GPUs. However, a combination of sliding, global & random attention appears to imply sparse matrix multiplication, which is harder to implement efficiently on modern hardware. One of the major contributions of BigBird is the proposition of a block sparse attention mechanism that allows computing sliding, global & random attention effectively. Let's look into it!\n\n### Understanding the need for global, sliding, random keys with Graphs\n\nFirst, let's get a better understanding of global, sliding & random attention using graphs and try to understand how the combination of these three attention mechanisms yields a very good approximation of standard Bert-like attention.\n\nThe above figure shows global (left), sliding (middle) & random (right) connections respectively as a graph. Each node corresponds to a token and each line represents an attention score. If no connection is made between 2 tokens, then an attention score is assumed to 0.\n\nBigBird block sparse attention is a combination of sliding, global & random connections (total 10 connections) as shown in gif in left. While a graph of normal attention (right) will have all 15 connections (note: total 6 nodes are present). You can simply think of normal attention as all the tokens attending globally 1 {}^1 1.\n\nNormal attention: Model can transfer information from one token to another token directly in a single layer since each token is queried over every other token and is attended by every other token. Let's consider an example similar to what is shown in the above figures. If the model needs to associate 'going' with 'now', it can simply do that in a single layer since there is a direct connection joining both the tokens.\n\nBlock sparse attention: If the model needs to share information between two nodes (or tokens), information will have to travel across various other nodes in the path for some of the tokens; since all the nodes are not directly connected in a single layer. Eg., assuming model needs to associate 'going' with 'now', then if only sliding attention is present the flow of information among those 2 tokens, is defined by the path: going -> am -> i -> now (i.e. it will have to travel over 2 other tokens). Hence, we may need multiple layers to capture the entire information of the sequence. Normal attention can capture this in a single layer. In an extreme case, this could mean that as many layers as input tokens are needed. If, however, we introduce some global tokens information can travel via the path: going -> i -> now (which is shorter). If we in addition introduce random connections it can travel via: going -> am -> now. With the help of random connections & global connections, information can travel very rapidly (with just a few layers) from one token to the next.\n\nIn case, we have many global tokens, then we may not need random connections since there will be multiple short paths through which information can travel. This is the idea behind keeping num_random_tokens = 0 when working with a variant of BigBird, called ETC (more on this in later sections).\n\n1 {}^1 1 In these graphics, we are assuming that the attention matrix is symmetric i.e. Aij=Aji\\mathbf{A}_{ij} = \\mathbf{A}_{ji}Aij​=Aji​ since in a graph if some token A attends B, then B will also attend A. You can see from the figure of the attention matrix shown in the next section that this assumption holds for most tokens in BigBird\n\nAttention Type\n\nglobal_tokens\n\nsliding_tokens\n\nrandom_tokens\n\noriginal_full\n\nn\n\n0\n\n0\n\nblock_sparse\n\n2 x block_size\n\n3 x block_size\n\nnum_random_blocks x block_size\n\noriginal_full represents BERT's attention while block_sparse represents BigBird's attention. Wondering what the block_size is? We will cover that in later sections. For now, consider it to be 1 for simplicity\n\n## BigBird block sparse attention\n\nBigBird block sparse attention is just an efficient implementation of what we discussed above. Each token is attending some global tokens, sliding tokens, & random tokens instead of attending to all other tokens. The authors hardcoded the attention matrix for multiple query components separately; and used a cool trick to speed up training/inference on GPU and TPU.\n\nNote: on the top, we have 2 extra sentences. As you can notice, every token is just switched by one place in both sentences. This is how sliding attention is implemented. When q[i] is multiplied with k[i,0:3], we will get a sliding attention score for q[i] (where i is index of element in sequence).\n\nYou can find the actual implementation of block_sparse attention here. This may look very scary 😨😨 now. But this article will surely ease your life in understanding the code.\n\n### Global Attention\n\nFor global attention, each query is simply attending to all the other tokens in the sequence & is attended by every other token. Let's assume Vasudev (1st token) & them (last token) to be global (in the above figure). You can see that these tokens are directly connected to all other tokens (blue boxes).\n\n```\n# pseudo code\n\nQ -> Query martix (seq_length, head_dim)\nK -> Key matrix (seq_length, head_dim)\n\n# 1st & last token attends all other tokens\nQ[0] x [K[0], K[1], K[2], ......, K[n-1]]\nQ[n-1] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# 1st & last token getting attended by all other tokens\nK[0] x [Q[0], Q[1], Q[2], ......, Q[n-1]]\nK[n-1] x [Q[0], Q[1], Q[2], ......, Q[n-1]]\n```\n\n### Sliding Attention\n\nThe sequence of key tokens is copied 2 times with each element shifted to the right in one of the copies and to the left in the other copy. Now if we multiply query sequence vectors by these 3 sequence vectors, we will cover all the sliding tokens. Computational complexity is simply O(3xn) = O(n). Referring to the above picture, the orange boxes represent the sliding attention. You can see 3 sequences at the top of the figure with 2 of them shifted by one token (1 to the left, 1 to the right).\n\n```\n# what we want to do\nQ[i] x [K[i-1], K[i], K[i+1]] for i = 1:-1\n\n# efficient implementation in code (assume dot product multiplication 👇)\n[Q[0], Q[1], Q[2], ......, Q[n-2], Q[n-1]] x [K[1], K[2], K[3], ......, K[n-1], K[0]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[n-1], K[0], K[1], ......, K[n-2]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# Each sequence is getting multiplied by only 3 sequences to keep `window_size = 3`.\n# Some computations might be missing; this is just a rough idea.\n```\n\n### Random Attention\n\nRandom attention is ensuring that each query token will attend a few random tokens as well. For the actual implementation, this means that the model gathers some tokens randomly and computes their attention score.\n\n```\n# r1, r2, r are some random indices; Note: r1, r2, r3 are different for each row 👇\nQ[1] x [K[r1], K[r2], ......, K[r]]\n.\n.\n.\nQ[n-2] x [K[r1], K[r2], ......, K[r]]\n\n# leaving 0th & (n-1)th token since they are already global\n```\n\nNote: The current implementation further divides sequence into blocks & each notation is defined w.r.to block instead of tokens. Let's discuss this in more detail in the next section.\n\n### Implementation\n\nRecap: In regular BERT attention, a sequence of tokens i.e. X=x1,x2,....,xn X = x_1, x_2, ...., x_n X=x1​,x2​,....,xn​ is projected through a dense layer into Q,K,V Q,K,V Q,K,V and the attention score Z Z Z is calculated as Z=Softmax(QKT) Z=Softmax(QK^T) Z=Softmax(QKT). In the case of BigBird block sparse attention, the same algorithm is used but only with some selected query & key vectors.\n\nLet's have a look at how bigbird block sparse attention is implemented. To begin with, let's assume b,r,s,gb, r, s, gb,r,s,g represent block_size, num_random_blocks, num_sliding_blocks, num_global_blocks, respectively. Visually, we can illustrate the components of big bird's block sparse attention with b=4,r=1,g=2,s=3,d=5b=4, r=1, g=2, s=3, d=5b=4,r=1,g=2,s=3,d=5 as follows:\n\nAttention scores for q1,q2,q3:n−2,qn−1,qn{q}_{1}, {q}_{2}, {q}_{3:n-2}, {q}_{n-1}, {q}_{n}q1​,q2​,q3:n−2​,qn−1​,qn​ are calculated separately as described below:\n\nAttention score for q1\\mathbf{q}_{1}q1​ represented by a1a_1a1​ where a1=Softmax(q1∗KT)a_1=Softmax(q_1 * K^T)a1​=Softmax(q1​∗KT), is nothing but attention score between all the tokens in 1st block with all the other tokens in the sequence.\n\nq1q_1q1​ represents 1st block, gig_igi​ represents iii block. We are simply performing normal attention operation between q1q_1q1​ & ggg (i.e. all the keys).\n\nFor calculating attention score for tokens in second block, we are gathering the first three blocks, the last block, and the fifth block. Then we can compute a2=Softmax(q2∗concat(k1,k2,k3,k5,k7)a_2 = Softmax(q_2 * concat(k_1, k_2, k_3, k_5, k_7)a2​=Softmax(q2​∗concat(k1​,k2​,k3​,k5​,k7​).\n\nI am representing tokens by g,r,sg, r, sg,r,s just to represent their nature explicitly (i.e. showing global, random, sliding tokens), else they are kkk only.\n\nFor calculating attention score for q3:n−2{q}_{3:n-2}q3:n−2​, we will gather global, sliding, random keys & will compute the normal attention operation over q3:n−2{q}_{3:n-2}q3:n−2​ and the gathered keys. Note that sliding keys are gathered using the special shifting trick as discussed earlier in the sliding attention section.\n\nFor calculating attention score for tokens in previous to last block (i.e. qn−1{q}_{n-1}qn−1​), we are gathering the first block, last three blocks, and the third block. Then we can apply the formula an−1=Softmax(qn−1∗concat(k1,k3,k5,k6,k7)){a}_{n-1} = Softmax({q}_{n-1} * concat(k_1, k_3, k_5, k_6, k_7))an−1​=Softmax(qn−1​∗concat(k1​,k3​,k5​,k6​,k7​)). This is very similar to what we did for q2q_2q2​.\n\nAttention score for qn\\mathbf{q}_{n}qn​ is represented by ana_nan​ where an=Softmax(qn∗KT)a_n=Softmax(q_n * K^T)an​=Softmax(qn​∗KT), and is nothing but attention score between all the tokens in the last block with all the other tokens in sequence. This is very similar to what we did for q1 q_1 q1​ .\n\nLet's combine the above matrices to get the final attention matrix. This attention matrix can be used to get a representation of all the tokens.\n\nblue -> global blocks, red -> random blocks, orange -> sliding blocks This attention matrix is just for illustration. During the forward pass, we aren't storing white blocks, but are computing a weighted value matrix (i.e. representation of each token) directly for each separated components as discussed above.\n\nNow, we have covered the hardest part of block sparse attention, i.e. its implementation. Hopefully, you now have a better background to understand the actual code. Feel free to dive into it and to connect each part of the code with one of the components above.\n\n## Time & Memory complexity\n\nAttention Type\n\nSequence length\n\nTime & Memory Complexity\n\noriginal_full\n\n512\n\nT\n\n—\n\n1024\n\n4 x T\n\n—\n\n4096\n\n64 x T\n\nblock_sparse\n\n1024\n\n2 x T\n\n—\n\n4096\n\n8 x T\n\nComparison of time & space complexity of BERT attention and BigBird block sparse attention.\n\nExpand this snippet in case you wanna see the calculations\n\n```\nBigBird time complexity = O(w x n + r x n + g x n)\nBERT time complexity = O(n^2)\n\nAssumptions:\n    w = 3 x 64\n    r = 3 x 64\n    g = 2 x 64\n\nWhen seqlen = 512\n=> **time complexity in BERT = 512^2**\n\nWhen seqlen = 1024\n=> time complexity in BERT = (2 x 512)^2\n=> **time complexity in BERT = 4 x 512^2**\n\n=> time complexity in BigBird = (8 x 64) x (2 x 512)\n=> **time complexity in BigBird = 2 x 512^2**\n\nWhen seqlen = 4096\n=> time complexity in BERT = (8 x 512)^2\n=> **time complexity in BERT = 64 x 512^2**\n\n=> compute in BigBird = (8 x 64) x (8 x 512)\n=> compute in BigBird = 8 x (512 x 512)\n=> **time complexity in BigBird = 8 x 512^2**\n```\n\n## ITC vs ETC\n\nThe BigBird model can be trained using 2 different strategies: ITC & ETC. ITC (internal transformer construction) is simply what we discussed above. In ETC (extended transformer construction), some additional tokens are made global such that they will attend to / will be attended by all tokens.\n\nITC requires less compute since very few tokens are global while at the same time the model can capture sufficient global information (also with the help of random attention). On the other hand, ETC can be very helpful for tasks in which we need a lot of global tokens such as `question-answering for which the entire question should be attended to globally by the context to be able to relate the context correctly to the question.\n\nNote: It is shown in the Big Bird paper that in many ETC experiments, the number of random blocks is set to 0. This is reasonable given our discussions above in the graph section.\n\nThe table below summarizes ITC & ETC:\n\n—\n\nITC\n\nETC\n\nAttention Matrix with global attention\n\nA=[111111111111111111111111] A = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} A=​1111111​11​11​11​11​11​1111111​​\n\nB=[11111111111111111111111111111111111111111111111111111111] B = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} B=​111111111​111111111​111111111​1111​1111​1111​1111​1111​111111111​​\n\nglobal_tokens\n\n2 x block_size\n\nextra_tokens + 2 x block_size\n\nrandom_tokens\n\nnum_random_blocks x block_size\n\nnum_random_blocks x block_size\n\nsliding_tokens\n\n3 x block_size\n\n3 x block_size\n\n## Using BigBird with 🤗Transformers\n\nYou can use BigBirdModel just like any other 🤗 model. Let's see some code below:\n\n```\nfrom transformers import BigBirdModel\n\n# loading bigbird from its pretrained checkpoint\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\")\n# This will init the model with default configuration i.e. attention_type = \"block_sparse\" num_random_blocks = 3, block_size = 64.\n# But You can freely change these arguments with any checkpoint. These 3 arguments will just change the number of tokens each query token is going to attend.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", num_random_blocks=2, block_size=16)\n\n# By setting attention_type to `original_full`, BigBird will be relying on the full attention of n^2 complexity. This way BigBird is 99.9 % similar to BERT.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", attention_type=\"original_full\")\n```\n\nThere are total 3 checkpoints available in 🤗Hub (at the point of writing this article): bigbird-roberta-base, bigbird-roberta-large, bigbird-base-trivia-itc. The first two checkpoints come from pretraining BigBirdForPretraining with masked_lm loss; while the last one corresponds to the checkpoint after finetuning BigBirdForQuestionAnswering on trivia-qa dataset.\n\nLet's have a look at minimal code you can write (in case you like to use your PyTorch trainer), to use 🤗's BigBird model for fine-tuning your tasks.\n\n```\n# let's consider our task to be question-answering as an example\n\nfrom transformers import BigBirdForQuestionAnswering, BigBirdTokenizer\nimport torch\n\ndevice = torch.device(\"cpu\")\nif torch.cuda.is_available():\n    device = torch.device(\"cuda\")\n\n# lets initialize bigbird model from pretrained weights with randomly initialized head on its top\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"google/bigbird-roberta-base\", block_size=64, num_random_blocks=3)\ntokenizer = BigBirdTokenizer.from_pretrained(\"google/bigbird-roberta-base\")\nmodel.to(device)\n\ndataset = \"torch.utils.data.DataLoader object\"\noptimizer = \"torch.optim object\"\nepochs = ...\n\n# very minimal training loop\nfor e in range(epochs):\n    for batch in dataset:\n        model.train()\n        batch = {k: batch[k].to(device) for k in batch}\n\n        # forward pass\n        output = model(**batch)\n\n        # back-propogation\n        output[\"loss\"].backward()\n        optimizer.step()\n        optimizer.zero_grad()\n\n# let's save final weights in a local directory\nmodel.save_pretrained(\"<YOUR-WEIGHTS-DIR>\")\n\n# let's push our weights to 🤗Hub\nfrom huggingface_hub import ModelHubMixin\nModelHubMixin.push_to_hub(\"<YOUR-WEIGHTS-DIR>\", model_id=\"<YOUR-FINETUNED-ID>\")\n\n# using finetuned model for inference\nquestion = [\"How are you doing?\", \"How is life going?\"]\ncontext = [\"<some big context having ans-1>\", \"<some big context having ans-2>\"]\nbatch = tokenizer(question, context, return_tensors=\"pt\")\nbatch = {k: batch[k].to(device) for k in batch}\n\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"<YOUR-FINETUNED-ID>\")\nmodel.to(device)\nwith torch.no_grad():\n    start_logits, end_logits = model(**batch).to_tuple()\n    # now decode start_logits, end_logits with what ever strategy you want.\n\n# Note:\n# This was very minimal code (in case you want to use raw PyTorch) just for showing how BigBird can be used very easily\n# I would suggest using 🤗Trainer to have access for a lot of features\n```\n\nIt's important to keep the following points in mind while working with big bird:\n\n- Sequence length must be a multiple of block size i.e. seqlen % block_size = 0. You need not worry since 🤗Transformers will automatically <pad> (to smallest multiple of block size which is greater than sequence length) if batch sequence length is not a multiple of block_size.\n\n- Currently, HuggingFace version doesn't support ETC and hence only 1st & last block will be global.\n\n- Current implementation doesn't support num_random_blocks = 0.\n\n- It's recommended by authors to set attention_type = \"original_full\" when sequence length < 1024.\n\n- This must hold: seq_length > global_token + random_tokens + sliding_tokens + buffer_tokens where global_tokens = 2 x block_size, sliding_tokens = 3 x block_size, random_tokens = num_random_blocks x block_size & buffer_tokens = num_random_blocks x block_size. In case you fail to do that, 🤗Transformers will automatically switch attention_type to original_full with a warning.\n\n- When using big bird as decoder (or using BigBirdForCasualLM), attention_type should be original_full. But you need not worry, 🤗Transformers will automatically switch attention_type to original_full in case you forget to do that.\n\n## What's next?\n\n@patrickvonplaten has made a really cool notebook on how to evaluate BigBirdForQuestionAnswering on the trivia-qa dataset. Feel free to play with BigBird using that notebook.\n\nYou will soon find BigBird Pegasus-like model in the library for long document summarization💥.\n\n## End Notes\n\nThe original implementation of block sparse attention matrix can be found here. You can find 🤗's version here.",
   "summaryZh": "Transformer模型在处理长序列时面临计算复杂度的瓶颈。BigBird通过引入块稀疏注意力机制替代传统的全注意力机制，在大幅降低计算成本的同时将序列处理长度提升至4096，为长文档摘要和长上下文问答提供了高效的解决方案。",
   "summaryGeneratedAt": "2026-09-06T03:31:16.458546Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
   "images": [
     {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/66ff8411309ec923a955826b/whc0dlLrNDkgvy_1SXmRn.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/66ff8411309ec923a955826b/whc0dlLrNDkgvy_1SXmRn.jpeg",
-      "id": "image_bb029e6aeab4462e"
-    },
-    {
-      "src": "https://huggingface.co/avatars/db42814a5df990ebb5971db4279eb9a3.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/db42814a5df990ebb5971db4279eb9a3.svg",
-      "id": "image_948870c6d73845dc"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/635c4736177df3f16e99db63/wP8zIiCLNLyVEJCwPr51-.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/635c4736177df3f16e99db63/wP8zIiCLNLyVEJCwPr51-.jpeg",
-      "id": "image_2df3c6638aec82ec"
-    },
-    {
-      "src": "https://huggingface.co/avatars/699e747282fb3dcd6f6eccb8f4294b65.svg",
-      "alt": "",
-      "originalUrl": "https://huggingface.co/avatars/699e747282fb3dcd6f6eccb8f4294b65.svg",
-      "id": "image_bf1d5969e15fd7d5"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/FHTYSziunobzhQfCPA11h.png",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/no-auth/FHTYSziunobzhQfCPA11h.png",
-      "id": "image_e3bed9b9f14b7049"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/6557909bf062c53d55855f9d/zZBpRnEV77QAW4KXkMxRz.jpeg",
-      "alt": "",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/6557909bf062c53d55855f9d/zZBpRnEV77QAW4KXkMxRz.jpeg",
-      "id": "image_98a67105f689302d"
-    },
-    {
-      "src": "https://cdn-avatars.huggingface.co/v1/production/uploads/5f6b44345e78cc6b0ed31d33/U4wAz5mxFz8Q6TTfSbApa.png",
-      "alt": "Vasudev Gupta's avatar",
-      "originalUrl": "https://cdn-avatars.huggingface.co/v1/production/uploads/5f6b44345e78cc6b0ed31d33/U4wAz5mxFz8Q6TTfSbApa.png",
-      "id": "image_8e0a74f5c1ae1145"
-    },
-    {
       "src": "https://huggingface.co/blog/assets/18_big_bird/global.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/global.png",
+      "alt": "",
       "id": "image_4a2a9d3f8c41abe4"
     },
     {
       "src": "https://huggingface.co/blog/assets/18_big_bird/sliding.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/sliding.png",
+      "alt": "",
       "id": "image_27289574821a067d"
     },
     {
       "src": "https://huggingface.co/blog/assets/18_big_bird/random.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/random.png",
+      "alt": "",
       "id": "image_9313fdd3414075ab"
     },
     {
       "src": "https://huggingface.co/blog/assets/18_big_bird/graph.gif",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/graph.gif",
+      "alt": "",
       "id": "image_7d37dc5b07a07e2b"
     },
     {
       "src": "https://huggingface.co/blog/assets/18_big_bird/full.png",
-      "alt": "",
       "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/full.png",
+      "alt": "",
       "id": "image_f9ec31d5343529b9"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/attn.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/attn.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_0b2aa9f1c04f2c4d"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/intro.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/intro.png",
+      "alt": "",
+      "id": "image_781c074edd445b5f"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/q1.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/q1.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_92aefa6217111f34"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/q2.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/q2.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_62aa66d2367b7395"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/q_middle.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/q_middle.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_7e82dfd92fe36c7f"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/qlast_sec.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/qlast_sec.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_71b296aeee8be7d6"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/qlast.png",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/qlast.png",
+      "alt": "BigBird block sparse attention",
+      "id": "image_2915efa17b24d882"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/18_big_bird/block-sparse-attn.gif",
+      "originalUrl": "https://huggingface.co/blog/assets/18_big_bird/block-sparse-attn.gif",
+      "alt": "BigBird block sparse attention",
+      "id": "image_dcafa117d9a803a7"
     }
   ],
   "videos": [],
@@ -102,121 +108,91 @@
   "mediaFormatVersion": 2,
   "mediaRecheckedAt": "2026-09-26T06:13:21.815916Z",
   "mediaLayoutVersion": 1,
-  "mediaLayoutBodyHash": "5adcdd002b5507d98bf8270b36815dcf4fc38fc06697b0ecb722a94214aea822",
+  "mediaLayoutBodyHash": "ca53c30be10b68ace25efecea970f54fa83d49e7bed04444a027e7a713f20ce4",
   "mediaLayout": [
-    {
-      "mediaId": "image_bb029e6aeab4462e",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 2
-    },
-    {
-      "mediaId": "image_948870c6d73845dc",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 3
-    },
-    {
-      "mediaId": "image_2df3c6638aec82ec",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 4
-    },
-    {
-      "mediaId": "image_bf1d5969e15fd7d5",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 5
-    },
-    {
-      "mediaId": "image_e3bed9b9f14b7049",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 6
-    },
-    {
-      "mediaId": "image_98a67105f689302d",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 7
-    },
-    {
-      "mediaId": "image_8e0a74f5c1ae1145",
-      "type": "image",
-      "afterBlockId": "b0002",
-      "order": 8
-    },
     {
       "mediaId": "image_4a2a9d3f8c41abe4",
       "type": "image",
-      "afterBlockId": "b0024",
-      "order": 35
+      "afterBlockId": "b0022",
+      "order": 0
     },
     {
       "mediaId": "image_27289574821a067d",
       "type": "image",
-      "afterBlockId": "b0024",
-      "order": 36
+      "afterBlockId": "b0022",
+      "order": 1
     },
     {
       "mediaId": "image_9313fdd3414075ab",
       "type": "image",
-      "afterBlockId": "b0024",
-      "order": 37
+      "afterBlockId": "b0022",
+      "order": 2
     },
     {
       "mediaId": "image_7d37dc5b07a07e2b",
       "type": "image",
-      "afterBlockId": "b0025",
-      "order": 39
+      "afterBlockId": "b0023",
+      "order": 3
     },
     {
       "mediaId": "image_f9ec31d5343529b9",
       "type": "image",
-      "afterBlockId": "b0025",
-      "order": 40
+      "afterBlockId": "b0023",
+      "order": 4
     },
     {
-      "mediaId": "image_bb029e6aeab4462e",
+      "mediaId": "image_0b2aa9f1c04f2c4d",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 109
+      "afterBlockId": "b0044",
+      "order": 5
     },
     {
-      "mediaId": "image_948870c6d73845dc",
+      "mediaId": "image_781c074edd445b5f",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 110
+      "afterBlockId": "b0055",
+      "order": 6
     },
     {
-      "mediaId": "image_2df3c6638aec82ec",
+      "mediaId": "image_92aefa6217111f34",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 111
+      "afterBlockId": "b0058",
+      "order": 7
     },
     {
-      "mediaId": "image_bf1d5969e15fd7d5",
+      "mediaId": "image_62aa66d2367b7395",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 112
+      "afterBlockId": "b0059",
+      "order": 8
     },
     {
-      "mediaId": "image_e3bed9b9f14b7049",
+      "mediaId": "image_7e82dfd92fe36c7f",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 113
+      "afterBlockId": "b0061",
+      "order": 9
     },
     {
-      "mediaId": "image_98a67105f689302d",
+      "mediaId": "image_71b296aeee8be7d6",
       "type": "image",
-      "afterBlockId": "b0087",
-      "order": 114
+      "afterBlockId": "b0062",
+      "order": 10
+    },
+    {
+      "mediaId": "image_2915efa17b24d882",
+      "type": "image",
+      "afterBlockId": "b0063",
+      "order": 11
+    },
+    {
+      "mediaId": "image_dcafa117d9a803a7",
+      "type": "image",
+      "afterBlockId": "b0064",
+      "order": 12
     }
   ],
   "mediaLayoutUnplaced": [],
-  "mediaLayoutMatched": 18,
+  "mediaLayoutMatched": 13,
   "mediaLayoutStatus": "complete",
-  "mediaLayoutCheckedAt": "2026-09-26T16:47:22.387103Z",
+  "mediaLayoutCheckedAt": "2026-10-05T16:26:32.545765Z",
   "articleKind": "page",
   "aiReview": {
     "version": "ai-editor-v3",
@@ -248,5 +224,1967 @@
     "summaryZh": "Transformer模型在处理长序列时面临计算复杂度的瓶颈。BigBird通过引入块稀疏注意力机制替代传统的全注意力机制，在大幅降低计算成本的同时将序列处理长度提升至4096，为长文档摘要和长上下文问答提供了高效的解决方案。",
     "glossary": [],
     "duplicateKey": "bigbird-block-sparse-attention"
-  }
+  },
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Transformer-based models have shown to be very useful for many NLP tasks. However, a major limitation of transformers-based models is its O(n2)O(n^2)O(n2) time & memory complexity (where nnn is sequence length). Hence, it's computationally very expensive to apply transformer-based models on long sequences n>512n > 512n>512. Several recent papers, e.g. Longformer, Performer, Reformer, Clustered attention try to remedy this problem by approximating the full attention matrix. You can checkout 🤗's recent blog post in case you are unfamiliar with these models.",
+      "spans": [
+        {
+          "start": 349,
+          "end": 353,
+          "kind": "em"
+        },
+        {
+          "start": 354,
+          "end": 364,
+          "kind": "code"
+        },
+        {
+          "start": 366,
+          "end": 375,
+          "kind": "code"
+        },
+        {
+          "start": 377,
+          "end": 385,
+          "kind": "code"
+        },
+        {
+          "start": 387,
+          "end": 406,
+          "kind": "code"
+        },
+        {
+          "start": 511,
+          "end": 515,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/long-range-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "BigBird (introduced in paper) is one of such recent models to address this issue. BigBird relies on block sparse attention instead of normal attention (i.e. BERT's attention) and can handle sequences up to a length of 4096 at a much lower computational cost compared to BERT. It has achieved SOTA on various tasks involving very long sequences such as long documents summarization, question-answering with long contexts.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "code"
+        },
+        {
+          "start": 23,
+          "end": 28,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2007.14062"
+        },
+        {
+          "start": 82,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 100,
+          "end": 122,
+          "kind": "strong"
+        },
+        {
+          "start": 152,
+          "end": 156,
+          "kind": "em"
+        },
+        {
+          "start": 218,
+          "end": 222,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "BigBird RoBERTa-like model is now available in 🤗Transformers. The goal of this post is to give the reader an in-depth understanding of big bird implementation & ease one's life in using BigBird with 🤗Transformers. But, before going into more depth, it is important to remember that the BigBird's attention is an approximation of BERT's full attention and therefore does not strive to be better than BERT's full attention, but rather to be more efficient. It simply allows to apply transformer-based models to much longer sequences since BERT's quadratic memory requirement quickly becomes unbearable. Simply put, if we would have ∞\\infty∞ compute & ∞\\infty∞ time, BERT's attention would be preferred over block sparse attention (which we are going to discuss in this post).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        },
+        {
+          "start": 109,
+          "end": 117,
+          "kind": "strong"
+        },
+        {
+          "start": 286,
+          "end": 295,
+          "kind": "code"
+        },
+        {
+          "start": 329,
+          "end": 333,
+          "kind": "code"
+        },
+        {
+          "start": 387,
+          "end": 393,
+          "kind": "strong"
+        },
+        {
+          "start": 399,
+          "end": 405,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "If you wonder why we need more compute when working with longer sequences, this blog post is just right for you!",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Some of the main questions one might have when working with standard BERT-like attention include:",
+      "spans": [
+        {
+          "start": 69,
+          "end": 73,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Do all tokens really have to attend to all other tokens?",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Why not compute attention only over important tokens?",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "How to decide what tokens are important?",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "How to attend to just a few tokens in a very efficient way?",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "In this blog post, we will try to answer those questions.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "What tokens should be attended to?",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "We will give a practical example of how attention works by considering the sentence \"BigBird is now available in HuggingFace for extractive question answering\". In BERT-like attention, every word would simply attend to all other tokens. Put mathematically, this would mean that each queried token query-token∈{BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering} \\text{query-token} \\in \\{\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering}\\} query-token∈{BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering}, would attend to the full list of key-tokens=[BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering] \\text{key-tokens} = \\left[\\text{BigBird},\\text{is},\\text{now},\\text{available},\\text{in},\\text{HuggingFace},\\text{for},\\text{extractive},\\text{question},\\text{answering} \\right]key-tokens=[BigBird,is,now,available,in,HuggingFace,for,extractive,question,answering].",
+      "spans": [
+        {
+          "start": 164,
+          "end": 168,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Let's think about a sensible choice of key tokens that a queried token actually only should attend to by writing some pseudo-code. Will will assume that the token available is queried and build a sensible list of key tokens to attend to.",
+      "spans": [
+        {
+          "start": 163,
+          "end": 172,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Nearby tokens should be important because, in a sentence (sequence of words), the current word is highly dependent on neighboring past & future tokens. This intuition is the idea behind the concept of sliding attention.",
+      "spans": [
+        {
+          "start": 201,
+          "end": 218,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Long-range dependencies: For some tasks, it is crucial to capture long-range relationships between tokens. E.g., in `question-answering the model needs to compare each token of the context to the whole question to be able to figure out which part of the context is useful for a correct answer. If most of the context tokens would just attend to other context tokens, but not to the question, it becomes much harder for the model to filter important context tokens from less important context tokens.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "strong"
+        },
+        {
+          "start": 107,
+          "end": 111,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Now, BigBird proposes two ways of allowing long-term attention dependencies while staying computationally efficient.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 12,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Global tokens: Introduce some tokens which will attend to every token and which are attended by every token. Eg: \"HuggingFace is building nice libraries for easy NLP\". Now, let's say 'building' is defined as a global token, and the model needs to know the relation among 'NLP' & 'HuggingFace' for some task (Note: these 2 tokens are at two extremes); Now having 'building' attend globally to all other tokens will probably help the model to associate 'NLP' with 'HuggingFace'.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 113,
+          "end": 166,
+          "kind": "em"
+        },
+        {
+          "start": 183,
+          "end": 193,
+          "kind": "em"
+        },
+        {
+          "start": 271,
+          "end": 276,
+          "kind": "em"
+        },
+        {
+          "start": 279,
+          "end": 292,
+          "kind": "em"
+        },
+        {
+          "start": 362,
+          "end": 372,
+          "kind": "em"
+        },
+        {
+          "start": 451,
+          "end": 456,
+          "kind": "em"
+        },
+        {
+          "start": 462,
+          "end": 475,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Random tokens: Select some tokens randomly which will transfer information by transferring to other tokens which in turn can transfer to other tokens. This may reduce the cost of information travel from one token to other.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "This way, the query token attends only to a subset of all possible tokens while yielding a good approximation of full attention. The same approach will is used for all other queried tokens. But remember, the whole point here is to approximate BERT's full attention as efficiently as possible. Simply making each queried token attend all key tokens as it's done for BERT can be computed very effectively as a sequence of matrix multiplication on modern hardware, like GPUs. However, a combination of sliding, global & random attention appears to imply sparse matrix multiplication, which is harder to implement efficiently on modern hardware. One of the major contributions of BigBird is the proposition of a block sparse attention mechanism that allows computing sliding, global & random attention effectively. Let's look into it!",
+      "spans": [
+        {
+          "start": 243,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 676,
+          "end": 683,
+          "kind": "code"
+        },
+        {
+          "start": 708,
+          "end": 720,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Understanding the need for global, sliding, random keys with Graphs",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "First, let's get a better understanding of global, sliding & random attention using graphs and try to understand how the combination of these three attention mechanisms yields a very good approximation of standard Bert-like attention.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 51,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 61,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 214,
+          "end": 223,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "The above figure shows global (left), sliding (middle) & random (right) connections respectively as a graph. Each node corresponds to a token and each line represents an attention score. If no connection is made between 2 tokens, then an attention score is assumed to 0.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 38,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 63,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 270,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "BigBird block sparse attention is a combination of sliding, global & random connections (total 10 connections) as shown in gif in left. While a graph of normal attention (right) will have all 15 connections (note: total 6 nodes are present). You can simply think of normal attention as all the tokens attending globally 1 {}^1 1.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "strong"
+        },
+        {
+          "start": 123,
+          "end": 126,
+          "kind": "code"
+        },
+        {
+          "start": 153,
+          "end": 169,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Normal attention: Model can transfer information from one token to another token directly in a single layer since each token is queried over every other token and is attended by every other token. Let's consider an example similar to what is shown in the above figures. If the model needs to associate 'going' with 'now', it can simply do that in a single layer since there is a direct connection joining both the tokens.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        },
+        {
+          "start": 302,
+          "end": 309,
+          "kind": "em"
+        },
+        {
+          "start": 315,
+          "end": 320,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Block sparse attention: If the model needs to share information between two nodes (or tokens), information will have to travel across various other nodes in the path for some of the tokens; since all the nodes are not directly connected in a single layer. Eg., assuming model needs to associate 'going' with 'now', then if only sliding attention is present the flow of information among those 2 tokens, is defined by the path: going -> am -> i -> now (i.e. it will have to travel over 2 other tokens). Hence, we may need multiple layers to capture the entire information of the sequence. Normal attention can capture this in a single layer. In an extreme case, this could mean that as many layers as input tokens are needed. If, however, we introduce some global tokens information can travel via the path: going -> i -> now (which is shorter). If we in addition introduce random connections it can travel via: going -> am -> now. With the help of random connections & global connections, information can travel very rapidly (with just a few layers) from one token to the next.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        },
+        {
+          "start": 256,
+          "end": 259,
+          "kind": "em"
+        },
+        {
+          "start": 295,
+          "end": 302,
+          "kind": "em"
+        },
+        {
+          "start": 308,
+          "end": 313,
+          "kind": "em"
+        },
+        {
+          "start": 427,
+          "end": 450,
+          "kind": "code"
+        },
+        {
+          "start": 807,
+          "end": 824,
+          "kind": "code"
+        },
+        {
+          "start": 911,
+          "end": 929,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "In case, we have many global tokens, then we may not need random connections since there will be multiple short paths through which information can travel. This is the idea behind keeping num_random_tokens = 0 when working with a variant of BigBird, called ETC (more on this in later sections).",
+      "spans": [
+        {
+          "start": 188,
+          "end": 209,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "1 {}^1 1 In these graphics, we are assuming that the attention matrix is symmetric i.e. Aij=Aji\\mathbf{A}_{ij} = \\mathbf{A}_{ji}Aij​=Aji​ since in a graph if some token A attends B, then B will also attend A. You can see from the figure of the attention matrix shown in the next section that this assumption holds for most tokens in BigBird",
+      "spans": [
+        {
+          "start": 83,
+          "end": 87,
+          "kind": "strong"
+        },
+        {
+          "start": 169,
+          "end": 170,
+          "kind": "strong"
+        },
+        {
+          "start": 179,
+          "end": 180,
+          "kind": "strong"
+        },
+        {
+          "start": 187,
+          "end": 188,
+          "kind": "strong"
+        },
+        {
+          "start": 206,
+          "end": 207,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Attention Type",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "global_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "sliding_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "random_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "original_full",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "n",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "block_sparse",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "2 x block_size",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "3 x block_size",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "num_random_blocks x block_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "original_full represents BERT's attention while block_sparse represents BigBird's attention. Wondering what the block_size is? We will cover that in later sections. For now, consider it to be 1 for simplicity",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 25,
+          "end": 29,
+          "kind": "code"
+        },
+        {
+          "start": 48,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 72,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 208,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "BigBird block sparse attention",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "BigBird block sparse attention is just an efficient implementation of what we discussed above. Each token is attending some global tokens, sliding tokens, & random tokens instead of attending to all other tokens. The authors hardcoded the attention matrix for multiple query components separately; and used a cool trick to speed up training/inference on GPU and TPU.",
+      "spans": [
+        {
+          "start": 124,
+          "end": 137,
+          "kind": "strong"
+        },
+        {
+          "start": 139,
+          "end": 153,
+          "kind": "strong"
+        },
+        {
+          "start": 157,
+          "end": 170,
+          "kind": "strong"
+        },
+        {
+          "start": 195,
+          "end": 198,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Note: on the top, we have 2 extra sentences. As you can notice, every token is just switched by one place in both sentences. This is how sliding attention is implemented. When q[i] is multiplied with k[i,0:3], we will get a sliding attention score for q[i] (where i is index of element in sequence).",
+      "spans": [
+        {
+          "start": 176,
+          "end": 180,
+          "kind": "code"
+        },
+        {
+          "start": 200,
+          "end": 208,
+          "kind": "code"
+        },
+        {
+          "start": 252,
+          "end": 256,
+          "kind": "code"
+        },
+        {
+          "start": 264,
+          "end": 265,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 299,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "You can find the actual implementation of block_sparse attention here. This may look very scary 😨😨 now. But this article will surely ease your life in understanding the code.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 54,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 69,
+          "kind": "a",
+          "href": "https://github.com/vasudevgupta7/transformers/blob/5f2d6a0c93ca2017961199aa04a344b9b779d454/src/transformers/models/big_bird/modeling_big_bird.py#L513"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Global Attention",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "For global attention, each query is simply attending to all the other tokens in the sequence & is attended by every other token. Let's assume Vasudev (1st token) & them (last token) to be global (in the above figure). You can see that these tokens are directly connected to all other tokens (blue boxes).",
+      "spans": [
+        {
+          "start": 142,
+          "end": 149,
+          "kind": "code"
+        },
+        {
+          "start": 164,
+          "end": 168,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Sliding Attention",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "The sequence of key tokens is copied 2 times with each element shifted to the right in one of the copies and to the left in the other copy. Now if we multiply query sequence vectors by these 3 sequence vectors, we will cover all the sliding tokens. Computational complexity is simply O(3xn) = O(n). Referring to the above picture, the orange boxes represent the sliding attention. You can see 3 sequences at the top of the figure with 2 of them shifted by one token (1 to the left, 1 to the right).",
+      "spans": [
+        {
+          "start": 284,
+          "end": 297,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Random Attention",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "Random attention is ensuring that each query token will attend a few random tokens as well. For the actual implementation, this means that the model gathers some tokens randomly and computes their attention score.",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Note: The current implementation further divides sequence into blocks & each notation is defined w.r.to block instead of tokens. Let's discuss this in more detail in the next section.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Implementation",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Recap: In regular BERT attention, a sequence of tokens i.e. X=x1,x2,....,xn X = x_1, x_2, ...., x_n X=x1​,x2​,....,xn​ is projected through a dense layer into Q,K,V Q,K,V Q,K,V and the attention score Z Z Z is calculated as Z=Softmax(QKT) Z=Softmax(QK^T) Z=Softmax(QKT). In the case of BigBird block sparse attention, the same algorithm is used but only with some selected query & key vectors.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Let's have a look at how bigbird block sparse attention is implemented. To begin with, let's assume b,r,s,gb, r, s, gb,r,s,g represent block_size, num_random_blocks, num_sliding_blocks, num_global_blocks, respectively. Visually, we can illustrate the components of big bird's block sparse attention with b=4,r=1,g=2,s=3,d=5b=4, r=1, g=2, s=3, d=5b=4,r=1,g=2,s=3,d=5 as follows:",
+      "spans": [
+        {
+          "start": 135,
+          "end": 145,
+          "kind": "code"
+        },
+        {
+          "start": 147,
+          "end": 164,
+          "kind": "code"
+        },
+        {
+          "start": 166,
+          "end": 184,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 203,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Attention scores for q1,q2,q3:n−2,qn−1,qn{q}_{1}, {q}_{2}, {q}_{3:n-2}, {q}_{n-1}, {q}_{n}q1​,q2​,q3:n−2​,qn−1​,qn​ are calculated separately as described below:",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "Attention score for q1\\mathbf{q}_{1}q1​ represented by a1a_1a1​ where a1=Softmax(q1∗KT)a_1=Softmax(q_1 * K^T)a1​=Softmax(q1​∗KT), is nothing but attention score between all the tokens in 1st block with all the other tokens in the sequence.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "q1q_1q1​ represents 1st block, gig_igi​ represents iii block. We are simply performing normal attention operation between q1q_1q1​ & ggg (i.e. all the keys).",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "For calculating attention score for tokens in second block, we are gathering the first three blocks, the last block, and the fifth block. Then we can compute a2=Softmax(q2∗concat(k1,k2,k3,k5,k7)a_2 = Softmax(q_2 * concat(k_1, k_2, k_3, k_5, k_7)a2​=Softmax(q2​∗concat(k1​,k2​,k3​,k5​,k7​).",
+      "spans": []
+    },
+    {
+      "id": "b0060",
+      "source": "I am representing tokens by g,r,sg, r, sg,r,s just to represent their nature explicitly (i.e. showing global, random, sliding tokens), else they are kkk only.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 158,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "For calculating attention score for q3:n−2{q}_{3:n-2}q3:n−2​, we will gather global, sliding, random keys & will compute the normal attention operation over q3:n−2{q}_{3:n-2}q3:n−2​ and the gathered keys. Note that sliding keys are gathered using the special shifting trick as discussed earlier in the sliding attention section.",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "For calculating attention score for tokens in previous to last block (i.e. qn−1{q}_{n-1}qn−1​), we are gathering the first block, last three blocks, and the third block. Then we can apply the formula an−1=Softmax(qn−1∗concat(k1,k3,k5,k6,k7)){a}_{n-1} = Softmax({q}_{n-1} * concat(k_1, k_3, k_5, k_6, k_7))an−1​=Softmax(qn−1​∗concat(k1​,k3​,k5​,k6​,k7​)). This is very similar to what we did for q2q_2q2​.",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Attention score for qn\\mathbf{q}_{n}qn​ is represented by ana_nan​ where an=Softmax(qn∗KT)a_n=Softmax(q_n * K^T)an​=Softmax(qn​∗KT), and is nothing but attention score between all the tokens in the last block with all the other tokens in sequence. This is very similar to what we did for q1 q_1 q1​ .",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "Let's combine the above matrices to get the final attention matrix. This attention matrix can be used to get a representation of all the tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "blue -> global blocks, red -> random blocks, orange -> sliding blocks This attention matrix is just for illustration. During the forward pass, we aren't storing white blocks, but are computing a weighted value matrix (i.e. representation of each token) directly for each separated components as discussed above.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 23,
+          "end": 43,
+          "kind": "code"
+        },
+        {
+          "start": 45,
+          "end": 69,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 311,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Now, we have covered the hardest part of block sparse attention, i.e. its implementation. Hopefully, you now have a better background to understand the actual code. Feel free to dive into it and to connect each part of the code with one of the components above.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Time & Memory complexity",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "Attention Type",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Sequence length",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Time & Memory Complexity",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "original_full",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "T",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "4 x T",
+      "spans": [
+        {
+          "start": 4,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "4096",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "64 x T",
+      "spans": [
+        {
+          "start": 5,
+          "end": 6,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "block_sparse",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "1024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "2 x T",
+      "spans": [
+        {
+          "start": 4,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "4096",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "8 x T",
+      "spans": [
+        {
+          "start": 4,
+          "end": 5,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "Comparison of time & space complexity of BERT attention and BigBird block sparse attention.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 91,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "Expand this snippet in case you wanna see the calculations",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "ITC vs ETC",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "The BigBird model can be trained using 2 different strategies: ITC & ETC. ITC (internal transformer construction) is simply what we discussed above. In ETC (extended transformer construction), some additional tokens are made global such that they will attend to / will be attended by all tokens.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 66,
+          "kind": "strong"
+        },
+        {
+          "start": 69,
+          "end": 72,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "ITC requires less compute since very few tokens are global while at the same time the model can capture sufficient global information (also with the help of random attention). On the other hand, ETC can be very helpful for tasks in which we need a lot of global tokens such as `question-answering for which the entire question should be attended to globally by the context to be able to relate the context correctly to the question.",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "Note: It is shown in the Big Bird paper that in many ETC experiments, the number of random blocks is set to 0. This is reasonable given our discussions above in the graph section.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        },
+        {
+          "start": 0,
+          "end": 179,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "The table below summarizes ITC & ETC:",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "ITC",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "ETC",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Attention Matrix with global attention",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "A=[111111111111111111111111] A = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} A=​1111111​11​11​11​11​11​1111111​​",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "B=[11111111111111111111111111111111111111111111111111111111] B = \\begin{bmatrix} 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & & & & & & 1 \\\\ 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 1 \\end{bmatrix} B=​111111111​111111111​111111111​1111​1111​1111​1111​1111​111111111​​",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "global_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "2 x block_size",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "extra_tokens + 2 x block_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 19,
+          "end": 29,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "random_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "num_random_blocks x block_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "num_random_blocks x block_size",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 30,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "sliding_tokens",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "3 x block_size",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "3 x block_size",
+      "spans": [
+        {
+          "start": 4,
+          "end": 14,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "Using BigBird with 🤗Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0109",
+      "source": "You can use BigBirdModel just like any other 🤗 model. Let's see some code below:",
+      "spans": [
+        {
+          "start": 12,
+          "end": 24,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "There are total 3 checkpoints available in 🤗Hub (at the point of writing this article): bigbird-roberta-base, bigbird-roberta-large, bigbird-base-trivia-itc. The first two checkpoints come from pretraining BigBirdForPretraining with masked_lm loss; while the last one corresponds to the checkpoint after finetuning BigBirdForQuestionAnswering on trivia-qa dataset.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 29,
+          "kind": "strong"
+        },
+        {
+          "start": 43,
+          "end": 47,
+          "kind": "strong"
+        },
+        {
+          "start": 88,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 88,
+          "end": 108,
+          "kind": "a",
+          "href": "https://huggingface.co/google/bigbird-roberta-base"
+        },
+        {
+          "start": 110,
+          "end": 131,
+          "kind": "code"
+        },
+        {
+          "start": 110,
+          "end": 131,
+          "kind": "a",
+          "href": "https://huggingface.co/google/bigbird-roberta-large"
+        },
+        {
+          "start": 133,
+          "end": 156,
+          "kind": "code"
+        },
+        {
+          "start": 133,
+          "end": 156,
+          "kind": "a",
+          "href": "https://huggingface.co/google/bigbird-base-trivia-itc"
+        },
+        {
+          "start": 206,
+          "end": 227,
+          "kind": "code"
+        },
+        {
+          "start": 233,
+          "end": 247,
+          "kind": "code"
+        },
+        {
+          "start": 315,
+          "end": 342,
+          "kind": "code"
+        },
+        {
+          "start": 346,
+          "end": 355,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0111",
+      "source": "Let's have a look at minimal code you can write (in case you like to use your PyTorch trainer), to use 🤗's BigBird model for fine-tuning your tasks.",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "It's important to keep the following points in mind while working with big bird:",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "Sequence length must be a multiple of block size i.e. seqlen % block_size = 0. You need not worry since 🤗Transformers will automatically <pad> (to smallest multiple of block size which is greater than sequence length) if batch sequence length is not a multiple of block_size.",
+      "spans": [
+        {
+          "start": 54,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 137,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 264,
+          "end": 274,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "Currently, HuggingFace version doesn't support ETC and hence only 1st & last block will be global.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 50,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0115",
+      "source": "Current implementation doesn't support num_random_blocks = 0.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 60,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0116",
+      "source": "It's recommended by authors to set attention_type = \"original_full\" when sequence length < 1024.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 67,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0117",
+      "source": "This must hold: seq_length > global_token + random_tokens + sliding_tokens + buffer_tokens where global_tokens = 2 x block_size, sliding_tokens = 3 x block_size, random_tokens = num_random_blocks x block_size & buffer_tokens = num_random_blocks x block_size. In case you fail to do that, 🤗Transformers will automatically switch attention_type to original_full with a warning.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 97,
+          "end": 127,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 160,
+          "kind": "code"
+        },
+        {
+          "start": 162,
+          "end": 208,
+          "kind": "code"
+        },
+        {
+          "start": 211,
+          "end": 257,
+          "kind": "code"
+        },
+        {
+          "start": 328,
+          "end": 342,
+          "kind": "code"
+        },
+        {
+          "start": 346,
+          "end": 359,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0118",
+      "source": "When using big bird as decoder (or using BigBirdForCasualLM), attention_type should be original_full. But you need not worry, 🤗Transformers will automatically switch attention_type to original_full in case you forget to do that.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 62,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 87,
+          "end": 100,
+          "kind": "code"
+        },
+        {
+          "start": 166,
+          "end": 180,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0119",
+      "source": "What's next?",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "@patrickvonplaten has made a really cool notebook on how to evaluate BigBirdForQuestionAnswering on the trivia-qa dataset. Feel free to play with BigBird using that notebook.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "a",
+          "href": "https://github.com/patrickvonplaten"
+        },
+        {
+          "start": 41,
+          "end": 49,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/patrickvonplaten/notebooks/blob/master/Evaluating_Big_Bird_on_TriviaQA.ipynb"
+        },
+        {
+          "start": 69,
+          "end": 96,
+          "kind": "code"
+        },
+        {
+          "start": 104,
+          "end": 113,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0121",
+      "source": "You will soon find BigBird Pegasus-like model in the library for long document summarization💥.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 39,
+          "kind": "strong"
+        },
+        {
+          "start": 65,
+          "end": 92,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0122",
+      "source": "End Notes",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "The original implementation of block sparse attention matrix can be found here. You can find 🤗's version here.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 60,
+          "kind": "strong"
+        },
+        {
+          "start": 74,
+          "end": 78,
+          "kind": "a",
+          "href": "https://github.com/google-research/bigbird/blob/master/bigbird/core/attention.py"
+        },
+        {
+          "start": 105,
+          "end": 109,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/tree/master/src/transformers/models/big_bird"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "ca53c30be10b68ace25efecea970f54fa83d49e7bed04444a027e7a713f20ce4",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": ">>> # let's consider following sentence as an example\n>>> example = ['BigBird', 'is', 'now', 'available', 'in', 'HuggingFace', 'for', 'extractive', 'question', 'answering']\n\n>>> # further let's assume, we're trying to understand the representation of 'available' i.e. \n>>> query_token = 'available'\n\n>>> # We will initialize an empty `set` and fill up the tokens of our interest as we proceed in this section.\n>>> key_tokens = [] # => currently 'available' token doesn't have anything to attend"
+    },
+    {
+      "id": "c0002",
+      "source": ">>> # considering `window_size = 3`, we will consider 1 token to left & 1 to right of 'available'\n>>> # left token: 'now' ; right token: 'in'\n>>> sliding_tokens = [\"now\", \"available\", \"in\"]\n\n>>> # let's update our collection with the above tokens\n>>> key_tokens.append(sliding_tokens)"
+    },
+    {
+      "id": "c0003",
+      "source": ">>> # let's assume 1st & last token to be `global`, then\n>>> global_tokens = [\"BigBird\", \"answering\"]\n\n>>> # fill up global tokens in our key tokens collection\n>>> key_tokens.append(global_tokens)"
+    },
+    {
+      "id": "c0004",
+      "source": ">>> # now we can choose `r` token randomly from our example sentence\n>>> # let's choose 'is' assuming `r=1`\n>>> random_tokens = [\"is\"] # Note: it is chosen compleletly randomly; so it can be anything else also.\n\n>>> # fill random tokens to our collection\n>>> key_tokens.append(random_tokens)\n\n>>> # it's time to see what tokens are in our `key_tokens` list\n>>> key_tokens\n{'now', 'is', 'in', 'answering', 'available', 'BigBird'}\n\n# Now, 'available' (query we choose in our 1st step) will attend only these tokens instead of attending the complete sequence"
+    },
+    {
+      "id": "c0005",
+      "source": "# pseudo code\n\nQ -> Query martix (seq_length, head_dim)\nK -> Key matrix (seq_length, head_dim)\n\n# 1st & last token attends all other tokens\nQ[0] x [K[0], K[1], K[2], ......, K[n-1]]\nQ[n-1] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# 1st & last token getting attended by all other tokens\nK[0] x [Q[0], Q[1], Q[2], ......, Q[n-1]]\nK[n-1] x [Q[0], Q[1], Q[2], ......, Q[n-1]]"
+    },
+    {
+      "id": "c0006",
+      "source": "# what we want to do\nQ[i] x [K[i-1], K[i], K[i+1]] for i = 1:-1\n\n# efficient implementation in code (assume dot product multiplication 👇)\n[Q[0], Q[1], Q[2], ......, Q[n-2], Q[n-1]] x [K[1], K[2], K[3], ......, K[n-1], K[0]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[n-1], K[0], K[1], ......, K[n-2]]\n[Q[0], Q[1], Q[2], ......, Q[n-1]] x [K[0], K[1], K[2], ......, K[n-1]]\n\n# Each sequence is getting multiplied by only 3 sequences to keep `window_size = 3`.\n# Some computations might be missing; this is just a rough idea."
+    },
+    {
+      "id": "c0007",
+      "source": "# r1, r2, r are some random indices; Note: r1, r2, r3 are different for each row 👇\nQ[1] x [K[r1], K[r2], ......, K[r]]\n.\n.\n.\nQ[n-2] x [K[r1], K[r2], ......, K[r]]\n\n# leaving 0th & (n-1)th token since they are already global"
+    },
+    {
+      "id": "c0008",
+      "source": "BigBird time complexity = O(w x n + r x n + g x n)\nBERT time complexity = O(n^2)\n\nAssumptions:\n    w = 3 x 64\n    r = 3 x 64\n    g = 2 x 64\n\nWhen seqlen = 512\n=> **time complexity in BERT = 512^2**\n\nWhen seqlen = 1024\n=> time complexity in BERT = (2 x 512)^2\n=> **time complexity in BERT = 4 x 512^2**\n\n=> time complexity in BigBird = (8 x 64) x (2 x 512)\n=> **time complexity in BigBird = 2 x 512^2**\n\nWhen seqlen = 4096\n=> time complexity in BERT = (8 x 512)^2\n=> **time complexity in BERT = 64 x 512^2**\n\n=> compute in BigBird = (8 x 64) x (8 x 512)\n=> compute in BigBird = 8 x (512 x 512)\n=> **time complexity in BigBird = 8 x 512^2**"
+    },
+    {
+      "id": "c0009",
+      "source": "from transformers import BigBirdModel\n\n# loading bigbird from its pretrained checkpoint\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\")\n# This will init the model with default configuration i.e. attention_type = \"block_sparse\" num_random_blocks = 3, block_size = 64.\n# But You can freely change these arguments with any checkpoint. These 3 arguments will just change the number of tokens each query token is going to attend.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", num_random_blocks=2, block_size=16)\n\n# By setting attention_type to `original_full`, BigBird will be relying on the full attention of n^2 complexity. This way BigBird is 99.9 % similar to BERT.\nmodel = BigBirdModel.from_pretrained(\"google/bigbird-roberta-base\", attention_type=\"original_full\")"
+    },
+    {
+      "id": "c0010",
+      "source": "# let's consider our task to be question-answering as an example\n\nfrom transformers import BigBirdForQuestionAnswering, BigBirdTokenizer\nimport torch\n\ndevice = torch.device(\"cpu\")\nif torch.cuda.is_available():\n    device = torch.device(\"cuda\")\n\n# lets initialize bigbird model from pretrained weights with randomly initialized head on its top\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"google/bigbird-roberta-base\", block_size=64, num_random_blocks=3)\ntokenizer = BigBirdTokenizer.from_pretrained(\"google/bigbird-roberta-base\")\nmodel.to(device)\n\ndataset = \"torch.utils.data.DataLoader object\"\noptimizer = \"torch.optim object\"\nepochs = ...\n\n# very minimal training loop\nfor e in range(epochs):\n    for batch in dataset:\n        model.train()\n        batch = {k: batch[k].to(device) for k in batch}\n\n        # forward pass\n        output = model(**batch)\n\n        # back-propogation\n        output[\"loss\"].backward()\n        optimizer.step()\n        optimizer.zero_grad()\n\n# let's save final weights in a local directory\nmodel.save_pretrained(\"<YOUR-WEIGHTS-DIR>\")\n\n# let's push our weights to 🤗Hub\nfrom huggingface_hub import ModelHubMixin\nModelHubMixin.push_to_hub(\"<YOUR-WEIGHTS-DIR>\", model_id=\"<YOUR-FINETUNED-ID>\")\n\n# using finetuned model for inference\nquestion = [\"How are you doing?\", \"How is life going?\"]\ncontext = [\"<some big context having ans-1>\", \"<some big context having ans-2>\"]\nbatch = tokenizer(question, context, return_tensors=\"pt\")\nbatch = {k: batch[k].to(device) for k in batch}\n\nmodel = BigBirdForQuestionAnswering.from_pretrained(\"<YOUR-FINETUNED-ID>\")\nmodel.to(device)\nwith torch.no_grad():\n    start_logits, end_logits = model(**batch).to_tuple()\n    # now decode start_logits, end_logits with what ever strategy you want.\n\n# Note:\n# This was very minimal code (in case you want to use raw PyTorch) just for showing how BigBird can be used very easily\n# I would suggest using 🤗Trainer to have access for a lot of features"
+    }
+  ],
+  "contentIntegrity": {
+    "sourceImages": 13,
+    "savedImages": 13,
+    "sourceImageOccurrences": 13,
+    "placedImageOccurrences": 13,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "hfContentCheckedAt": "2026-10-05T16:26:32.545751Z"
 }
