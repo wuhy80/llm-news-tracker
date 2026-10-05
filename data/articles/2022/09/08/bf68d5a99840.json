@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/train-decision-transformers",
   "resolvedUrl": "https://huggingface.co/blog/train-decision-transformers",
   "fetchedAt": "2026-08-27T03:10:36.765316Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "In a previous post, we announced the launch of Decision Transformers in the transformers library. This new technique of using a Transformer as a Decision-making model is getting increasingly popular.\n\nSo today, you’ll learn to train your first Offline Decision Transformer model from scratch to make a half-cheetah run. We'll train it directly on a Google Colab that you can find here 👉 https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb\n\n\\*An \"expert\" Decision Transformers model, learned using offline RL in the Gym HalfCheetah environment.*\n\nSounds exciting? Let's get started!\n\n- What are Decision Transformers?\n\nTraining Decision Transformers\n\n- Loading the dataset and building the Custom Data Collator\n\n- Training the Decision Transformer model with a 🤗 transformers Trainer\n\n- Conclusion\n\n- What’s next?\n\n- References\n\n## What are Decision Transformers?\n\nThe Decision Transformer model was introduced by “Decision Transformer: Reinforcement Learning via Sequence Modeling” by Chen L. et al. It abstracts Reinforcement Learning as a conditional-sequence modeling problem.\n\nThe main idea is that instead of training a policy using RL methods, such as fitting a value function that will tell us what action to take to maximize the return (cumulative reward), we use a sequence modeling algorithm (Transformer) that, given the desired return, past states, and actions, will generate future actions to achieve this desired return. It’s an autoregressive model conditioned on the desired return, past states, and actions to generate future actions that achieve the desired return.\n\nThis is a complete shift in the Reinforcement Learning paradigm since we use generative trajectory modeling (modeling the joint distribution of the sequence of states, actions, and rewards) to replace conventional RL algorithms. It means that in Decision Transformers, we don’t maximize the return but rather generate a series of future actions that achieve the desired return.\n\nThe process goes this way:\n\nWe feed the last K timesteps into the Decision Transformer with three inputs:\n\n- Return-to-go\n\n- State\n\n- Action\n\n- The tokens are embedded either with a linear layer if the state is a vector or a CNN encoder if it’s frames.\n\n- The inputs are processed by a GPT-2 model, which predicts future actions via autoregressive modeling.\n\nDecision Transformer architecture. States, actions, and returns are fed into modality-specific linear embeddings, and a positional episodic timestep encoding is added. Tokens are fed into a GPT architecture which predicts actions autoregressively using a causal self-attention mask. Figure from [1].\n\nThere are different types of Decision Transformers, but today, we’re going to train an offline Decision Transformer, meaning that we only use data collected from other agents or human demonstrations. The agent does not interact with the environment. If you want to know more about the difference between offline and online reinforcement learning, check this article.\n\nNow that we understand the theory behind Offline Decision Transformers, let’s see how we’re going to train one in practice.\n\n## Training Decision Transformers\n\nIn the previous post, we demonstrated how to use a transformers Decision Transformer model and load pretrained weights from the 🤗 hub.\n\nIn this part we will use 🤗 Trainer and a custom Data Collator to train a Decision Transformer model from scratch, using an Offline RL Dataset hosted on the 🤗 hub. You can find code for this tutorial in this Colab notebook.\n\nWe will be performing offline RL to learn the following behavior in the mujoco halfcheetah environment.\n\n\\*An \"expert\" Decision Transformers model, learned using offline RL in the Gym HalfCheetah environment.*\n\n### Loading the dataset and building the Custom Data Collator\n\nWe host a number of Offline RL Datasets on the hub. Today we will be training with the halfcheetah “expert” dataset, hosted here on hub.\n\nFirst we need to import the load_dataset function from the 🤗 datasets package and download the dataset to our machine.\n\n```\nfrom datasets import load_dataset\ndataset = load_dataset(\"edbeeching/decision_transformer_gym_replay\", \"halfcheetah-expert-v2\")\n```\n\nWhile most datasets on the hub are ready to use out of the box, sometimes we wish to perform some additional processing or modification of the dataset. In this case we wish to match the author's implementation, that is we need to:\n\n- Normalize each feature by subtracting the mean and dividing by the standard deviation.\n\n- Pre-compute discounted returns for each trajectory.\n\n- Scale the rewards and returns by a factor of 1000.\n\n- Augment the dataset sampling distribution so it takes into account the length of the expert agent’s trajectories.\n\nIn order to perform this dataset preprocessing, we will use a custom 🤗 Data Collator.\n\nNow let’s get started on the Custom Data Collator for Offline Reinforcement Learning.\n\n```\n@dataclass\nclass DecisionTransformerGymDataCollator:\n    return_tensors: str = \"pt\"\n    max_len: int = 20 #subsets of the episode we use for training\n    state_dim: int = 17  # size of state space\n    act_dim: int = 6  # size of action space\n    max_ep_len: int = 1000 # max episode length in the dataset\n    scale: float = 1000.0  # normalization of rewards/returns\n    state_mean: np.array = None  # to store state means\n    state_std: np.array = None  # to store state stds\n    p_sample: np.array = None  # a distribution to take account trajectory lengths\n    n_traj: int = 0 # to store the number of trajectories in the dataset\n\n    def __init__(self, dataset) -> None:\n        self.act_dim = len(dataset[0][\"actions\"][0])\n        self.state_dim = len(dataset[0][\"observations\"][0])\n        self.dataset = dataset\n        # calculate dataset stats for normalization of states\n        states = []\n        traj_lens = []\n        for obs in dataset[\"observations\"]:\n            states.extend(obs)\n            traj_lens.append(len(obs))\n        self.n_traj = len(traj_lens)\n        states = np.vstack(states)\n        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6\n        \n        traj_lens = np.array(traj_lens)\n        self.p_sample = traj_lens / sum(traj_lens)\n\n    def _discount_cumsum(self, x, gamma):\n        discount_cumsum = np.zeros_like(x)\n        discount_cumsum[-1] = x[-1]\n        for t in reversed(range(x.shape[0] - 1)):\n            discount_cumsum[t] = x[t] + gamma * discount_cumsum[t + 1]\n        return discount_cumsum\n\n    def __call__(self, features):\n        batch_size = len(features)\n        # this is a bit of a hack to be able to sample of a non-uniform distribution\n        batch_inds = np.random.choice(\n            np.arange(self.n_traj),\n            size=batch_size,\n            replace=True,\n            p=self.p_sample,  # reweights so we sample according to timesteps\n        )\n        # a batch of dataset features\n        s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []\n        \n        for ind in batch_inds:\n            # for feature in features:\n            feature = self.dataset[int(ind)]\n            si = random.randint(0, len(feature[\"rewards\"]) - 1)\n\n            # get sequences from dataset\n            s.append(np.array(feature[\"observations\"][si : si + self.max_len]).reshape(1, -1, self.state_dim))\n            a.append(np.array(feature[\"actions\"][si : si + self.max_len]).reshape(1, -1, self.act_dim))\n            r.append(np.array(feature[\"rewards\"][si : si + self.max_len]).reshape(1, -1, 1))\n\n            d.append(np.array(feature[\"dones\"][si : si + self.max_len]).reshape(1, -1))\n            timesteps.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))\n            timesteps[-1][timesteps[-1] >= self.max_ep_len] = self.max_ep_len - 1  # padding cutoff\n            rtg.append(\n                self._discount_cumsum(np.array(feature[\"rewards\"][si:]), gamma=1.0)[\n                    : s[-1].shape[1]   # TODO check the +1 removed here\n                ].reshape(1, -1, 1)\n            )\n            if rtg[-1].shape[1] < s[-1].shape[1]:\n                print(\"if true\")\n                rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)\n\n            # padding and state + reward normalization\n            tlen = s[-1].shape[1]\n            s[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, self.state_dim)), s[-1]], axis=1)\n            s[-1] = (s[-1] - self.state_mean) / self.state_std\n            a[-1] = np.concatenate(\n                [np.ones((1, self.max_len - tlen, self.act_dim)) * -10.0, a[-1]],\n                axis=1,\n            )\n            r[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, 1)), r[-1]], axis=1)\n            d[-1] = np.concatenate([np.ones((1, self.max_len - tlen)) * 2, d[-1]], axis=1)\n            rtg[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, 1)), rtg[-1]], axis=1) / self.scale\n            timesteps[-1] = np.concatenate([np.zeros((1, self.max_len - tlen)), timesteps[-1]], axis=1)\n            mask.append(np.concatenate([np.zeros((1, self.max_len - tlen)), np.ones((1, tlen))], axis=1))\n\n        s = torch.from_numpy(np.concatenate(s, axis=0)).float()\n        a = torch.from_numpy(np.concatenate(a, axis=0)).float()\n        r = torch.from_numpy(np.concatenate(r, axis=0)).float()\n        d = torch.from_numpy(np.concatenate(d, axis=0))\n        rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).float()\n        timesteps = torch.from_numpy(np.concatenate(timesteps, axis=0)).long()\n        mask = torch.from_numpy(np.concatenate(mask, axis=0)).float()\n\n        return {\n            \"states\": s,\n            \"actions\": a,\n            \"rewards\": r,\n            \"returns_to_go\": rtg,\n            \"timesteps\": timesteps,\n            \"attention_mask\": mask,\n        }\n```\n\nThat was a lot of code, the TLDR is that we defined a class that takes our dataset, performs the required preprocessing and will return us batches of states, actions, rewards, returns, timesteps and masks. These batches can be directly used to train a Decision Transformer model with a 🤗 transformers Trainer.\n\n### Training the Decision Transformer model with a 🤗 transformers Trainer.\n\nIn order to train the model with the 🤗 Trainer class, we first need to ensure the dictionary it returns contains a loss, in this case L-2 norm of the models action predictions and the targets. We achieve this by making a TrainableDT class, which inherits from the Decision Transformer model.\n\n```\nclass TrainableDT(DecisionTransformerModel):\n    def __init__(self, config):\n        super().__init__(config)\n\n    def forward(self, **kwargs):\n        output = super().forward(**kwargs)\n        # add the DT loss\n        action_preds = output[1]\n        action_targets = kwargs[\"actions\"]\n        attention_mask = kwargs[\"attention_mask\"]\n        act_dim = action_preds.shape[2]\n        action_preds = action_preds.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]\n        action_targets = action_targets.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]\n        \n        loss = torch.mean((action_preds - action_targets) ** 2)\n\n        return {\"loss\": loss}\n\n    def original_forward(self, **kwargs):\n        return super().forward(**kwargs)\n```\n\nThe transformers Trainer class required a number of arguments, defined in the TrainingArguments class. We use the same hyperparameters are in the authors original implementation, but train for fewer iterations. This takes around 40 minutes to train in a Colab notebook, so grab a coffee or read the 🤗 Annotated Diffusion blog post while you wait. The authors train for around 3 hours, so the results we get here will not be quite as good as theirs.\n\n```\ntraining_args = TrainingArguments(\n    output_dir=\"output/\",\n    remove_unused_columns=False,\n    num_train_epochs=120,\n    per_device_train_batch_size=64,\n    learning_rate=1e-4,\n    weight_decay=1e-4,\n    warmup_ratio=0.1,\n    optim=\"adamw_torch\",\n    max_grad_norm=0.25,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset[\"train\"],\n    data_collator=collator,\n)\n\ntrainer.train()\n```\n\nNow that we explained the theory behind Decision Transformer, the Trainer, and how to train it. You're ready to train your first offline Decision Transformer model from scratch to make a half-cheetah run 👉 https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb The Colab includes visualizations of the trained model, as well as how to save your model on the 🤗 hub.\n\n## Conclusion\n\nThis post has demonstrated how to train the Decision Transformer on an offline RL dataset, hosted on 🤗 datasets. We have used a 🤗 transformers Trainer and a custom data collator.\n\nIn addition to Decision Transformers, we want to support more use cases and tools from the Deep Reinforcement Learning community. Therefore, it would be great to hear your feedback on the Decision Transformer model, and more generally anything we can build with you that would be useful for RL. Feel free to reach out to us.\n\n## What’s next?\n\nIn the coming weeks and months, we plan on supporting other tools from the ecosystem:\n\n- Expanding our repository of Decision Transformer models with models trained or finetuned in an online setting [2]\n\n- Integrating sample-factory version 2.0\n\nThe best way to keep in touch is to join our discord server to exchange with us and with the community.\n\n## References\n\n[1] Chen, Lili, et al. \"Decision transformer: Reinforcement learning via sequence modeling.\" Advances in neural information processing systems 34 (2021).\n\n[2] Zheng, Qinqing and Zhang, Amy and Grover, Aditya “Online Decision Transformer” (arXiv preprint, 2022)",
   "summaryZh": "文章探讨了决策Transformer（Decision Transformer）的训练方法，该架构创新性地将强化学习任务转化为条件序列建模问题。通过将状态、动作和回报拼接成序列输入Transformer，为强化学习领域提供了新的模型范式，对技术人员理解和实现此类架构具有实用指导意义。",
   "summaryGeneratedAt": "2026-09-06T03:11:43.447807Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,668 @@
     "summaryZh": "文章探讨了决策Transformer（Decision Transformer）的训练方法，该架构创新性地将强化学习任务转化为条件序列建模问题。通过将状态、动作和回报拼接成序列输入Transformer，为强化学习领域提供了新的模型范式，对技术人员理解和实现此类架构具有实用指导意义。",
     "glossary": [],
     "duplicateKey": "train-your-first-decision-transformer"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/58_decision-transformers/dt-architecture.gif",
+      "originalUrl": "https://huggingface.co/blog/assets/58_decision-transformers/dt-architecture.gif",
+      "alt": "https://huggingface.co/blog/assets/58_decision-transformers/dt-architecture.gif",
+      "id": "image_0930b32c68d35be1"
+    }
+  ],
+  "videos": [
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/blog/assets/101_train-decision-transformers/replay.mp4",
+      "originalUrl": "https://huggingface.co/blog/assets/101_train-decision-transformers/replay.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/train-decision-transformers",
+      "id": "video_589491720633e4f7"
+    }
+  ],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In a previous post, we announced the launch of Decision Transformers in the transformers library. This new technique of using a Transformer as a Decision-making model is getting increasingly popular.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 18,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/decision-transformers"
+        },
+        {
+          "start": 120,
+          "end": 166,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "So today, you’ll learn to train your first Offline Decision Transformer model from scratch to make a half-cheetah run. We'll train it directly on a Google Colab that you can find here 👉 https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb",
+      "spans": [
+        {
+          "start": 10,
+          "end": 118,
+          "kind": "strong"
+        },
+        {
+          "start": 186,
+          "end": 279,
+          "kind": "a",
+          "href": "https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "*An \"expert\" Decision Transformers model, learned using offline RL in the Gym HalfCheetah environment.*",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Sounds exciting? Let's get started!",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "What are Decision Transformers?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#what-are-decision-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Training Decision Transformers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 30,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#training-decision-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Loading the dataset and building the Custom Data Collator",
+      "spans": [
+        {
+          "start": 0,
+          "end": 57,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#loading-the-dataset-and-building-the-custom-data-collator"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Training the Decision Transformer model with a 🤗 transformers Trainer",
+      "spans": [
+        {
+          "start": 0,
+          "end": 69,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#training-the-decision-transformer-model-with-a--transformers-trainer"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Conclusion",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#conclusion"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "What’s next?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#whats-next"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "References",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/train-decision-transformers#references"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "What are Decision Transformers?",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "The Decision Transformer model was introduced by “Decision Transformer: Reinforcement Learning via Sequence Modeling” by Chen L. et al. It abstracts Reinforcement Learning as a conditional-sequence modeling problem.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 134,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2106.01345"
+        },
+        {
+          "start": 49,
+          "end": 134,
+          "kind": "strong"
+        },
+        {
+          "start": 177,
+          "end": 214,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "The main idea is that instead of training a policy using RL methods, such as fitting a value function that will tell us what action to take to maximize the return (cumulative reward), we use a sequence modeling algorithm (Transformer) that, given the desired return, past states, and actions, will generate future actions to achieve this desired return. It’s an autoregressive model conditioned on the desired return, past states, and actions to generate future actions that achieve the desired return.",
+      "spans": [
+        {
+          "start": 184,
+          "end": 234,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "This is a complete shift in the Reinforcement Learning paradigm since we use generative trajectory modeling (modeling the joint distribution of the sequence of states, actions, and rewards) to replace conventional RL algorithms. It means that in Decision Transformers, we don’t maximize the return but rather generate a series of future actions that achieve the desired return.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 63,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "The process goes this way:",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "We feed the last K timesteps into the Decision Transformer with three inputs:",
+      "spans": [
+        {
+          "start": 8,
+          "end": 28,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Return-to-go",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "State",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Action",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "The tokens are embedded either with a linear layer if the state is a vector or a CNN encoder if it’s frames.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "The inputs are processed by a GPT-2 model, which predicts future actions via autoregressive modeling.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 41,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Decision Transformer architecture. States, actions, and returns are fed into modality-specific linear embeddings, and a positional episodic timestep encoding is added. Tokens are fed into a GPT architecture which predicts actions autoregressively using a causal self-attention mask. Figure from [1].",
+      "spans": [
+        {
+          "start": 0,
+          "end": 299,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "There are different types of Decision Transformers, but today, we’re going to train an offline Decision Transformer, meaning that we only use data collected from other agents or human demonstrations. The agent does not interact with the environment. If you want to know more about the difference between offline and online reinforcement learning, check this article.",
+      "spans": [
+        {
+          "start": 200,
+          "end": 248,
+          "kind": "strong"
+        },
+        {
+          "start": 347,
+          "end": 365,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/decision-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Now that we understand the theory behind Offline Decision Transformers, let’s see how we’re going to train one in practice.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 123,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Training Decision Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "In the previous post, we demonstrated how to use a transformers Decision Transformer model and load pretrained weights from the 🤗 hub.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "In this part we will use 🤗 Trainer and a custom Data Collator to train a Decision Transformer model from scratch, using an Offline RL Dataset hosted on the 🤗 hub. You can find code for this tutorial in this Colab notebook.",
+      "spans": [
+        {
+          "start": 202,
+          "end": 221,
+          "kind": "a",
+          "href": "https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "We will be performing offline RL to learn the following behavior in the mujoco halfcheetah environment.",
+      "spans": [
+        {
+          "start": 72,
+          "end": 102,
+          "kind": "a",
+          "href": "https://www.gymlibrary.dev/environments/mujoco/half_cheetah/"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "*An \"expert\" Decision Transformers model, learned using offline RL in the Gym HalfCheetah environment.*",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Loading the dataset and building the Custom Data Collator",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "We host a number of Offline RL Datasets on the hub. Today we will be training with the halfcheetah “expert” dataset, hosted here on hub.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "First we need to import the load_dataset function from the 🤗 datasets package and download the dataset to our machine.",
+      "spans": [
+        {
+          "start": 28,
+          "end": 40,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "While most datasets on the hub are ready to use out of the box, sometimes we wish to perform some additional processing or modification of the dataset. In this case we wish to match the author's implementation, that is we need to:",
+      "spans": [
+        {
+          "start": 165,
+          "end": 209,
+          "kind": "a",
+          "href": "https://github.com/kzl/decision-transformer"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Normalize each feature by subtracting the mean and dividing by the standard deviation.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Pre-compute discounted returns for each trajectory.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Scale the rewards and returns by a factor of 1000.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Augment the dataset sampling distribution so it takes into account the length of the expert agent’s trajectories.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "In order to perform this dataset preprocessing, we will use a custom 🤗 Data Collator.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 84,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/main_classes/data_collator"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Now let’s get started on the Custom Data Collator for Offline Reinforcement Learning.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "That was a lot of code, the TLDR is that we defined a class that takes our dataset, performs the required preprocessing and will return us batches of states, actions, rewards, returns, timesteps and masks. These batches can be directly used to train a Decision Transformer model with a 🤗 transformers Trainer.",
+      "spans": [
+        {
+          "start": 150,
+          "end": 156,
+          "kind": "strong"
+        },
+        {
+          "start": 158,
+          "end": 165,
+          "kind": "strong"
+        },
+        {
+          "start": 167,
+          "end": 174,
+          "kind": "strong"
+        },
+        {
+          "start": 176,
+          "end": 183,
+          "kind": "strong"
+        },
+        {
+          "start": 185,
+          "end": 194,
+          "kind": "strong"
+        },
+        {
+          "start": 199,
+          "end": 205,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Training the Decision Transformer model with a 🤗 transformers Trainer.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "In order to train the model with the 🤗 Trainer class, we first need to ensure the dictionary it returns contains a loss, in this case L-2 norm of the models action predictions and the targets. We achieve this by making a TrainableDT class, which inherits from the Decision Transformer model.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/main_classes/trainer#trainer"
+        },
+        {
+          "start": 134,
+          "end": 142,
+          "kind": "a",
+          "href": "https://en.wikipedia.org/wiki/Norm_(mathematics)#Euclidean_norm"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "The transformers Trainer class required a number of arguments, defined in the TrainingArguments class. We use the same hyperparameters are in the authors original implementation, but train for fewer iterations. This takes around 40 minutes to train in a Colab notebook, so grab a coffee or read the 🤗 Annotated Diffusion blog post while you wait. The authors train for around 3 hours, so the results we get here will not be quite as good as theirs.",
+      "spans": [
+        {
+          "start": 301,
+          "end": 320,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/annotated-diffusion"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "Now that we explained the theory behind Decision Transformer, the Trainer, and how to train it. You're ready to train your first offline Decision Transformer model from scratch to make a half-cheetah run 👉 https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb The Colab includes visualizations of the trained model, as well as how to save your model on the 🤗 hub.",
+      "spans": [
+        {
+          "start": 96,
+          "end": 203,
+          "kind": "strong"
+        },
+        {
+          "start": 206,
+          "end": 299,
+          "kind": "a",
+          "href": "https://github.com/huggingface/blog/blob/main/notebooks/101_train-decision-transformers.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "This post has demonstrated how to train the Decision Transformer on an offline RL dataset, hosted on 🤗 datasets. We have used a 🤗 transformers Trainer and a custom data collator.",
+      "spans": [
+        {
+          "start": 101,
+          "end": 111,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/index"
+        },
+        {
+          "start": 143,
+          "end": 150,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/v4.21.3/en/model_doc/decision_transformer#overview"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "In addition to Decision Transformers, we want to support more use cases and tools from the Deep Reinforcement Learning community. Therefore, it would be great to hear your feedback on the Decision Transformer model, and more generally anything we can build with you that would be useful for RL. Feel free to reach out to us.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 128,
+          "kind": "strong"
+        },
+        {
+          "start": 308,
+          "end": 323,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "What’s next?",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "In the coming weeks and months, we plan on supporting other tools from the ecosystem:",
+      "spans": [
+        {
+          "start": 32,
+          "end": 84,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Expanding our repository of Decision Transformer models with models trained or finetuned in an online setting [2]",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "Integrating sample-factory version 2.0",
+      "spans": [
+        {
+          "start": 12,
+          "end": 38,
+          "kind": "a",
+          "href": "https://github.com/alex-petrenko/sample-factory"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "The best way to keep in touch is to join our discord server to exchange with us and with the community.",
+      "spans": [
+        {
+          "start": 36,
+          "end": 59,
+          "kind": "a",
+          "href": "https://discord.gg/YRAq8fMnUG"
+        },
+        {
+          "start": 36,
+          "end": 59,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "[1] Chen, Lili, et al. \"Decision transformer: Reinforcement learning via sequence modeling.\" Advances in neural information processing systems 34 (2021).",
+      "spans": [
+        {
+          "start": 93,
+          "end": 142,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "[2] Zheng, Qinqing and Zhang, Amy and Grover, Aditya “Online Decision Transformer” (arXiv preprint, 2022)",
+      "spans": [
+        {
+          "start": 54,
+          "end": 82,
+          "kind": "em"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "6167a52387d1ec50cf0b78a2b46e3643b6a750ba6849cdcca3d03f804359f696",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from datasets import load_dataset\ndataset = load_dataset(\"edbeeching/decision_transformer_gym_replay\", \"halfcheetah-expert-v2\")"
+    },
+    {
+      "id": "c0002",
+      "source": "@dataclass\nclass DecisionTransformerGymDataCollator:\n    return_tensors: str = \"pt\"\n    max_len: int = 20 #subsets of the episode we use for training\n    state_dim: int = 17  # size of state space\n    act_dim: int = 6  # size of action space\n    max_ep_len: int = 1000 # max episode length in the dataset\n    scale: float = 1000.0  # normalization of rewards/returns\n    state_mean: np.array = None  # to store state means\n    state_std: np.array = None  # to store state stds\n    p_sample: np.array = None  # a distribution to take account trajectory lengths\n    n_traj: int = 0 # to store the number of trajectories in the dataset\n\n    def __init__(self, dataset) -> None:\n        self.act_dim = len(dataset[0][\"actions\"][0])\n        self.state_dim = len(dataset[0][\"observations\"][0])\n        self.dataset = dataset\n        # calculate dataset stats for normalization of states\n        states = []\n        traj_lens = []\n        for obs in dataset[\"observations\"]:\n            states.extend(obs)\n            traj_lens.append(len(obs))\n        self.n_traj = len(traj_lens)\n        states = np.vstack(states)\n        self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6\n        \n        traj_lens = np.array(traj_lens)\n        self.p_sample = traj_lens / sum(traj_lens)\n\n    def _discount_cumsum(self, x, gamma):\n        discount_cumsum = np.zeros_like(x)\n        discount_cumsum[-1] = x[-1]\n        for t in reversed(range(x.shape[0] - 1)):\n            discount_cumsum[t] = x[t] + gamma * discount_cumsum[t + 1]\n        return discount_cumsum\n\n    def __call__(self, features):\n        batch_size = len(features)\n        # this is a bit of a hack to be able to sample of a non-uniform distribution\n        batch_inds = np.random.choice(\n            np.arange(self.n_traj),\n            size=batch_size,\n            replace=True,\n            p=self.p_sample,  # reweights so we sample according to timesteps\n        )\n        # a batch of dataset features\n        s, a, r, d, rtg, timesteps, mask = [], [], [], [], [], [], []\n        \n        for ind in batch_inds:\n            # for feature in features:\n            feature = self.dataset[int(ind)]\n            si = random.randint(0, len(feature[\"rewards\"]) - 1)\n\n            # get sequences from dataset\n            s.append(np.array(feature[\"observations\"][si : si + self.max_len]).reshape(1, -1, self.state_dim))\n            a.append(np.array(feature[\"actions\"][si : si + self.max_len]).reshape(1, -1, self.act_dim))\n            r.append(np.array(feature[\"rewards\"][si : si + self.max_len]).reshape(1, -1, 1))\n\n            d.append(np.array(feature[\"dones\"][si : si + self.max_len]).reshape(1, -1))\n            timesteps.append(np.arange(si, si + s[-1].shape[1]).reshape(1, -1))\n            timesteps[-1][timesteps[-1] >= self.max_ep_len] = self.max_ep_len - 1  # padding cutoff\n            rtg.append(\n                self._discount_cumsum(np.array(feature[\"rewards\"][si:]), gamma=1.0)[\n                    : s[-1].shape[1]   # TODO check the +1 removed here\n                ].reshape(1, -1, 1)\n            )\n            if rtg[-1].shape[1] < s[-1].shape[1]:\n                print(\"if true\")\n                rtg[-1] = np.concatenate([rtg[-1], np.zeros((1, 1, 1))], axis=1)\n\n            # padding and state + reward normalization\n            tlen = s[-1].shape[1]\n            s[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, self.state_dim)), s[-1]], axis=1)\n            s[-1] = (s[-1] - self.state_mean) / self.state_std\n            a[-1] = np.concatenate(\n                [np.ones((1, self.max_len - tlen, self.act_dim)) * -10.0, a[-1]],\n                axis=1,\n            )\n            r[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, 1)), r[-1]], axis=1)\n            d[-1] = np.concatenate([np.ones((1, self.max_len - tlen)) * 2, d[-1]], axis=1)\n            rtg[-1] = np.concatenate([np.zeros((1, self.max_len - tlen, 1)), rtg[-1]], axis=1) / self.scale\n            timesteps[-1] = np.concatenate([np.zeros((1, self.max_len - tlen)), timesteps[-1]], axis=1)\n            mask.append(np.concatenate([np.zeros((1, self.max_len - tlen)), np.ones((1, tlen))], axis=1))\n\n        s = torch.from_numpy(np.concatenate(s, axis=0)).float()\n        a = torch.from_numpy(np.concatenate(a, axis=0)).float()\n        r = torch.from_numpy(np.concatenate(r, axis=0)).float()\n        d = torch.from_numpy(np.concatenate(d, axis=0))\n        rtg = torch.from_numpy(np.concatenate(rtg, axis=0)).float()\n        timesteps = torch.from_numpy(np.concatenate(timesteps, axis=0)).long()\n        mask = torch.from_numpy(np.concatenate(mask, axis=0)).float()\n\n        return {\n            \"states\": s,\n            \"actions\": a,\n            \"rewards\": r,\n            \"returns_to_go\": rtg,\n            \"timesteps\": timesteps,\n            \"attention_mask\": mask,\n        }"
+    },
+    {
+      "id": "c0003",
+      "source": "class TrainableDT(DecisionTransformerModel):\n    def __init__(self, config):\n        super().__init__(config)\n\n    def forward(self, **kwargs):\n        output = super().forward(**kwargs)\n        # add the DT loss\n        action_preds = output[1]\n        action_targets = kwargs[\"actions\"]\n        attention_mask = kwargs[\"attention_mask\"]\n        act_dim = action_preds.shape[2]\n        action_preds = action_preds.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]\n        action_targets = action_targets.reshape(-1, act_dim)[attention_mask.reshape(-1) > 0]\n        \n        loss = torch.mean((action_preds - action_targets) ** 2)\n\n        return {\"loss\": loss}\n\n    def original_forward(self, **kwargs):\n        return super().forward(**kwargs)"
+    },
+    {
+      "id": "c0004",
+      "source": "training_args = TrainingArguments(\n    output_dir=\"output/\",\n    remove_unused_columns=False,\n    num_train_epochs=120,\n    per_device_train_batch_size=64,\n    learning_rate=1e-4,\n    weight_decay=1e-4,\n    warmup_ratio=0.1,\n    optim=\"adamw_torch\",\n    max_grad_norm=0.25,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset[\"train\"],\n    data_collator=collator,\n)\n\ntrainer.train()"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "6167a52387d1ec50cf0b78a2b46e3643b6a750ba6849cdcca3d03f804359f696",
+  "mediaLayout": [
+    {
+      "mediaId": "video_589491720633e4f7",
+      "type": "video",
+      "afterBlockId": "b0002",
+      "order": 0
+    },
+    {
+      "mediaId": "image_0930b32c68d35be1",
+      "type": "image",
+      "afterBlockId": "b0022",
+      "order": 1
+    },
+    {
+      "mediaId": "video_589491720633e4f7",
+      "type": "video",
+      "afterBlockId": "b0029",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 1,
+    "savedVideos": 1,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:42:06.034193Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:42:06.034210Z"
 }

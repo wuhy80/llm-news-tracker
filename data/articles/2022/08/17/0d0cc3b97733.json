@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/hf-bitsandbytes-integration",
   "resolvedUrl": "https://huggingface.co/blog/hf-bitsandbytes-integration",
   "fetchedAt": "2026-08-27T03:10:36.971099Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "## Introduction\n\nLanguage models are becoming larger all the time. At the time of this writing, PaLM has 540B parameters, OPT, GPT-3, and BLOOM have around 176B parameters, and we are trending towards even larger models. Below is a diagram showing the size of some recent language models.\n\nTherefore, these models are hard to run on easily accessible devices. For example, just to do inference on BLOOM-176B, you would need to have 8x 80GB A100 GPUs (~$15k each). To fine-tune BLOOM-176B, you'd need 72 of these GPUs! Much larger models, like PaLM would require even more resources.\n\nBecause these huge models require so many GPUs to run, we need to find ways to reduce these requirements while preserving the model's performance. Various technologies have been developed that try to shrink the model size, you may have heard of quantization and distillation, and there are many others.\n\nAfter completing the training of BLOOM-176B, we at HuggingFace and BigScience were looking for ways to make this big model easier to run on less GPUs. Through our BigScience community we were made aware of research on Int8 inference that does not degrade predictive performance of large models and reduces the memory footprint of large models by a factor or 2x. Soon we started collaboring on this research which ended with a full integration into Hugging Face transformers. With this blog post, we offer LLM.int8() integration for all Hugging Face models which we explain in more detail below. If you want to read more about our research, you can read our paper, LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale.\n\nThis article focuses on giving a high-level overview of this quantization technology, outlining the difficulties in incorporating it into the transformers library, and drawing up the long-term goals of this partnership.\n\nHere you will learn what exactly make a large model use so much memory? What makes BLOOM 350GB? Let's begin by gradually going over a few basic premises.\n\n## Common data types used in Machine Learning\n\nWe start with the basic understanding of different floating point data types, which are also referred to as \"precision\" in the context of Machine Learning.\n\nThe size of a model is determined by the number of its parameters, and their precision, typically one of float32, float16 or bfloat16 (image below from: https://blogs.nvidia.com/blog/2020/05/14/tensorfloat-32-precision-format/).\n\nFloat32 (FP32) stands for the standardized IEEE 32-bit floating point representation. With this data type it is possible to represent a wide range of floating numbers. In FP32, 8 bits are reserved for the \"exponent\", 23 bits for the \"mantissa\" and 1 bit for the sign of the number. In addition to that, most of the hardware supports FP32 operations and instructions.\n\nIn the float16 (FP16) data type, 5 bits are reserved for the exponent and 10 bits are reserved for the mantissa. This makes the representable range of FP16 numbers much lower than FP32. This exposes FP16 numbers to the risk of overflowing (trying to represent a number that is very large) and underflowing (representing a number that is very small).\n\nFor example, if you do 10k * 10k you end up with 100M which is not possible to represent in FP16, as the largest number possible is 64k. And thus you'd end up with NaN (Not a Number) result and if you have sequential computation like in neural networks, all the prior work is destroyed. Usually, loss scaling is used to overcome this issue, but it doesn't always work well.\n\nA new format, bfloat16 (BF16), was created to avoid these constraints. In BF16, 8 bits are reserved for the exponent (which is the same as in FP32) and 7 bits are reserved for the fraction.\n\nThis means that in BF16 we can retain the same dynamic range as FP32. But we lose 3 bits of precision with respect to FP16. Now there is absolutely no problem with huge numbers, but the precision is worse than FP16 here.\n\nIn the Ampere architecture, NVIDIA also introduced TensorFloat-32 (TF32) precision format, combining the dynamic range of BF16 and precision of FP16 to only use 19 bits. It's currently only used internally during certain operations.\n\nIn the machine learning jargon FP32 is called full precision (4 bytes), while BF16 and FP16 are referred to as half-precision (2 bytes). On top of that, the int8 (INT8) data type consists of an 8-bit representation that can store 2^8 different values (between [0, 255] or [-128, 127] for signed integers).\n\nWhile, ideally the training and inference should be done in FP32, it is two times slower than FP16/BF16 and therefore a mixed precision approach is used where the weights are held in FP32 as a precise \"main weights\" reference, while computation in a forward and backward pass are done for FP16/BF16 to enhance training speed. The FP16/BF16 gradients are then used to update the FP32 main weights.\n\nDuring training, the main weights are always stored in FP32, but in practice, the half-precision weights often provide similar quality during inference as their FP32 counterpart -- a precise reference of the model is only needed when it receives multiple gradient updates. This means we can use the half-precision weights and use half the GPUs to accomplish the same outcome.\n\nTo calculate the model size in bytes, one multiplies the number of parameters by the size of the chosen precision in bytes. For example, if we use the bfloat16 version of the BLOOM-176B model, we have 176*10**9 x 2 bytes = 352GB! As discussed earlier, this is quite a challenge to fit into a few GPUs.\n\nBut what if we can store those weights with less memory using a different data type? A methodology called quantization has been used widely in Deep Learning.\n\n## Introduction to model quantization\n\nExperimentially, we have discovered that instead of using the 4-byte FP32 precision, we can get an almost identical inference outcome with 2-byte BF16/FP16 half-precision, which halves the model size. It'd be amazing to cut it further, but the inference quality outcome starts to drop dramatically at lower precision.\n\nTo remediate that, we introduce 8-bit quantization. This method uses a quarter precision, thus needing only 1/4th of the model size! But it's not done by just dropping another half of the bits.\n\nQuantization is done by essentially “rounding” from one data type to another. For example, if one data type has the range 0..9 and another 0..4, then the value “4” in the first data type would be rounded to “2” in the second data type. However, if we have the value “3” in the first data type, it lies between 1 and 2 of the second data type, then we would usually round to “2”. This shows that both values “4” and “3” of the first data type have the same value “2” in the second data type. This highlights that quantization is a noisy process that can lead to information loss, a sort of lossy compression.\n\nThe two most common 8-bit quantization techniques are zero-point quantization and absolute maximum (absmax) quantization. Zero-point quantization and absmax quantization map the floating point values into more compact int8 (1 byte) values. First, these methods normalize the input by scaling it by a quantization constant.\n\nFor example, in zero-point quantization, if my range is -1.0…1.0 and I want to quantize into the range -127…127, I want to scale by the factor of 127 and then round it into the 8-bit precision. To retrieve the original value, you would need to divide the int8 value by that same quantization factor of 127. For example, the value 0.3 would be scaled to 0.3*127 = 38.1. Through rounding, we get the value of 38. If we reverse this, we get 38/127=0.2992 – we have a quantization error of 0.008 in this example. These seemingly tiny errors tend to accumulate and grow as they get propagated through the model’s layers and result in performance degradation.\n\n(Image taken from: this blogpost )\n\nNow let's look at the details of absmax quantization. To calculate the mapping between the fp16 number and its corresponding int8 number in absmax quantization, you have to first divide by the absolute maximum value of the tensor and then multiply by the total range of the data type.\n\nFor example, let's assume you want to apply absmax quantization in a vector that contains [1.2, -0.5, -4.3, 1.2, -3.1, 0.8, 2.4, 5.4]. You extract the absolute maximum of it, which is 5.4 in this case. Int8 has a range of [-127, 127], so we divide 127 by 5.4 and obtain 23.5 for the scaling factor. Therefore multiplying the original vector by it gives the quantized vector [28, -12, -101, 28, -73, 19, 56, 127].\n\nTo retrieve the latest, one can just divide in full precision the int8 number with the quantization factor, but since the result above is \"rounded\" some precision will be lost.\n\nFor an unsigned int8, we would subtract the minimum and scale by the absolute maximum. This is close to what zero-point quantization does. It's is similar to a min-max scaling but the latter maintains the value scales in such a way that the value “0” is always represented by an integer without any quantization error.\n\nThese tricks can be combined in several ways, for example, row-wise or vector-wise quantization, when it comes to matrix multiplication for more accurate results. Looking at the matrix multiplication, A*B=C, instead of regular quantization that normalize by a absolute maximum value per tensor, vector-wise quantization finds the absolute maximum of each row of A and each column of B. Then we normalize A and B by dividing these vectors. We then multiply A*B to get C. Finally, to get back the FP16 values, we denormalize by computing the outer product of the absolute maximum vector of A and B. More details on this technique can be found in the LLM.int8() paper or in the blog post about quantization and emergent features on Tim's blog.\n\nWhile these basic techniques enable us to quanitize Deep Learning models, they usually lead to a drop in accuracy for larger models. The LLM.int8() implementation that we integrated into Hugging Face Transformers and Accelerate libraries is the first technique that does not degrade performance even for large models with 176B parameters, such as BLOOM.\n\n## A gentle summary of LLM.int8(): zero degradation matrix multiplication for Large Language Models\n\nIn LLM.int8(), we have demonstrated that it is crucial to comprehend the scale-dependent emergent properties of transformers in order to understand why traditional quantization fails for large models. We demonstrate that performance deterioration is caused by outlier features, which we explain in the next section. The LLM.int8() algorithm itself can be explain as follows.\n\nIn essence, LLM.int8() seeks to complete the matrix multiplication computation in three steps:\n\n- From the input hidden states, extract the outliers (i.e. values that are larger than a certain threshold) by column.\n\n- Perform the matrix multiplication of the outliers in FP16 and the non-outliers in int8.\n\n- Dequantize the non-outlier results and add both outlier and non-outlier results together to receive the full result in FP16.\n\nThese steps can be summarized in the following animation:\n\n### The importance of outlier features\n\nA value that is outside the range of some numbers' global distribution is generally referred to as an outlier. Outlier detection has been widely used and covered in the current literature, and having prior knowledge of the distribution of your features helps with the task of outlier detection. More specifically, we have observed that classic quantization at scale fails for transformer-based models >6B parameters. While large outlier features are also present in smaller models, we observe that a certain threshold these outliers from highly systematic patterns across transformers which are present in every layer of the transformer. For more details on these phenomena see the LLM.int8() paper and emergent features blog post.\n\nAs mentioned earlier, 8-bit precision is extremely constrained, therefore quantizing a vector with several big values can produce wildly erroneous results. Additionally, because of a built-in characteristic of the transformer-based architecture that links all the elements together, these errors tend to compound as they get propagated across multiple layers. Therefore, mixed-precision decomposition has been developed to facilitate efficient quantization with such extreme outliers. It is discussed next.\n\n### Inside the MatMul\n\nOnce the hidden states are computed we extract the outliers using a custom threshold and we decompose the matrix into two parts as explained above. We found that extracting all outliers with magnitude 6 or greater in this way recoveres full inference performance. The outlier part is done in fp16 so it is a classic matrix multiplication, whereas the 8-bit matrix multiplication is done by quantizing the weights and hidden states into 8-bit precision using vector-wise quantization -- that is, row-wise quantization for the hidden state and column-wise quantization for the weight matrix. After this step, the results are dequantized and returned in half-precision in order to add them to the first matrix multiplication.\n\n### What does 0 degradation mean?\n\nHow can we properly evaluate the performance degradation of this method? How much quality do we lose in terms of generation when using 8-bit models?\n\nWe ran several common benchmarks with the 8-bit and native models using lm-eval-harness and reported the results.\n\nFor OPT-175B:\n\nbenchmarks\n\n\\-\n\n\\-\n\n\\-\n\n\\-\n\ndifference - value\n\nname\n\nmetric\n\nvalue - int8\n\nvalue - fp16\n\nstd err - fp16\n\n\\-\n\nhellaswag\n\nacc_norm\n\n0.7849\n\n0.7849\n\n0.0041\n\n0\n\nhellaswag\n\nacc\n\n0.5921\n\n0.5931\n\n0.0049\n\n0.001\n\npiqa\n\nacc\n\n0.7965\n\n0.7959\n\n0.0094\n\n0.0006\n\npiqa\n\nacc_norm\n\n0.8101\n\n0.8107\n\n0.0091\n\n0.0006\n\nlambada\n\nppl\n\n3.0142\n\n3.0152\n\n0.0552\n\n0.001\n\nlambada\n\nacc\n\n0.7464\n\n0.7466\n\n0.0061\n\n0.0002\n\nwinogrande\n\nacc\n\n0.7174\n\n0.7245\n\n0.0125\n\n0.0071\n\nFor BLOOM-176:\n\nbenchmarks\n\n\\-\n\n\\-\n\n\\-\n\n\\-\n\ndifference - value\n\nname\n\nmetric\n\nvalue - int8\n\nvalue - bf16\n\nstd err - bf16\n\n\\-\n\nhellaswag\n\nacc_norm\n\n0.7274\n\n0.7303\n\n0.0044\n\n0.0029\n\nhellaswag\n\nacc\n\n0.5563\n\n0.5584\n\n0.005\n\n0.0021\n\npiqa\n\nacc\n\n0.7835\n\n0.7884\n\n0.0095\n\n0.0049\n\npiqa\n\nacc_norm\n\n0.7922\n\n0.7911\n\n0.0095\n\n0.0011\n\nlambada\n\nppl\n\n3.9191\n\n3.931\n\n0.0846\n\n0.0119\n\nlambada\n\nacc\n\n0.6808\n\n0.6718\n\n0.0065\n\n0.009\n\nwinogrande\n\nacc\n\n0.7048\n\n0.7048\n\n0.0128\n\n0\n\nWe indeed observe 0 performance degradation for those models since the absolute difference of the metrics are all below the standard error (except for BLOOM-int8 which is slightly better than the native model on lambada). For a more detailed performance evaluation against state-of-the-art approaches, take a look at the paper!\n\n### Is it faster than native models?\n\nThe main purpose of the LLM.int8() method is to make large models more accessible without performance degradation. But the method would be less useful if it is very slow. So we benchmarked the generation speed of multiple models. We find that BLOOM-176B with LLM.int8() is about 15% to 23% slower than the fp16 version – which is still quite acceptable. We found larger slowdowns for smaller models, like T5-3B and T5-11B. We worked hard to speed up these small models. Within a day, we could improve inference per token from 312 ms to 173 ms for T5-3B and from 45 ms to 25 ms for T5-11B. Additionally, issues were already identified, and LLM.int8() will likely be faster still for small models in upcoming releases. For now, the current numbers are in the table below.\n\nPrecision\n\nNumber of parameters\n\nHardware\n\nTime per token in milliseconds for Batch Size 1\n\nTime per token in milliseconds for Batch Size 8\n\nTime per token in milliseconds for Batch Size 32\n\nbf16\n\n176B\n\n8xA100 80GB\n\n239\n\n32\n\n9.9\n\nint8\n\n176B\n\n4xA100 80GB\n\n282\n\n37.5\n\n10.2\n\nbf16\n\n176B\n\n14xA100 40GB\n\n285\n\n36.5\n\n10.4\n\nint8\n\n176B\n\n5xA100 40GB\n\n367\n\n46.4\n\noom\n\nfp16\n\n11B\n\n2xT4 15GB\n\n11.7\n\n1.7\n\n0.5\n\nint8\n\n11B\n\n1xT4 15GB\n\n43.5\n\n5.3\n\n1.3\n\nfp32\n\n3B\n\n2xT4 15GB\n\n45\n\n7.2\n\n3.1\n\nint8\n\n3B\n\n1xT4 15GB\n\n312\n\n39.1\n\n10.2\n\nThe 3 models are BLOOM-176B, T5-11B and T5-3B.\n\n### Hugging Face transformers integration nuances\n\nNext let's discuss the specifics of the Hugging Face transformers integration. Let's look at the usage and the common culprit you may encounter while trying to set things up.\n\n### Usage\n\nThe module responsible for the whole magic described in this blog post is called Linear8bitLt and you can easily import it from the bitsandbytes library. It is derived from a classic torch.nn Module and can be easily used and deployed in your architecture with the code described below.\n\nHere is a step-by-step example of the following use case: let's say you want to convert a small model in int8 using bitsandbytes.\n\n- First we need the correct imports below!\n\n```\nimport torch\nimport torch.nn as nn\n\nimport bitsandbytes as bnb\nfrom bnb.nn import Linear8bitLt\n```\n\n- Then you can define your own model. Note that you can convert a checkpoint or model of any precision to 8-bit (FP16, BF16 or FP32) but, currently, the input of the model has to be FP16 for our Int8 module to work. So we treat our model here as a fp16 model.\n\n```\nfp16_model = nn.Sequential(\n    nn.Linear(64, 64),\n    nn.Linear(64, 64)\n)\n```\n\n- Let's say you have trained your model on your favorite dataset and task! Now time to save the model:\n\n```\n[... train the model ...]\ntorch.save(fp16_model.state_dict(), \"model.pt\")\n```\n\n- Now that your state_dict is saved, let us define an int8 model:\n\n```\nint8_model = nn.Sequential(\n    Linear8bitLt(64, 64, has_fp16_weights=False),\n    Linear8bitLt(64, 64, has_fp16_weights=False)\n)\n```\n\nHere it is very important to add the flag has_fp16_weights. By default, this is set to True which is used to train in mixed Int8/FP16 precision. However, we are interested in memory efficient inference for which we need to use has_fp16_weights=False.\n\n- Now time to load your model in 8-bit!\n\n```\nint8_model.load_state_dict(torch.load(\"model.pt\"))\nint8_model = int8_model.to(0) # Quantization happens here\n```\n\nNote that the quantization step is done in the second line once the model is set on the GPU. If you print int8_model[0].weight before calling the .to function you get:\n\n```\nint8_model[0].weight\nParameter containing:\ntensor([[ 0.0031, -0.0438,  0.0494,  ..., -0.0046, -0.0410,  0.0436],\n        [-0.1013,  0.0394,  0.0787,  ...,  0.0986,  0.0595,  0.0162],\n        [-0.0859, -0.1227, -0.1209,  ...,  0.1158,  0.0186, -0.0530],\n        ...,\n        [ 0.0804,  0.0725,  0.0638,  ..., -0.0487, -0.0524, -0.1076],\n        [-0.0200, -0.0406,  0.0663,  ...,  0.0123,  0.0551, -0.0121],\n        [-0.0041,  0.0865, -0.0013,  ..., -0.0427, -0.0764,  0.1189]],\n       dtype=torch.float16)\n```\n\nWhereas if you print it after the second line's call you get:\n\n```\nint8_model[0].weight\nParameter containing:\ntensor([[   3,  -47,   54,  ...,   -5,  -44,   47],\n        [-104,   40,   81,  ...,  101,   61,   17],\n        [ -89, -127, -125,  ...,  120,   19,  -55],\n        ...,\n        [  82,   74,   65,  ...,  -49,  -53, -109],\n        [ -21,  -42,   68,  ...,   13,   57,  -12],\n        [  -4,   88,   -1,  ...,  -43,  -78,  121]],\n        device='cuda:0', dtype=torch.int8, requires_grad=True)\n```\n\nThe weights values are \"truncated\" as we have seen when explaining quantization in the previous sections. Also, the values seem to be distributed between [-127, 127]. You might also wonder how to retrieve the FP16 weights in order to perform the outlier MatMul in fp16? You can simply do:\n\n```\n(int8_model[0].weight.CB * int8_model[0].weight.SCB) / 127\n```\n\nAnd you will get:\n\n```\ntensor([[ 0.0028, -0.0459,  0.0522,  ..., -0.0049, -0.0428,  0.0462],\n        [-0.0960,  0.0391,  0.0782,  ...,  0.0994,  0.0593,  0.0167],\n        [-0.0822, -0.1240, -0.1207,  ...,  0.1181,  0.0185, -0.0541],\n        ...,\n        [ 0.0757,  0.0723,  0.0628,  ..., -0.0482, -0.0516, -0.1072],\n        [-0.0194, -0.0410,  0.0657,  ...,  0.0128,  0.0554, -0.0118],\n        [-0.0037,  0.0859, -0.0010,  ..., -0.0423, -0.0759,  0.1190]],\n       device='cuda:0')\n```\n\nWhich is close enough to the original FP16 values (2 print outs up)!\n\n- Now you can safely infer using your model by making sure your input is on the correct GPU and is in FP16:\n\n```\ninput_ = torch.randn((1, 64), dtype=torch.float16)\nhidden_states = int8_model(input_.to(torch.device('cuda', 0)))\n```\n\nCheck out the example script for the full minimal code!\n\nAs a side note, you should be aware that these modules differ slightly from the nn.Linear modules in that their parameters come from the bnb.nn.Int8Params class rather than the nn.Parameter class. You'll see later that this presented an additional obstacle on our journey!\n\nNow the time has come to understand how to integrate that into the transformers library!\n\n### accelerate is all you need\n\nWhen working with huge models, the accelerate library includes a number of helpful utilities. The init_empty_weights method is especially helpful because any model, regardless of size, may be initialized with this method as a context manager without allocating any memory for the model weights.\n\n```\nimport torch.nn as nn\nfrom accelerate import init_empty_weights\n\nwith init_empty_weights():\n    model = nn.Sequential([nn.Linear(100000, 100000) for _ in range(1000)]) # This will take ~0 RAM!\n```\n\nThe initialized model will be put on PyTorch's meta device, an underlying mechanism to represent shape and dtype without allocating memory for storage. How cool is that?\n\nInitially, this function is called inside the .from_pretrained function and overrides all parameters to torch.nn.Parameter. This would not fit our requirement since we want to keep the Int8Params class in our case for Linear8bitLt modules as explained above. We managed to fix that on the following PR that modifies:\n\n```\nmodule._parameters[name] = nn.Parameter(module._parameters[name].to(torch.device(\"meta\")))\n```\n\nto\n\n```\nparam_cls = type(module._parameters[name])\nkwargs = module._parameters[name].__dict__\nmodule._parameters[name] = param_cls(module._parameters[name].to(torch.device(\"meta\")), **kwargs)\n```\n\nNow that this is fixed, we can easily leverage this context manager and play with it to replace all nn.Linear modules to bnb.nn.Linear8bitLt at no memory cost using a custom function!\n\n```\ndef replace_8bit_linear(model, threshold=6.0, module_to_not_convert=\"lm_head\"):\n    for name, module in model.named_children():\n        if len(list(module.children())) > 0:\n            replace_8bit_linear(module, threshold, module_to_not_convert)\n\n        if isinstance(module, nn.Linear) and name != module_to_not_convert:\n            with init_empty_weights():\n                model._modules[name] = bnb.nn.Linear8bitLt(\n                    module.in_features,\n                    module.out_features,\n                    module.bias is not None,\n                    has_fp16_weights=False,\n                    threshold=threshold,\n                )\n    return model\n```\n\nThis function recursively replaces all nn.Linear layers of a given model initialized on the meta device and replaces them with a Linear8bitLt module. The attribute has_fp16_weights has to be set to False in order to directly load the weights in int8 together with the quantization statistics.\n\nWe also discard the replacement for some modules (here the lm_head) since we want to keep the latest in their native precision for more precise and stable results.\n\nBut it isn't over yet! The function above is executed under the init_empty_weights context manager which means that the new model will be still in the meta device. For models that are initialized under this context manager, accelerate will manually load the parameters of each module and move them to the correct devices. In bitsandbytes, setting a Linear8bitLt module's device is a crucial step (if you are curious, you can check the code snippet here) as we have seen in our toy script.\n\nHere the quantization step fails when calling it twice. We had to come up with an implementation of accelerate's set_module_tensor_to_device function (termed as set_module_8bit_tensor_to_device) to make sure we don't call it twice. Let's discuss this in detail in the section below!\n\n### Be very careful on how to set devices with accelerate\n\nHere we played a very delicate balancing act with the accelerate library! Once you load your model and set it on the correct devices, sometimes you still need to call set_module_tensor_to_device to dispatch the model with hooks on all devices. This is done inside the dispatch_model function from accelerate, which involves potentially calling .to several times and is something we want to avoid. 2 Pull Requests were needed to achieve what we wanted! The initial PR proposed here broke some tests but this PR successfully fixed everything!\n\n### Wrapping it all up\n\nTherefore the ultimate recipe is:\n\n- Initialize a model in the meta device with the correct modules\n\n- Set the parameters one by one on the correct GPU device and make sure you never do this procedure twice!\n\n- Put new keyword arguments in the correct place everywhere, and add some nice documentation\n\n- Add very extensive tests! Check our tests here for more details This may sound quite easy, but we went through many hard debugging sessions together, often times involving CUDA kernels!\n\nAll said and done, this integration adventure was very fun; from deep diving and doing some \"surgery\" on different libraries to aligning everything and making it work!\n\nNow time to see how to benefit from this integration and how to successfully use it in transformers!\n\n## How to use it in transformers\n\n### Hardware requirements\n\n8-bit tensor cores are not supported on the CPU. bitsandbytes can be run on 8-bit tensor core-supported hardware, which are Turing and Ampere GPUs (RTX 20s, RTX 30s, A40-A100, T4+). For example, Google Colab GPUs are usually NVIDIA T4 GPUs, and their latest generation of GPUs does support 8-bit tensor cores. Our demos are based on Google Colab so check them out below!\n\n### Installation\n\nJust install the latest version of the libraries using the commands below (make sure that you are using python>=3.8) and run the commands below to try out\n\n```\npip install accelerate\npip install bitsandbytes\npip install git+https://github.com/huggingface/transformers.git\n```\n\n### Example demos - running T5 11b on a Google Colab\n\nCheck out the Google Colab demos for running 8bit models on a BLOOM-3B model!\n\nHere is the demo for running T5-11B. The T5-11B model checkpoint is in FP32 which uses 42GB of memory and does not fit on Google Colab. With our 8-bit modules it only uses 11GB and fits easily:\n\nOr this demo for BLOOM-3B:\n\n## Scope of improvements\n\nThis approach, in our opinion, greatly improves access to very large models. With no performance degradation, it enables users with less compute to access models that were previously inaccessible. We've found several areas for improvement that can be worked on in the future to make this method even better for large models!\n\n### Faster inference speed for smaller models\n\nAs we have seen in the the benchmarking section, we could improve the runtime speed for small model (<=6B parameters) by a factor of almost 2x. However, while the inference speed is robust for large models like BLOOM-176B there are still improvements to be had for small models. We already identified the issues and likely recover same performance as fp16, or get small speedups. You will see these changes being integrated within the next couple of weeks.\n\n### Support for Kepler GPUs (GTX 1080 etc)\n\nWhile we support all GPUs from the past four years, some old GPUs like GTX 1080 still see heavy use. While these GPUs do not have Int8 tensor cores, they do have Int8 vector units (a kind of \"weak\" tensor core). As such, these GPUs can also experience Int8 acceleration. However, it requires a entire different stack of software for fast inference. While we do plan to integrate support for Kepler GPUs to make the LLM.int8() feature more widely available, it will take some time to realize this due to its complexity.\n\n### Saving 8-bit state dicts on the Hub\n\n8-bit state dicts cannot currently be loaded directly into the 8-bit model after being pushed on the Hub. This is due to the fact that the statistics (remember weight.CB and weight.SCB) computed by the model are not currently stored or taken into account inside the state dict, and the Linear8bitLt module does not support this feature yet. We think that having the ability to save that and push it to the Hub might contribute to greater accessibility.\n\n### CPU support\n\nCPU devices do not support 8-bit cores, as was stated at the beginning of this blogpost. Can we, however, get past that? Running this module on CPUs would also significantly improve usability and accessibility.\n\n### Scaling up on other modalities\n\nCurrently, language models dominate very large models. Leveraging this method on very large vision, audio, and multi-modal models might be an interesting thing to do for better accessibility in the coming years as these models become more accessible.\n\n## Credits\n\nHuge thanks to the following who contributed to improve the readability of the article as well as contributed in the integration procedure in transformers (listed in alphabetic order): JustHeuristic (Yozh), Michael Benayoun, Stas Bekman, Steven Liu, Sylvain Gugger, Tim Dettmers",
   "summaryZh": "文章介绍了如何使用transformers、accelerate和bitsandbytes库在超大规模Transformer模型中实现8位矩阵乘法。该技术能显著降低大模型的显存开销，对推动大模型在消费级硬件上的实际部署具有重要意义。",
   "summaryGeneratedAt": "2026-09-06T03:11:49.568820Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -53,5 +52,3407 @@
     "summaryZh": "文章介绍了如何使用transformers、accelerate和bitsandbytes库在超大规模Transformer模型中实现8位矩阵乘法。该技术能显著降低大模型的显存开销，对推动大模型在消费级硬件上的实际部署具有重要意义。",
     "glossary": [],
     "duplicateKey": "8bit-matrix-multiplication-transformers"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Thumbnail_blue.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Thumbnail_blue.png",
+      "alt": "thumbnail",
+      "id": "image_605fab2e4d25eb20"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/LLM3.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/LLM3.png",
+      "alt": "LLM",
+      "id": "image_b1eeba5562721218"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/tf32-Mantissa-chart-hi-res-FINAL.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/tf32-Mantissa-chart-hi-res-FINAL.png",
+      "alt": "Summary",
+      "id": "image_d91b37a4bcd30114"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Model-storage.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Model-storage.png",
+      "alt": "Model-storage",
+      "id": "image_45f1b7a012837f66"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/quantization.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/quantization.png",
+      "alt": "quantization",
+      "id": "image_3b13139de4800413"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/out-quant.gif",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/out-quant.gif",
+      "alt": "out-quant.gif",
+      "id": "image_ee7c3da9590627cb"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/quant-freeze.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/quant-freeze.png",
+      "alt": "quant-freeze",
+      "id": "image_c6a4985d6a4cab3c"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Mixed-int8.gif",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Mixed-int8.gif",
+      "alt": "Mixed-int8.gif",
+      "id": "image_01e58355ffc9dcba"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Matmul.png",
+      "originalUrl": "https://huggingface.co/blog/assets/96_hf_bitsandbytes_integration/Matmul.png",
+      "alt": "Matmul.png",
+      "id": "image_8cc175615f837d78"
+    },
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab: T5-11b demo",
+      "id": "image_dfb4615ac36cf94c"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Language models are becoming larger all the time. At the time of this writing, PaLM has 540B parameters, OPT, GPT-3, and BLOOM have around 176B parameters, and we are trending towards even larger models. Below is a diagram showing the size of some recent language models.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Therefore, these models are hard to run on easily accessible devices. For example, just to do inference on BLOOM-176B, you would need to have 8x 80GB A100 GPUs (~$15k each). To fine-tune BLOOM-176B, you'd need 72 of these GPUs! Much larger models, like PaLM would require even more resources.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Because these huge models require so many GPUs to run, we need to find ways to reduce these requirements while preserving the model's performance. Various technologies have been developed that try to shrink the model size, you may have heard of quantization and distillation, and there are many others.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "After completing the training of BLOOM-176B, we at HuggingFace and BigScience were looking for ways to make this big model easier to run on less GPUs. Through our BigScience community we were made aware of research on Int8 inference that does not degrade predictive performance of large models and reduces the memory footprint of large models by a factor or 2x. Soon we started collaboring on this research which ended with a full integration into Hugging Face transformers. With this blog post, we offer LLM.int8() integration for all Hugging Face models which we explain in more detail below. If you want to read more about our research, you can read our paper, LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale.",
+      "spans": [
+        {
+          "start": 461,
+          "end": 473,
+          "kind": "code"
+        },
+        {
+          "start": 664,
+          "end": 729,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2208.07339"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "This article focuses on giving a high-level overview of this quantization technology, outlining the difficulties in incorporating it into the transformers library, and drawing up the long-term goals of this partnership.",
+      "spans": [
+        {
+          "start": 142,
+          "end": 154,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Here you will learn what exactly make a large model use so much memory? What makes BLOOM 350GB? Let's begin by gradually going over a few basic premises.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Common data types used in Machine Learning",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "We start with the basic understanding of different floating point data types, which are also referred to as \"precision\" in the context of Machine Learning.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "The size of a model is determined by the number of its parameters, and their precision, typically one of float32, float16 or bfloat16 (image below from: https://blogs.nvidia.com/blog/2020/05/14/tensorfloat-32-precision-format/).",
+      "spans": [
+        {
+          "start": 153,
+          "end": 226,
+          "kind": "a",
+          "href": "https://blogs.nvidia.com/blog/2020/05/14/tensorfloat-32-precision-format/"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Float32 (FP32) stands for the standardized IEEE 32-bit floating point representation. With this data type it is possible to represent a wide range of floating numbers. In FP32, 8 bits are reserved for the \"exponent\", 23 bits for the \"mantissa\" and 1 bit for the sign of the number. In addition to that, most of the hardware supports FP32 operations and instructions.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "In the float16 (FP16) data type, 5 bits are reserved for the exponent and 10 bits are reserved for the mantissa. This makes the representable range of FP16 numbers much lower than FP32. This exposes FP16 numbers to the risk of overflowing (trying to represent a number that is very large) and underflowing (representing a number that is very small).",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "For example, if you do 10k * 10k you end up with 100M which is not possible to represent in FP16, as the largest number possible is 64k. And thus you'd end up with NaN (Not a Number) result and if you have sequential computation like in neural networks, all the prior work is destroyed. Usually, loss scaling is used to overcome this issue, but it doesn't always work well.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 32,
+          "kind": "code"
+        },
+        {
+          "start": 49,
+          "end": 53,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 135,
+          "kind": "code"
+        },
+        {
+          "start": 164,
+          "end": 167,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "A new format, bfloat16 (BF16), was created to avoid these constraints. In BF16, 8 bits are reserved for the exponent (which is the same as in FP32) and 7 bits are reserved for the fraction.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "This means that in BF16 we can retain the same dynamic range as FP32. But we lose 3 bits of precision with respect to FP16. Now there is absolutely no problem with huge numbers, but the precision is worse than FP16 here.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "In the Ampere architecture, NVIDIA also introduced TensorFloat-32 (TF32) precision format, combining the dynamic range of BF16 and precision of FP16 to only use 19 bits. It's currently only used internally during certain operations.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 65,
+          "kind": "a",
+          "href": "https://blogs.nvidia.com/blog/2020/05/14/tensorfloat-32-precision-format/"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "In the machine learning jargon FP32 is called full precision (4 bytes), while BF16 and FP16 are referred to as half-precision (2 bytes). On top of that, the int8 (INT8) data type consists of an 8-bit representation that can store 2^8 different values (between [0, 255] or [-128, 127] for signed integers).",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "While, ideally the training and inference should be done in FP32, it is two times slower than FP16/BF16 and therefore a mixed precision approach is used where the weights are held in FP32 as a precise \"main weights\" reference, while computation in a forward and backward pass are done for FP16/BF16 to enhance training speed. The FP16/BF16 gradients are then used to update the FP32 main weights.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "During training, the main weights are always stored in FP32, but in practice, the half-precision weights often provide similar quality during inference as their FP32 counterpart -- a precise reference of the model is only needed when it receives multiple gradient updates. This means we can use the half-precision weights and use half the GPUs to accomplish the same outcome.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "To calculate the model size in bytes, one multiplies the number of parameters by the size of the chosen precision in bytes. For example, if we use the bfloat16 version of the BLOOM-176B model, we have 176*10**9 x 2 bytes = 352GB! As discussed earlier, this is quite a challenge to fit into a few GPUs.",
+      "spans": [
+        {
+          "start": 201,
+          "end": 228,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "But what if we can store those weights with less memory using a different data type? A methodology called quantization has been used widely in Deep Learning.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "Introduction to model quantization",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Experimentially, we have discovered that instead of using the 4-byte FP32 precision, we can get an almost identical inference outcome with 2-byte BF16/FP16 half-precision, which halves the model size. It'd be amazing to cut it further, but the inference quality outcome starts to drop dramatically at lower precision.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "To remediate that, we introduce 8-bit quantization. This method uses a quarter precision, thus needing only 1/4th of the model size! But it's not done by just dropping another half of the bits.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Quantization is done by essentially “rounding” from one data type to another. For example, if one data type has the range 0..9 and another 0..4, then the value “4” in the first data type would be rounded to “2” in the second data type. However, if we have the value “3” in the first data type, it lies between 1 and 2 of the second data type, then we would usually round to “2”. This shows that both values “4” and “3” of the first data type have the same value “2” in the second data type. This highlights that quantization is a noisy process that can lead to information loss, a sort of lossy compression.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "The two most common 8-bit quantization techniques are zero-point quantization and absolute maximum (absmax) quantization. Zero-point quantization and absmax quantization map the floating point values into more compact int8 (1 byte) values. First, these methods normalize the input by scaling it by a quantization constant.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "For example, in zero-point quantization, if my range is -1.0…1.0 and I want to quantize into the range -127…127, I want to scale by the factor of 127 and then round it into the 8-bit precision. To retrieve the original value, you would need to divide the int8 value by that same quantization factor of 127. For example, the value 0.3 would be scaled to 0.3*127 = 38.1. Through rounding, we get the value of 38. If we reverse this, we get 38/127=0.2992 – we have a quantization error of 0.008 in this example. These seemingly tiny errors tend to accumulate and grow as they get propagated through the model’s layers and result in performance degradation.",
+      "spans": [
+        {
+          "start": 353,
+          "end": 367,
+          "kind": "code"
+        },
+        {
+          "start": 438,
+          "end": 451,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "(Image taken from: this blogpost )",
+      "spans": [
+        {
+          "start": 19,
+          "end": 32,
+          "kind": "a",
+          "href": "https://intellabs.github.io/distiller/algo_quantization.html"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Now let's look at the details of absmax quantization. To calculate the mapping between the fp16 number and its corresponding int8 number in absmax quantization, you have to first divide by the absolute maximum value of the tensor and then multiply by the total range of the data type.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "For example, let's assume you want to apply absmax quantization in a vector that contains [1.2, -0.5, -4.3, 1.2, -3.1, 0.8, 2.4, 5.4]. You extract the absolute maximum of it, which is 5.4 in this case. Int8 has a range of [-127, 127], so we divide 127 by 5.4 and obtain 23.5 for the scaling factor. Therefore multiplying the original vector by it gives the quantized vector [28, -12, -101, 28, -73, 19, 56, 127].",
+      "spans": [
+        {
+          "start": 90,
+          "end": 133,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 187,
+          "kind": "code"
+        },
+        {
+          "start": 222,
+          "end": 233,
+          "kind": "code"
+        },
+        {
+          "start": 255,
+          "end": 258,
+          "kind": "code"
+        },
+        {
+          "start": 270,
+          "end": 274,
+          "kind": "code"
+        },
+        {
+          "start": 374,
+          "end": 411,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "To retrieve the latest, one can just divide in full precision the int8 number with the quantization factor, but since the result above is \"rounded\" some precision will be lost.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "For an unsigned int8, we would subtract the minimum and scale by the absolute maximum. This is close to what zero-point quantization does. It's is similar to a min-max scaling but the latter maintains the value scales in such a way that the value “0” is always represented by an integer without any quantization error.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "These tricks can be combined in several ways, for example, row-wise or vector-wise quantization, when it comes to matrix multiplication for more accurate results. Looking at the matrix multiplication, A*B=C, instead of regular quantization that normalize by a absolute maximum value per tensor, vector-wise quantization finds the absolute maximum of each row of A and each column of B. Then we normalize A and B by dividing these vectors. We then multiply A*B to get C. Finally, to get back the FP16 values, we denormalize by computing the outer product of the absolute maximum vector of A and B. More details on this technique can be found in the LLM.int8() paper or in the blog post about quantization and emergent features on Tim's blog.",
+      "spans": [
+        {
+          "start": 648,
+          "end": 664,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2208.07339"
+        },
+        {
+          "start": 675,
+          "end": 725,
+          "kind": "a",
+          "href": "https://timdettmers.com/2022/08/17/llm-int8-and-emergent-features/"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "While these basic techniques enable us to quanitize Deep Learning models, they usually lead to a drop in accuracy for larger models. The LLM.int8() implementation that we integrated into Hugging Face Transformers and Accelerate libraries is the first technique that does not degrade performance even for large models with 176B parameters, such as BLOOM.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "A gentle summary of LLM.int8(): zero degradation matrix multiplication for Large Language Models",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "In LLM.int8(), we have demonstrated that it is crucial to comprehend the scale-dependent emergent properties of transformers in order to understand why traditional quantization fails for large models. We demonstrate that performance deterioration is caused by outlier features, which we explain in the next section. The LLM.int8() algorithm itself can be explain as follows.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "In essence, LLM.int8() seeks to complete the matrix multiplication computation in three steps:",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "From the input hidden states, extract the outliers (i.e. values that are larger than a certain threshold) by column.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Perform the matrix multiplication of the outliers in FP16 and the non-outliers in int8.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Dequantize the non-outlier results and add both outlier and non-outlier results together to receive the full result in FP16.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "These steps can be summarized in the following animation:",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "The importance of outlier features",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "A value that is outside the range of some numbers' global distribution is generally referred to as an outlier. Outlier detection has been widely used and covered in the current literature, and having prior knowledge of the distribution of your features helps with the task of outlier detection. More specifically, we have observed that classic quantization at scale fails for transformer-based models >6B parameters. While large outlier features are also present in smaller models, we observe that a certain threshold these outliers from highly systematic patterns across transformers which are present in every layer of the transformer. For more details on these phenomena see the LLM.int8() paper and emergent features blog post.",
+      "spans": [
+        {
+          "start": 682,
+          "end": 698,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2208.07339"
+        },
+        {
+          "start": 703,
+          "end": 730,
+          "kind": "a",
+          "href": "https://timdettmers.com/2022/08/17/llm-int8-and-emergent-features/"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "As mentioned earlier, 8-bit precision is extremely constrained, therefore quantizing a vector with several big values can produce wildly erroneous results. Additionally, because of a built-in characteristic of the transformer-based architecture that links all the elements together, these errors tend to compound as they get propagated across multiple layers. Therefore, mixed-precision decomposition has been developed to facilitate efficient quantization with such extreme outliers. It is discussed next.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Inside the MatMul",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Once the hidden states are computed we extract the outliers using a custom threshold and we decompose the matrix into two parts as explained above. We found that extracting all outliers with magnitude 6 or greater in this way recoveres full inference performance. The outlier part is done in fp16 so it is a classic matrix multiplication, whereas the 8-bit matrix multiplication is done by quantizing the weights and hidden states into 8-bit precision using vector-wise quantization -- that is, row-wise quantization for the hidden state and column-wise quantization for the weight matrix. After this step, the results are dequantized and returned in half-precision in order to add them to the first matrix multiplication.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "What does 0 degradation mean?",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "How can we properly evaluate the performance degradation of this method? How much quality do we lose in terms of generation when using 8-bit models?",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "We ran several common benchmarks with the 8-bit and native models using lm-eval-harness and reported the results.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "For OPT-175B:",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "benchmarks",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "difference - value",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "name",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "metric",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "value - int8",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "value - fp16",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "std err - fp16",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "hellaswag",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "acc_norm",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "0.7849",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "0.7849",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "0.0041",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "hellaswag",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "0.5921",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "0.5931",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "0.0049",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "0.001",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "piqa",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "0.7965",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "0.7959",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "0.0094",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "0.0006",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "piqa",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "acc_norm",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "0.8101",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "0.8107",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "0.0091",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "0.0006",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "lambada",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "ppl",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "3.0142",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "3.0152",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "0.0552",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "0.001",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "lambada",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "0.7464",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "0.7466",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "0.0061",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "0.0002",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "winogrande",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "0.7174",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "0.7245",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "0.0125",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "0.0071",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "For BLOOM-176:",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "benchmarks",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "difference - value",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "name",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "metric",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "value - int8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "value - bf16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "std err - bf16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "hellaswag",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "acc_norm",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "0.7274",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "0.7303",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "0.0044",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "0.0029",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "hellaswag",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "0.5563",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "0.5584",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "0.005",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "0.0021",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "piqa",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "0.7835",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "0.7884",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "0.0095",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "0.0049",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "piqa",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "acc_norm",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "0.7922",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "0.7911",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "0.0095",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "0.0011",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "lambada",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "ppl",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "3.9191",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "3.931",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "0.0846",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "0.0119",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "lambada",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "0.6808",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "0.6718",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "0.0065",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "0.009",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "winogrande",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "acc",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "0.7048",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "0.7048",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "0.0128",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "0",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "We indeed observe 0 performance degradation for those models since the absolute difference of the metrics are all below the standard error (except for BLOOM-int8 which is slightly better than the native model on lambada). For a more detailed performance evaluation against state-of-the-art approaches, take a look at the paper!",
+      "spans": [
+        {
+          "start": 321,
+          "end": 326,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2208.07339"
+        }
+      ]
+    },
+    {
+      "id": "b0161",
+      "source": "Is it faster than native models?",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "The main purpose of the LLM.int8() method is to make large models more accessible without performance degradation. But the method would be less useful if it is very slow. So we benchmarked the generation speed of multiple models. We find that BLOOM-176B with LLM.int8() is about 15% to 23% slower than the fp16 version – which is still quite acceptable. We found larger slowdowns for smaller models, like T5-3B and T5-11B. We worked hard to speed up these small models. Within a day, we could improve inference per token from 312 ms to 173 ms for T5-3B and from 45 ms to 25 ms for T5-11B. Additionally, issues were already identified, and LLM.int8() will likely be faster still for small models in upcoming releases. For now, the current numbers are in the table below.",
+      "spans": [
+        {
+          "start": 615,
+          "end": 633,
+          "kind": "a",
+          "href": "https://github.com/TimDettmers/bitsandbytes/issues/6#issuecomment-1211345635"
+        }
+      ]
+    },
+    {
+      "id": "b0163",
+      "source": "Precision",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "Number of parameters",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "Hardware",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "Time per token in milliseconds for Batch Size 1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "Time per token in milliseconds for Batch Size 8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "Time per token in milliseconds for Batch Size 32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "bf16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "176B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "8xA100 80GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "239",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "9.9",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "176B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "4xA100 80GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "282",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "37.5",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "10.2",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "bf16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "176B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0183",
+      "source": "14xA100 40GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0184",
+      "source": "285",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0185",
+      "source": "36.5",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0186",
+      "source": "10.4",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0187",
+      "source": "int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0188",
+      "source": "176B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0189",
+      "source": "5xA100 40GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0190",
+      "source": "367",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0191",
+      "source": "46.4",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0192",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0193",
+      "source": "fp16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0194",
+      "source": "11B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0195",
+      "source": "2xT4 15GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0196",
+      "source": "11.7",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0197",
+      "source": "1.7",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0198",
+      "source": "0.5",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0199",
+      "source": "int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0200",
+      "source": "11B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0201",
+      "source": "1xT4 15GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0202",
+      "source": "43.5",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0203",
+      "source": "5.3",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0204",
+      "source": "1.3",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0205",
+      "source": "fp32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0206",
+      "source": "3B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0207",
+      "source": "2xT4 15GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0208",
+      "source": "45",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0209",
+      "source": "7.2",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0210",
+      "source": "3.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0211",
+      "source": "int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "3B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "1xT4 15GB",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "312",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "39.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "10.2",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "The 3 models are BLOOM-176B, T5-11B and T5-3B.",
+      "spans": []
+    },
+    {
+      "id": "b0218",
+      "source": "Hugging Face transformers integration nuances",
+      "spans": [
+        {
+          "start": 13,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0219",
+      "source": "Next let's discuss the specifics of the Hugging Face transformers integration. Let's look at the usage and the common culprit you may encounter while trying to set things up.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0220",
+      "source": "Usage",
+      "spans": []
+    },
+    {
+      "id": "b0221",
+      "source": "The module responsible for the whole magic described in this blog post is called Linear8bitLt and you can easily import it from the bitsandbytes library. It is derived from a classic torch.nn Module and can be easily used and deployed in your architecture with the code described below.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 132,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 183,
+          "end": 191,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0222",
+      "source": "Here is a step-by-step example of the following use case: let's say you want to convert a small model in int8 using bitsandbytes.",
+      "spans": [
+        {
+          "start": 116,
+          "end": 128,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0223",
+      "source": "First we need the correct imports below!",
+      "spans": []
+    },
+    {
+      "id": "b0224",
+      "source": "Then you can define your own model. Note that you can convert a checkpoint or model of any precision to 8-bit (FP16, BF16 or FP32) but, currently, the input of the model has to be FP16 for our Int8 module to work. So we treat our model here as a fp16 model.",
+      "spans": []
+    },
+    {
+      "id": "b0225",
+      "source": "Let's say you have trained your model on your favorite dataset and task! Now time to save the model:",
+      "spans": []
+    },
+    {
+      "id": "b0226",
+      "source": "Now that your state_dict is saved, let us define an int8 model:",
+      "spans": [
+        {
+          "start": 14,
+          "end": 24,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0227",
+      "source": "Here it is very important to add the flag has_fp16_weights. By default, this is set to True which is used to train in mixed Int8/FP16 precision. However, we are interested in memory efficient inference for which we need to use has_fp16_weights=False.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 58,
+          "kind": "code"
+        },
+        {
+          "start": 87,
+          "end": 91,
+          "kind": "code"
+        },
+        {
+          "start": 227,
+          "end": 249,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0228",
+      "source": "Now time to load your model in 8-bit!",
+      "spans": []
+    },
+    {
+      "id": "b0229",
+      "source": "Note that the quantization step is done in the second line once the model is set on the GPU. If you print int8_model[0].weight before calling the .to function you get:",
+      "spans": [
+        {
+          "start": 106,
+          "end": 126,
+          "kind": "code"
+        },
+        {
+          "start": 146,
+          "end": 149,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0230",
+      "source": "Whereas if you print it after the second line's call you get:",
+      "spans": []
+    },
+    {
+      "id": "b0231",
+      "source": "The weights values are \"truncated\" as we have seen when explaining quantization in the previous sections. Also, the values seem to be distributed between [-127, 127]. You might also wonder how to retrieve the FP16 weights in order to perform the outlier MatMul in fp16? You can simply do:",
+      "spans": []
+    },
+    {
+      "id": "b0232",
+      "source": "And you will get:",
+      "spans": []
+    },
+    {
+      "id": "b0233",
+      "source": "Which is close enough to the original FP16 values (2 print outs up)!",
+      "spans": []
+    },
+    {
+      "id": "b0234",
+      "source": "Now you can safely infer using your model by making sure your input is on the correct GPU and is in FP16:",
+      "spans": []
+    },
+    {
+      "id": "b0235",
+      "source": "Check out the example script for the full minimal code!",
+      "spans": [
+        {
+          "start": 10,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/assets/96_hf_bitsandbytes_integration/example.py"
+        }
+      ]
+    },
+    {
+      "id": "b0236",
+      "source": "As a side note, you should be aware that these modules differ slightly from the nn.Linear modules in that their parameters come from the bnb.nn.Int8Params class rather than the nn.Parameter class. You'll see later that this presented an additional obstacle on our journey!",
+      "spans": [
+        {
+          "start": 80,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 137,
+          "end": 154,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 189,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0237",
+      "source": "Now the time has come to understand how to integrate that into the transformers library!",
+      "spans": [
+        {
+          "start": 67,
+          "end": 79,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0238",
+      "source": "accelerate is all you need",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0239",
+      "source": "When working with huge models, the accelerate library includes a number of helpful utilities. The init_empty_weights method is especially helpful because any model, regardless of size, may be initialized with this method as a context manager without allocating any memory for the model weights.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 98,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0240",
+      "source": "The initialized model will be put on PyTorch's meta device, an underlying mechanism to represent shape and dtype without allocating memory for storage. How cool is that?",
+      "spans": [
+        {
+          "start": 47,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0241",
+      "source": "Initially, this function is called inside the .from_pretrained function and overrides all parameters to torch.nn.Parameter. This would not fit our requirement since we want to keep the Int8Params class in our case for Linear8bitLt modules as explained above. We managed to fix that on the following PR that modifies:",
+      "spans": [
+        {
+          "start": 46,
+          "end": 62,
+          "kind": "code"
+        },
+        {
+          "start": 104,
+          "end": 122,
+          "kind": "code"
+        },
+        {
+          "start": 185,
+          "end": 195,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 230,
+          "kind": "code"
+        },
+        {
+          "start": 285,
+          "end": 301,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate/pull/519"
+        }
+      ]
+    },
+    {
+      "id": "b0242",
+      "source": "to",
+      "spans": []
+    },
+    {
+      "id": "b0243",
+      "source": "Now that this is fixed, we can easily leverage this context manager and play with it to replace all nn.Linear modules to bnb.nn.Linear8bitLt at no memory cost using a custom function!",
+      "spans": [
+        {
+          "start": 100,
+          "end": 109,
+          "kind": "code"
+        },
+        {
+          "start": 121,
+          "end": 140,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0244",
+      "source": "This function recursively replaces all nn.Linear layers of a given model initialized on the meta device and replaces them with a Linear8bitLt module. The attribute has_fp16_weights has to be set to False in order to directly load the weights in int8 together with the quantization statistics.",
+      "spans": [
+        {
+          "start": 39,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 96,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 141,
+          "kind": "code"
+        },
+        {
+          "start": 164,
+          "end": 180,
+          "kind": "code"
+        },
+        {
+          "start": 198,
+          "end": 203,
+          "kind": "code"
+        },
+        {
+          "start": 245,
+          "end": 249,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0245",
+      "source": "We also discard the replacement for some modules (here the lm_head) since we want to keep the latest in their native precision for more precise and stable results.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 66,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0246",
+      "source": "But it isn't over yet! The function above is executed under the init_empty_weights context manager which means that the new model will be still in the meta device. For models that are initialized under this context manager, accelerate will manually load the parameters of each module and move them to the correct devices. In bitsandbytes, setting a Linear8bitLt module's device is a crucial step (if you are curious, you can check the code snippet here) as we have seen in our toy script.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 82,
+          "kind": "code"
+        },
+        {
+          "start": 151,
+          "end": 155,
+          "kind": "code"
+        },
+        {
+          "start": 224,
+          "end": 234,
+          "kind": "code"
+        },
+        {
+          "start": 325,
+          "end": 337,
+          "kind": "code"
+        },
+        {
+          "start": 349,
+          "end": 361,
+          "kind": "code"
+        },
+        {
+          "start": 448,
+          "end": 452,
+          "kind": "a",
+          "href": "https://github.com/TimDettmers/bitsandbytes/blob/bd515328d70f344f935075f359c5aefc616878d5/bitsandbytes/nn/modules.py#L94"
+        }
+      ]
+    },
+    {
+      "id": "b0247",
+      "source": "Here the quantization step fails when calling it twice. We had to come up with an implementation of accelerate's set_module_tensor_to_device function (termed as set_module_8bit_tensor_to_device) to make sure we don't call it twice. Let's discuss this in detail in the section below!",
+      "spans": [
+        {
+          "start": 100,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 113,
+          "end": 140,
+          "kind": "code"
+        },
+        {
+          "start": 161,
+          "end": 193,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0248",
+      "source": "Be very careful on how to set devices with accelerate",
+      "spans": [
+        {
+          "start": 43,
+          "end": 53,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0249",
+      "source": "Here we played a very delicate balancing act with the accelerate library! Once you load your model and set it on the correct devices, sometimes you still need to call set_module_tensor_to_device to dispatch the model with hooks on all devices. This is done inside the dispatch_model function from accelerate, which involves potentially calling .to several times and is something we want to avoid. 2 Pull Requests were needed to achieve what we wanted! The initial PR proposed here broke some tests but this PR successfully fixed everything!",
+      "spans": [
+        {
+          "start": 54,
+          "end": 64,
+          "kind": "code"
+        },
+        {
+          "start": 167,
+          "end": 194,
+          "kind": "code"
+        },
+        {
+          "start": 268,
+          "end": 282,
+          "kind": "code"
+        },
+        {
+          "start": 297,
+          "end": 307,
+          "kind": "code"
+        },
+        {
+          "start": 344,
+          "end": 347,
+          "kind": "code"
+        },
+        {
+          "start": 476,
+          "end": 480,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate/pull/539/"
+        },
+        {
+          "start": 502,
+          "end": 509,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate/pull/576/"
+        }
+      ]
+    },
+    {
+      "id": "b0250",
+      "source": "Wrapping it all up",
+      "spans": []
+    },
+    {
+      "id": "b0251",
+      "source": "Therefore the ultimate recipe is:",
+      "spans": []
+    },
+    {
+      "id": "b0252",
+      "source": "Initialize a model in the meta device with the correct modules",
+      "spans": [
+        {
+          "start": 26,
+          "end": 30,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0253",
+      "source": "Set the parameters one by one on the correct GPU device and make sure you never do this procedure twice!",
+      "spans": []
+    },
+    {
+      "id": "b0254",
+      "source": "Put new keyword arguments in the correct place everywhere, and add some nice documentation",
+      "spans": []
+    },
+    {
+      "id": "b0255",
+      "source": "Add very extensive tests! Check our tests here for more details This may sound quite easy, but we went through many hard debugging sessions together, often times involving CUDA kernels!",
+      "spans": [
+        {
+          "start": 42,
+          "end": 46,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/blob/main/tests/mixed_int8/test_mixed_int8.py"
+        }
+      ]
+    },
+    {
+      "id": "b0256",
+      "source": "All said and done, this integration adventure was very fun; from deep diving and doing some \"surgery\" on different libraries to aligning everything and making it work!",
+      "spans": []
+    },
+    {
+      "id": "b0257",
+      "source": "Now time to see how to benefit from this integration and how to successfully use it in transformers!",
+      "spans": [
+        {
+          "start": 87,
+          "end": 99,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0258",
+      "source": "How to use it in transformers",
+      "spans": [
+        {
+          "start": 17,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0259",
+      "source": "Hardware requirements",
+      "spans": []
+    },
+    {
+      "id": "b0260",
+      "source": "8-bit tensor cores are not supported on the CPU. bitsandbytes can be run on 8-bit tensor core-supported hardware, which are Turing and Ampere GPUs (RTX 20s, RTX 30s, A40-A100, T4+). For example, Google Colab GPUs are usually NVIDIA T4 GPUs, and their latest generation of GPUs does support 8-bit tensor cores. Our demos are based on Google Colab so check them out below!",
+      "spans": []
+    },
+    {
+      "id": "b0261",
+      "source": "Installation",
+      "spans": []
+    },
+    {
+      "id": "b0262",
+      "source": "Just install the latest version of the libraries using the commands below (make sure that you are using python>=3.8) and run the commands below to try out",
+      "spans": []
+    },
+    {
+      "id": "b0263",
+      "source": "Example demos - running T5 11b on a Google Colab",
+      "spans": []
+    },
+    {
+      "id": "b0264",
+      "source": "Check out the Google Colab demos for running 8bit models on a BLOOM-3B model!",
+      "spans": []
+    },
+    {
+      "id": "b0265",
+      "source": "Here is the demo for running T5-11B. The T5-11B model checkpoint is in FP32 which uses 42GB of memory and does not fit on Google Colab. With our 8-bit modules it only uses 11GB and fits easily:",
+      "spans": []
+    },
+    {
+      "id": "b0266",
+      "source": "Or this demo for BLOOM-3B:",
+      "spans": []
+    },
+    {
+      "id": "b0267",
+      "source": "Scope of improvements",
+      "spans": []
+    },
+    {
+      "id": "b0268",
+      "source": "This approach, in our opinion, greatly improves access to very large models. With no performance degradation, it enables users with less compute to access models that were previously inaccessible. We've found several areas for improvement that can be worked on in the future to make this method even better for large models!",
+      "spans": []
+    },
+    {
+      "id": "b0269",
+      "source": "Faster inference speed for smaller models",
+      "spans": []
+    },
+    {
+      "id": "b0270",
+      "source": "As we have seen in the the benchmarking section, we could improve the runtime speed for small model (<=6B parameters) by a factor of almost 2x. However, while the inference speed is robust for large models like BLOOM-176B there are still improvements to be had for small models. We already identified the issues and likely recover same performance as fp16, or get small speedups. You will see these changes being integrated within the next couple of weeks.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 47,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/hf-bitsandbytes-integration#is-it-faster-than-native-models"
+        }
+      ]
+    },
+    {
+      "id": "b0271",
+      "source": "Support for Kepler GPUs (GTX 1080 etc)",
+      "spans": []
+    },
+    {
+      "id": "b0272",
+      "source": "While we support all GPUs from the past four years, some old GPUs like GTX 1080 still see heavy use. While these GPUs do not have Int8 tensor cores, they do have Int8 vector units (a kind of \"weak\" tensor core). As such, these GPUs can also experience Int8 acceleration. However, it requires a entire different stack of software for fast inference. While we do plan to integrate support for Kepler GPUs to make the LLM.int8() feature more widely available, it will take some time to realize this due to its complexity.",
+      "spans": []
+    },
+    {
+      "id": "b0273",
+      "source": "Saving 8-bit state dicts on the Hub",
+      "spans": []
+    },
+    {
+      "id": "b0274",
+      "source": "8-bit state dicts cannot currently be loaded directly into the 8-bit model after being pushed on the Hub. This is due to the fact that the statistics (remember weight.CB and weight.SCB) computed by the model are not currently stored or taken into account inside the state dict, and the Linear8bitLt module does not support this feature yet. We think that having the ability to save that and push it to the Hub might contribute to greater accessibility.",
+      "spans": [
+        {
+          "start": 160,
+          "end": 169,
+          "kind": "code"
+        },
+        {
+          "start": 174,
+          "end": 184,
+          "kind": "code"
+        },
+        {
+          "start": 286,
+          "end": 298,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0275",
+      "source": "CPU support",
+      "spans": []
+    },
+    {
+      "id": "b0276",
+      "source": "CPU devices do not support 8-bit cores, as was stated at the beginning of this blogpost. Can we, however, get past that? Running this module on CPUs would also significantly improve usability and accessibility.",
+      "spans": []
+    },
+    {
+      "id": "b0277",
+      "source": "Scaling up on other modalities",
+      "spans": []
+    },
+    {
+      "id": "b0278",
+      "source": "Currently, language models dominate very large models. Leveraging this method on very large vision, audio, and multi-modal models might be an interesting thing to do for better accessibility in the coming years as these models become more accessible.",
+      "spans": []
+    },
+    {
+      "id": "b0279",
+      "source": "Credits",
+      "spans": []
+    },
+    {
+      "id": "b0280",
+      "source": "Huge thanks to the following who contributed to improve the readability of the article as well as contributed in the integration procedure in transformers (listed in alphabetic order): JustHeuristic (Yozh), Michael Benayoun, Stas Bekman, Steven Liu, Sylvain Gugger, Tim Dettmers",
+      "spans": [
+        {
+          "start": 142,
+          "end": 154,
+          "kind": "code"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "ff3210bfef6726fa986aeff32fef28b1bc7437d8976e05341f37e08fb71fca74",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import torch\nimport torch.nn as nn\n\nimport bitsandbytes as bnb\nfrom bnb.nn import Linear8bitLt"
+    },
+    {
+      "id": "c0002",
+      "source": "fp16_model = nn.Sequential(\n    nn.Linear(64, 64),\n    nn.Linear(64, 64)\n)"
+    },
+    {
+      "id": "c0003",
+      "source": "[... train the model ...]\ntorch.save(fp16_model.state_dict(), \"model.pt\")"
+    },
+    {
+      "id": "c0004",
+      "source": "int8_model = nn.Sequential(\n    Linear8bitLt(64, 64, has_fp16_weights=False),\n    Linear8bitLt(64, 64, has_fp16_weights=False)\n)"
+    },
+    {
+      "id": "c0005",
+      "source": "int8_model.load_state_dict(torch.load(\"model.pt\"))\nint8_model = int8_model.to(0) # Quantization happens here"
+    },
+    {
+      "id": "c0006",
+      "source": "int8_model[0].weight\nParameter containing:\ntensor([[ 0.0031, -0.0438,  0.0494,  ..., -0.0046, -0.0410,  0.0436],\n        [-0.1013,  0.0394,  0.0787,  ...,  0.0986,  0.0595,  0.0162],\n        [-0.0859, -0.1227, -0.1209,  ...,  0.1158,  0.0186, -0.0530],\n        ...,\n        [ 0.0804,  0.0725,  0.0638,  ..., -0.0487, -0.0524, -0.1076],\n        [-0.0200, -0.0406,  0.0663,  ...,  0.0123,  0.0551, -0.0121],\n        [-0.0041,  0.0865, -0.0013,  ..., -0.0427, -0.0764,  0.1189]],\n       dtype=torch.float16)"
+    },
+    {
+      "id": "c0007",
+      "source": "int8_model[0].weight\nParameter containing:\ntensor([[   3,  -47,   54,  ...,   -5,  -44,   47],\n        [-104,   40,   81,  ...,  101,   61,   17],\n        [ -89, -127, -125,  ...,  120,   19,  -55],\n        ...,\n        [  82,   74,   65,  ...,  -49,  -53, -109],\n        [ -21,  -42,   68,  ...,   13,   57,  -12],\n        [  -4,   88,   -1,  ...,  -43,  -78,  121]],\n        device='cuda:0', dtype=torch.int8, requires_grad=True)"
+    },
+    {
+      "id": "c0008",
+      "source": "(int8_model[0].weight.CB * int8_model[0].weight.SCB) / 127"
+    },
+    {
+      "id": "c0009",
+      "source": "tensor([[ 0.0028, -0.0459,  0.0522,  ..., -0.0049, -0.0428,  0.0462],\n        [-0.0960,  0.0391,  0.0782,  ...,  0.0994,  0.0593,  0.0167],\n        [-0.0822, -0.1240, -0.1207,  ...,  0.1181,  0.0185, -0.0541],\n        ...,\n        [ 0.0757,  0.0723,  0.0628,  ..., -0.0482, -0.0516, -0.1072],\n        [-0.0194, -0.0410,  0.0657,  ...,  0.0128,  0.0554, -0.0118],\n        [-0.0037,  0.0859, -0.0010,  ..., -0.0423, -0.0759,  0.1190]],\n       device='cuda:0')"
+    },
+    {
+      "id": "c0010",
+      "source": "input_ = torch.randn((1, 64), dtype=torch.float16)\nhidden_states = int8_model(input_.to(torch.device('cuda', 0)))"
+    },
+    {
+      "id": "c0011",
+      "source": "import torch.nn as nn\nfrom accelerate import init_empty_weights\n\nwith init_empty_weights():\n    model = nn.Sequential([nn.Linear(100000, 100000) for _ in range(1000)]) # This will take ~0 RAM!"
+    },
+    {
+      "id": "c0012",
+      "source": "module._parameters[name] = nn.Parameter(module._parameters[name].to(torch.device(\"meta\")))"
+    },
+    {
+      "id": "c0013",
+      "source": "param_cls = type(module._parameters[name])\nkwargs = module._parameters[name].__dict__\nmodule._parameters[name] = param_cls(module._parameters[name].to(torch.device(\"meta\")), **kwargs)"
+    },
+    {
+      "id": "c0014",
+      "source": "def replace_8bit_linear(model, threshold=6.0, module_to_not_convert=\"lm_head\"):\n    for name, module in model.named_children():\n        if len(list(module.children())) > 0:\n            replace_8bit_linear(module, threshold, module_to_not_convert)\n\n        if isinstance(module, nn.Linear) and name != module_to_not_convert:\n            with init_empty_weights():\n                model._modules[name] = bnb.nn.Linear8bitLt(\n                    module.in_features,\n                    module.out_features,\n                    module.bias is not None,\n                    has_fp16_weights=False,\n                    threshold=threshold,\n                )\n    return model"
+    },
+    {
+      "id": "c0015",
+      "source": "pip install accelerate\npip install bitsandbytes\npip install git+https://github.com/huggingface/transformers.git"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "ff3210bfef6726fa986aeff32fef28b1bc7437d8976e05341f37e08fb71fca74",
+  "mediaLayout": [
+    {
+      "mediaId": "image_605fab2e4d25eb20",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_b1eeba5562721218",
+      "type": "image",
+      "afterBlockId": "b0002",
+      "order": 1
+    },
+    {
+      "mediaId": "image_d91b37a4bcd30114",
+      "type": "image",
+      "afterBlockId": "b0010",
+      "order": 2
+    },
+    {
+      "mediaId": "image_45f1b7a012837f66",
+      "type": "image",
+      "afterBlockId": "b0019",
+      "order": 3
+    },
+    {
+      "mediaId": "image_3b13139de4800413",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 4
+    },
+    {
+      "mediaId": "image_ee7c3da9590627cb",
+      "type": "image",
+      "afterBlockId": "b0030",
+      "order": 5
+    },
+    {
+      "mediaId": "image_c6a4985d6a4cab3c",
+      "type": "image",
+      "afterBlockId": "b0031",
+      "order": 6
+    },
+    {
+      "mediaId": "image_01e58355ffc9dcba",
+      "type": "image",
+      "afterBlockId": "b0041",
+      "order": 7
+    },
+    {
+      "mediaId": "image_8cc175615f837d78",
+      "type": "image",
+      "afterBlockId": "b0046",
+      "order": 8
+    },
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": "b0265",
+      "order": 9
+    },
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": "b0266",
+      "order": 10
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 11,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 10,
+    "savedImages": 10,
+    "sourceImageOccurrences": 11,
+    "placedImageOccurrences": 11,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:42:34.137875Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:42:34.137894Z"
 }

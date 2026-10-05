@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/openvino",
   "resolvedUrl": "https://huggingface.co/blog/openvino",
   "fetchedAt": "2026-08-27T03:10:36.265614Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Last July, we announced that Intel and Hugging Face would collaborate on building state-of-the-art yet simple hardware acceleration tools for Transformer models. ​ Today, we are very happy to announce that we added Intel OpenVINO to Optimum Intel. You can now easily perform inference with OpenVINO Runtime on a variety of Intel processors (see the full list of supported devices) using Transformers models which can be hosted either on the Hugging Face hub or locally. You can also quantize your model with the OpenVINO Neural Network Compression Framework (NNCF), and reduce its size and prediction latency in near minutes. ​\n\nThis first release is based on OpenVINO 2022.2 and enables inference for a large quantity of PyTorch models using our OVModels. Post-training static quantization and quantization aware training can be applied on many encoder models (BERT, DistilBERT, etc.). More encoder models will be supported in the upcoming OpenVINO release. Currently the quantization of Encoder Decoder models is not enabled, however this restriction should be lifted with our integration of the next OpenVINO release.\n\n​Let us show you how to get started in minutes!​\n\n## Quantizing a Vision Transformer with Optimum Intel and OpenVINO\n\n​ In this example, we will run post-training static quantization on a Vision Transformer (ViT) model fine-tuned for image classification on the food101 dataset. ​\n\nQuantization is a process that lowers memory and compute requirements by reducing the bit width of model parameters. Reducing the number of bits means that the resulting model requires less memory at inference time, and that operations like matrix multiplication can be performed faster thanks to integer arithmetic.\n\nFirst, let's create a virtual environment and install all dependencies.​\n\n```\nvirtualenv openvino\nsource openvino/bin/activate\npip install pip --upgrade\npip install optimum[openvino,nncf] torchvision evaluate\n```\n\nNext, moving to a Python environment, we import the appropriate modules and download the original model as well as its processor. ​\n\n```\nfrom transformers import AutoImageProcessor, AutoModelForImageClassification\n​\nmodel_id = \"juliensimon/autotrain-food101-1471154050\"\nmodel = AutoModelForImageClassification.from_pretrained(model_id)\nprocessor = AutoImageProcessor.from_pretrained(model_id)\n```\n\n​ Post-training static quantization requires a calibration step where data is fed through the network in order to compute the quantized activation parameters. Here, we take 300 samples from the original dataset to build the calibration dataset. ​\n\n```\nfrom optimum.intel.openvino import OVQuantizer\n​\nquantizer = OVQuantizer.from_pretrained(model)\ncalibration_dataset = quantizer.get_calibration_dataset(\n    \"food101\",\n    num_samples=300,\n    dataset_split=\"train\",\n)\n```\n\nAs usual with image datasets, we need to apply the same image transformations that were used at training time. We use the preprocessing defined in the processor. We also define a data collation function to feed the model batches of properly formatted tensors. ​\n\n```\nimport torch\nfrom torchvision.transforms import (\n    CenterCrop,\n    Compose,\n    Normalize,\n    Resize,\n    ToTensor,\n)\n​\nnormalize = Normalize(mean=processor.image_mean, std=processor.image_std)\nsize = processor.size[\"height\"]\n_val_transforms = Compose(\n    [\n        Resize(size),\n        CenterCrop(size),\n        ToTensor(),\n        normalize,\n    ]\n)\ndef val_transforms(example_batch):\n    example_batch[\"pixel_values\"] = [_val_transforms(pil_img.convert(\"RGB\")) for pil_img in example_batch[\"image\"]]\n    return example_batch\n​\ncalibration_dataset.set_transform(val_transforms)\n​\ndef collate_fn(examples):\n    pixel_values = torch.stack([example[\"pixel_values\"] for example in examples])\n    labels = torch.tensor([example[\"label\"] for example in examples])\n    return {\"pixel_values\": pixel_values, \"labels\": labels}\n```\n\nFor our first attempt, we use the default configuration for quantization. You can also specify the number of samples to use during the calibration step, which is by default 300.\n\n```\nfrom optimum.intel.openvino import OVConfig\n​\nquantization_config = OVConfig()\nquantization_config.compression[\"initializer\"][\"range\"][\"num_init_samples\"] = 300\n```\n\nWe're now ready to quantize the model. The OVQuantizer.quantize() method quantizes the model and exports it to the OpenVINO format. The resulting graph is represented with two files: an XML file describing the network topology and a binary file describing the weights. The resulting model can run on any target Intel® device.\n\n```\nsave_dir = \"quantized_model\"\n\n# Apply static quantization and export the resulting quantized model to OpenVINO IR format\nquantizer.quantize(\n    quantization_config=quantization_config,\n    calibration_dataset=calibration_dataset,\n    data_collator=collate_fn,\n    remove_unused_columns=False,\n    save_directory=save_dir,\n)\nprocessor.save_pretrained(save_dir)\n```\n\nA minute or two later, the model has been quantized. We can then easily load it with our OVModelForXxx classes, the equivalent of the Transformers AutoModelForXxx classes found in the transformers library. Likewise, we can create pipelines and run inference with OpenVINO Runtime. ​\n\n```\nfrom transformers import pipeline\nfrom optimum.intel.openvino import OVModelForImageClassification\n​\nov_model = OVModelForImageClassification.from_pretrained(save_dir)\nov_pipe = pipeline(\"image-classification\", model=ov_model, image_processor=processor)\noutputs = ov_pipe(\"http://farm2.staticflickr.com/1375/1394861946_171ea43524_z.jpg\")\nprint(outputs)\n```\n\n​To verify that quantization did not have a negative impact on accuracy, we applied an evaluation step to compare the accuracy of the original model with its quantized counterpart. We evaluate both models on a subset of the dataset (taking only 20% of the evaluation dataset). We observed little to no loss in accuracy with both models having an accuracy of 87.6.\n\n```\nfrom datasets import load_dataset\nfrom evaluate import evaluator\n\n# We run the evaluation step on 20% of the evaluation dataset\neval_dataset = load_dataset(\"food101\", split=\"validation\").select(range(5050))\ntask_evaluator = evaluator(\"image-classification\")\n\nov_eval_results = task_evaluator.compute(\n    model_or_pipeline=ov_pipe,\n    data=eval_dataset,\n    metric=\"accuracy\",\n    label_mapping=ov_pipe.model.config.label2id,\n)\n\ntrfs_pipe = pipeline(\"image-classification\", model=model, image_processor=processor)\ntrfs_eval_results = task_evaluator.compute(\n    model_or_pipeline=trfs_pipe,\n    data=eval_dataset,\n    metric=\"accuracy\",\n    label_mapping=trfs_pipe.model.config.label2id,\n)\nprint(trfs_eval_results, ov_eval_results)\n```\n\nLooking at the quantized model, we see that its memory size decreased by 3.8x from 344MB to 90MB. Running a quick benchmark on 5050 image predictions, we also notice a speedup in latency of 2.4x, from 98ms to 41ms per sample. That's not bad for a few lines of code!\n\n⚠️ An important thing to mention is that the model is compiled just before the first inference, which will inflate the latency of the first inference. So before doing your own benchmark, make sure to first warmup your model by doing at least one prediction.\n\nYou can find the resulting model hosted on the Hugging Face hub. To load it, you can easily do as follows:\n\n```\nfrom optimum.intel.openvino import OVModelForImageClassification\n​\nov_model = OVModelForImageClassification.from_pretrained(\"echarlaix/vit-food101-int8\")\n```\n\n## Now it's your turn\n\n​ As you can see, it's pretty easy to accelerate your models with 🤗 Optimum Intel and OpenVINO. If you'd like to get started, please visit the Optimum Intel repository, and don't forget to give it a star ⭐. You'll also find additional examples there. If you'd like to dive deeper into OpenVINO, the Intel documentation has you covered.\n\n​ Give it a try and let us know what you think. We'd love to hear your feedback on the Hugging Face forum, and please feel free to request features or file issues on Github. ​\n\nHave fun with 🤗 Optimum Intel, and thank you for reading.\n\n​",
   "summaryZh": "本文介绍了如何借助Optimum Intel和OpenVINO工具包，在英特尔硬件上对大模型和机器学习模型进行推理加速。",
   "summaryGeneratedAt": "2026-09-06T02:38:17.568077Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,353 @@
     "summaryZh": "本文介绍了如何借助Optimum Intel和OpenVINO工具包，在英特尔硬件上对大模型和机器学习模型进行推理加速。",
     "glossary": [],
     "duplicateKey": "optimum-intel-openvino"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/113_openvino/thumbnail.png",
+      "originalUrl": "https://huggingface.co/blog/assets/113_openvino/thumbnail.png",
+      "alt": "image",
+      "id": "image_67ae5ecebfbc0541"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Last July, we announced that Intel and Hugging Face would collaborate on building state-of-the-art yet simple hardware acceleration tools for Transformer models. ​ Today, we are very happy to announce that we added Intel OpenVINO to Optimum Intel. You can now easily perform inference with OpenVINO Runtime on a variety of Intel processors (see the full list of supported devices) using Transformers models which can be hosted either on the Hugging Face hub or locally. You can also quantize your model with the OpenVINO Neural Network Compression Framework (NNCF), and reduce its size and prediction latency in near minutes. ​",
+      "spans": [
+        {
+          "start": 14,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/intel"
+        },
+        {
+          "start": 221,
+          "end": 229,
+          "kind": "a",
+          "href": "https://docs.openvino.ai/latest/index.html"
+        },
+        {
+          "start": 233,
+          "end": 246,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        },
+        {
+          "start": 341,
+          "end": 344,
+          "kind": "a",
+          "href": "https://docs.openvino.ai/latest/openvino_docs_OV_UG_supported_plugins_Supported_Devices.html"
+        },
+        {
+          "start": 559,
+          "end": 563,
+          "kind": "a",
+          "href": "https://github.com/openvinotoolkit/nncf"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This first release is based on OpenVINO 2022.2 and enables inference for a large quantity of PyTorch models using our OVModels. Post-training static quantization and quantization aware training can be applied on many encoder models (BERT, DistilBERT, etc.). More encoder models will be supported in the upcoming OpenVINO release. Currently the quantization of Encoder Decoder models is not enabled, however this restriction should be lifted with our integration of the next OpenVINO release.",
+      "spans": [
+        {
+          "start": 118,
+          "end": 126,
+          "kind": "code"
+        },
+        {
+          "start": 118,
+          "end": 126,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/intel/inference"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "​Let us show you how to get started in minutes!​",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Quantizing a Vision Transformer with Optimum Intel and OpenVINO",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "​ In this example, we will run post-training static quantization on a Vision Transformer (ViT) model fine-tuned for image classification on the food101 dataset. ​",
+      "spans": [
+        {
+          "start": 95,
+          "end": 100,
+          "kind": "a",
+          "href": "https://huggingface.co/juliensimon/autotrain-food101-1471154050"
+        },
+        {
+          "start": 144,
+          "end": 151,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/food101"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Quantization is a process that lowers memory and compute requirements by reducing the bit width of model parameters. Reducing the number of bits means that the resulting model requires less memory at inference time, and that operations like matrix multiplication can be performed faster thanks to integer arithmetic.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "First, let's create a virtual environment and install all dependencies.​",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Next, moving to a Python environment, we import the appropriate modules and download the original model as well as its processor. ​",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "​ Post-training static quantization requires a calibration step where data is fed through the network in order to compute the quantized activation parameters. Here, we take 300 samples from the original dataset to build the calibration dataset. ​",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "As usual with image datasets, we need to apply the same image transformations that were used at training time. We use the preprocessing defined in the processor. We also define a data collation function to feed the model batches of properly formatted tensors. ​",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "For our first attempt, we use the default configuration for quantization. You can also specify the number of samples to use during the calibration step, which is by default 300.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "We're now ready to quantize the model. The OVQuantizer.quantize() method quantizes the model and exports it to the OpenVINO format. The resulting graph is represented with two files: an XML file describing the network topology and a binary file describing the weights. The resulting model can run on any target Intel® device.",
+      "spans": [
+        {
+          "start": 43,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "A minute or two later, the model has been quantized. We can then easily load it with our OVModelForXxx classes, the equivalent of the Transformers AutoModelForXxx classes found in the transformers library. Likewise, we can create pipelines and run inference with OpenVINO Runtime. ​",
+      "spans": [
+        {
+          "start": 89,
+          "end": 102,
+          "kind": "code"
+        },
+        {
+          "start": 89,
+          "end": 102,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/intel/inference"
+        },
+        {
+          "start": 147,
+          "end": 162,
+          "kind": "code"
+        },
+        {
+          "start": 147,
+          "end": 162,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/autoclass_tutorial#automodel"
+        },
+        {
+          "start": 184,
+          "end": 196,
+          "kind": "code"
+        },
+        {
+          "start": 230,
+          "end": 239,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/main_classes/pipelines"
+        },
+        {
+          "start": 263,
+          "end": 279,
+          "kind": "a",
+          "href": "https://docs.openvino.ai/latest/openvino_docs_OV_UG_OV_Runtime_User_Guide.html"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "​To verify that quantization did not have a negative impact on accuracy, we applied an evaluation step to compare the accuracy of the original model with its quantized counterpart. We evaluate both models on a subset of the dataset (taking only 20% of the evaluation dataset). We observed little to no loss in accuracy with both models having an accuracy of 87.6.",
+      "spans": [
+        {
+          "start": 358,
+          "end": 362,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Looking at the quantized model, we see that its memory size decreased by 3.8x from 344MB to 90MB. Running a quick benchmark on 5050 image predictions, we also notice a speedup in latency of 2.4x, from 98ms to 41ms per sample. That's not bad for a few lines of code!",
+      "spans": [
+        {
+          "start": 73,
+          "end": 77,
+          "kind": "strong"
+        },
+        {
+          "start": 190,
+          "end": 194,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "⚠️ An important thing to mention is that the model is compiled just before the first inference, which will inflate the latency of the first inference. So before doing your own benchmark, make sure to first warmup your model by doing at least one prediction.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "You can find the resulting model hosted on the Hugging Face hub. To load it, you can easily do as follows:",
+      "spans": [
+        {
+          "start": 27,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/echarlaix/vit-food101-int8"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Now it's your turn",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "​ As you can see, it's pretty easy to accelerate your models with 🤗 Optimum Intel and OpenVINO. If you'd like to get started, please visit the Optimum Intel repository, and don't forget to give it a star ⭐. You'll also find additional examples there. If you'd like to dive deeper into OpenVINO, the Intel documentation has you covered.",
+      "spans": [
+        {
+          "start": 143,
+          "end": 156,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        },
+        {
+          "start": 244,
+          "end": 249,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/optimum/intel/optimization_ov"
+        },
+        {
+          "start": 305,
+          "end": 318,
+          "kind": "a",
+          "href": "https://docs.openvino.ai/latest/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "​ Give it a try and let us know what you think. We'd love to hear your feedback on the Hugging Face forum, and please feel free to request features or file issues on Github. ​",
+      "spans": [
+        {
+          "start": 100,
+          "end": 105,
+          "kind": "a",
+          "href": "https://discuss.huggingface.co/c/optimum"
+        },
+        {
+          "start": 166,
+          "end": 172,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-intel"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Have fun with 🤗 Optimum Intel, and thank you for reading.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "​",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "75465f97ba2533f8f8b0c5467764d9854dbb485715016b308323b25f47ab579a",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "virtualenv openvino\nsource openvino/bin/activate\npip install pip --upgrade\npip install optimum[openvino,nncf] torchvision evaluate"
+    },
+    {
+      "id": "c0002",
+      "source": "from transformers import AutoImageProcessor, AutoModelForImageClassification\n​\nmodel_id = \"juliensimon/autotrain-food101-1471154050\"\nmodel = AutoModelForImageClassification.from_pretrained(model_id)\nprocessor = AutoImageProcessor.from_pretrained(model_id)"
+    },
+    {
+      "id": "c0003",
+      "source": "from optimum.intel.openvino import OVQuantizer\n​\nquantizer = OVQuantizer.from_pretrained(model)\ncalibration_dataset = quantizer.get_calibration_dataset(\n    \"food101\",\n    num_samples=300,\n    dataset_split=\"train\",\n)"
+    },
+    {
+      "id": "c0004",
+      "source": "import torch\nfrom torchvision.transforms import (\n    CenterCrop,\n    Compose,\n    Normalize,\n    Resize,\n    ToTensor,\n)\n​\nnormalize = Normalize(mean=processor.image_mean, std=processor.image_std)\nsize = processor.size[\"height\"]\n_val_transforms = Compose(\n    [\n        Resize(size),\n        CenterCrop(size),\n        ToTensor(),\n        normalize,\n    ]\n)\ndef val_transforms(example_batch):\n    example_batch[\"pixel_values\"] = [_val_transforms(pil_img.convert(\"RGB\")) for pil_img in example_batch[\"image\"]]\n    return example_batch\n​\ncalibration_dataset.set_transform(val_transforms)\n​\ndef collate_fn(examples):\n    pixel_values = torch.stack([example[\"pixel_values\"] for example in examples])\n    labels = torch.tensor([example[\"label\"] for example in examples])\n    return {\"pixel_values\": pixel_values, \"labels\": labels}"
+    },
+    {
+      "id": "c0005",
+      "source": "from optimum.intel.openvino import OVConfig\n​\nquantization_config = OVConfig()\nquantization_config.compression[\"initializer\"][\"range\"][\"num_init_samples\"] = 300"
+    },
+    {
+      "id": "c0006",
+      "source": "save_dir = \"quantized_model\"\n\n# Apply static quantization and export the resulting quantized model to OpenVINO IR format\nquantizer.quantize(\n    quantization_config=quantization_config,\n    calibration_dataset=calibration_dataset,\n    data_collator=collate_fn,\n    remove_unused_columns=False,\n    save_directory=save_dir,\n)\nprocessor.save_pretrained(save_dir)"
+    },
+    {
+      "id": "c0007",
+      "source": "from transformers import pipeline\nfrom optimum.intel.openvino import OVModelForImageClassification\n​\nov_model = OVModelForImageClassification.from_pretrained(save_dir)\nov_pipe = pipeline(\"image-classification\", model=ov_model, image_processor=processor)\noutputs = ov_pipe(\"http://farm2.staticflickr.com/1375/1394861946_171ea43524_z.jpg\")\nprint(outputs)"
+    },
+    {
+      "id": "c0008",
+      "source": "from datasets import load_dataset\nfrom evaluate import evaluator\n\n# We run the evaluation step on 20% of the evaluation dataset\neval_dataset = load_dataset(\"food101\", split=\"validation\").select(range(5050))\ntask_evaluator = evaluator(\"image-classification\")\n\nov_eval_results = task_evaluator.compute(\n    model_or_pipeline=ov_pipe,\n    data=eval_dataset,\n    metric=\"accuracy\",\n    label_mapping=ov_pipe.model.config.label2id,\n)\n\ntrfs_pipe = pipeline(\"image-classification\", model=model, image_processor=processor)\ntrfs_eval_results = task_evaluator.compute(\n    model_or_pipeline=trfs_pipe,\n    data=eval_dataset,\n    metric=\"accuracy\",\n    label_mapping=trfs_pipe.model.config.label2id,\n)\nprint(trfs_eval_results, ov_eval_results)"
+    },
+    {
+      "id": "c0009",
+      "source": "from optimum.intel.openvino import OVModelForImageClassification\n​\nov_model = OVModelForImageClassification.from_pretrained(\"echarlaix/vit-food101-int8\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "75465f97ba2533f8f8b0c5467764d9854dbb485715016b308323b25f47ab579a",
+  "mediaLayout": [
+    {
+      "mediaId": "image_67ae5ecebfbc0541",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:41:10.382057Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:41:10.382074Z"
 }

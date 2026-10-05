@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/pytorch-ddp-accelerate-transformers",
   "resolvedUrl": "https://huggingface.co/blog/pytorch-ddp-accelerate-transformers",
   "fetchedAt": "2026-08-27T03:10:36.278054Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "## General Overview\n\nThis tutorial assumes you have a basic understanding of PyTorch and how to train a simple model. It will showcase training on multiple GPUs through a process called Distributed Data Parallelism (DDP) through three different levels of increasing abstraction:\n\n- Native PyTorch DDP through the pytorch.distributed module\n\n- Utilizing 🤗 Accelerate's light wrapper around pytorch.distributed that also helps ensure the code can be run on a single GPU and TPUs with zero code changes and miminimal code changes to the original code\n\n- Utilizing 🤗 Transformer's high-level Trainer API which abstracts all the boilerplate code and supports various devices and distributed scenarios\n\n## What is \"Distributed\" training and why does it matter?\n\nTake some very basic PyTorch training code below, which sets up and trains a model on MNIST based on the official MNIST example\n\n```\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch.optim as optim\nfrom torchvision import datasets, transforms\n\nclass BasicNet(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.conv1 = nn.Conv2d(1, 32, 3, 1)\n        self.conv2 = nn.Conv2d(32, 64, 3, 1)\n        self.dropout1 = nn.Dropout(0.25)\n        self.dropout2 = nn.Dropout(0.5)\n        self.fc1 = nn.Linear(9216, 128)\n        self.fc2 = nn.Linear(128, 10)\n        self.act = F.relu\n\n    def forward(self, x):\n        x = self.act(self.conv1(x))\n        x = self.act(self.conv2(x))\n        x = F.max_pool2d(x, 2)\n        x = self.dropout1(x)\n        x = torch.flatten(x, 1)\n        x = self.act(self.fc1(x))\n        x = self.dropout2(x)\n        x = self.fc2(x)\n        output = F.log_softmax(x, dim=1)\n        return output\n```\n\nWe define the training device (cuda):\n\n```\ndevice = \"cuda\"\n```\n\nBuild some PyTorch DataLoaders:\n\n```\ntransform = transforms.Compose([\n    transforms.ToTensor(),\n    transforms.Normalize((0.1307), (0.3081))\n])\n\ntrain_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\ntest_dset = datasets.MNIST('data', train=False, transform=transform)\n\ntrain_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\ntest_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)\n```\n\nMove the model to the CUDA device:\n\n```\nmodel = BasicNet().to(device)\n```\n\nBuild a PyTorch optimizer:\n\n```\noptimizer = optim.AdamW(model.parameters(), lr=1e-3)\n```\n\nBefore finally creating a simplistic training and evaluation loop that performs one full iteration over the dataset and calculates the test accuracy:\n\n```\nmodel.train()\nfor batch_idx, (data, target) in enumerate(train_loader):\n    data, target = data.to(device), target.to(device)\n    output = model(data)\n    loss = F.nll_loss(output, target)\n    loss.backward()\n    optimizer.step()\n    optimizer.zero_grad()\n\nmodel.eval()\ncorrect = 0\nwith torch.no_grad():\n    for data, target in test_loader:\n        data, target = data.to(device), target.to(device)\n        output = model(data)\n        pred = output.argmax(dim=1, keepdim=True)\n        correct += pred.eq(target.view_as(pred)).sum().item()\nprint(f'Accuracy: {100. * correct / len(test_loader.dataset)}')\n```\n\nTypically from here, one could either throw all of this into a python script or run it on a Jupyter Notebook.\n\nHowever, how would you then get this script to run on say two GPUs or on multiple machines if these resources are available, which could improve training speed through distributed training? Just doing python myscript.py will only ever run the script using a single GPU. This is where torch.distributed comes into play\n\n## PyTorch Distributed Data Parallelism\n\nAs the name implies, torch.distributed is meant to work on distributed setups. This can include multi-node, where you have a number of machines each with a single GPU, or multi-gpu where a single system has multiple GPUs, or some combination of both.\n\nTo convert our above code to work within a distributed setup, a few setup configurations must first be defined, detailed in the Getting Started with DDP Tutorial\n\nFirst a setup and a cleanup function must be declared. This will open up a processing group that all of the compute processes can communicate through\n\nNote: for this section of the tutorial it should be assumed these are sent in python script files. Later on a launcher using Accelerate will be discussed that removes this necessity\n\n```\nimport os\nimport torch.distributed as dist\n\ndef setup(rank, world_size):\n    \"Sets up the process group and configuration for PyTorch Distributed Data Parallelism\"\n    os.environ[\"MASTER_ADDR\"] = 'localhost'\n    os.environ[\"MASTER_PORT\"] = \"12355\"\n\n    # Initialize the process group\n    dist.init_process_group(\"gloo\", rank=rank, world_size=world_size)\n\ndef cleanup():\n    \"Cleans up the distributed environment\"\n    dist.destroy_process_group()\n```\n\nThe last piece of the puzzle is how do I send my data and model to another GPU?\n\nThis is where the DistributedDataParallel module comes into play. It will copy your model onto each GPU, and when loss.backward() is called the backpropagation is performed and the resulting gradients across all these copies of the model will be averaged/reduced. This ensures each device has the same weights post the optimizer step.\n\nBelow is an example of our training setup, refactored as a function, with this capability:\n\nNote: Here rank is the overall rank of the current GPU compared to all the other GPUs available, meaning they have a rank of 0 -> n-1\n\n```\nfrom torch.nn.parallel import DistributedDataParallel as DDP\n\ndef train(model, rank, world_size):\n    setup(rank, world_size)\n    model = model.to(rank)\n    ddp_model = DDP(model, device_ids=[rank])\n    optimizer = optim.AdamW(ddp_model.parameters(), lr=1e-3)\n    # Train for one epoch\n    ddp_model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        data, target = data.to(rank), target.to(rank)\n        output = model(data)\n        loss = F.nll_loss(output, target)\n        loss.backward()\n        optimizer.step()\n        optimizer.zero_grad()\n    cleanup()\n```\n\nThe optimizer needs to be declared based on the model on the specific device (so ddp_model and not model) for all of the gradients to properly be calculated.\n\nLastly, to run the script PyTorch has a convenient torchrun command line module that can help. Just pass in the number of nodes it should use as well as the script to run and you are set:\n\n```\ntorchrun --nproc_per_node=2 --nnodes=1 example_script.py\n```\n\nThe above will run the training script on two GPUs that live on a single machine and this is the barebones for performing only distributed training with PyTorch.\n\nNow let's talk about Accelerate, a library aimed to make this process more seameless and also help with a few best practices\n\n## 🤗 Accelerate\n\nAccelerate is a library designed to allow you to perform what we just did above, without needing to modify your code greatly. On top of this, the data pipeline innate to Accelerate can also improve performance to your code as well.\n\nFirst, let's wrap all of the above code we just performed into a single function, to help us visualize the difference:\n\n```\ndef train_ddp(rank, world_size):\n    setup(rank, world_size)\n    # Build DataLoaders\n    transform = transforms.Compose([\n        transforms.ToTensor(),\n        transforms.Normalize((0.1307), (0.3081))\n    ])\n\n    train_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\n    test_dset = datasets.MNIST('data', train=False, transform=transform)\n\n    train_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\n    test_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)\n\n    # Build model\n    model = model.to(rank)\n    ddp_model = DDP(model, device_ids=[rank])\n\n    # Build optimizer\n    optimizer = optim.AdamW(ddp_model.parameters(), lr=1e-3)\n\n    # Train for a single epoch\n    ddp_model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        data, target = data.to(rank), target.to(rank)\n        output = ddp_model(data)\n        loss = F.nll_loss(output, target)\n        loss.backward()\n        optimizer.step()\n        optimizer.zero_grad()\n    \n    # Evaluate\n    model.eval()\n    correct = 0\n    with torch.no_grad():\n        for data, target in test_loader:\n            data, target = data.to(rank), target.to(rank)\n            output = ddp_model(data)\n            pred = output.argmax(dim=1, keepdim=True)\n            correct += pred.eq(target.view_as(pred)).sum().item()\n    print(f'Accuracy: {100. * correct / len(test_loader.dataset)}')\n```\n\nNext let's talk about how Accelerate can help. There's a few issues with the above code:\n\n- This is slightly inefficient, given that n dataloaders are made based on each device and pushed.\n\n- This code will only work for multi-GPU, so special care would need to be made for it to be ran on a single node again, or on TPU.\n\nAccelerate helps this through the Accelerator class. Through it, the code remains much the same except for three lines of code when comparing a single node to multinode, as shown below:\n\n```\ndef train_ddp_accelerate():\n    accelerator = Accelerator()\n    # Build DataLoaders\n    transform = transforms.Compose([\n        transforms.ToTensor(),\n        transforms.Normalize((0.1307), (0.3081))\n    ])\n\n    train_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\n    test_dset = datasets.MNIST('data', train=False, transform=transform)\n\n    train_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\n    test_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)\n\n    # Build model\n    model = BasicNet()\n\n    # Build optimizer\n    optimizer = optim.AdamW(model.parameters(), lr=1e-3)\n\n    # Send everything through `accelerator.prepare`\n    train_loader, test_loader, model, optimizer = accelerator.prepare(\n        train_loader, test_loader, model, optimizer\n    )\n\n    # Train for a single epoch\n    model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        output = model(data)\n        loss = F.nll_loss(output, target)\n        accelerator.backward(loss)\n        optimizer.step()\n        optimizer.zero_grad()\n    \n    # Evaluate\n    model.eval()\n    correct = 0\n    with torch.no_grad():\n        for data, target in test_loader:\n            data, target = data.to(device), target.to(device)\n            output = model(data)\n            pred = output.argmax(dim=1, keepdim=True)\n            correct += pred.eq(target.view_as(pred)).sum().item()\n    print(f'Accuracy: {100. * correct / len(test_loader.dataset)}')\n```\n\nWith this your PyTorch training loop is now setup to be ran on any distributed setup thanks to the Accelerator object. This code can then still be launched through the torchrun CLI or through Accelerate's own CLI interface, accelerate launch.\n\nAs a result its now trivialized to perform distributed training with Accelerate and keeping as much of the barebones PyTorch code the same as possible.\n\nEarlier it was mentioned that Accelerate also makes the DataLoaders more efficient. This is through custom Samplers that can send parts of the batches automatically to different devices during training allowing for a single copy of the data to be known at one time, rather than four at once into memory depending on the configuration. Along with this, there is only a single full copy of the original dataset in memory total. Subsets of this dataset are split between all of the nodes that are utilized for training, allowing for much larger datasets to be trained on a single instance without an explosion in memory utilized.\n\n### Using the notebook_launcher\n\nEarlier it was mentioned you can start distributed code directly out of your Jupyter Notebook. This comes from Accelerate's notebook_launcher utility, which allows for starting multi-gpu training based on code inside of a Jupyter Notebook.\n\nTo use it is as trivial as importing the launcher:\n\n```\nfrom accelerate import notebook_launcher\n```\n\nAnd passing the training function we declared earlier, any arguments to be passed, and the number of processes to use (such as 8 on a TPU, or 2 for two GPUs). Both of the above training functions can be ran, but do note that after you start a single launch, the instance needs to be restarted before spawning another\n\n```\nnotebook_launcher(train_ddp, args=(), num_processes=2)\n```\n\nOr:\n\n```\nnotebook_launcher(train_ddp_accelerate, args=(), num_processes=2)\n```\n\n## Using 🤗 Trainer\n\nFinally, we arrive at the highest level of API -- the Hugging Face Trainer.\n\nThis wraps as much training as possible while still being able to train on distributed systems without the user needing to do anything at all.\n\nFirst we need to import the Trainer:\n\n```\nfrom transformers import Trainer\n```\n\nThen we define some TrainingArguments to control all the usual hyper-parameters. The trainer also works through dictionaries, so a custom collate function needs to be made.\n\nFinally, we subclass the trainer and write our own compute_loss.\n\nAfterwards, this code will also work on a distributed setup without any training code needing to be written whatsoever!\n\n```\nfrom transformers import Trainer, TrainingArguments\n\nmodel = BasicNet()\n\ntraining_args = TrainingArguments(\n    \"basic-trainer\",\n    per_device_train_batch_size=64,\n    per_device_eval_batch_size=64,\n    num_train_epochs=1,\n    evaluation_strategy=\"epoch\",\n    remove_unused_columns=False\n)\n\ndef collate_fn(examples):\n    pixel_values = torch.stack([example[0] for example in examples])\n    labels = torch.tensor([example[1] for example in examples])\n    return {\"x\":pixel_values, \"labels\":labels}\n\nclass MyTrainer(Trainer):\n    def compute_loss(self, model, inputs, return_outputs=False):\n        outputs = model(inputs[\"x\"])\n        target = inputs[\"labels\"]\n        loss = F.nll_loss(outputs, target)\n        return (loss, outputs) if return_outputs else loss\n\ntrainer = MyTrainer(\n    model,\n    training_args,\n    train_dataset=train_dset,\n    eval_dataset=test_dset,\n    data_collator=collate_fn,\n)\n```\n\n```\ntrainer.train()\n```\n\n```\n    ***** Running training *****\n      Num examples = 60000\n      Num Epochs = 1\n      Instantaneous batch size per device = 64\n      Total train batch size (w. parallel, distributed & accumulation) = 64\n      Gradient Accumulation steps = 1\n      Total optimization steps = 938\n```\n\nEpoch\n\nTraining Loss\n\nValidation Loss\n\n1\n\n0.875700\n\n0.282633\n\nSimilarly to the above examples with the notebook_launcher, this can be done again here by throwing it all into a training function:\n\n```\ndef train_trainer_ddp():\n    model = BasicNet()\n\n    training_args = TrainingArguments(\n        \"basic-trainer\",\n        per_device_train_batch_size=64,\n        per_device_eval_batch_size=64,\n        num_train_epochs=1,\n        evaluation_strategy=\"epoch\",\n        remove_unused_columns=False\n    )\n\n    def collate_fn(examples):\n        pixel_values = torch.stack([example[0] for example in examples])\n        labels = torch.tensor([example[1] for example in examples])\n        return {\"x\":pixel_values, \"labels\":labels}\n\n    class MyTrainer(Trainer):\n        def compute_loss(self, model, inputs, return_outputs=False):\n            outputs = model(inputs[\"x\"])\n            target = inputs[\"labels\"]\n            loss = F.nll_loss(outputs, target)\n            return (loss, outputs) if return_outputs else loss\n\n    trainer = MyTrainer(\n        model,\n        training_args,\n        train_dataset=train_dset,\n        eval_dataset=test_dset,\n        data_collator=collate_fn,\n    )\n\n    trainer.train()\n\nnotebook_launcher(train_trainer_ddp, args=(), num_processes=2)\n```\n\n## Resources\n\nTo learn more about PyTorch Distributed Data Parallelism, check out the documentation here\n\nTo learn more about 🤗 Accelerate, check out the documentation here\n\nTo learn more about 🤗 Transformers, check out the documentation here",
   "summaryZh": "该文章介绍了如何通过PyTorch DDP、Accelerate以及Trainer等工具和框架，实现分布式训练的轻松上手与掌握。它梳理了深度学习训练中从底层原生分布式数据并行向高级封装工具的过渡路径。",
   "summaryGeneratedAt": "2026-09-06T02:38:24.052207Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -53,5 +52,691 @@
     "summaryZh": "该文章介绍了如何通过PyTorch DDP、Accelerate以及Trainer等工具和框架，实现分布式训练的轻松上手与掌握。它梳理了深度学习训练中从底层原生分布式数据并行向高级封装工具的过渡路径。",
     "glossary": [],
     "duplicateKey": "pytorch-ddp-accelerate-trainer"
-  }
+  },
+  "images": [],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "General Overview",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "This tutorial assumes you have a basic understanding of PyTorch and how to train a simple model. It will showcase training on multiple GPUs through a process called Distributed Data Parallelism (DDP) through three different levels of increasing abstraction:",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Native PyTorch DDP through the pytorch.distributed module",
+      "spans": [
+        {
+          "start": 31,
+          "end": 50,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Utilizing 🤗 Accelerate's light wrapper around pytorch.distributed that also helps ensure the code can be run on a single GPU and TPUs with zero code changes and miminimal code changes to the original code",
+      "spans": [
+        {
+          "start": 46,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Utilizing 🤗 Transformer's high-level Trainer API which abstracts all the boilerplate code and supports various devices and distributed scenarios",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "What is \"Distributed\" training and why does it matter?",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Take some very basic PyTorch training code below, which sets up and trains a model on MNIST based on the official MNIST example",
+      "spans": [
+        {
+          "start": 105,
+          "end": 127,
+          "kind": "a",
+          "href": "https://github.com/pytorch/examples/blob/main/mnist/main.py"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "We define the training device (cuda):",
+      "spans": [
+        {
+          "start": 31,
+          "end": 35,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Build some PyTorch DataLoaders:",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Move the model to the CUDA device:",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Build a PyTorch optimizer:",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Before finally creating a simplistic training and evaluation loop that performs one full iteration over the dataset and calculates the test accuracy:",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Typically from here, one could either throw all of this into a python script or run it on a Jupyter Notebook.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "However, how would you then get this script to run on say two GPUs or on multiple machines if these resources are available, which could improve training speed through distributed training? Just doing python myscript.py will only ever run the script using a single GPU. This is where torch.distributed comes into play",
+      "spans": [
+        {
+          "start": 168,
+          "end": 179,
+          "kind": "em"
+        },
+        {
+          "start": 201,
+          "end": 219,
+          "kind": "code"
+        },
+        {
+          "start": 284,
+          "end": 301,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "PyTorch Distributed Data Parallelism",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "As the name implies, torch.distributed is meant to work on distributed setups. This can include multi-node, where you have a number of machines each with a single GPU, or multi-gpu where a single system has multiple GPUs, or some combination of both.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 38,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 70,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "To convert our above code to work within a distributed setup, a few setup configurations must first be defined, detailed in the Getting Started with DDP Tutorial",
+      "spans": [
+        {
+          "start": 128,
+          "end": 161,
+          "kind": "a",
+          "href": "https://pytorch.org/tutorials/intermediate/ddp_tutorial.html"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "First a setup and a cleanup function must be declared. This will open up a processing group that all of the compute processes can communicate through",
+      "spans": [
+        {
+          "start": 8,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 20,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Note: for this section of the tutorial it should be assumed these are sent in python script files. Later on a launcher using Accelerate will be discussed that removes this necessity",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "The last piece of the puzzle is how do I send my data and model to another GPU?",
+      "spans": [
+        {
+          "start": 32,
+          "end": 79,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "This is where the DistributedDataParallel module comes into play. It will copy your model onto each GPU, and when loss.backward() is called the backpropagation is performed and the resulting gradients across all these copies of the model will be averaged/reduced. This ensures each device has the same weights post the optimizer step.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 41,
+          "kind": "code"
+        },
+        {
+          "start": 114,
+          "end": 129,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Below is an example of our training setup, refactored as a function, with this capability:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Note: Here rank is the overall rank of the current GPU compared to all the other GPUs available, meaning they have a rank of 0 -> n-1",
+      "spans": [
+        {
+          "start": 125,
+          "end": 133,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "The optimizer needs to be declared based on the model on the specific device (so ddp_model and not model) for all of the gradients to properly be calculated.",
+      "spans": [
+        {
+          "start": 54,
+          "end": 76,
+          "kind": "em"
+        },
+        {
+          "start": 81,
+          "end": 90,
+          "kind": "code"
+        },
+        {
+          "start": 99,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Lastly, to run the script PyTorch has a convenient torchrun command line module that can help. Just pass in the number of nodes it should use as well as the script to run and you are set:",
+      "spans": [
+        {
+          "start": 51,
+          "end": 59,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "The above will run the training script on two GPUs that live on a single machine and this is the barebones for performing only distributed training with PyTorch.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Now let's talk about Accelerate, a library aimed to make this process more seameless and also help with a few best practices",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "🤗 Accelerate",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Accelerate is a library designed to allow you to perform what we just did above, without needing to modify your code greatly. On top of this, the data pipeline innate to Accelerate can also improve performance to your code as well.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "First, let's wrap all of the above code we just performed into a single function, to help us visualize the difference:",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Next let's talk about how Accelerate can help. There's a few issues with the above code:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "This is slightly inefficient, given that n dataloaders are made based on each device and pushed.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 42,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "This code will only work for multi-GPU, so special care would need to be made for it to be ran on a single node again, or on TPU.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 19,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "Accelerate helps this through the Accelerator class. Through it, the code remains much the same except for three lines of code when comparing a single node to multinode, as shown below:",
+      "spans": [
+        {
+          "start": 34,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/v0.12.0/en/package_reference/accelerator#accelerator"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "With this your PyTorch training loop is now setup to be ran on any distributed setup thanks to the Accelerator object. This code can then still be launched through the torchrun CLI or through Accelerate's own CLI interface, accelerate launch.",
+      "spans": [
+        {
+          "start": 99,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 176,
+          "kind": "code"
+        },
+        {
+          "start": 224,
+          "end": 241,
+          "kind": "code"
+        },
+        {
+          "start": 224,
+          "end": 241,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/v0.12.0/en/basic_tutorials/launch"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "As a result its now trivialized to perform distributed training with Accelerate and keeping as much of the barebones PyTorch code the same as possible.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Earlier it was mentioned that Accelerate also makes the DataLoaders more efficient. This is through custom Samplers that can send parts of the batches automatically to different devices during training allowing for a single copy of the data to be known at one time, rather than four at once into memory depending on the configuration. Along with this, there is only a single full copy of the original dataset in memory total. Subsets of this dataset are split between all of the nodes that are utilized for training, allowing for much larger datasets to be trained on a single instance without an explosion in memory utilized.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Using the notebook_launcher",
+      "spans": [
+        {
+          "start": 10,
+          "end": 27,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Earlier it was mentioned you can start distributed code directly out of your Jupyter Notebook. This comes from Accelerate's notebook_launcher utility, which allows for starting multi-gpu training based on code inside of a Jupyter Notebook.",
+      "spans": [
+        {
+          "start": 124,
+          "end": 141,
+          "kind": "code"
+        },
+        {
+          "start": 124,
+          "end": 141,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/v0.12.0/en/basic_tutorials/notebook"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "To use it is as trivial as importing the launcher:",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "And passing the training function we declared earlier, any arguments to be passed, and the number of processes to use (such as 8 on a TPU, or 2 for two GPUs). Both of the above training functions can be ran, but do note that after you start a single launch, the instance needs to be restarted before spawning another",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Or:",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Using 🤗 Trainer",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Finally, we arrive at the highest level of API -- the Hugging Face Trainer.",
+      "spans": [
+        {
+          "start": 67,
+          "end": 74,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/trainer"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "This wraps as much training as possible while still being able to train on distributed systems without the user needing to do anything at all.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "First we need to import the Trainer:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Then we define some TrainingArguments to control all the usual hyper-parameters. The trainer also works through dictionaries, so a custom collate function needs to be made.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 37,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Finally, we subclass the trainer and write our own compute_loss.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 63,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Afterwards, this code will also work on a distributed setup without any training code needing to be written whatsoever!",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Epoch",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "Training Loss",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Validation Loss",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "0.875700",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "0.282633",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "Similarly to the above examples with the notebook_launcher, this can be done again here by throwing it all into a training function:",
+      "spans": [
+        {
+          "start": 41,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Resources",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "To learn more about PyTorch Distributed Data Parallelism, check out the documentation here",
+      "spans": [
+        {
+          "start": 86,
+          "end": 90,
+          "kind": "a",
+          "href": "https://pytorch.org/docs/stable/distributed.html"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "To learn more about 🤗 Accelerate, check out the documentation here",
+      "spans": [
+        {
+          "start": 62,
+          "end": 66,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "To learn more about 🤗 Transformers, check out the documentation here",
+      "spans": [
+        {
+          "start": 64,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "b85cb6198e5aad385f7fff499c92fb60d438ef809ec590b6f294be3b48dcd234",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch.optim as optim\nfrom torchvision import datasets, transforms\n\nclass BasicNet(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.conv1 = nn.Conv2d(1, 32, 3, 1)\n        self.conv2 = nn.Conv2d(32, 64, 3, 1)\n        self.dropout1 = nn.Dropout(0.25)\n        self.dropout2 = nn.Dropout(0.5)\n        self.fc1 = nn.Linear(9216, 128)\n        self.fc2 = nn.Linear(128, 10)\n        self.act = F.relu\n\n    def forward(self, x):\n        x = self.act(self.conv1(x))\n        x = self.act(self.conv2(x))\n        x = F.max_pool2d(x, 2)\n        x = self.dropout1(x)\n        x = torch.flatten(x, 1)\n        x = self.act(self.fc1(x))\n        x = self.dropout2(x)\n        x = self.fc2(x)\n        output = F.log_softmax(x, dim=1)\n        return output"
+    },
+    {
+      "id": "c0002",
+      "source": "device = \"cuda\""
+    },
+    {
+      "id": "c0003",
+      "source": "transform = transforms.Compose([\n    transforms.ToTensor(),\n    transforms.Normalize((0.1307), (0.3081))\n])\n\ntrain_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\ntest_dset = datasets.MNIST('data', train=False, transform=transform)\n\ntrain_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\ntest_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)"
+    },
+    {
+      "id": "c0004",
+      "source": "model = BasicNet().to(device)"
+    },
+    {
+      "id": "c0005",
+      "source": "optimizer = optim.AdamW(model.parameters(), lr=1e-3)"
+    },
+    {
+      "id": "c0006",
+      "source": "model.train()\nfor batch_idx, (data, target) in enumerate(train_loader):\n    data, target = data.to(device), target.to(device)\n    output = model(data)\n    loss = F.nll_loss(output, target)\n    loss.backward()\n    optimizer.step()\n    optimizer.zero_grad()\n\nmodel.eval()\ncorrect = 0\nwith torch.no_grad():\n    for data, target in test_loader:\n        data, target = data.to(device), target.to(device)\n        output = model(data)\n        pred = output.argmax(dim=1, keepdim=True)\n        correct += pred.eq(target.view_as(pred)).sum().item()\nprint(f'Accuracy: {100. * correct / len(test_loader.dataset)}')"
+    },
+    {
+      "id": "c0007",
+      "source": "import os\nimport torch.distributed as dist\n\ndef setup(rank, world_size):\n    \"Sets up the process group and configuration for PyTorch Distributed Data Parallelism\"\n    os.environ[\"MASTER_ADDR\"] = 'localhost'\n    os.environ[\"MASTER_PORT\"] = \"12355\"\n\n    # Initialize the process group\n    dist.init_process_group(\"gloo\", rank=rank, world_size=world_size)\n\ndef cleanup():\n    \"Cleans up the distributed environment\"\n    dist.destroy_process_group()"
+    },
+    {
+      "id": "c0008",
+      "source": "from torch.nn.parallel import DistributedDataParallel as DDP\n\ndef train(model, rank, world_size):\n    setup(rank, world_size)\n    model = model.to(rank)\n    ddp_model = DDP(model, device_ids=[rank])\n    optimizer = optim.AdamW(ddp_model.parameters(), lr=1e-3)\n    # Train for one epoch\n    ddp_model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        data, target = data.to(rank), target.to(rank)\n        output = model(data)\n        loss = F.nll_loss(output, target)\n        loss.backward()\n        optimizer.step()\n        optimizer.zero_grad()\n    cleanup()"
+    },
+    {
+      "id": "c0009",
+      "source": "torchrun --nproc_per_node=2 --nnodes=1 example_script.py"
+    },
+    {
+      "id": "c0010",
+      "source": "def train_ddp(rank, world_size):\n    setup(rank, world_size)\n    # Build DataLoaders\n    transform = transforms.Compose([\n        transforms.ToTensor(),\n        transforms.Normalize((0.1307), (0.3081))\n    ])\n\n    train_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\n    test_dset = datasets.MNIST('data', train=False, transform=transform)\n\n    train_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\n    test_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)\n\n    # Build model\n    model = model.to(rank)\n    ddp_model = DDP(model, device_ids=[rank])\n\n    # Build optimizer\n    optimizer = optim.AdamW(ddp_model.parameters(), lr=1e-3)\n\n    # Train for a single epoch\n    ddp_model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        data, target = data.to(rank), target.to(rank)\n        output = ddp_model(data)\n        loss = F.nll_loss(output, target)\n        loss.backward()\n        optimizer.step()\n        optimizer.zero_grad()\n    \n    # Evaluate\n    model.eval()\n    correct = 0\n    with torch.no_grad():\n        for data, target in test_loader:\n            data, target = data.to(rank), target.to(rank)\n            output = ddp_model(data)\n            pred = output.argmax(dim=1, keepdim=True)\n            correct += pred.eq(target.view_as(pred)).sum().item()\n    print(f'Accuracy: {100. * correct / len(test_loader.dataset)}')"
+    },
+    {
+      "id": "c0011",
+      "source": "def train_ddp_accelerate():\n    accelerator = Accelerator()\n    # Build DataLoaders\n    transform = transforms.Compose([\n        transforms.ToTensor(),\n        transforms.Normalize((0.1307), (0.3081))\n    ])\n\n    train_dset = datasets.MNIST('data', train=True, download=True, transform=transform)\n    test_dset = datasets.MNIST('data', train=False, transform=transform)\n\n    train_loader = torch.utils.data.DataLoader(train_dset, shuffle=True, batch_size=64)\n    test_loader = torch.utils.data.DataLoader(test_dset, shuffle=False, batch_size=64)\n\n    # Build model\n    model = BasicNet()\n\n    # Build optimizer\n    optimizer = optim.AdamW(model.parameters(), lr=1e-3)\n\n    # Send everything through `accelerator.prepare`\n    train_loader, test_loader, model, optimizer = accelerator.prepare(\n        train_loader, test_loader, model, optimizer\n    )\n\n    # Train for a single epoch\n    model.train()\n    for batch_idx, (data, target) in enumerate(train_loader):\n        output = model(data)\n        loss = F.nll_loss(output, target)\n        accelerator.backward(loss)\n        optimizer.step()\n        optimizer.zero_grad()\n    \n    # Evaluate\n    model.eval()\n    correct = 0\n    with torch.no_grad():\n        for data, target in test_loader:\n            data, target = data.to(device), target.to(device)\n            output = model(data)\n            pred = output.argmax(dim=1, keepdim=True)\n            correct += pred.eq(target.view_as(pred)).sum().item()\n    print(f'Accuracy: {100. * correct / len(test_loader.dataset)}')"
+    },
+    {
+      "id": "c0012",
+      "source": "from accelerate import notebook_launcher"
+    },
+    {
+      "id": "c0013",
+      "source": "notebook_launcher(train_ddp, args=(), num_processes=2)"
+    },
+    {
+      "id": "c0014",
+      "source": "notebook_launcher(train_ddp_accelerate, args=(), num_processes=2)"
+    },
+    {
+      "id": "c0015",
+      "source": "from transformers import Trainer"
+    },
+    {
+      "id": "c0016",
+      "source": "from transformers import Trainer, TrainingArguments\n\nmodel = BasicNet()\n\ntraining_args = TrainingArguments(\n    \"basic-trainer\",\n    per_device_train_batch_size=64,\n    per_device_eval_batch_size=64,\n    num_train_epochs=1,\n    evaluation_strategy=\"epoch\",\n    remove_unused_columns=False\n)\n\ndef collate_fn(examples):\n    pixel_values = torch.stack([example[0] for example in examples])\n    labels = torch.tensor([example[1] for example in examples])\n    return {\"x\":pixel_values, \"labels\":labels}\n\nclass MyTrainer(Trainer):\n    def compute_loss(self, model, inputs, return_outputs=False):\n        outputs = model(inputs[\"x\"])\n        target = inputs[\"labels\"]\n        loss = F.nll_loss(outputs, target)\n        return (loss, outputs) if return_outputs else loss\n\ntrainer = MyTrainer(\n    model,\n    training_args,\n    train_dataset=train_dset,\n    eval_dataset=test_dset,\n    data_collator=collate_fn,\n)"
+    },
+    {
+      "id": "c0017",
+      "source": "trainer.train()"
+    },
+    {
+      "id": "c0018",
+      "source": "    ***** Running training *****\n      Num examples = 60000\n      Num Epochs = 1\n      Instantaneous batch size per device = 64\n      Total train batch size (w. parallel, distributed & accumulation) = 64\n      Gradient Accumulation steps = 1\n      Total optimization steps = 938"
+    },
+    {
+      "id": "c0019",
+      "source": "def train_trainer_ddp():\n    model = BasicNet()\n\n    training_args = TrainingArguments(\n        \"basic-trainer\",\n        per_device_train_batch_size=64,\n        per_device_eval_batch_size=64,\n        num_train_epochs=1,\n        evaluation_strategy=\"epoch\",\n        remove_unused_columns=False\n    )\n\n    def collate_fn(examples):\n        pixel_values = torch.stack([example[0] for example in examples])\n        labels = torch.tensor([example[1] for example in examples])\n        return {\"x\":pixel_values, \"labels\":labels}\n\n    class MyTrainer(Trainer):\n        def compute_loss(self, model, inputs, return_outputs=False):\n            outputs = model(inputs[\"x\"])\n            target = inputs[\"labels\"]\n            loss = F.nll_loss(outputs, target)\n            return (loss, outputs) if return_outputs else loss\n\n    trainer = MyTrainer(\n        model,\n        training_args,\n        train_dataset=train_dset,\n        eval_dataset=test_dset,\n        data_collator=collate_fn,\n    )\n\n    trainer.train()\n\nnotebook_launcher(train_trainer_ddp, args=(), num_processes=2)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "b85cb6198e5aad385f7fff499c92fb60d438ef809ec590b6f294be3b48dcd234",
+  "mediaLayout": [],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 0,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:41:17.305841Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:41:17.305856Z"
 }

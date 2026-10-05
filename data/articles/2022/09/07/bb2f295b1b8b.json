@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/megatron-training",
   "resolvedUrl": "https://huggingface.co/blog/megatron-training",
   "fetchedAt": "2026-08-27T03:10:36.750013Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "Training large language models in Pytorch requires more than a simple training loop. It is usually distributed across multiple devices, with many optimization techniques for a stable and efficient training. Hugging Face 🤗 Accelerate library was created to support distributed training across GPUs and TPUs with very easy integration into the training loops. 🤗 Transformers also support distributed training through the Trainer API, which provides feature-complete training in PyTorch, without even needing to implement a training loop.\n\nAnother popular tool among researchers to pre-train large transformer models is Megatron-LM, a powerful framework developed by the Applied Deep Learning Research team at NVIDIA. Unlike accelerate and the Trainer, using Megatron-LM is not straightforward and can be a little overwhelming for beginners. But it is highly optimized for the training on GPUs and can give some speedups. In this blogpost, you will learn how to train a language model on NVIDIA GPUs in Megatron-LM, and use it with transformers.\n\nWe will try to break down the different steps for training a GPT2 model in this framework, this includes:\n\n- Environment setup\n\n- Data preprocessing\n\n- Training\n\n- Model conversion to 🤗 Transformers\n\n## Why Megatron-LM?\n\nBefore getting into the training details, let’s first understand what makes this framework more efficient than others. This section is inspired by this great blog about BLOOM training with Megatron-DeepSpeed, please refer to it for more details as this blog is intended to give a gentle introduction to Megatron-LM.\n\n### DataLoader\n\nMegatron-LM comes with an efficient DataLoader where the data is tokenized and shuffled before the training. It also splits the data into numbered sequences with indexes that are stored such that they need to be computed only once. To build the index, the number of epochs is computed based on the training parameters and an ordering is created and then shuffled. This is unlike most cases where we iterate through the entire dataset until it is exhausted and then repeat for the second epoch. This smoothes the learning curve and saves time during the training.\n\n### Fused CUDA Kernels\n\nWhen a computation is run on the GPU, the necessary data is fetched from memory, then the computation is run and the result is saved back into memory. In simple terms, the idea of fused kernels is that similar operations, usually performed separately by Pytorch, are combined into a single hardware operation. So they reduce the number of memory movements done in multiple discrete computations by merging them into one. The figure below illustrates the idea of Kernel Fusion. It is inspired from this paper, which discusses the concept in detail.\n\nWhen f, g and h are fused in one kernel, the intermediary results x’ and y’ of f and g are stored in the GPU registers and immediately used by h. But without fusion, x’ and y’ would need to be copied to the memory and then loaded by h. Therefore, Kernel Fusion gives a significant speed up to the computations. Megatron-LM also uses a Fused implementation of AdamW from Apex which is faster than the Pytorch implementation.\n\nWhile one can customize the DataLoader like Megatron-LM and use Apex’s Fused optimizer with transformers, it is not a beginner friendly undertaking to build custom Fused CUDA Kernels.\n\nNow that you are familiar with the framework and what makes it advantageous, let’s get into the training details!\n\n## How to train with Megatron-LM ?\n\n### Setup\n\nThe easiest way to setup the environment is to pull an NVIDIA PyTorch Container that comes with all the required installations from NGC. See documentation for more details. If you don't want to use this container you will need to install the latest pytorch, cuda, nccl, and NVIDIA APEX releases and the nltk library.\n\nSo after having installed Docker, you can run the container with the following command (xx.xx denotes your Docker version), and then clone Megatron-LM repository inside it:\n\n```\ndocker run --gpus all -it --rm nvcr.io/nvidia/pytorch:xx.xx-py3\ngit clone https://github.com/NVIDIA/Megatron-LM\n```\n\nYou also need to add the vocabulary file vocab.json and merges table merges.txt of your tokenizer inside Megatron-LM folder of your container. These files can be found in the model’s repository with the weights, see this repository for GPT2. You can also train your own tokenizer using transformers. You can checkout the CodeParrot project for a practical example. Now if you want to copy this data from outside the container you can use the following commands:\n\n```\nsudo docker cp vocab.json CONTAINER_ID:/workspace/Megatron-LM\nsudo docker cp merges.txt CONTAINER_ID:/workspace/Megatron-LM\n```\n\n### Data preprocessing\n\nIn the rest of this tutorial we will be using CodeParrot model and data as an example.\n\nThe training data requires some preprocessing. First, you need to convert it into a loose json format, with one json containing a text sample per line. If you're using 🤗 Datasets, here is an example on how to do that (always inside Megatron-LM folder):\n\n```\nfrom datasets import load_dataset\n\ntrain_data = load_dataset('codeparrot/codeparrot-clean-train', split='train')\ntrain_data.to_json(\"codeparrot_data.json\", lines=True)  \n```\n\nThe data is then tokenized, shuffled and processed into a binary format for training using the following command:\n\n```\n#if nltk isn't installed\npip install nltk\npython tools/preprocess_data.py \\\n       --input codeparrot_data.json \\\n       --output-prefix codeparrot \\\n       --vocab vocab.json \\\n       --dataset-impl mmap \\\n       --tokenizer-type GPT2BPETokenizer \\\n       --merge-file merges.txt \\\n       --json-keys content \\\n       --workers 32 \\\n       --chunk-size 25 \\\n       --append-eod\n```\n\nThe workers and chunk_size options refer to the number of workers used in the preprocessing and the chunk size of data assigned to each one. dataset-impl refers to the implementation mode of the indexed datasets from ['lazy', 'cached', 'mmap']. This outputs two files codeparrot_content_document.idx and codeparrot_content_document.bin which are used in the training.\n\n### Training\n\nYou can configure the model architecture and training parameters as shown below, or put it in a bash script that you will run. This command runs the pretraining on 8 GPUs for a 110M parameter CodeParrot model. Note that the data is partitioned by default into a 969:30:1 ratio for training/validation/test sets.\n\n```\nGPUS_PER_NODE=8\nMASTER_ADDR=localhost\nMASTER_PORT=6001\nNNODES=1\nNODE_RANK=0\nWORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))\nDISTRIBUTED_ARGS=\"--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT\"\nCHECKPOINT_PATH=/workspace/Megatron-LM/experiments/codeparrot-small\nVOCAB_FILE=vocab.json\nMERGE_FILE=merges.txt\nDATA_PATH=codeparrot_content_document\nGPT_ARGS=\"--num-layers 12\n--hidden-size 768\n--num-attention-heads 12\n--seq-length 1024\n--max-position-embeddings 1024\n--micro-batch-size 12\n--global-batch-size 192\n--lr 0.0005\n--train-iters 150000\n--lr-decay-iters 150000\n--lr-decay-style cosine\n--lr-warmup-iters 2000\n--weight-decay .1\n--adam-beta2 .999\n--fp16\n--log-interval 10\n--save-interval 2000\n--eval-interval 200\n--eval-iters 10\n\"\nTENSORBOARD_ARGS=\"--tensorboard-dir experiments/tensorboard\"\npython3 -m torch.distributed.launch $DISTRIBUTED_ARGS \\\n        pretrain_gpt.py \\\n        --tensor-model-parallel-size 1 \\\n        --pipeline-model-parallel-size 1 \\\n        $GPT_ARGS \\\n        --vocab-file $VOCAB_FILE \\\n        --merge-file $MERGE_FILE \\\n        --save $CHECKPOINT_PATH \\\n        --load $CHECKPOINT_PATH \\\n        --data-path $DATA_PATH \\\n        $TENSORBOARD_ARGS\n```\n\nWith this setting, the training takes roughly 12 hours.\n\nThis setup uses Data Parallelism, but it is also possible to use Model Parallelism for very large models that don't fit in one GPU. The first option consists of Tensor Parallelism that splits the execution of a single transformer module over multiple GPUs, you will need to change tensor-model-parallel-size parameter to the desired number of GPUs. The second option is Pipeline Parallelism where the transformer modules are split into equally sized stages. The parameter pipeline-model-parallel-size determines the number of stages to split the model into. For more details please refer to this blog\n\n### Converting the model to 🤗 Transformers\n\nAfter training we want to use the model in transformers e.g. for evaluation or to deploy it to production. You can convert it to a transformers model following this tutorial. For instance, after the training is finished you can copy the weights of the last iteration 150k and convert the model_optim_rng.pt file to a pytorch_model.bin file that is supported by transformers with the following commands:\n\n```\n# to execute outside the container:\nmkdir -p nvidia/megatron-codeparrot-small\n# copy the weights from the container\nsudo docker cp CONTAINER_ID:/workspace/Megatron-LM/experiments/codeparrot-small/iter_0150000/mp_rank_00/model_optim_rng.pt nvidia/megatron-codeparrot-small\ngit clone https://github.com/huggingface/transformers.git\ngit clone https://github.com/NVIDIA/Megatron-LM.git\nexport PYTHONPATH=Megatron-LM\npython transformers/src/transformers/models/megatron_gpt2/convert_megatron_gpt2_checkpoint.py nvidia/megatron-codeparrot-small/model_optim_rng.pt\n```\n\nBe careful, you will need to replace the generated vocabulary file and merges table after the conversion, with the original ones we introduced earlier if you plan to load the tokenizer from there.\n\nDon't forget to push your model to the hub and share it with the community, it only takes three lines of code 🤗:\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"nvidia/megatron-codeparrot-small\")\n# this creates a repository under your username with the model name codeparrot-small\nmodel.push_to_hub(\"codeparrot-small\")\n```\n\nYou can also easily use it to generate text:\n\n```\nfrom transformers import pipeline\n\npipe = pipeline(\"text-generation\", model=\"your_username/codeparrot-small\")\noutputs = pipe(\"def hello_world():\")\nprint(outputs[0][\"generated_text\"])\n```\n\n```\n def hello_world():   \n    print(\"Hello World!\")\n```\n\nTranfsormers also handle big model inference efficiently. In case you trained a very large model (e.g. using Model Parallelism), you can easily use it for inference with the following command:\n\n```\nfrom transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"your_username/codeparrot-large\", device_map=\"auto\")\n```\n\nThis will use accelerate library behind the scenes to automatically dispatch the model weights across the devices you have available (GPUs, CPU RAM).\n\nDisclaimer: We have shown that anyone can use Megatron-LM to train language models. The question is when to use it. This framework obviously adds some time overhead because of the extra preprocessing and conversion steps. So it is important that you decide which framework is more appropriate for your case and model size. We recommend trying it for pre-training models or extended fine-tuning, but probably not for shorter fine-tuning of medium-sized models. The Trainer API and accelerate library are also very handy for model training, they are device-agnostic and give significant flexibility to the users.\n\nCongratulations 🎉 now you know how to train a GPT2 model in Megatron-LM and make it supported by transformers!",
   "summaryZh": "本文聚焦于利用英伟达Megatron-LM框架训练大型语言模型的方法。Megatron-LM通过张量并行和流水线并行等分布式训练技术，解决了超大参数量模型在单卡及单节点上无法加载和训练的痛点，是当前大模型工程落地中不可或缺的基础设施技术教程。",
   "summaryGeneratedAt": "2026-09-06T03:11:43.447807Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,535 @@
     "summaryZh": "本文聚焦于利用英伟达Megatron-LM框架训练大型语言模型的方法。Megatron-LM通过张量并行和流水线并行等分布式训练技术，解决了超大参数量模型在单卡及单节点上无法加载和训练的痛点，是当前大模型工程落地中不可或缺的基础设施技术教程。",
     "glossary": [],
     "duplicateKey": "how-to-train-a-language-model-with-megatron-lm"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/100_megatron_training/kernel_fusion.png",
+      "originalUrl": "https://huggingface.co/blog/assets/100_megatron_training/kernel_fusion.png",
+      "alt": "",
+      "id": "image_3a12c87db531efad"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Training large language models in Pytorch requires more than a simple training loop. It is usually distributed across multiple devices, with many optimization techniques for a stable and efficient training. Hugging Face 🤗 Accelerate library was created to support distributed training across GPUs and TPUs with very easy integration into the training loops. 🤗 Transformers also support distributed training through the Trainer API, which provides feature-complete training in PyTorch, without even needing to implement a training loop.",
+      "spans": [
+        {
+          "start": 222,
+          "end": 232,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/index"
+        },
+        {
+          "start": 360,
+          "end": 372,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/index"
+        },
+        {
+          "start": 419,
+          "end": 426,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main_classes/trainer#transformers.Trainer"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Another popular tool among researchers to pre-train large transformer models is Megatron-LM, a powerful framework developed by the Applied Deep Learning Research team at NVIDIA. Unlike accelerate and the Trainer, using Megatron-LM is not straightforward and can be a little overwhelming for beginners. But it is highly optimized for the training on GPUs and can give some speedups. In this blogpost, you will learn how to train a language model on NVIDIA GPUs in Megatron-LM, and use it with transformers.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 91,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/Megatron-LM"
+        },
+        {
+          "start": 185,
+          "end": 195,
+          "kind": "code"
+        },
+        {
+          "start": 204,
+          "end": 211,
+          "kind": "code"
+        },
+        {
+          "start": 492,
+          "end": 504,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "We will try to break down the different steps for training a GPT2 model in this framework, this includes:",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Environment setup",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "Data preprocessing",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Training",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Model conversion to 🤗 Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Why Megatron-LM?",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Before getting into the training details, let’s first understand what makes this framework more efficient than others. This section is inspired by this great blog about BLOOM training with Megatron-DeepSpeed, please refer to it for more details as this blog is intended to give a gentle introduction to Megatron-LM.",
+      "spans": [
+        {
+          "start": 158,
+          "end": 162,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bloom-megatron-deepspeed"
+        },
+        {
+          "start": 189,
+          "end": 207,
+          "kind": "a",
+          "href": "https://github.com/bigscience-workshop/Megatron-DeepSpeed"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "DataLoader",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Megatron-LM comes with an efficient DataLoader where the data is tokenized and shuffled before the training. It also splits the data into numbered sequences with indexes that are stored such that they need to be computed only once. To build the index, the number of epochs is computed based on the training parameters and an ordering is created and then shuffled. This is unlike most cases where we iterate through the entire dataset until it is exhausted and then repeat for the second epoch. This smoothes the learning curve and saves time during the training.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Fused CUDA Kernels",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "When a computation is run on the GPU, the necessary data is fetched from memory, then the computation is run and the result is saved back into memory. In simple terms, the idea of fused kernels is that similar operations, usually performed separately by Pytorch, are combined into a single hardware operation. So they reduce the number of memory movements done in multiple discrete computations by merging them into one. The figure below illustrates the idea of Kernel Fusion. It is inspired from this paper, which discusses the concept in detail.",
+      "spans": [
+        {
+          "start": 502,
+          "end": 507,
+          "kind": "a",
+          "href": "https://www.arxiv-vanity.com/papers/1305.1183/"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "When f, g and h are fused in one kernel, the intermediary results x’ and y’ of f and g are stored in the GPU registers and immediately used by h. But without fusion, x’ and y’ would need to be copied to the memory and then loaded by h. Therefore, Kernel Fusion gives a significant speed up to the computations. Megatron-LM also uses a Fused implementation of AdamW from Apex which is faster than the Pytorch implementation.",
+      "spans": [
+        {
+          "start": 370,
+          "end": 374,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/apex"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "While one can customize the DataLoader like Megatron-LM and use Apex’s Fused optimizer with transformers, it is not a beginner friendly undertaking to build custom Fused CUDA Kernels.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Now that you are familiar with the framework and what makes it advantageous, let’s get into the training details!",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "How to train with Megatron-LM ?",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "The easiest way to setup the environment is to pull an NVIDIA PyTorch Container that comes with all the required installations from NGC. See documentation for more details. If you don't want to use this container you will need to install the latest pytorch, cuda, nccl, and NVIDIA APEX releases and the nltk library.",
+      "spans": [
+        {
+          "start": 132,
+          "end": 135,
+          "kind": "a",
+          "href": "https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch"
+        },
+        {
+          "start": 141,
+          "end": 154,
+          "kind": "a",
+          "href": "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/index.html"
+        },
+        {
+          "start": 281,
+          "end": 285,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/apex#quick-start"
+        },
+        {
+          "start": 303,
+          "end": 307,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "So after having installed Docker, you can run the container with the following command (xx.xx denotes your Docker version), and then clone Megatron-LM repository inside it:",
+      "spans": [
+        {
+          "start": 88,
+          "end": 93,
+          "kind": "code"
+        },
+        {
+          "start": 139,
+          "end": 161,
+          "kind": "a",
+          "href": "https://github.com/NVIDIA/Megatron-LM"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "You also need to add the vocabulary file vocab.json and merges table merges.txt of your tokenizer inside Megatron-LM folder of your container. These files can be found in the model’s repository with the weights, see this repository for GPT2. You can also train your own tokenizer using transformers. You can checkout the CodeParrot project for a practical example. Now if you want to copy this data from outside the container you can use the following commands:",
+      "spans": [
+        {
+          "start": 41,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 69,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 221,
+          "end": 231,
+          "kind": "a",
+          "href": "https://huggingface.co/gpt2/tree/main"
+        },
+        {
+          "start": 286,
+          "end": 298,
+          "kind": "code"
+        },
+        {
+          "start": 321,
+          "end": 339,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/tree/main/examples/research_projects/codeparrot"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Data preprocessing",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "In the rest of this tutorial we will be using CodeParrot model and data as an example.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 56,
+          "kind": "a",
+          "href": "https://huggingface.co/codeparrot/codeparrot-small"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "The training data requires some preprocessing. First, you need to convert it into a loose json format, with one json containing a text sample per line. If you're using 🤗 Datasets, here is an example on how to do that (always inside Megatron-LM folder):",
+      "spans": [
+        {
+          "start": 170,
+          "end": 178,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/datasets/index"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "The data is then tokenized, shuffled and processed into a binary format for training using the following command:",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "The workers and chunk_size options refer to the number of workers used in the preprocessing and the chunk size of data assigned to each one. dataset-impl refers to the implementation mode of the indexed datasets from ['lazy', 'cached', 'mmap']. This outputs two files codeparrot_content_document.idx and codeparrot_content_document.bin which are used in the training.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 11,
+          "kind": "code"
+        },
+        {
+          "start": 16,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 141,
+          "end": 153,
+          "kind": "code"
+        },
+        {
+          "start": 268,
+          "end": 299,
+          "kind": "code"
+        },
+        {
+          "start": 304,
+          "end": 335,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "Training",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "You can configure the model architecture and training parameters as shown below, or put it in a bash script that you will run. This command runs the pretraining on 8 GPUs for a 110M parameter CodeParrot model. Note that the data is partitioned by default into a 969:30:1 ratio for training/validation/test sets.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "With this setting, the training takes roughly 12 hours.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "This setup uses Data Parallelism, but it is also possible to use Model Parallelism for very large models that don't fit in one GPU. The first option consists of Tensor Parallelism that splits the execution of a single transformer module over multiple GPUs, you will need to change tensor-model-parallel-size parameter to the desired number of GPUs. The second option is Pipeline Parallelism where the transformer modules are split into equally sized stages. The parameter pipeline-model-parallel-size determines the number of stages to split the model into. For more details please refer to this blog",
+      "spans": [
+        {
+          "start": 281,
+          "end": 307,
+          "kind": "code"
+        },
+        {
+          "start": 472,
+          "end": 500,
+          "kind": "code"
+        },
+        {
+          "start": 596,
+          "end": 600,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/bloom-megatron-deepspeed"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Converting the model to 🤗 Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "After training we want to use the model in transformers e.g. for evaluation or to deploy it to production. You can convert it to a transformers model following this tutorial. For instance, after the training is finished you can copy the weights of the last iteration 150k and convert the model_optim_rng.pt file to a pytorch_model.bin file that is supported by transformers with the following commands:",
+      "spans": [
+        {
+          "start": 43,
+          "end": 55,
+          "kind": "code"
+        },
+        {
+          "start": 131,
+          "end": 143,
+          "kind": "code"
+        },
+        {
+          "start": 165,
+          "end": 173,
+          "kind": "a",
+          "href": "https://huggingface.co/nvidia/megatron-gpt2-345m"
+        },
+        {
+          "start": 288,
+          "end": 306,
+          "kind": "code"
+        },
+        {
+          "start": 317,
+          "end": 334,
+          "kind": "code"
+        },
+        {
+          "start": 361,
+          "end": 373,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Be careful, you will need to replace the generated vocabulary file and merges table after the conversion, with the original ones we introduced earlier if you plan to load the tokenizer from there.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Don't forget to push your model to the hub and share it with the community, it only takes three lines of code 🤗:",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "You can also easily use it to generate text:",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Tranfsormers also handle big model inference efficiently. In case you trained a very large model (e.g. using Model Parallelism), you can easily use it for inference with the following command:",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "This will use accelerate library behind the scenes to automatically dispatch the model weights across the devices you have available (GPUs, CPU RAM).",
+      "spans": [
+        {
+          "start": 14,
+          "end": 24,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/index"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Disclaimer: We have shown that anyone can use Megatron-LM to train language models. The question is when to use it. This framework obviously adds some time overhead because of the extra preprocessing and conversion steps. So it is important that you decide which framework is more appropriate for your case and model size. We recommend trying it for pre-training models or extended fine-tuning, but probably not for shorter fine-tuning of medium-sized models. The Trainer API and accelerate library are also very handy for model training, they are device-agnostic and give significant flexibility to the users.",
+      "spans": [
+        {
+          "start": 464,
+          "end": 471,
+          "kind": "code"
+        },
+        {
+          "start": 480,
+          "end": 490,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Congratulations 🎉 now you know how to train a GPT2 model in Megatron-LM and make it supported by transformers!",
+      "spans": [
+        {
+          "start": 97,
+          "end": 109,
+          "kind": "code"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "f6f694b668500fa1e85e98e68d46a08bade7d413b5b38115c4dacaf0bf517e24",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "docker run --gpus all -it --rm nvcr.io/nvidia/pytorch:xx.xx-py3\ngit clone https://github.com/NVIDIA/Megatron-LM"
+    },
+    {
+      "id": "c0002",
+      "source": "sudo docker cp vocab.json CONTAINER_ID:/workspace/Megatron-LM\nsudo docker cp merges.txt CONTAINER_ID:/workspace/Megatron-LM"
+    },
+    {
+      "id": "c0003",
+      "source": "from datasets import load_dataset\n\ntrain_data = load_dataset('codeparrot/codeparrot-clean-train', split='train')\ntrain_data.to_json(\"codeparrot_data.json\", lines=True)  "
+    },
+    {
+      "id": "c0004",
+      "source": "#if nltk isn't installed\npip install nltk\npython tools/preprocess_data.py \\\n       --input codeparrot_data.json \\\n       --output-prefix codeparrot \\\n       --vocab vocab.json \\\n       --dataset-impl mmap \\\n       --tokenizer-type GPT2BPETokenizer \\\n       --merge-file merges.txt \\\n       --json-keys content \\\n       --workers 32 \\\n       --chunk-size 25 \\\n       --append-eod"
+    },
+    {
+      "id": "c0005",
+      "source": "GPUS_PER_NODE=8\nMASTER_ADDR=localhost\nMASTER_PORT=6001\nNNODES=1\nNODE_RANK=0\nWORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))\nDISTRIBUTED_ARGS=\"--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT\"\nCHECKPOINT_PATH=/workspace/Megatron-LM/experiments/codeparrot-small\nVOCAB_FILE=vocab.json\nMERGE_FILE=merges.txt\nDATA_PATH=codeparrot_content_document\nGPT_ARGS=\"--num-layers 12\n--hidden-size 768\n--num-attention-heads 12\n--seq-length 1024\n--max-position-embeddings 1024\n--micro-batch-size 12\n--global-batch-size 192\n--lr 0.0005\n--train-iters 150000\n--lr-decay-iters 150000\n--lr-decay-style cosine\n--lr-warmup-iters 2000\n--weight-decay .1\n--adam-beta2 .999\n--fp16\n--log-interval 10\n--save-interval 2000\n--eval-interval 200\n--eval-iters 10\n\"\nTENSORBOARD_ARGS=\"--tensorboard-dir experiments/tensorboard\"\npython3 -m torch.distributed.launch $DISTRIBUTED_ARGS \\\n        pretrain_gpt.py \\\n        --tensor-model-parallel-size 1 \\\n        --pipeline-model-parallel-size 1 \\\n        $GPT_ARGS \\\n        --vocab-file $VOCAB_FILE \\\n        --merge-file $MERGE_FILE \\\n        --save $CHECKPOINT_PATH \\\n        --load $CHECKPOINT_PATH \\\n        --data-path $DATA_PATH \\\n        $TENSORBOARD_ARGS"
+    },
+    {
+      "id": "c0006",
+      "source": "# to execute outside the container:\nmkdir -p nvidia/megatron-codeparrot-small\n# copy the weights from the container\nsudo docker cp CONTAINER_ID:/workspace/Megatron-LM/experiments/codeparrot-small/iter_0150000/mp_rank_00/model_optim_rng.pt nvidia/megatron-codeparrot-small\ngit clone https://github.com/huggingface/transformers.git\ngit clone https://github.com/NVIDIA/Megatron-LM.git\nexport PYTHONPATH=Megatron-LM\npython transformers/src/transformers/models/megatron_gpt2/convert_megatron_gpt2_checkpoint.py nvidia/megatron-codeparrot-small/model_optim_rng.pt"
+    },
+    {
+      "id": "c0007",
+      "source": "from transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"nvidia/megatron-codeparrot-small\")\n# this creates a repository under your username with the model name codeparrot-small\nmodel.push_to_hub(\"codeparrot-small\")"
+    },
+    {
+      "id": "c0008",
+      "source": "from transformers import pipeline\n\npipe = pipeline(\"text-generation\", model=\"your_username/codeparrot-small\")\noutputs = pipe(\"def hello_world():\")\nprint(outputs[0][\"generated_text\"])"
+    },
+    {
+      "id": "c0009",
+      "source": " def hello_world():   \n    print(\"Hello World!\")"
+    },
+    {
+      "id": "c0010",
+      "source": "from transformers import AutoModelForCausalLM\n\nmodel = AutoModelForCausalLM.from_pretrained(\"your_username/codeparrot-large\", device_map=\"auto\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "f6f694b668500fa1e85e98e68d46a08bade7d413b5b38115c4dacaf0bf517e24",
+  "mediaLayout": [
+    {
+      "mediaId": "image_3a12c87db531efad",
+      "type": "image",
+      "afterBlockId": "b0013",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:42:09.587342Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:42:09.587360Z"
 }

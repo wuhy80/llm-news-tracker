@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/stable_diffusion_jax",
   "resolvedUrl": "https://huggingface.co/blog/stable_diffusion_jax",
   "fetchedAt": "2026-08-27T03:10:36.390333Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "🤗 Hugging Face Diffusers supports Flax since version 0.5.1! This allows for super fast inference on Google TPUs, such as those available in Colab, Kaggle or Google Cloud Platform.\n\nThis post shows how to run inference using JAX / Flax. If you want more details about how Stable Diffusion works or want to run it in GPU, please refer to this Colab notebook.\n\nIf you want to follow along, click the button above to open this post as a Colab notebook.\n\nFirst, make sure you are using a TPU backend. If you are running this notebook in Colab, select Runtime in the menu above, then select the option \"Change runtime type\" and then select TPU under the Hardware accelerator setting.\n\nNote that JAX is not exclusive to TPUs, but it shines on that hardware because each TPU server has 8 TPU accelerators working in parallel.\n\n## Setup\n\n```\nimport jax\nnum_devices = jax.device_count()\ndevice_type = jax.devices()[0].device_kind\n\nprint(f\"Found {num_devices} JAX devices of type {device_type}.\")\nassert \"TPU\" in device_type, \"Available device is not a TPU, please select TPU from Edit > Notebook settings > Hardware accelerator\"\n```\n\nOutput:\n\n```\n    Found 8 JAX devices of type TPU v2.\n```\n\nMake sure diffusers is installed.\n\n```\n!pip install diffusers==0.5.1\n```\n\nThen we import all the dependencies.\n\n```\nimport numpy as np\nimport jax\nimport jax.numpy as jnp\n\nfrom pathlib import Path\nfrom jax import pmap\nfrom flax.jax_utils import replicate\nfrom flax.training.common_utils import shard\nfrom PIL import Image\n\nfrom huggingface_hub import notebook_login\nfrom diffusers import FlaxStableDiffusionPipeline\n```\n\n## Model Loading\n\nBefore using the model, you need to accept the model license in order to download and use the weights.\n\nThe license is designed to mitigate the potential harmful effects of such a powerful machine learning system. We request users to read the license entirely and carefully. Here we offer a summary:\n\n- You can't use the model to deliberately produce nor share illegal or harmful outputs or content,\n\n- We claim no rights on the outputs you generate, you are free to use them and are accountable for their use which should not go against the provisions set in the license, and\n\n- You may re-distribute the weights and use the model commercially and/or as a service. If you do, please be aware you have to include the same use restrictions as the ones in the license and share a copy of the CreativeML OpenRAIL-M to all your users.\n\nFlax weights are available in Hugging Face Hub as part of the Stable Diffusion repo. The Stable Diffusion model is distributed under the CreateML OpenRail-M license. It's an open license that claims no rights on the outputs you generate and prohibits you from deliberately producing illegal or harmful content. The model card provides more details, so take a moment to read them and consider carefully whether you accept the license. If you do, you need to be a registered user in the Hub and use an access token for the code to work. You have two options to provide your access token:\n\n- Use the huggingface-cli login command-line tool in your terminal and paste your token when prompted. It will be saved in a file in your computer.\n\n- Or use notebook_login() in a notebook, which does the same thing.\n\nThe following cell will present a login interface unless you've already authenticated before in this computer. You'll need to paste your access token.\n\n```\nif not (Path.home()/'.huggingface'/'token').exists(): notebook_login()\n```\n\nTPU devices support bfloat16, an efficient half-float type. We'll use it for our tests, but you can also use float32 to use full precision instead.\n\n```\ndtype = jnp.bfloat16\n```\n\nFlax is a functional framework, so models are stateless and parameters are stored outside them. Loading the pre-trained Flax pipeline will return both the pipeline itself and the model weights (or parameters). We are using a bf16 version of the weights, which leads to type warnings that you can safely ignore.\n\n```\npipeline, params = FlaxStableDiffusionPipeline.from_pretrained(\n    \"CompVis/stable-diffusion-v1-4\",\n    revision=\"bf16\",\n    dtype=dtype,\n)\n```\n\n## Inference\n\nSince TPUs usually have 8 devices working in parallel, we'll replicate our prompt as many times as devices we have. Then we'll perform inference on the 8 devices at once, each responsible for generating one image. Thus, we'll get 8 images in the same amount of time it takes for one chip to generate a single one.\n\nAfter replicating the prompt, we obtain the tokenized text ids by invoking the prepare_inputs function of the pipeline. The length of the tokenized text is set to 77 tokens, as required by the configuration of the underlying CLIP Text model.\n\n```\nprompt = \"A cinematic film still of Morgan Freeman starring as Jimi Hendrix, portrait, 40mm lens, shallow depth of field, close up, split lighting, cinematic\"\nprompt = [prompt] * jax.device_count()\nprompt_ids = pipeline.prepare_inputs(prompt)\nprompt_ids.shape\n```\n\nOutput:\n\n```\n    (8, 77)\n```\n\n### Replication and parallelization\n\nModel parameters and inputs have to be replicated across the 8 parallel devices we have. The parameters dictionary is replicated using flax.jax_utils.replicate, which traverses the dictionary and changes the shape of the weights so they are repeated 8 times. Arrays are replicated using shard.\n\n```\np_params = replicate(params)\n```\n\n```\nprompt_ids = shard(prompt_ids)\nprompt_ids.shape\n```\n\nOutput:\n\n```\n    (8, 1, 77)\n```\n\nThat shape means that each one of the 8 devices will receive as an input a jnp array with shape (1, 77). 1 is therefore the batch size per device. In TPUs with sufficient memory, it could be larger than 1 if we wanted to generate multiple images (per chip) at once.\n\nWe are almost ready to generate images! We just need to create a random number generator to pass to the generation function. This is the standard procedure in Flax, which is very serious and opinionated about random numbers – all functions that deal with random numbers are expected to receive a generator. This ensures reproducibility, even when we are training across multiple distributed devices.\n\nThe helper function below uses a seed to initialize a random number generator. As long as we use the same seed, we'll get the exact same results. Feel free to use different seeds when exploring results later in the notebook.\n\n```\ndef create_key(seed=0):\n    return jax.random.PRNGKey(seed)\n```\n\nWe obtain a rng and then \"split\" it 8 times so each device receives a different generator. Therefore, each device will create a different image, and the full process is reproducible.\n\n```\nrng = create_key(0)\nrng = jax.random.split(rng, jax.device_count())\n```\n\nJAX code can be compiled to an efficient representation that runs very fast. However, we need to ensure that all inputs have the same shape in subsequent calls; otherwise, JAX will have to recompile the code, and we wouldn't be able to take advantage of the optimized speed.\n\nThe Flax pipeline can compile the code for us if we pass jit = True as an argument. It will also ensure that the model runs in parallel in the 8 available devices.\n\nThe first time we run the following cell it will take a long time to compile, but subsequent calls (even with different inputs) will be much faster. For example, it took more than a minute to compile in a TPU v2-8 when I tested, but then it takes about 7s for future inference runs.\n\n```\nimages = pipeline(prompt_ids, p_params, rng, jit=True)[0]\n```\n\nOutput:\n\n```\n    CPU times: user 464 ms, sys: 105 ms, total: 569 ms\n    Wall time: 7.07 s\n```\n\nThe returned array has shape (8, 1, 512, 512, 3). We reshape it to get rid of the second dimension and obtain 8 images of 512 × 512 × 3 and then convert them to PIL.\n\n```\nimages = images.reshape((images.shape[0],) + images.shape[-3:])\nimages = pipeline.numpy_to_pil(images)\n```\n\n### Visualization\n\nLet's create a helper function to display images in a grid.\n\n```\ndef image_grid(imgs, rows, cols):\n    w,h = imgs[0].size\n    grid = Image.new('RGB', size=(cols*w, rows*h))\n    for i, img in enumerate(imgs): grid.paste(img, box=(i%cols*w, i//cols*h))\n    return grid\n```\n\n```\nimage_grid(images, 2, 4)\n```\n\n## Using different prompts\n\nWe don't have to replicate the same prompt in all the devices. We can do whatever we want: generate 2 prompts 4 times each, or even generate 8 different prompts at once. Let's do that!\n\nFirst, we'll refactor the input preparation code into a handy function:\n\n```\nprompts = [\n    \"Labrador in the style of Hokusai\",\n    \"Painting of a squirrel skating in New York\",\n    \"HAL-9000 in the style of Van Gogh\",\n    \"Times Square under water, with fish and a dolphin swimming around\",\n    \"Ancient Roman fresco showing a man working on his laptop\",\n    \"Close-up photograph of young black woman against urban background, high quality, bokeh\",\n    \"Armchair in the shape of an avocado\",\n    \"Clown astronaut in space, with Earth in the background\",\n]\n```\n\n```\nprompt_ids = pipeline.prepare_inputs(prompts)\nprompt_ids = shard(prompt_ids)\nimages = pipeline(prompt_ids, p_params, rng, jit=True).images\nimages = images.reshape((images.shape[0], ) + images.shape[-3:])\nimages = pipeline.numpy_to_pil(images)\nimage_grid(images, 2, 4)\n```\n\n## How does parallelization work?\n\nWe said before that the diffusers Flax pipeline automatically compiles the model and runs it in parallel on all available devices. We'll now briefly look inside that process to show how it works.\n\nJAX parallelization can be done in multiple ways. The easiest one revolves around using the jax.pmap function to achieve single-program, multiple-data (SPMD) parallelization. It means we'll run several copies of the same code, each on different data inputs. More sophisticated approaches are possible, we invite you to go over the JAX documentation and the pjit pages to explore this topic if you are interested!\n\njax.pmap does two things for us:\n\n- Compiles (or jits) the code, as if we had invoked jax.jit(). This does not happen when we call pmap, but the first time the pmapped function is invoked.\n\n- Ensures the compiled code runs in parallel in all the available devices.\n\nTo show how it works we pmap the _generate method of the pipeline, which is the private method that runs generates images. Please, note that this method may be renamed or removed in future releases of diffusers.\n\n```\np_generate = pmap(pipeline._generate)\n```\n\nAfter we use pmap, the prepared function p_generate will conceptually do the following:\n\n- Invoke a copy of the underlying function pipeline._generate in each device.\n\n- Send each device a different portion of the input arguments. That's what sharding is used for. In our case, prompt_ids has shape (8, 1, 77, 768). This array will be split in 8 and each copy of _generate will receive an input with shape (1, 77, 768).\n\nWe can code _generate completely ignoring the fact that it will be invoked in parallel. We just care about our batch size (1 in this example) and the dimensions that make sense for our code, and don't have to change anything to make it work in parallel.\n\nThe same way as when we used the pipeline call, the first time we run the following cell it will take a while, but then it will be much faster.\n\n```\nimages = p_generate(prompt_ids, p_params, rng)\nimages = images.block_until_ready()\nimages.shape\n```\n\nOutput:\n\n```\n    CPU times: user 118 ms, sys: 83.9 ms, total: 202 ms\n    Wall time: 6.82 s\n\n    (8, 1, 512, 512, 3)\n```\n\nWe use block_until_ready() to correctly measure inference time, because JAX uses asynchronous dispatch and returns control to the Python loop as soon as it can. You don't need to use that in your code; blocking will occur automatically when you want to use the result of a computation that has not yet been materialized.",
   "summaryZh": "本文探讨了如何在JAX和Flax框架下运行Stable Diffusion模型。这为研究人员和开发者提供了除PyTorch之外的高性能替代方案，有助于在特定硬件加速器上实现更高效的图像生成。",
   "summaryGeneratedAt": "2026-09-06T02:38:24.052207Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -53,5 +52,773 @@
     "summaryZh": "本文探讨了如何在JAX和Flax框架下运行Stable Diffusion模型。这为研究人员和开发者提供了除PyTorch之外的高性能替代方案，有助于在特定硬件加速器上实现更高效的图像生成。",
     "glossary": [],
     "duplicateKey": "stable-diffusion-jax-flax"
-  }
+  },
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/108_stable_diffusion_jax/jax_stable_diffusion_1.png",
+      "originalUrl": "https://huggingface.co/blog/assets/108_stable_diffusion_jax/jax_stable_diffusion_1.png",
+      "alt": "png",
+      "id": "image_5afbd8346786b195"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/108_stable_diffusion_jax/jax_stable_diffusion_2.png",
+      "originalUrl": "https://huggingface.co/blog/assets/108_stable_diffusion_jax/jax_stable_diffusion_2.png",
+      "alt": "png",
+      "id": "image_aea6003f856b04b1"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "🤗 Hugging Face Diffusers supports Flax since version 0.5.1! This allows for super fast inference on Google TPUs, such as those available in Colab, Kaggle or Google Cloud Platform.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 24,
+          "kind": "a",
+          "href": "https://github.com/huggingface/diffusers"
+        },
+        {
+          "start": 53,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This post shows how to run inference using JAX / Flax. If you want more details about how Stable Diffusion works or want to run it in GPU, please refer to this Colab notebook.",
+      "spans": [
+        {
+          "start": 155,
+          "end": 174,
+          "kind": "a",
+          "href": "https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/stable_diffusion.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "If you want to follow along, click the button above to open this post as a Colab notebook.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "First, make sure you are using a TPU backend. If you are running this notebook in Colab, select Runtime in the menu above, then select the option \"Change runtime type\" and then select TPU under the Hardware accelerator setting.",
+      "spans": [
+        {
+          "start": 96,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 187,
+          "kind": "code"
+        },
+        {
+          "start": 198,
+          "end": 218,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Note that JAX is not exclusive to TPUs, but it shines on that hardware because each TPU server has 8 TPU accelerators working in parallel.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Make sure diffusers is installed.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 19,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Then we import all the dependencies.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Model Loading",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Before using the model, you need to accept the model license in order to download and use the weights.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/CompVis/stable-diffusion-license"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "The license is designed to mitigate the potential harmful effects of such a powerful machine learning system. We request users to read the license entirely and carefully. Here we offer a summary:",
+      "spans": [
+        {
+          "start": 130,
+          "end": 169,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "You can't use the model to deliberately produce nor share illegal or harmful outputs or content,",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "We claim no rights on the outputs you generate, you are free to use them and are accountable for their use which should not go against the provisions set in the license, and",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "You may re-distribute the weights and use the model commercially and/or as a service. If you do, please be aware you have to include the same use restrictions as the ones in the license and share a copy of the CreativeML OpenRAIL-M to all your users.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Flax weights are available in Hugging Face Hub as part of the Stable Diffusion repo. The Stable Diffusion model is distributed under the CreateML OpenRail-M license. It's an open license that claims no rights on the outputs you generate and prohibits you from deliberately producing illegal or harmful content. The model card provides more details, so take a moment to read them and consider carefully whether you accept the license. If you do, you need to be a registered user in the Hub and use an access token for the code to work. You have two options to provide your access token:",
+      "spans": [
+        {
+          "start": 315,
+          "end": 325,
+          "kind": "a",
+          "href": "https://huggingface.co/CompVis/stable-diffusion-v1-4"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Use the huggingface-cli login command-line tool in your terminal and paste your token when prompted. It will be saved in a file in your computer.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 29,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Or use notebook_login() in a notebook, which does the same thing.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 23,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "The following cell will present a login interface unless you've already authenticated before in this computer. You'll need to paste your access token.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "TPU devices support bfloat16, an efficient half-float type. We'll use it for our tests, but you can also use float32 to use full precision instead.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 109,
+          "end": 116,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Flax is a functional framework, so models are stateless and parameters are stored outside them. Loading the pre-trained Flax pipeline will return both the pipeline itself and the model weights (or parameters). We are using a bf16 version of the weights, which leads to type warnings that you can safely ignore.",
+      "spans": [
+        {
+          "start": 225,
+          "end": 229,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Since TPUs usually have 8 devices working in parallel, we'll replicate our prompt as many times as devices we have. Then we'll perform inference on the 8 devices at once, each responsible for generating one image. Thus, we'll get 8 images in the same amount of time it takes for one chip to generate a single one.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "After replicating the prompt, we obtain the tokenized text ids by invoking the prepare_inputs function of the pipeline. The length of the tokenized text is set to 77 tokens, as required by the configuration of the underlying CLIP Text model.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 93,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Replication and parallelization",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Model parameters and inputs have to be replicated across the 8 parallel devices we have. The parameters dictionary is replicated using flax.jax_utils.replicate, which traverses the dictionary and changes the shape of the weights so they are repeated 8 times. Arrays are replicated using shard.",
+      "spans": [
+        {
+          "start": 135,
+          "end": 159,
+          "kind": "code"
+        },
+        {
+          "start": 287,
+          "end": 292,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "That shape means that each one of the 8 devices will receive as an input a jnp array with shape (1, 77). 1 is therefore the batch size per device. In TPUs with sufficient memory, it could be larger than 1 if we wanted to generate multiple images (per chip) at once.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 39,
+          "kind": "code"
+        },
+        {
+          "start": 75,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 96,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 106,
+          "kind": "code"
+        },
+        {
+          "start": 203,
+          "end": 204,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "We are almost ready to generate images! We just need to create a random number generator to pass to the generation function. This is the standard procedure in Flax, which is very serious and opinionated about random numbers – all functions that deal with random numbers are expected to receive a generator. This ensures reproducibility, even when we are training across multiple distributed devices.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "The helper function below uses a seed to initialize a random number generator. As long as we use the same seed, we'll get the exact same results. Feel free to use different seeds when exploring results later in the notebook.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "We obtain a rng and then \"split\" it 8 times so each device receives a different generator. Therefore, each device will create a different image, and the full process is reproducible.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "JAX code can be compiled to an efficient representation that runs very fast. However, we need to ensure that all inputs have the same shape in subsequent calls; otherwise, JAX will have to recompile the code, and we wouldn't be able to take advantage of the optimized speed.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "The Flax pipeline can compile the code for us if we pass jit = True as an argument. It will also ensure that the model runs in parallel in the 8 available devices.",
+      "spans": [
+        {
+          "start": 57,
+          "end": 67,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "The first time we run the following cell it will take a long time to compile, but subsequent calls (even with different inputs) will be much faster. For example, it took more than a minute to compile in a TPU v2-8 when I tested, but then it takes about 7s for future inference runs.",
+      "spans": [
+        {
+          "start": 253,
+          "end": 255,
+          "kind": "code"
+        },
+        {
+          "start": 253,
+          "end": 255,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "The returned array has shape (8, 1, 512, 512, 3). We reshape it to get rid of the second dimension and obtain 8 images of 512 × 512 × 3 and then convert them to PIL.",
+      "spans": [
+        {
+          "start": 29,
+          "end": 48,
+          "kind": "code"
+        },
+        {
+          "start": 122,
+          "end": 135,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "Visualization",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "Let's create a helper function to display images in a grid.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Using different prompts",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "We don't have to replicate the same prompt in all the devices. We can do whatever we want: generate 2 prompts 4 times each, or even generate 8 different prompts at once. Let's do that!",
+      "spans": [
+        {
+          "start": 31,
+          "end": 35,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "First, we'll refactor the input preparation code into a handy function:",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "How does parallelization work?",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "We said before that the diffusers Flax pipeline automatically compiles the model and runs it in parallel on all available devices. We'll now briefly look inside that process to show how it works.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 33,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "JAX parallelization can be done in multiple ways. The easiest one revolves around using the jax.pmap function to achieve single-program, multiple-data (SPMD) parallelization. It means we'll run several copies of the same code, each on different data inputs. More sophisticated approaches are possible, we invite you to go over the JAX documentation and the pjit pages to explore this topic if you are interested!",
+      "spans": [
+        {
+          "start": 92,
+          "end": 100,
+          "kind": "code"
+        },
+        {
+          "start": 331,
+          "end": 348,
+          "kind": "a",
+          "href": "https://jax.readthedocs.io/en/latest/index.html"
+        },
+        {
+          "start": 357,
+          "end": 361,
+          "kind": "code"
+        },
+        {
+          "start": 357,
+          "end": 367,
+          "kind": "a",
+          "href": "https://jax.readthedocs.io/en/latest/jax-101/08-pjit.html?highlight=pjit"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "jax.pmap does two things for us:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 8,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Compiles (or jits) the code, as if we had invoked jax.jit(). This does not happen when we call pmap, but the first time the pmapped function is invoked.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 16,
+          "kind": "code"
+        },
+        {
+          "start": 50,
+          "end": 59,
+          "kind": "code"
+        },
+        {
+          "start": 95,
+          "end": 99,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Ensures the compiled code runs in parallel in all the available devices.",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "To show how it works we pmap the _generate method of the pipeline, which is the private method that runs generates images. Please, note that this method may be renamed or removed in future releases of diffusers.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 28,
+          "kind": "code"
+        },
+        {
+          "start": 33,
+          "end": 42,
+          "kind": "code"
+        },
+        {
+          "start": 201,
+          "end": 210,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "After we use pmap, the prepared function p_generate will conceptually do the following:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 41,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Invoke a copy of the underlying function pipeline._generate in each device.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 59,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Send each device a different portion of the input arguments. That's what sharding is used for. In our case, prompt_ids has shape (8, 1, 77, 768). This array will be split in 8 and each copy of _generate will receive an input with shape (1, 77, 768).",
+      "spans": [
+        {
+          "start": 108,
+          "end": 118,
+          "kind": "code"
+        },
+        {
+          "start": 129,
+          "end": 144,
+          "kind": "code"
+        },
+        {
+          "start": 174,
+          "end": 175,
+          "kind": "code"
+        },
+        {
+          "start": 193,
+          "end": 202,
+          "kind": "code"
+        },
+        {
+          "start": 236,
+          "end": 248,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "We can code _generate completely ignoring the fact that it will be invoked in parallel. We just care about our batch size (1 in this example) and the dimensions that make sense for our code, and don't have to change anything to make it work in parallel.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 21,
+          "kind": "code"
+        },
+        {
+          "start": 123,
+          "end": 124,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The same way as when we used the pipeline call, the first time we run the following cell it will take a while, but then it will be much faster.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Output:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "We use block_until_ready() to correctly measure inference time, because JAX uses asynchronous dispatch and returns control to the Python loop as soon as it can. You don't need to use that in your code; blocking will occur automatically when you want to use the result of a computation that has not yet been materialized.",
+      "spans": [
+        {
+          "start": 7,
+          "end": 26,
+          "kind": "code"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "8e4c894eb4170ee6321cbebbbb040ace624c22e8b5c89be47b4797a3fb01d433",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import jax\nnum_devices = jax.device_count()\ndevice_type = jax.devices()[0].device_kind\n\nprint(f\"Found {num_devices} JAX devices of type {device_type}.\")\nassert \"TPU\" in device_type, \"Available device is not a TPU, please select TPU from Edit > Notebook settings > Hardware accelerator\""
+    },
+    {
+      "id": "c0002",
+      "source": "    Found 8 JAX devices of type TPU v2."
+    },
+    {
+      "id": "c0003",
+      "source": "!pip install diffusers==0.5.1"
+    },
+    {
+      "id": "c0004",
+      "source": "import numpy as np\nimport jax\nimport jax.numpy as jnp\n\nfrom pathlib import Path\nfrom jax import pmap\nfrom flax.jax_utils import replicate\nfrom flax.training.common_utils import shard\nfrom PIL import Image\n\nfrom huggingface_hub import notebook_login\nfrom diffusers import FlaxStableDiffusionPipeline"
+    },
+    {
+      "id": "c0005",
+      "source": "if not (Path.home()/'.huggingface'/'token').exists(): notebook_login()"
+    },
+    {
+      "id": "c0006",
+      "source": "dtype = jnp.bfloat16"
+    },
+    {
+      "id": "c0007",
+      "source": "pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(\n    \"CompVis/stable-diffusion-v1-4\",\n    revision=\"bf16\",\n    dtype=dtype,\n)"
+    },
+    {
+      "id": "c0008",
+      "source": "prompt = \"A cinematic film still of Morgan Freeman starring as Jimi Hendrix, portrait, 40mm lens, shallow depth of field, close up, split lighting, cinematic\"\nprompt = [prompt] * jax.device_count()\nprompt_ids = pipeline.prepare_inputs(prompt)\nprompt_ids.shape"
+    },
+    {
+      "id": "c0009",
+      "source": "    (8, 77)"
+    },
+    {
+      "id": "c0010",
+      "source": "p_params = replicate(params)"
+    },
+    {
+      "id": "c0011",
+      "source": "prompt_ids = shard(prompt_ids)\nprompt_ids.shape"
+    },
+    {
+      "id": "c0012",
+      "source": "    (8, 1, 77)"
+    },
+    {
+      "id": "c0013",
+      "source": "def create_key(seed=0):\n    return jax.random.PRNGKey(seed)"
+    },
+    {
+      "id": "c0014",
+      "source": "rng = create_key(0)\nrng = jax.random.split(rng, jax.device_count())"
+    },
+    {
+      "id": "c0015",
+      "source": "images = pipeline(prompt_ids, p_params, rng, jit=True)[0]"
+    },
+    {
+      "id": "c0016",
+      "source": "    CPU times: user 464 ms, sys: 105 ms, total: 569 ms\n    Wall time: 7.07 s"
+    },
+    {
+      "id": "c0017",
+      "source": "images = images.reshape((images.shape[0],) + images.shape[-3:])\nimages = pipeline.numpy_to_pil(images)"
+    },
+    {
+      "id": "c0018",
+      "source": "def image_grid(imgs, rows, cols):\n    w,h = imgs[0].size\n    grid = Image.new('RGB', size=(cols*w, rows*h))\n    for i, img in enumerate(imgs): grid.paste(img, box=(i%cols*w, i//cols*h))\n    return grid"
+    },
+    {
+      "id": "c0019",
+      "source": "image_grid(images, 2, 4)"
+    },
+    {
+      "id": "c0020",
+      "source": "prompts = [\n    \"Labrador in the style of Hokusai\",\n    \"Painting of a squirrel skating in New York\",\n    \"HAL-9000 in the style of Van Gogh\",\n    \"Times Square under water, with fish and a dolphin swimming around\",\n    \"Ancient Roman fresco showing a man working on his laptop\",\n    \"Close-up photograph of young black woman against urban background, high quality, bokeh\",\n    \"Armchair in the shape of an avocado\",\n    \"Clown astronaut in space, with Earth in the background\",\n]"
+    },
+    {
+      "id": "c0021",
+      "source": "prompt_ids = pipeline.prepare_inputs(prompts)\nprompt_ids = shard(prompt_ids)\nimages = pipeline(prompt_ids, p_params, rng, jit=True).images\nimages = images.reshape((images.shape[0], ) + images.shape[-3:])\nimages = pipeline.numpy_to_pil(images)\nimage_grid(images, 2, 4)"
+    },
+    {
+      "id": "c0022",
+      "source": "p_generate = pmap(pipeline._generate)"
+    },
+    {
+      "id": "c0023",
+      "source": "images = p_generate(prompt_ids, p_params, rng)\nimages = images.block_until_ready()\nimages.shape"
+    },
+    {
+      "id": "c0024",
+      "source": "    CPU times: user 118 ms, sys: 83.9 ms, total: 202 ms\n    Wall time: 6.82 s\n\n    (8, 1, 512, 512, 3)"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "8e4c894eb4170ee6321cbebbbb040ace624c22e8b5c89be47b4797a3fb01d433",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_5afbd8346786b195",
+      "type": "image",
+      "afterBlockId": "c0019",
+      "order": 1
+    },
+    {
+      "mediaId": "image_aea6003f856b04b1",
+      "type": "image",
+      "afterBlockId": "c0021",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:41:27.687716Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:41:27.687729Z"
 }

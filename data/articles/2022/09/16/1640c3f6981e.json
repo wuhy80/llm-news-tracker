@@ -17,10 +17,9 @@
   "originalUrl": "https://huggingface.co/blog/bloom-inference-pytorch-scripts",
   "resolvedUrl": "https://huggingface.co/blog/bloom-inference-pytorch-scripts",
   "fetchedAt": "2026-08-27T03:10:36.715384Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "This article shows how to get an incredibly fast per token throughput when generating with the 176B parameter BLOOM model.\n\nAs the model needs 352GB in bf16 (bfloat16) weights (176*2), the most efficient set-up is 8x80GB A100 GPUs. Also 2x8x40GB A100s or 2x8x48GB A6000 can be used. The main reason for using these GPUs is that at the time of this writing they provide the largest GPU memory, but other GPUs can be used as well. For example, 24x32GB V100s can be used.\n\nUsing a single node will typically deliver a fastest throughput since most of the time intra-node GPU linking hardware is faster than inter-node one, but it's not always the case.\n\nIf you don't have that much hardware, it's still possible to run BLOOM inference on smaller GPUs, by using CPU or NVMe offload, but of course, the generation time will be much slower.\n\nWe are also going to cover the 8bit quantized solutions, which require half the GPU memory at the cost of slightly slower throughput. We will discuss BitsAndBytes and Deepspeed-Inference libraries there.\n\n## Benchmarks\n\nWithout any further delay let's show some numbers.\n\nFor the sake of consistency, unless stated differently, the benchmarks in this article were all done on the same 8x80GB A100 node w/ 512GB of CPU memory on Jean Zay HPC. The JeanZay HPC users enjoy a very fast IO of about 3GB/s read speed (GPFS). This is important for checkpoint loading time. A slow disc will result in slow loading time. Especially since we are concurrently doing IO in multiple processes.\n\nAll benchmarks are doing greedy generation of 100 token outputs:\n\n```\nGenerate args {'max_length': 100, 'do_sample': False}\n```\n\nThe input prompt is comprised of just a few tokens. The previous token caching is on as well, as it'd be quite slow to recalculate them all the time.\n\nFirst, let's have a quick look at how long did it take to get ready to generate - i.e. how long did it take to load and prepare the model:\n\nproject\n\nsecs\n\naccelerate\n\n121\n\nds-inference shard-int8\n\n61\n\nds-inference shard-fp16\n\n60\n\nds-inference unsharded\n\n662\n\nds-zero\n\n462\n\nDeepspeed-Inference comes with pre-sharded weight repositories and there the loading takes about 1 minuted. Accelerate's loading time is excellent as well - at just about 2 minutes. The other solutions are much slower here.\n\nThe loading time may or may not be of importance, since once loaded you can continually generate tokens again and again without an additional loading overhead.\n\nNext the most important benchmark of token generation throughput. The throughput metric here is a simple - how long did it take to generate 100 new tokens divided by 100 and the batch size (i.e. divided by the total number of generated tokens).\n\nHere is the throughput in msecs on 8x80GB GPUs:\n\nproject \\ bs\n\n1\n\n8\n\n16\n\n32\n\n64\n\n128\n\n256\n\n512\n\naccelerate bf16\n\n230.38\n\n31.78\n\n17.84\n\n10.89\n\noom\n\n—\n\n—\n\n—\n\naccelerate int8\n\n286.56\n\n40.92\n\n22.65\n\n13.27\n\noom\n\n—\n\n—\n\n—\n\nds-inference fp16\n\n44.02\n\n5.70\n\n3.01\n\n1.68\n\n1.00\n\n0.69\n\noom\n\n—\n\nds-inference int8\n\n89.09\n\n11.44\n\n5.88\n\n3.09\n\n1.71\n\n1.02\n\n0.71\n\noom\n\nds-zero bf16\n\n283\n\n34.88\n\noom\n\n—\n\n—\n\n—\n\n—\n\n—\n\nwhere OOM == Out of Memory condition where the batch size was too big to fit into GPU memory.\n\nGetting an under 1 msec throughput with Deepspeed-Inference's Tensor Parallelism (TP) and custom fused CUDA kernels! That's absolutely amazing! Though using this solution for other models that it hasn't been tried on may require some developer time to make it work.\n\nAccelerate is super fast as well. It uses a very simple approach of naive Pipeline Parallelism (PP) and because it's very simple it should work out of the box with any model.\n\nSince Deepspeed-ZeRO can process multiple generate streams in parallel its throughput can be further divided by 8 or 16, depending on whether 8 or 16 GPUs were used during the generate call. And, of course, it means that it can process a batch size of 64 in the case of 8x80 A100 (the table above) and thus the throughput is about 4msec - so all 3 solutions are very close to each other.\n\nLet's revisit again how these numbers were calculated. To generate 100 new tokens for a batch size of 128 took 8832 msecs in real time when using Deepspeed-Inference in fp16 mode. So now to calculate the throughput we did: walltime/(batch_size*new_tokens) or 8832/(128*100) = 0.69.\n\nNow let's look at the power of quantized int8-based models provided by Deepspeed-Inference and BitsAndBytes, as it requires only half the original GPU memory of inference in bfloat16 or float16.\n\nThroughput in msecs 4x80GB A100:\n\nproject bs\n\n1\n\n8\n\n16\n\n32\n\n64\n\n128\n\naccelerate int8\n\n284.15\n\n40.14\n\n21.97\n\noom\n\n—\n\n—\n\nds-inference int8\n\n156.51\n\n20.11\n\n10.38\n\n5.50\n\n2.96\n\noom\n\nTo reproduce the benchmark results simply add --benchmark to any of these 3 scripts discussed below.\n\n## Solutions\n\nFirst checkout the demo repository:\n\n```\ngit clone https://github.com/huggingface/transformers-bloom-inference\ncd transformers-bloom-inference\n```\n\nIn this article we are going to use 3 scripts located under bloom-inference-scripts/.\n\nThe framework-specific solutions are presented in an alphabetical order:\n\n## HuggingFace Accelerate\n\nAccelerate\n\nAccelerate handles big models for inference in the following way:\n\n- Instantiate the model with empty weights.\n\n- Analyze the size of each layer and the available space on each device (GPUs, CPU) to decide where each layer should go.\n\n- Load the model checkpoint bit by bit and put each weight on its device\n\nIt then ensures the model runs properly with hooks that transfer the inputs and outputs on the right device and that the model weights offloaded on the CPU (or even the disk) are loaded on a GPU just before the forward pass, before being offloaded again once the forward pass is finished.\n\nIn a situation where there are multiple GPUs with enough space to accommodate the whole model, it switches control from one GPU to the next until all layers have run. Only one GPU works at any given time, which sounds very inefficient but it does produce decent throughput despite the idling of the GPUs.\n\nIt is also very flexible since the same code can run on any given setup. Accelerate will use all available GPUs first, then offload on the CPU until the RAM is full, and finally on the disk. Offloading to CPU or disk will make things slower. As an example, users have reported running BLOOM with no code changes on just 2 A100s with a throughput of 15s per token as compared to 10 msecs on 8x80 A100s.\n\nYou can learn more about this solution in Accelerate documentation.\n\n### Setup\n\n```\npip install transformers>=4.21.3 accelerate>=0.12.0\n```\n\n### Run\n\nThe simple execution is:\n\n```\npython bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --batch_size 1 --benchmark\n```\n\nTo activate the 8bit quantized solution from BitsAndBytes first install bitsandbytes:\n\n```\npip install bitsandbytes\n```\n\nand then add --dtype int8 to the previous command line:\n\n```\npython bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --dtype int8 --batch_size 1 --benchmark\n```\n\nif you have more than 4 GPUs you can tell it to use only 4 with:\n\n```\nCUDA_VISIBLE_DEVICES=0,1,2,3 python bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --dtype int8 --batch_size 1 --benchmark\n```\n\nThe highest batch size we were able to run without OOM was 40 in this case. If you look inside the script we had to tweak the memory allocation map to free the first GPU to handle only activations and the previous tokens' cache.\n\n## DeepSpeed-Inference\n\nDeepSpeed-Inference uses Tensor-Parallelism and efficient fused CUDA kernels to deliver a super-fast <1msec per token inference on a large batch size of 128.\n\n### Setup\n\n```\npip install deepspeed>=0.7.3\n```\n\n### Run\n\n- the fastest approach is to use a TP-pre-sharded (TP = Tensor Parallel) checkpoint that takes only ~1min to load, as compared to 10min for non-pre-sharded bloom checkpoint:\n\n```\ndeepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-fp16\n```\n\n1a. if you want to run the original bloom checkpoint, which once loaded will run at the same throughput as the previous solution, but the loading will take 10-20min:\n\n```\ndeepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name bigscience/bloom\n```\n\n2a. The 8bit quantized version requires you to have only half the GPU memory of the normal half precision version:\n\n```\ndeepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-int8 --dtype int8\n```\n\nHere we used microsoft/bloom-deepspeed-inference-int8 and also told the script to run in int8.\n\nAnd of course, just 4x80GB A100 GPUs is now sufficient:\n\n```\ndeepspeed --num_gpus 4 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-int8 --dtype int8\n```\n\nThe highest batch size we were able to run without OOM was 128 in this case.\n\nYou can see two factors at play leading to better performance here.\n\nThe throughput here was improved by using Tensor Parallelism (TP) instead of the Pipeline Parallelism (PP) of Accelerate. Because Accelerate is meant to be very generic it is also unfortunately hard to maximize the GPU usage. All computations are done first on GPU 0, then on GPU 1, etc. until GPU 8, which means 7 GPUs are idle all the time. DeepSpeed-Inference on the other hand uses TP, meaning it will send tensors to all GPUs, compute part of the generation on each GPU and then all GPUs communicate to each other the results, then move on to the next layer. That means all GPUs are active at once but they need to communicate much more.\n\nDeepSpeed-Inference also uses custom CUDA kernels to avoid allocating too much memory and doing tensor copying to and from GPUs. The effect of this is lesser memory requirements and fewer kernel starts which improves the throughput and allows for bigger batch sizes leading to higher overall throughput.\n\nIf you are interested in more examples you can take a look at Accelerate GPT-J inference with DeepSpeed-Inference on GPUs or Accelerate BERT inference with DeepSpeed-Inference on GPUs.\n\n## Deepspeed ZeRO-Inference\n\nDeepspeed ZeRO uses a magical sharding approach which can take almost any model and scale it across a few or hundreds of GPUs and the do training or inference on it.\n\n### Setup\n\n```\npip install deepspeed\n```\n\n### Run\n\nNote that the script currently runs the same inputs on all GPUs, but you can run a different stream on each GPU, and get n_gpu times faster throughput. You can't do that with Deepspeed-Inference.\n\n```\ndeepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 1 --benchmark\n```\n\nPlease remember that with ZeRO the user can generate multiple unique streams at the same time - and thus the overall performance should be throughput in secs/token divided by number of participating GPUs - so 8x to 16x faster depending on whether 8 or 16 GPUs were used!\n\nYou can also try the offloading solutions with just one smallish GPU, which will take a long time to run, but if you don't have 8 huge GPUs this is as good as it gets.\n\nCPU-Offload (1x GPUs):\n\n```\ndeepspeed --num_gpus 1 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 8 --cpu_offload --benchmark\n```\n\nNVMe-Offload (1x GPUs):\n\n```\ndeepspeed --num_gpus 1 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 8 --nvme_offload_path=/path/to/nvme_offload --benchmark\n```\n\nmake sure to adjust /path/to/nvme_offload to somewhere you have ~400GB of free memory on a fast NVMe drive.\n\n## Additional Client and Server Solutions\n\nAt transformers-bloom-inference you will find more very efficient solutions, including server solutions.\n\nHere are some previews.\n\nServer solutions:\n\nMayank Mishra took all the demo scripts discussed in this blog post and turned them into a webserver package, which you can download from here\n\nNicolas Patry has developed a super-efficient Rust-based webserver solution.\n\nMore client-side solutions:\n\nThomas Wang is developing a very fast custom CUDA kernel BLOOM model.\n\nThe JAX team @HuggingFace has developed a JAX-based solution\n\nAs this blog post is likely to become outdated if you read this months after it was published please use transformers-bloom-inference to find the most up-to-date solutions.\n\n## Blog credits\n\nHuge thanks to the following kind folks who asked good questions and helped improve the readability of the article: Olatunji Ruwase and Philipp Schmid.",
   "summaryZh": "本文探讨了如何利用DeepSpeed和Accelerate技术来实现BLOOM大模型的高效极速推理。在面对巨型语言模型的高显存消耗和低推理速度瓶颈时，该优化方案有效提升了硬件利用率，对降低大模型部署成本、推动开源大模型在实际业务中的落地具有重要参考意义。",
   "summaryGeneratedAt": "2026-09-06T03:11:43.447807Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -54,5 +53,1842 @@
     "summaryZh": "本文探讨了如何利用DeepSpeed和Accelerate技术来实现BLOOM大模型的高效极速推理。在面对巨型语言模型的高显存消耗和低推理速度瓶颈时，该优化方案有效提升了硬件利用率，对降低大模型部署成本、推动开源大模型在实际业务中的落地具有重要参考意义。",
     "glossary": [],
     "duplicateKey": "incredibly-fast-bloom-inference-with-deepspeed-and-accelerate"
-  }
+  },
+  "images": [],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "This article shows how to get an incredibly fast per token throughput when generating with the 176B parameter BLOOM model.",
+      "spans": [
+        {
+          "start": 110,
+          "end": 121,
+          "kind": "a",
+          "href": "https://huggingface.co/bigscience/bloom"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "As the model needs 352GB in bf16 (bfloat16) weights (176*2), the most efficient set-up is 8x80GB A100 GPUs. Also 2x8x40GB A100s or 2x8x48GB A6000 can be used. The main reason for using these GPUs is that at the time of this writing they provide the largest GPU memory, but other GPUs can be used as well. For example, 24x32GB V100s can be used.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 58,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Using a single node will typically deliver a fastest throughput since most of the time intra-node GPU linking hardware is faster than inter-node one, but it's not always the case.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "If you don't have that much hardware, it's still possible to run BLOOM inference on smaller GPUs, by using CPU or NVMe offload, but of course, the generation time will be much slower.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "We are also going to cover the 8bit quantized solutions, which require half the GPU memory at the cost of slightly slower throughput. We will discuss BitsAndBytes and Deepspeed-Inference libraries there.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 55,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/hf-bitsandbytes-integration"
+        },
+        {
+          "start": 150,
+          "end": 162,
+          "kind": "a",
+          "href": "https://github.com/TimDettmers/bitsandbytes"
+        },
+        {
+          "start": 167,
+          "end": 186,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai/tutorials/inference-tutorial/"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Benchmarks",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Without any further delay let's show some numbers.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "For the sake of consistency, unless stated differently, the benchmarks in this article were all done on the same 8x80GB A100 node w/ 512GB of CPU memory on Jean Zay HPC. The JeanZay HPC users enjoy a very fast IO of about 3GB/s read speed (GPFS). This is important for checkpoint loading time. A slow disc will result in slow loading time. Especially since we are concurrently doing IO in multiple processes.",
+      "spans": [
+        {
+          "start": 156,
+          "end": 168,
+          "kind": "a",
+          "href": "http://www.idris.fr/eng/jean-zay/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "All benchmarks are doing greedy generation of 100 token outputs:",
+      "spans": [
+        {
+          "start": 25,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/how-to-generate#greedy-search"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "The input prompt is comprised of just a few tokens. The previous token caching is on as well, as it'd be quite slow to recalculate them all the time.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "First, let's have a quick look at how long did it take to get ready to generate - i.e. how long did it take to load and prepare the model:",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "project",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0013",
+      "source": "secs",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0014",
+      "source": "accelerate",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0015",
+      "source": "121",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0016",
+      "source": "ds-inference shard-int8",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0017",
+      "source": "61",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0018",
+      "source": "ds-inference shard-fp16",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0019",
+      "source": "60",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0020",
+      "source": "ds-inference unsharded",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "662",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "ds-zero",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "462",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "Deepspeed-Inference comes with pre-sharded weight repositories and there the loading takes about 1 minuted. Accelerate's loading time is excellent as well - at just about 2 minutes. The other solutions are much slower here.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "The loading time may or may not be of importance, since once loaded you can continually generate tokens again and again without an additional loading overhead.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Next the most important benchmark of token generation throughput. The throughput metric here is a simple - how long did it take to generate 100 new tokens divided by 100 and the batch size (i.e. divided by the total number of generated tokens).",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Here is the throughput in msecs on 8x80GB GPUs:",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "project \\ bs",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "32",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "64",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "128",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "256",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 7,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "512",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 8,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "accelerate bf16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "230.38",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "31.78",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "17.84",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0041",
+      "source": "10.89",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0042",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0043",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0044",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0045",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "accelerate int8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "286.56",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "40.92",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "22.65",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "13.27",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "ds-inference fp16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "44.02",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "5.70",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "3.01",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "1.68",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "1.00",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "0.69",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "ds-inference int8",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "89.09",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "11.44",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "5.88",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "3.09",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "1.71",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "1.02",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "0.71",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "ds-zero bf16",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "283",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "34.88",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 7,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 8,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "where OOM == Out of Memory condition where the batch size was too big to fit into GPU memory.",
+      "spans": []
+    },
+    {
+      "id": "b0083",
+      "source": "Getting an under 1 msec throughput with Deepspeed-Inference's Tensor Parallelism (TP) and custom fused CUDA kernels! That's absolutely amazing! Though using this solution for other models that it hasn't been tried on may require some developer time to make it work.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Accelerate is super fast as well. It uses a very simple approach of naive Pipeline Parallelism (PP) and because it's very simple it should work out of the box with any model.",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Since Deepspeed-ZeRO can process multiple generate streams in parallel its throughput can be further divided by 8 or 16, depending on whether 8 or 16 GPUs were used during the generate call. And, of course, it means that it can process a batch size of 64 in the case of 8x80 A100 (the table above) and thus the throughput is about 4msec - so all 3 solutions are very close to each other.",
+      "spans": [
+        {
+          "start": 176,
+          "end": 184,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "Let's revisit again how these numbers were calculated. To generate 100 new tokens for a batch size of 128 took 8832 msecs in real time when using Deepspeed-Inference in fp16 mode. So now to calculate the throughput we did: walltime/(batch_size*new_tokens) or 8832/(128*100) = 0.69.",
+      "spans": [
+        {
+          "start": 259,
+          "end": 280,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "Now let's look at the power of quantized int8-based models provided by Deepspeed-Inference and BitsAndBytes, as it requires only half the original GPU memory of inference in bfloat16 or float16.",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "Throughput in msecs 4x80GB A100:",
+      "spans": []
+    },
+    {
+      "id": "b0089",
+      "source": "project bs",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "16",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "64",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "128",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "accelerate int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "284.15",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "40.14",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "21.97",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "ds-inference int8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "156.51",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "20.11",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "10.38",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "5.50",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "2.96",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "oom",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "To reproduce the benchmark results simply add --benchmark to any of these 3 scripts discussed below.",
+      "spans": [
+        {
+          "start": 46,
+          "end": 57,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0111",
+      "source": "Solutions",
+      "spans": []
+    },
+    {
+      "id": "b0112",
+      "source": "First checkout the demo repository:",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "In this article we are going to use 3 scripts located under bloom-inference-scripts/.",
+      "spans": [
+        {
+          "start": 60,
+          "end": 84,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "The framework-specific solutions are presented in an alphabetical order:",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "HuggingFace Accelerate",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "Accelerate",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate"
+        }
+      ]
+    },
+    {
+      "id": "b0117",
+      "source": "Accelerate handles big models for inference in the following way:",
+      "spans": []
+    },
+    {
+      "id": "b0118",
+      "source": "Instantiate the model with empty weights.",
+      "spans": []
+    },
+    {
+      "id": "b0119",
+      "source": "Analyze the size of each layer and the available space on each device (GPUs, CPU) to decide where each layer should go.",
+      "spans": []
+    },
+    {
+      "id": "b0120",
+      "source": "Load the model checkpoint bit by bit and put each weight on its device",
+      "spans": []
+    },
+    {
+      "id": "b0121",
+      "source": "It then ensures the model runs properly with hooks that transfer the inputs and outputs on the right device and that the model weights offloaded on the CPU (or even the disk) are loaded on a GPU just before the forward pass, before being offloaded again once the forward pass is finished.",
+      "spans": []
+    },
+    {
+      "id": "b0122",
+      "source": "In a situation where there are multiple GPUs with enough space to accommodate the whole model, it switches control from one GPU to the next until all layers have run. Only one GPU works at any given time, which sounds very inefficient but it does produce decent throughput despite the idling of the GPUs.",
+      "spans": []
+    },
+    {
+      "id": "b0123",
+      "source": "It is also very flexible since the same code can run on any given setup. Accelerate will use all available GPUs first, then offload on the CPU until the RAM is full, and finally on the disk. Offloading to CPU or disk will make things slower. As an example, users have reported running BLOOM with no code changes on just 2 A100s with a throughput of 15s per token as compared to 10 msecs on 8x80 A100s.",
+      "spans": []
+    },
+    {
+      "id": "b0124",
+      "source": "You can learn more about this solution in Accelerate documentation.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 66,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/big_modeling"
+        }
+      ]
+    },
+    {
+      "id": "b0125",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0126",
+      "source": "Run",
+      "spans": []
+    },
+    {
+      "id": "b0127",
+      "source": "The simple execution is:",
+      "spans": []
+    },
+    {
+      "id": "b0128",
+      "source": "To activate the 8bit quantized solution from BitsAndBytes first install bitsandbytes:",
+      "spans": [
+        {
+          "start": 45,
+          "end": 57,
+          "kind": "a",
+          "href": "https://github.com/TimDettmers/bitsandbytes"
+        },
+        {
+          "start": 72,
+          "end": 84,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0129",
+      "source": "and then add --dtype int8 to the previous command line:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0130",
+      "source": "if you have more than 4 GPUs you can tell it to use only 4 with:",
+      "spans": []
+    },
+    {
+      "id": "b0131",
+      "source": "The highest batch size we were able to run without OOM was 40 in this case. If you look inside the script we had to tweak the memory allocation map to free the first GPU to handle only activations and the previous tokens' cache.",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "DeepSpeed-Inference",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "DeepSpeed-Inference uses Tensor-Parallelism and efficient fused CUDA kernels to deliver a super-fast <1msec per token inference on a large batch size of 128.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai/tutorials/inference-tutorial/"
+        }
+      ]
+    },
+    {
+      "id": "b0134",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0135",
+      "source": "Run",
+      "spans": []
+    },
+    {
+      "id": "b0136",
+      "source": "the fastest approach is to use a TP-pre-sharded (TP = Tensor Parallel) checkpoint that takes only ~1min to load, as compared to 10min for non-pre-sharded bloom checkpoint:",
+      "spans": []
+    },
+    {
+      "id": "b0137",
+      "source": "1a. if you want to run the original bloom checkpoint, which once loaded will run at the same throughput as the previous solution, but the loading will take 10-20min:",
+      "spans": []
+    },
+    {
+      "id": "b0138",
+      "source": "2a. The 8bit quantized version requires you to have only half the GPU memory of the normal half precision version:",
+      "spans": []
+    },
+    {
+      "id": "b0139",
+      "source": "Here we used microsoft/bloom-deepspeed-inference-int8 and also told the script to run in int8.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 53,
+          "kind": "code"
+        },
+        {
+          "start": 89,
+          "end": 93,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0140",
+      "source": "And of course, just 4x80GB A100 GPUs is now sufficient:",
+      "spans": []
+    },
+    {
+      "id": "b0141",
+      "source": "The highest batch size we were able to run without OOM was 128 in this case.",
+      "spans": []
+    },
+    {
+      "id": "b0142",
+      "source": "You can see two factors at play leading to better performance here.",
+      "spans": []
+    },
+    {
+      "id": "b0143",
+      "source": "The throughput here was improved by using Tensor Parallelism (TP) instead of the Pipeline Parallelism (PP) of Accelerate. Because Accelerate is meant to be very generic it is also unfortunately hard to maximize the GPU usage. All computations are done first on GPU 0, then on GPU 1, etc. until GPU 8, which means 7 GPUs are idle all the time. DeepSpeed-Inference on the other hand uses TP, meaning it will send tensors to all GPUs, compute part of the generation on each GPU and then all GPUs communicate to each other the results, then move on to the next layer. That means all GPUs are active at once but they need to communicate much more.",
+      "spans": []
+    },
+    {
+      "id": "b0144",
+      "source": "DeepSpeed-Inference also uses custom CUDA kernels to avoid allocating too much memory and doing tensor copying to and from GPUs. The effect of this is lesser memory requirements and fewer kernel starts which improves the throughput and allows for bigger batch sizes leading to higher overall throughput.",
+      "spans": []
+    },
+    {
+      "id": "b0145",
+      "source": "If you are interested in more examples you can take a look at Accelerate GPT-J inference with DeepSpeed-Inference on GPUs or Accelerate BERT inference with DeepSpeed-Inference on GPUs.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 121,
+          "kind": "a",
+          "href": "https://www.philschmid.de/gptj-deepspeed-inference"
+        },
+        {
+          "start": 125,
+          "end": 183,
+          "kind": "a",
+          "href": "https://www.philschmid.de/bert-deepspeed-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0146",
+      "source": "Deepspeed ZeRO-Inference",
+      "spans": []
+    },
+    {
+      "id": "b0147",
+      "source": "Deepspeed ZeRO uses a magical sharding approach which can take almost any model and scale it across a few or hundreds of GPUs and the do training or inference on it.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai/tutorials/zero/"
+        }
+      ]
+    },
+    {
+      "id": "b0148",
+      "source": "Setup",
+      "spans": []
+    },
+    {
+      "id": "b0149",
+      "source": "Run",
+      "spans": []
+    },
+    {
+      "id": "b0150",
+      "source": "Note that the script currently runs the same inputs on all GPUs, but you can run a different stream on each GPU, and get n_gpu times faster throughput. You can't do that with Deepspeed-Inference.",
+      "spans": [
+        {
+          "start": 121,
+          "end": 126,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0151",
+      "source": "Please remember that with ZeRO the user can generate multiple unique streams at the same time - and thus the overall performance should be throughput in secs/token divided by number of participating GPUs - so 8x to 16x faster depending on whether 8 or 16 GPUs were used!",
+      "spans": []
+    },
+    {
+      "id": "b0152",
+      "source": "You can also try the offloading solutions with just one smallish GPU, which will take a long time to run, but if you don't have 8 huge GPUs this is as good as it gets.",
+      "spans": []
+    },
+    {
+      "id": "b0153",
+      "source": "CPU-Offload (1x GPUs):",
+      "spans": []
+    },
+    {
+      "id": "b0154",
+      "source": "NVMe-Offload (1x GPUs):",
+      "spans": []
+    },
+    {
+      "id": "b0155",
+      "source": "make sure to adjust /path/to/nvme_offload to somewhere you have ~400GB of free memory on a fast NVMe drive.",
+      "spans": [
+        {
+          "start": 20,
+          "end": 41,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0156",
+      "source": "Additional Client and Server Solutions",
+      "spans": []
+    },
+    {
+      "id": "b0157",
+      "source": "At transformers-bloom-inference you will find more very efficient solutions, including server solutions.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 31,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-bloom-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0158",
+      "source": "Here are some previews.",
+      "spans": []
+    },
+    {
+      "id": "b0159",
+      "source": "Server solutions:",
+      "spans": []
+    },
+    {
+      "id": "b0160",
+      "source": "Mayank Mishra took all the demo scripts discussed in this blog post and turned them into a webserver package, which you can download from here",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://github.com/mayank31398"
+        },
+        {
+          "start": 138,
+          "end": 142,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-bloom-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0161",
+      "source": "Nicolas Patry has developed a super-efficient Rust-based webserver solution.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://github.com/Narsil"
+        },
+        {
+          "start": 46,
+          "end": 75,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/(https://github.com/Narsil/bloomserver"
+        }
+      ]
+    },
+    {
+      "id": "b0162",
+      "source": "More client-side solutions:",
+      "spans": []
+    },
+    {
+      "id": "b0163",
+      "source": "Thomas Wang is developing a very fast custom CUDA kernel BLOOM model.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://github.com/thomasw21"
+        },
+        {
+          "start": 38,
+          "end": 68,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers_bloom_parallel"
+        }
+      ]
+    },
+    {
+      "id": "b0164",
+      "source": "The JAX team @HuggingFace has developed a JAX-based solution",
+      "spans": [
+        {
+          "start": 42,
+          "end": 60,
+          "kind": "a",
+          "href": "https://github.com/huggingface/bloom-jax-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0165",
+      "source": "As this blog post is likely to become outdated if you read this months after it was published please use transformers-bloom-inference to find the most up-to-date solutions.",
+      "spans": [
+        {
+          "start": 105,
+          "end": 133,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-bloom-inference"
+        }
+      ]
+    },
+    {
+      "id": "b0166",
+      "source": "Blog credits",
+      "spans": []
+    },
+    {
+      "id": "b0167",
+      "source": "Huge thanks to the following kind folks who asked good questions and helped improve the readability of the article: Olatunji Ruwase and Philipp Schmid.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "1f2cb0a8b5a405a0b678ef8589f3cc7731935829e14f0cec550dc1d470441b01",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "Generate args {'max_length': 100, 'do_sample': False}"
+    },
+    {
+      "id": "c0002",
+      "source": "git clone https://github.com/huggingface/transformers-bloom-inference\ncd transformers-bloom-inference"
+    },
+    {
+      "id": "c0003",
+      "source": "pip install transformers>=4.21.3 accelerate>=0.12.0"
+    },
+    {
+      "id": "c0004",
+      "source": "python bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --batch_size 1 --benchmark"
+    },
+    {
+      "id": "c0005",
+      "source": "pip install bitsandbytes"
+    },
+    {
+      "id": "c0006",
+      "source": "python bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --dtype int8 --batch_size 1 --benchmark"
+    },
+    {
+      "id": "c0007",
+      "source": "CUDA_VISIBLE_DEVICES=0,1,2,3 python bloom-inference-scripts/bloom-accelerate-inference.py --name bigscience/bloom --dtype int8 --batch_size 1 --benchmark"
+    },
+    {
+      "id": "c0008",
+      "source": "pip install deepspeed>=0.7.3"
+    },
+    {
+      "id": "c0009",
+      "source": "deepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-fp16"
+    },
+    {
+      "id": "c0010",
+      "source": "deepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name bigscience/bloom"
+    },
+    {
+      "id": "c0011",
+      "source": "deepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-int8 --dtype int8"
+    },
+    {
+      "id": "c0012",
+      "source": "deepspeed --num_gpus 4 bloom-inference-scripts/bloom-ds-inference.py --name microsoft/bloom-deepspeed-inference-int8 --dtype int8"
+    },
+    {
+      "id": "c0013",
+      "source": "pip install deepspeed"
+    },
+    {
+      "id": "c0014",
+      "source": "deepspeed --num_gpus 8 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 1 --benchmark"
+    },
+    {
+      "id": "c0015",
+      "source": "deepspeed --num_gpus 1 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 8 --cpu_offload --benchmark"
+    },
+    {
+      "id": "c0016",
+      "source": "deepspeed --num_gpus 1 bloom-inference-scripts/bloom-ds-zero-inference.py --name bigscience/bloom --batch_size 8 --nvme_offload_path=/path/to/nvme_offload --benchmark"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "1f2cb0a8b5a405a0b678ef8589f3cc7731935829e14f0cec550dc1d470441b01",
+  "mediaLayout": [],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 0,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 0,
+    "savedImages": 0,
+    "sourceImageOccurrences": 0,
+    "placedImageOccurrences": 0,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:41:59.040486Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:41:59.040507Z"
 }

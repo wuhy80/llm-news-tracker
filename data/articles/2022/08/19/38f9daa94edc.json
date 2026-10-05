@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/deploy-vertex-ai",
   "resolvedUrl": "https://huggingface.co/blog/deploy-vertex-ai",
   "fetchedAt": "2026-08-27T03:10:36.914868Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "In the previous posts, we showed how to deploy a Vision Transformers (ViT) model from 🤗 Transformers locally and on a Kubernetes cluster. This post will show you how to deploy the same model on the Vertex AI platform. You’ll achieve the same scalability level as Kubernetes-based deployment but with significantly less code.\n\nThis post builds on top of the previous two posts linked above. You’re advised to check them out if you haven’t already.\n\nYou can find a completely worked-out example in the Colab Notebook linked at the beginning of the post.\n\n## What is Vertex AI?\n\nAccording to Google Cloud:\n\nVertex AI provides tools to support your entire ML workflow, across different model types and varying levels of ML expertise.\n\nConcerning model deployment, Vertex AI provides a few important features with a unified API design:\n\nAuthentication\n\nAutoscaling based on traffic\n\nModel versioning\n\nTraffic splitting between different versions of a model\n\nRate limiting\n\nModel monitoring and logging\n\nSupport for online and batch predictions\n\nFor TensorFlow models, it offers various off-the-shelf utilities, which you’ll get to in this post. But it also has similar support for other frameworks like PyTorch and scikit-learn.\n\nTo use Vertex AI, you’ll need a billing-enabled Google Cloud Platform (GCP) project and the following services enabled:\n\nVertex AI\n\nCloud Storage\n\n## Revisiting the Serving Model\n\nYou’ll use the same ViT B/16 model implemented in TensorFlow as you did in the last two posts. You serialized the model with corresponding pre-processing and post-processing operations embedded to reduce training-serving skew. Please refer to the first post that discusses this in detail. The signature of the final serialized SavedModel looks like:\n\n```\nThe given SavedModel SignatureDef contains the following input(s):\n  inputs['string_input'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: serving_default_string_input:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['confidence'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1)\n      name: StatefulPartitionedCall:0\n  outputs['label'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: StatefulPartitionedCall:1\nMethod name is: tensorflow/serving/predict\n```\n\nThe model will accept base64 encoded strings of images, perform pre-processing, run inference, and finally perform the post-processing steps. The strings are base64 encoded to prevent any modifications during network transmission. Pre-processing includes resizing the input image to 224x224 resolution, standardizing it to the [-1, 1] range, and transposing it to the channels_first memory layout. Postprocessing includes mapping the predicted logits to string labels.\n\nTo perform a deployment on Vertex AI, you need to keep the model artifacts in a Google Cloud Storage (GCS) bucket. The accompanying Colab Notebook shows how to create a GCS bucket and save the model artifacts into it.\n\n## Deployment workflow with Vertex AI\n\nThe figure below gives a pictorial workflow of deploying an already trained TensorFlow model on Vertex AI.\n\nLet’s now discuss what the Vertex AI Model Registry and Endpoint are.\n\n### Vertex AI Model Registry\n\nVertex AI Model Registry is a fully managed machine learning model registry. There are a couple of things to note about what fully managed means here. First, you don’t need to worry about how and where models are stored. Second, it manages different versions of the same model.\n\nThese features are important for machine learning in production. Building a model registry that guarantees high availability and security is nontrivial. Also, there are often situations where you want to roll back the current model to a past version since we can not control the inside of a black box machine learning model. Vertex AI Model Registry allows us to achieve these without much difficulty.\n\nThe currently supported model types include SavedModel from TensorFlow, scikit-learn, and XGBoost.\n\n### Vertex AI Endpoint\n\nFrom the user’s perspective, Vertex AI Endpoint simply provides an endpoint to receive requests and send responses back. However, it has a lot of things under the hood for machine learning operators to configure. Here are some of the configurations that you can choose:\n\nVersion of a model\n\nSpecification of VM in terms of CPU, memory, and accelerators\n\nMin/Max number of compute nodes\n\nTraffic split percentage\n\nModel monitoring window length and its objectives\n\nPrediction requests sampling rate\n\n## Performing the Deployment\n\nThe google-cloud-aiplatform Python SDK provides easy APIs to manage the lifecycle of a deployment on Vertex AI. It is divided into four steps:\n\n- uploading a model\n\n- creating an endpoint\n\n- deploying the model to the endpoint\n\n- making prediction requests.\n\nThroughout these steps, you will need ModelServiceClient, EndpointServiceClient, and PredictionServiceClient modules from the google-cloud-aiplatform Python SDK to interact with Vertex AI.\n\n\\1. The first step in the workflow is to upload the SavedModel to Vertex AI’s model registry:\n\n```\ntf28_gpu_model_dict = {\n    \"display_name\": \"ViT Base TF2.8 GPU model\",\n    \"artifact_uri\": f\"{GCS_BUCKET}/{LOCAL_MODEL_DIR}\",\n    \"container_spec\": {\n        \"image_uri\": \"us-docker.pkg.dev/vertex-ai/prediction/tf2-gpu.2-8:latest\",\n    },\n}\ntf28_gpu_model = (\n    model_service_client.upload_model(parent=PARENT, model=tf28_gpu_model_dict)\n    .result(timeout=180)\n    .model\n)\n```\n\nLet’s unpack the code piece by piece:\n\nGCS_BUCKET denotes the path of your GCS bucket where the model artifacts are located (e.g., gs://hf-tf-vision).\n\nIn container_spec, you provide the URI of a Docker image that will be used to serve predictions. Vertex AI provides pre-built images to serve TensorFlow models, but you can also use your custom Docker images when using a different framework (an example).\n\nmodel_service_client is a ModelServiceClient object that exposes the methods to upload a model to the Vertex AI Model Registry.\n\nPARENT is set to f\"projects/{PROJECT_ID}/locations/{REGION}\" that lets Vertex AI determine where the model is going to be scoped inside GCP.\n\n\\2. Then you need to create a Vertex AI Endpoint:\n\n```\ntf28_gpu_endpoint_dict = {\n    \"display_name\": \"ViT Base TF2.8 GPU endpoint\",\n}\ntf28_gpu_endpoint = (\n    endpoint_service_client.create_endpoint(\n        parent=PARENT, endpoint=tf28_gpu_endpoint_dict\n    )\n    .result(timeout=300)\n    .name\n)\n```\n\nHere you’re using an endpoint_service_client which is an EndpointServiceClient object. It lets you create and configure your Vertex AI Endpoint.\n\n\\3. Now you’re down to performing the actual deployment!\n\n```\ntf28_gpu_deployed_model_dict = {\n    \"model\": tf28_gpu_model,\n    \"display_name\": \"ViT Base TF2.8 GPU deployed model\",\n    \"dedicated_resources\": {\n        \"min_replica_count\": 1,\n        \"max_replica_count\": 1,\n        \"machine_spec\": {\n            \"machine_type\": DEPLOY_COMPUTE, # \"n1-standard-8\"\n            \"accelerator_type\": DEPLOY_GPU, # aip.AcceleratorType.NVIDIA_TESLA_T4\n            \"accelerator_count\": 1,\n        },\n    },\n}\n\ntf28_gpu_deployed_model = endpoint_service_client.deploy_model(\n    endpoint=tf28_gpu_endpoint,\n    deployed_model=tf28_gpu_deployed_model_dict,\n    traffic_split={\"0\": 100},\n).result()\n```\n\nHere, you’re chaining together the model you uploaded to the Vertex AI Model Registry and the Endpoint you created in the above steps. You’re first defining the configurations of the deployment under tf28_gpu_deployed_model_dict.\n\nUnder dedicated_resources you’re configuring:\n\nmin_replica_count and max_replica_count that handle the autoscaling aspects of your deployment.\n\nmachine_spec lets you define the configurations of the deployment hardware:\n\nmachine_type is the base machine type that will be used to run the Docker image. The underlying autoscaler will scale this machine as per the traffic load. You can choose one from the supported machine types.\n\naccelerator_type is the hardware accelerator that will be used to perform inference.\n\naccelerator_count denotes the number of hardware accelerators to attach to each replica.\n\nNote that providing an accelerator is not a requirement to deploy models on Vertex AI.\n\nNext, you deploy the endpoint using the above specifications:\n\n```\ntf28_gpu_deployed_model = endpoint_service_client.deploy_model(\n    endpoint=tf28_gpu_endpoint,\n    deployed_model=tf28_gpu_deployed_model_dict,\n    traffic_split={\"0\": 100},\n).result()\n```\n\nNotice how you’re defining the traffic split for the model. If you had multiple versions of the model, you could have defined a dictionary where the keys would denote the model version and values would denote the percentage of traffic the model is supposed to serve.\n\nWith a Model Registry and a dedicated interface to manage Endpoints, Vertex AI lets you easily control the important aspects of the deployment.\n\nIt takes about 15 - 30 minutes for Vertex AI to scope the deployment. Once it’s done, you should be able to see it on the console.\n\n## Performing Predictions\n\nIf your deployment was successful, you can test the deployed Endpoint by making a prediction request.\n\nFirst, prepare a base64 encoded image string:\n\n```\nimport base64\nimport tensorflow as tf\n\nimage_path = tf.keras.utils.get_file(\n    \"image.jpg\", \"http://images.cocodataset.org/val2017/000000039769.jpg\"\n)\nbytes = tf.io.read_file(image_path)\nb64str = base64.b64encode(bytes.numpy()).decode(\"utf-8\")\n```\n\n\\4. The following utility first prepares a list of instances (only one instance in this case) and then uses a prediction service client (of type PredictionServiceClient). serving_input is the name of the input signature key of the served model. In this case, the serving_input is string_input, which you can verify from the SavedModel signature output shown above.\n\n```\nfrom google.protobuf import json_format\nfrom google.protobuf.struct_pb2 import Value\n\ndef predict_image(image, endpoint, serving_input):\n    # The format of each instance should conform to\n    # the deployed model's prediction input schema.\n    instances_list = [{serving_input: {\"b64\": image}}]\n    instances = [json_format.ParseDict(s, Value()) for s in instances_list]\n\n    print(\n        prediction_service_client.predict(\n            endpoint=endpoint,\n            instances=instances,\n        )\n    )\n\npredict_image(b64str, tf28_gpu_endpoint, serving_input)\n```\n\nFor TensorFlow models deployed on Vertex AI, the request payload needs to be formatted in a certain way. For models like ViT that deal with binary data like images, they need to be base64 encoded. According to the official guide, the request payload for each instance needs to be like so:\n\n```\n{serving_input: {\"b64\": base64.b64encode(jpeg_data).decode()}}\n```\n\nThe predict_image() utility prepares the request payload conforming to this specification.\n\nIf everything goes well with the deployment, when you call predict_image(), you should get an output like so:\n\n```\npredictions {\n  struct_value {\n    fields {\n      key: \"confidence\"\n      value {\n        number_value: 0.896659553\n      }\n    }\n    fields {\n      key: \"label\"\n      value {\n        string_value: \"Egyptian cat\"\n      }\n    }\n  }\n}\ndeployed_model_id: \"5163311002082607104\"\nmodel: \"projects/29880397572/locations/us-central1/models/7235960789184544768\"\nmodel_display_name: \"ViT Base TF2.8 GPU model\"\n```\n\nNote, however, this is not the only way to obtain predictions using a Vertex AI Endpoint. If you head over to the Endpoint console and select your endpoint, it will show you two different ways to obtain predictions:\n\nIt’s also possible to avoid cURL requests and obtain predictions programmatically without using the Vertex AI SDK. Refer to this notebook to learn more.\n\nNow that you’ve learned how to use Vertex AI to deploy a TensorFlow model, let’s now discuss some beneficial features provided by Vertex AI. These help you get deeper insights into your deployment.\n\n## Monitoring with Vertex AI\n\nVertex AI also lets you monitor your model without any configuration. From the Endpoint console, you can get details about the performance of the Endpoint and the utilization of the allocated resources.\n\nAs seen in the above chart, for a brief amount of time, the accelerator duty cycle (utilization) was about 100% which is a sight for sore eyes. For the rest of the time, there weren’t any requests to process hence things were idle.\n\nThis type of monitoring helps you quickly flag the currently deployed Endpoint and make adjustments as necessary. It’s also possible to request monitoring of model explanations. Refer here to learn more.\n\n## Local Load Testing\n\nWe conducted a local load test to better understand the limits of the Endpoint with Locust. The table below summarizes the request statistics:\n\nAmong all the different statistics shown in the table, Average (ms) refers to the average latency of the Endpoint. Locust fired off about 17230 requests, and the reported average latency is 646 Milliseconds, which is impressive. In practice, you’d want to simulate more real traffic by conducting the load test in a distributed manner. Refer here to learn more.\n\nThis directory has all the information needed to know how we conducted the load test.\n\n## Pricing\n\nYou can use the GCP cost estimator to estimate the cost of usage, and the exact hourly pricing table can be found here. It is worth noting that you are only charged when the node is processing the actual prediction requests, and you need to calculate the price with and without GPUs.\n\nFor the Vertex Prediction for a custom-trained model, we can choose N1 machine types from n1-standard-2 to n1-highcpu-32. You used n1-standard-8 for this post which is equipped with 8 vCPUs and 32GBs of RAM.\n\nMachine Type\n\nHourly Pricing (USD)\n\nn1-standard-8 (8vCPU, 30GB)\n\n$ 0.4372\n\nAlso, when you attach accelerators to the compute node, you will be charged extra by the type of accelerator you want. We used NVIDIA_TESLA_T4 for this blog post, but almost all modern accelerators, including TPUs are supported. You can find further information here.\n\nAccelerator Type\n\nHourly Pricing (USD)\n\nNVIDIA_TESLA_T4\n\n$ 0.4024\n\n## Call for Action\n\nThe collection of TensorFlow vision models in 🤗 Transformers is growing. It now supports state-of-the-art semantic segmentation with SegFormer. We encourage you to extend the deployment workflow you learned in this post to semantic segmentation models like SegFormer.\n\n## Conclusion\n\nIn this post, you learned how to deploy a Vision Transformer model with the Vertex AI platform using the easy APIs it provides. You also learned how Vertex AI’s features benefit the model deployment process by enabling you to focus on declarative configurations and removing the complex parts. Vertex AI also supports deployment of PyTorch models via custom prediction routes. Refer here for more details.\n\nThe series first introduced you to TensorFlow Serving for locally deploying a vision model from 🤗 Transformers. In the second post, you learned how to scale that local deployment with Docker and Kubernetes. We hope this series on the online deployment of TensorFlow vision models was beneficial for you to take your ML toolbox to the next level. We can’t wait to see what you build with these tools.\n\n## Acknowledgements\n\nThanks to the ML Developer Relations Program team at Google, which provided us with GCP credits for conducting the experiments.\n\nParts of the deployment code were referred from this notebook of the official GitHub repository of Vertex AI code samples.",
   "summaryZh": "Hugging Face发布了关于在Google Cloud Vertex AI上部署Vision Transformer模型的指南。",
   "summaryGeneratedAt": "2026-09-06T03:11:49.568820Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,1249 @@
     "summaryZh": "Hugging Face发布了关于在Google Cloud Vertex AI上部署Vision Transformer模型的指南。",
     "glossary": [],
     "duplicateKey": "deploying-vit-vertex-ai"
-  }
+  },
+  "images": [
+    {
+      "src": "https://colab.research.google.com/assets/colab-badge.svg",
+      "originalUrl": "https://colab.research.google.com/assets/colab-badge.svg",
+      "alt": "Open In Colab",
+      "id": "image_dfb4615ac36cf94c"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image7.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image7.png",
+      "alt": "",
+      "id": "image_a519212d81cd49df"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image3.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image3.png",
+      "alt": "",
+      "id": "image_94b4902efbfe7fc0"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image4.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image4.png",
+      "alt": "",
+      "id": "image_971d8c15a193d5e2"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image8.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image8.png",
+      "alt": "",
+      "id": "image_08b9eb7e9482f800"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image6.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image6.png",
+      "alt": "",
+      "id": "image_3198597d93bb670e"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/97_vertex_ai/image5.png",
+      "originalUrl": "https://huggingface.co/blog/assets/97_vertex_ai/image5.png",
+      "alt": "",
+      "id": "image_2a454858daaee995"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In the previous posts, we showed how to deploy a Vision Transformers (ViT) model from 🤗 Transformers locally and on a Kubernetes cluster. This post will show you how to deploy the same model on the Vertex AI platform. You’ll achieve the same scalability level as Kubernetes-based deployment but with significantly less code.",
+      "spans": [
+        {
+          "start": 49,
+          "end": 80,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/vit"
+        },
+        {
+          "start": 101,
+          "end": 108,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tf-serving-vision"
+        },
+        {
+          "start": 118,
+          "end": 136,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/deploy-tfserving-kubernetes"
+        },
+        {
+          "start": 198,
+          "end": 216,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This post builds on top of the previous two posts linked above. You’re advised to check them out if you haven’t already.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "You can find a completely worked-out example in the Colab Notebook linked at the beginning of the post.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "What is Vertex AI?",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "According to Google Cloud:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 25,
+          "kind": "a",
+          "href": "https://www.youtube.com/watch?v=766OilR6xWc"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Vertex AI provides tools to support your entire ML workflow, across different model types and varying levels of ML expertise.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Concerning model deployment, Vertex AI provides a few important features with a unified API design:",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Authentication",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Autoscaling based on traffic",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Model versioning",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Traffic splitting between different versions of a model",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Rate limiting",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Model monitoring and logging",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Support for online and batch predictions",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "For TensorFlow models, it offers various off-the-shelf utilities, which you’ll get to in this post. But it also has similar support for other frameworks like PyTorch and scikit-learn.",
+      "spans": [
+        {
+          "start": 158,
+          "end": 165,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/topics/developers-practitioners/pytorch-google-cloud-how-deploy-pytorch-models-vertex-ai"
+        },
+        {
+          "start": 170,
+          "end": 182,
+          "kind": "a",
+          "href": "https://codelabs.developers.google.com/vertex-cpr-sklearn"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "To use Vertex AI, you’ll need a billing-enabled Google Cloud Platform (GCP) project and the following services enabled:",
+      "spans": [
+        {
+          "start": 32,
+          "end": 83,
+          "kind": "a",
+          "href": "https://cloud.google.com/billing/docs/how-to/modify-project"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Vertex AI",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Cloud Storage",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Revisiting the Serving Model",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "You’ll use the same ViT B/16 model implemented in TensorFlow as you did in the last two posts. You serialized the model with corresponding pre-processing and post-processing operations embedded to reduce training-serving skew. Please refer to the first post that discusses this in detail. The signature of the final serialized SavedModel looks like:",
+      "spans": [
+        {
+          "start": 20,
+          "end": 60,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/main/en/model_doc/vit#transformers.TFViTForImageClassification"
+        },
+        {
+          "start": 204,
+          "end": 225,
+          "kind": "a",
+          "href": "https://developers.google.com/machine-learning/guides/rules-of-ml#:~:text=Training%2Dserving%20skew%20is%20a,train%20and%20when%20you%20serve."
+        },
+        {
+          "start": 247,
+          "end": 257,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/tf-serving-vision"
+        },
+        {
+          "start": 327,
+          "end": 337,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "The model will accept base64 encoded strings of images, perform pre-processing, run inference, and finally perform the post-processing steps. The strings are base64 encoded to prevent any modifications during network transmission. Pre-processing includes resizing the input image to 224x224 resolution, standardizing it to the [-1, 1] range, and transposing it to the channels_first memory layout. Postprocessing includes mapping the predicted logits to string labels.",
+      "spans": [
+        {
+          "start": 22,
+          "end": 36,
+          "kind": "a",
+          "href": "https://www.base64encode.org/"
+        },
+        {
+          "start": 327,
+          "end": 334,
+          "kind": "code"
+        },
+        {
+          "start": 368,
+          "end": 382,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "To perform a deployment on Vertex AI, you need to keep the model artifacts in a Google Cloud Storage (GCS) bucket. The accompanying Colab Notebook shows how to create a GCS bucket and save the model artifacts into it.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 113,
+          "kind": "a",
+          "href": "https://cloud.google.com/storage/docs/json_api/v1/buckets"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Deployment workflow with Vertex AI",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "The figure below gives a pictorial workflow of deploying an already trained TensorFlow model on Vertex AI.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Let’s now discuss what the Vertex AI Model Registry and Endpoint are.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Vertex AI Model Registry",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "Vertex AI Model Registry is a fully managed machine learning model registry. There are a couple of things to note about what fully managed means here. First, you don’t need to worry about how and where models are stored. Second, it manages different versions of the same model.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "These features are important for machine learning in production. Building a model registry that guarantees high availability and security is nontrivial. Also, there are often situations where you want to roll back the current model to a past version since we can not control the inside of a black box machine learning model. Vertex AI Model Registry allows us to achieve these without much difficulty.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "The currently supported model types include SavedModel from TensorFlow, scikit-learn, and XGBoost.",
+      "spans": [
+        {
+          "start": 44,
+          "end": 54,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Vertex AI Endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "From the user’s perspective, Vertex AI Endpoint simply provides an endpoint to receive requests and send responses back. However, it has a lot of things under the hood for machine learning operators to configure. Here are some of the configurations that you can choose:",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Version of a model",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Specification of VM in terms of CPU, memory, and accelerators",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Min/Max number of compute nodes",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Traffic split percentage",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Model monitoring window length and its objectives",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Prediction requests sampling rate",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Performing the Deployment",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "The google-cloud-aiplatform Python SDK provides easy APIs to manage the lifecycle of a deployment on Vertex AI. It is divided into four steps:",
+      "spans": [
+        {
+          "start": 4,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 4,
+          "end": 27,
+          "kind": "a",
+          "href": "https://pypi.org/project/google-cloud-aiplatform/"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "uploading a model",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "creating an endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "deploying the model to the endpoint",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "making prediction requests.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Throughout these steps, you will need ModelServiceClient, EndpointServiceClient, and PredictionServiceClient modules from the google-cloud-aiplatform Python SDK to interact with Vertex AI.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 56,
+          "kind": "code"
+        },
+        {
+          "start": 58,
+          "end": 79,
+          "kind": "code"
+        },
+        {
+          "start": 85,
+          "end": 108,
+          "kind": "code"
+        },
+        {
+          "start": 126,
+          "end": 149,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "1. The first step in the workflow is to upload the SavedModel to Vertex AI’s model registry:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        },
+        {
+          "start": 51,
+          "end": 61,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Let’s unpack the code piece by piece:",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "GCS_BUCKET denotes the path of your GCS bucket where the model artifacts are located (e.g., gs://hf-tf-vision).",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 109,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "In container_spec, you provide the URI of a Docker image that will be used to serve predictions. Vertex AI provides pre-built images to serve TensorFlow models, but you can also use your custom Docker images when using a different framework (an example).",
+      "spans": [
+        {
+          "start": 3,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 116,
+          "end": 132,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/(https://cloud.google.com/vertex-ai/docs/predictions/pre-built-containers)"
+        },
+        {
+          "start": 242,
+          "end": 252,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/topics/developers-practitioners/pytorch-google-cloud-how-deploy-pytorch-models-vertex-ai"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "model_service_client is a ModelServiceClient object that exposes the methods to upload a model to the Vertex AI Model Registry.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 26,
+          "end": 44,
+          "kind": "a",
+          "href": "https://cloud.google.com/python/docs/reference/aiplatform/latest/google.cloud.aiplatform_v1.services.model_service.ModelServiceClient"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "PARENT is set to f\"projects/{PROJECT_ID}/locations/{REGION}\" that lets Vertex AI determine where the model is going to be scoped inside GCP.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "code"
+        },
+        {
+          "start": 17,
+          "end": 60,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "2. Then you need to create a Vertex AI Endpoint:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Here you’re using an endpoint_service_client which is an EndpointServiceClient object. It lets you create and configure your Vertex AI Endpoint.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 78,
+          "kind": "code"
+        },
+        {
+          "start": 57,
+          "end": 78,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/docs/samples/aiplatform-create-endpoint-sample"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "3. Now you’re down to performing the actual deployment!",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Here, you’re chaining together the model you uploaded to the Vertex AI Model Registry and the Endpoint you created in the above steps. You’re first defining the configurations of the deployment under tf28_gpu_deployed_model_dict.",
+      "spans": [
+        {
+          "start": 200,
+          "end": 228,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Under dedicated_resources you’re configuring:",
+      "spans": [
+        {
+          "start": 6,
+          "end": 25,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "min_replica_count and max_replica_count that handle the autoscaling aspects of your deployment.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        },
+        {
+          "start": 22,
+          "end": 39,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "machine_spec lets you define the configurations of the deployment hardware:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "machine_type is the base machine type that will be used to run the Docker image. The underlying autoscaler will scale this machine as per the traffic load. You can choose one from the supported machine types.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        },
+        {
+          "start": 184,
+          "end": 207,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/docs/predictions/configure-compute#machine-types"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "accelerator_type is the hardware accelerator that will be used to perform inference.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "accelerator_count denotes the number of hardware accelerators to attach to each replica.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Note that providing an accelerator is not a requirement to deploy models on Vertex AI.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Next, you deploy the endpoint using the above specifications:",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Notice how you’re defining the traffic split for the model. If you had multiple versions of the model, you could have defined a dictionary where the keys would denote the model version and values would denote the percentage of traffic the model is supposed to serve.",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "With a Model Registry and a dedicated interface to manage Endpoints, Vertex AI lets you easily control the important aspects of the deployment.",
+      "spans": [
+        {
+          "start": 38,
+          "end": 47,
+          "kind": "a",
+          "href": "https://console.cloud.google.com/vertex-ai/endpoints"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "It takes about 15 - 30 minutes for Vertex AI to scope the deployment. Once it’s done, you should be able to see it on the console.",
+      "spans": [
+        {
+          "start": 122,
+          "end": 129,
+          "kind": "a",
+          "href": "https://console.cloud.google.com/vertex-ai/endpoints"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Performing Predictions",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "If your deployment was successful, you can test the deployed Endpoint by making a prediction request.",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "First, prepare a base64 encoded image string:",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "4. The following utility first prepares a list of instances (only one instance in this case) and then uses a prediction service client (of type PredictionServiceClient). serving_input is the name of the input signature key of the served model. In this case, the serving_input is string_input, which you can verify from the SavedModel signature output shown above.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        },
+        {
+          "start": 144,
+          "end": 167,
+          "kind": "code"
+        },
+        {
+          "start": 144,
+          "end": 167,
+          "kind": "a",
+          "href": "https://cloud.google.com/python/docs/reference/automl/latest/google.cloud.automl_v1beta1.services.prediction_service.PredictionServiceClient"
+        },
+        {
+          "start": 170,
+          "end": 183,
+          "kind": "code"
+        },
+        {
+          "start": 262,
+          "end": 275,
+          "kind": "code"
+        },
+        {
+          "start": 279,
+          "end": 291,
+          "kind": "code"
+        },
+        {
+          "start": 323,
+          "end": 333,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "For TensorFlow models deployed on Vertex AI, the request payload needs to be formatted in a certain way. For models like ViT that deal with binary data like images, they need to be base64 encoded. According to the official guide, the request payload for each instance needs to be like so:",
+      "spans": [
+        {
+          "start": 214,
+          "end": 228,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/docs/predictions/online-predictions-custom-models#encoding-binary-data"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "The predict_image() utility prepares the request payload conforming to this specification.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 19,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "If everything goes well with the deployment, when you call predict_image(), you should get an output like so:",
+      "spans": [
+        {
+          "start": 59,
+          "end": 74,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0073",
+      "source": "Note, however, this is not the only way to obtain predictions using a Vertex AI Endpoint. If you head over to the Endpoint console and select your endpoint, it will show you two different ways to obtain predictions:",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "It’s also possible to avoid cURL requests and obtain predictions programmatically without using the Vertex AI SDK. Refer to this notebook to learn more.",
+      "spans": [
+        {
+          "start": 124,
+          "end": 137,
+          "kind": "a",
+          "href": "https://github.com/sayakpaul/deploy-hf-tf-vision-models/blob/main/hf_vision_model_vertex_ai/test-vertex-ai-endpoint.ipynb"
+        }
+      ]
+    },
+    {
+      "id": "b0075",
+      "source": "Now that you’ve learned how to use Vertex AI to deploy a TensorFlow model, let’s now discuss some beneficial features provided by Vertex AI. These help you get deeper insights into your deployment.",
+      "spans": []
+    },
+    {
+      "id": "b0076",
+      "source": "Monitoring with Vertex AI",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "Vertex AI also lets you monitor your model without any configuration. From the Endpoint console, you can get details about the performance of the Endpoint and the utilization of the allocated resources.",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "As seen in the above chart, for a brief amount of time, the accelerator duty cycle (utilization) was about 100% which is a sight for sore eyes. For the rest of the time, there weren’t any requests to process hence things were idle.",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "This type of monitoring helps you quickly flag the currently deployed Endpoint and make adjustments as necessary. It’s also possible to request monitoring of model explanations. Refer here to learn more.",
+      "spans": [
+        {
+          "start": 184,
+          "end": 188,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/docs/explainable-ai/overview"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Local Load Testing",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "We conducted a local load test to better understand the limits of the Endpoint with Locust. The table below summarizes the request statistics:",
+      "spans": [
+        {
+          "start": 84,
+          "end": 90,
+          "kind": "a",
+          "href": "https://locust.io/"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "Among all the different statistics shown in the table, Average (ms) refers to the average latency of the Endpoint. Locust fired off about 17230 requests, and the reported average latency is 646 Milliseconds, which is impressive. In practice, you’d want to simulate more real traffic by conducting the load test in a distributed manner. Refer here to learn more.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 138,
+          "end": 152,
+          "kind": "strong"
+        },
+        {
+          "start": 190,
+          "end": 206,
+          "kind": "strong"
+        },
+        {
+          "start": 342,
+          "end": 346,
+          "kind": "a",
+          "href": "https://cloud.google.com/architecture/load-testing-and-monitoring-aiplatform-models"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "This directory has all the information needed to know how we conducted the load test.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://github.com/sayakpaul/deploy-hf-tf-vision-models/tree/main/hf_vision_model_vertex_ai/locust"
+        }
+      ]
+    },
+    {
+      "id": "b0084",
+      "source": "Pricing",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "You can use the GCP cost estimator to estimate the cost of usage, and the exact hourly pricing table can be found here. It is worth noting that you are only charged when the node is processing the actual prediction requests, and you need to calculate the price with and without GPUs.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 34,
+          "kind": "a",
+          "href": "https://cloud.google.com/products/calculator"
+        },
+        {
+          "start": 114,
+          "end": 118,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/pricing#custom-trained_models"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "For the Vertex Prediction for a custom-trained model, we can choose N1 machine types from n1-standard-2 to n1-highcpu-32. You used n1-standard-8 for this post which is equipped with 8 vCPUs and 32GBs of RAM.",
+      "spans": [
+        {
+          "start": 90,
+          "end": 103,
+          "kind": "code"
+        },
+        {
+          "start": 107,
+          "end": 120,
+          "kind": "code"
+        },
+        {
+          "start": 68,
+          "end": 120,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/pricing#custom-trained_models"
+        },
+        {
+          "start": 131,
+          "end": 144,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0087",
+      "source": "Machine Type",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "Hourly Pricing (USD)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "n1-standard-8 (8vCPU, 30GB)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "$ 0.4372",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "Also, when you attach accelerators to the compute node, you will be charged extra by the type of accelerator you want. We used NVIDIA_TESLA_T4 for this blog post, but almost all modern accelerators, including TPUs are supported. You can find further information here.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 262,
+          "end": 266,
+          "kind": "a",
+          "href": "https://cloud.google.com/vertex-ai/pricing#custom-trained_models"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "Accelerator Type",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "Hourly Pricing (USD)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 20,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "NVIDIA_TESLA_T4",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "$ 0.4024",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Call for Action",
+      "spans": []
+    },
+    {
+      "id": "b0097",
+      "source": "The collection of TensorFlow vision models in 🤗 Transformers is growing. It now supports state-of-the-art semantic segmentation with SegFormer. We encourage you to extend the deployment workflow you learned in this post to semantic segmentation models like SegFormer.",
+      "spans": [
+        {
+          "start": 133,
+          "end": 142,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/model_doc/segformer#transformers.TFSegformerForSemanticSegmentation"
+        }
+      ]
+    },
+    {
+      "id": "b0098",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "In this post, you learned how to deploy a Vision Transformer model with the Vertex AI platform using the easy APIs it provides. You also learned how Vertex AI’s features benefit the model deployment process by enabling you to focus on declarative configurations and removing the complex parts. Vertex AI also supports deployment of PyTorch models via custom prediction routes. Refer here for more details.",
+      "spans": [
+        {
+          "start": 383,
+          "end": 387,
+          "kind": "a",
+          "href": "https://cloud.google.com/blog/topics/developers-practitioners/pytorch-google-cloud-how-deploy-pytorch-models-vertex-ai"
+        }
+      ]
+    },
+    {
+      "id": "b0100",
+      "source": "The series first introduced you to TensorFlow Serving for locally deploying a vision model from 🤗 Transformers. In the second post, you learned how to scale that local deployment with Docker and Kubernetes. We hope this series on the online deployment of TensorFlow vision models was beneficial for you to take your ML toolbox to the next level. We can’t wait to see what you build with these tools.",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "Acknowledgements",
+      "spans": []
+    },
+    {
+      "id": "b0102",
+      "source": "Thanks to the ML Developer Relations Program team at Google, which provided us with GCP credits for conducting the experiments.",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "Parts of the deployment code were referred from this notebook of the official GitHub repository of Vertex AI code samples.",
+      "spans": [
+        {
+          "start": 48,
+          "end": 61,
+          "kind": "a",
+          "href": "https://github.com/GoogleCloudPlatform/vertex-ai-samples/tree/main/notebooks/community/vertex_endpoints/optimized_tensorflow_runtime"
+        },
+        {
+          "start": 78,
+          "end": 95,
+          "kind": "a",
+          "href": "https://github.com/GoogleCloudPlatform/vertex-ai-samples"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "52b0a7807f946d3b430d25b9ad9ae821cb575fdc0720db3a048bbe4dd8262bd3",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "The given SavedModel SignatureDef contains the following input(s):\n  inputs['string_input'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: serving_default_string_input:0\nThe given SavedModel SignatureDef contains the following output(s):\n  outputs['confidence'] tensor_info:\n      dtype: DT_FLOAT\n      shape: (-1)\n      name: StatefulPartitionedCall:0\n  outputs['label'] tensor_info:\n      dtype: DT_STRING\n      shape: (-1)\n      name: StatefulPartitionedCall:1\nMethod name is: tensorflow/serving/predict"
+    },
+    {
+      "id": "c0002",
+      "source": "tf28_gpu_model_dict = {\n    \"display_name\": \"ViT Base TF2.8 GPU model\",\n    \"artifact_uri\": f\"{GCS_BUCKET}/{LOCAL_MODEL_DIR}\",\n    \"container_spec\": {\n        \"image_uri\": \"us-docker.pkg.dev/vertex-ai/prediction/tf2-gpu.2-8:latest\",\n    },\n}\ntf28_gpu_model = (\n    model_service_client.upload_model(parent=PARENT, model=tf28_gpu_model_dict)\n    .result(timeout=180)\n    .model\n)"
+    },
+    {
+      "id": "c0003",
+      "source": "tf28_gpu_endpoint_dict = {\n    \"display_name\": \"ViT Base TF2.8 GPU endpoint\",\n}\ntf28_gpu_endpoint = (\n    endpoint_service_client.create_endpoint(\n        parent=PARENT, endpoint=tf28_gpu_endpoint_dict\n    )\n    .result(timeout=300)\n    .name\n)"
+    },
+    {
+      "id": "c0004",
+      "source": "tf28_gpu_deployed_model_dict = {\n    \"model\": tf28_gpu_model,\n    \"display_name\": \"ViT Base TF2.8 GPU deployed model\",\n    \"dedicated_resources\": {\n        \"min_replica_count\": 1,\n        \"max_replica_count\": 1,\n        \"machine_spec\": {\n            \"machine_type\": DEPLOY_COMPUTE, # \"n1-standard-8\"\n            \"accelerator_type\": DEPLOY_GPU, # aip.AcceleratorType.NVIDIA_TESLA_T4\n            \"accelerator_count\": 1,\n        },\n    },\n}\n\ntf28_gpu_deployed_model = endpoint_service_client.deploy_model(\n    endpoint=tf28_gpu_endpoint,\n    deployed_model=tf28_gpu_deployed_model_dict,\n    traffic_split={\"0\": 100},\n).result()"
+    },
+    {
+      "id": "c0005",
+      "source": "tf28_gpu_deployed_model = endpoint_service_client.deploy_model(\n    endpoint=tf28_gpu_endpoint,\n    deployed_model=tf28_gpu_deployed_model_dict,\n    traffic_split={\"0\": 100},\n).result()"
+    },
+    {
+      "id": "c0006",
+      "source": "import base64\nimport tensorflow as tf\n\nimage_path = tf.keras.utils.get_file(\n    \"image.jpg\", \"http://images.cocodataset.org/val2017/000000039769.jpg\"\n)\nbytes = tf.io.read_file(image_path)\nb64str = base64.b64encode(bytes.numpy()).decode(\"utf-8\")"
+    },
+    {
+      "id": "c0007",
+      "source": "from google.protobuf import json_format\nfrom google.protobuf.struct_pb2 import Value\n\ndef predict_image(image, endpoint, serving_input):\n    # The format of each instance should conform to\n    # the deployed model's prediction input schema.\n    instances_list = [{serving_input: {\"b64\": image}}]\n    instances = [json_format.ParseDict(s, Value()) for s in instances_list]\n\n    print(\n        prediction_service_client.predict(\n            endpoint=endpoint,\n            instances=instances,\n        )\n    )\n\npredict_image(b64str, tf28_gpu_endpoint, serving_input)"
+    },
+    {
+      "id": "c0008",
+      "source": "{serving_input: {\"b64\": base64.b64encode(jpeg_data).decode()}}"
+    },
+    {
+      "id": "c0009",
+      "source": "predictions {\n  struct_value {\n    fields {\n      key: \"confidence\"\n      value {\n        number_value: 0.896659553\n      }\n    }\n    fields {\n      key: \"label\"\n      value {\n        string_value: \"Egyptian cat\"\n      }\n    }\n  }\n}\ndeployed_model_id: \"5163311002082607104\"\nmodel: \"projects/29880397572/locations/us-central1/models/7235960789184544768\"\nmodel_display_name: \"ViT Base TF2.8 GPU model\""
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "52b0a7807f946d3b430d25b9ad9ae821cb575fdc0720db3a048bbe4dd8262bd3",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dfb4615ac36cf94c",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    },
+    {
+      "mediaId": "image_a519212d81cd49df",
+      "type": "image",
+      "afterBlockId": "b0024",
+      "order": 1
+    },
+    {
+      "mediaId": "image_94b4902efbfe7fc0",
+      "type": "image",
+      "afterBlockId": "b0044",
+      "order": 2
+    },
+    {
+      "mediaId": "image_971d8c15a193d5e2",
+      "type": "image",
+      "afterBlockId": "b0073",
+      "order": 3
+    },
+    {
+      "mediaId": "image_08b9eb7e9482f800",
+      "type": "image",
+      "afterBlockId": "b0077",
+      "order": 4
+    },
+    {
+      "mediaId": "image_3198597d93bb670e",
+      "type": "image",
+      "afterBlockId": "b0077",
+      "order": 5
+    },
+    {
+      "mediaId": "image_2a454858daaee995",
+      "type": "image",
+      "afterBlockId": "b0081",
+      "order": 6
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 7,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 7,
+    "savedImages": 7,
+    "sourceImageOccurrences": 7,
+    "placedImageOccurrences": 7,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:42:27.128774Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:42:27.128790Z"
 }

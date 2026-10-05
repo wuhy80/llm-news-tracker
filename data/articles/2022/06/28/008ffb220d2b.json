@@ -16,10 +16,9 @@
   "originalUrl": "https://huggingface.co/blog/accelerate-deepspeed",
   "resolvedUrl": "https://huggingface.co/blog/accelerate-deepspeed",
   "fetchedAt": "2026-08-27T03:10:37.743730Z",
-  "contentKind": "summary",
+  "contentKind": "page",
   "archiveVersion": 2,
-  "body": "来自原始信息源的最新动态，点击标题查看完整内容。",
-  "note": "page:HTTPError:HTTP Error 429: Too Many Requests",
+  "body": "In this post we will look at how we can leverage the Accelerate library for training large models which enables users to leverage the ZeRO features of DeeSpeed.\n\n## Motivation 🤗\n\nTired of Out of Memory (OOM) errors while trying to train large models? We've got you covered. Large models are very performant [1] but difficult to train with the available hardware. To get the most of the available hardware for training large models one can leverage Data Parallelism using ZeRO - Zero Redundancy Optimizer [2].\n\nBelow is a short description of Data Parallelism using ZeRO with diagram from this blog post\n\n(Source: link)\n\na. Stage 1 : Shards optimizer states across data parallel workers/GPUs\n\nb. Stage 2 : Shards optimizer states + gradients across data parallel workers/GPUs\n\nc. Stage 3: Shards optimizer states + gradients + model parameters across data parallel workers/GPUs\n\nd. Optimizer Offload: Offloads the gradients + optimizer states to CPU/Disk building on top of ZERO Stage 2\n\ne. Param Offload: Offloads the model parameters to CPU/Disk building on top of ZERO Stage 3\n\nIn this blogpost we will look at how to leverage Data Parallelism using ZeRO using Accelerate. DeepSpeed, FairScale and PyTorch FullyShardedDataParallel (FSDP) have implemented the core ideas of the ZERO paper. These have already been integrated in 🤗 transformers Trainer and 🤗 accelerate accompanied by great blogs Fit More and Train Faster With ZeRO via DeepSpeed and FairScale [4] and Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel [5]. We defer the explanation of what goes behind the scenes to those blogs and mainly focus on leveraging DeepSpeed ZeRO using Accelerate.\n\n## Accelerate 🚀: Leverage DeepSpeed ZeRO without any code changes\n\nHardware setup: 2X24GB NVIDIA Titan RTX GPUs. 60GB RAM.\n\nWe will look at the task of finetuning encoder-only model for text-classification. We will use pretrained microsoft/deberta-v2-xlarge-mnli (900M params) for finetuning on MRPC GLUE dataset.\n\nThe code is available here run_cls_no_trainer.py. It is similar to the official text-classification example here with the addition of logic to measure train and eval time. Let's compare performance between Distributed Data Parallel (DDP) and DeepSpeed ZeRO Stage-2 in a Multi-GPU Setup.\n\nTo enable DeepSpeed ZeRO Stage-2 without any code changes, please run accelerate config and leverage the Accelerate DeepSpeed Plugin.\n\nZeRO Stage-2 DeepSpeed Plugin Example\n\n```\ncompute_environment: LOCAL_MACHINE\ndeepspeed_config:\n gradient_accumulation_steps: 1\n gradient_clipping: 1.0\n offload_optimizer_device: none\n offload_param_device: none\n zero3_init_flag: false\n zero_stage: 2\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false\n```\n\nNow, run below command for training:\n\n```\naccelerate launch run_cls_no_trainer.py \\\n  --model_name_or_path \"microsoft/deberta-v2-xlarge-mnli\" \\\n  --task_name \"mrpc\" \\\n  --ignore_mismatched_sizes \\\n  --max_length 128 \\\n  --per_device_train_batch_size 40 \\\n  --learning_rate 2e-5 \\\n  --num_train_epochs 3 \\\n  --output_dir \"/tmp/mrpc/deepspeed_stage2/\" \\\n  --with_tracking \\\n  --report_to \"wandb\" \\\n```\n\nIn our Single-Node Multi-GPU setup, the maximum batch size that DDP supports without OOM error is 8. In contrast, DeepSpeed Zero-Stage 2 enables batch size of 40 without running into OOM errors. Therefore, DeepSpeed enables to fit 5X more data per GPU when compared to DDP. Below is the snapshot of the plots from wandb run along with benchmarking table comparing DDP vs DeepSpeed.\n\nMethod\n\nBatch Size Max\n\nTrain time per epoch (seconds)\n\nEval time per epoch (seconds)\n\nF1 score\n\nAccuracy\n\nDDP (Distributed Data Parallel)\n\n8\n\n103.57\n\n2.04\n\n0.931\n\n0.904\n\nDeepSpeed ZeRO Stage 2\n\n40\n\n28.98\n\n1.79\n\n0.936\n\n0.912\n\nTable 1: Benchmarking DeepSpeed ZeRO Stage-2 on DeBERTa-XL (900M) model\n\nWith this bigger batch size, we observe ~3.5X speed up in total training time without any drop in performance metrics, all this without changing any code. Yay! 🤗.\n\nTo be able to tweak more options, you will need to use a DeepSpeed config file and minimal code changes. Let's see how to do this.\n\n## Accelerate 🚀: Leverage a DeepSpeed Config file to tweak more options\n\nFirst, We will look at the task of finetuning a sequence-to-sequence model for training our own Chatbot. Specifically, we will finetune facebook/blenderbot-400M-distill on the smangrul/MuDoConv (Multi-Domain Conversation) dataset. The dataset contains conversations from 10 different data sources covering personas, grounding in specific emotional contexts, goal-oriented (e.g., restaurant reservation) and general wikipedia topics (e.g, Cricket).\n\nThe code is available here run_seq2seq_no_trainer.py. Current practice to effectively measure the Engagingness and Humanness of Chatbots is via Human evlauations which are expensive [6]. As such for this example, the metric being tracked is BLEU score (which isn't ideal but is the conventional metric for such tasks). One can adapt the code to train larger T5 models if you have access to GPUs that support bfloat16 precision else you will run into NaN loss values. We will run a quick benchmark on 10000 train samples and 1000 eval samples as we are interested in DeepSpeed vs DDP.\n\nWe will leverage the DeepSpeed Zero Stage-2 config zero2_config_accelerate.json (given below) For training. for detailed information on the various config features, please refer DeeSpeed documentation.\n\n```\n{\n    \"fp16\": {\n        \"enabled\": \"true\",\n        \"loss_scale\": 0,\n        \"loss_scale_window\": 1000,\n        \"initial_scale_power\": 15,\n        \"hysteresis\": 2,\n        \"min_loss_scale\": 1\n    },\n    \"optimizer\": {\n        \"type\": \"AdamW\",\n        \"params\": {\n            \"lr\": \"auto\",\n            \"weight_decay\": \"auto\",\n            \"torch_adam\": true,\n            \"adam_w_mode\": true\n        }\n    },\n    \"scheduler\": {\n        \"type\": \"WarmupDecayLR\",\n        \"params\": {\n            \"warmup_min_lr\": \"auto\",\n            \"warmup_max_lr\": \"auto\",\n            \"warmup_num_steps\": \"auto\",\n            \"total_num_steps\": \"auto\"\n        }\n    },\n    \"zero_optimization\": {\n        \"stage\": 2,\n        \"allgather_partitions\": true,\n        \"allgather_bucket_size\": 2e8,\n        \"overlap_comm\": true,\n        \"reduce_scatter\": true,\n        \"reduce_bucket_size\": 2e8,\n        \"contiguous_gradients\": true\n    },\n    \"gradient_accumulation_steps\": 1,\n    \"gradient_clipping\": \"auto\",\n    \"steps_per_print\": 2000,\n    \"train_batch_size\": \"auto\",\n    \"train_micro_batch_size_per_gpu\": \"auto\",\n    \"wall_clock_breakdown\": false\n}\n```\n\nTo enable DeepSpeed ZeRO Stage-2 with above config, please run accelerate config and provide the config file path when asked. For more details, refer the 🤗 accelerate official documentation for DeepSpeed Config File.\n\nZeRO Stage-2 DeepSpeed Config File Example\n\n```\ncompute_environment: LOCAL_MACHINE\ndeepspeed_config:\n deepspeed_config_file: /path/to/zero2_config_accelerate.json\n zero3_init_flag: false\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false\n```\n\nNow, run below command for training:\n\n```\naccelerate launch run_seq2seq_no_trainer.py \\\n    --dataset_name \"smangrul/MuDoConv\" \\\n    --max_source_length 128 \\\n    --source_prefix \"chatbot: \" \\\n    --max_target_length 64 \\\n    --val_max_target_length 64 \\\n    --val_min_target_length 20 \\\n    --n_val_batch_generations 5 \\\n    --n_train 10000 \\\n    --n_val 1000 \\\n    --pad_to_max_length \\\n    --num_beams 10 \\\n    --model_name_or_path \"facebook/blenderbot-400M-distill\" \\\n    --per_device_train_batch_size 200 \\\n    --per_device_eval_batch_size 100 \\\n    --learning_rate 1e-6 \\\n    --weight_decay 0.0 \\\n    --num_train_epochs 1 \\\n    --gradient_accumulation_steps 1 \\\n    --num_warmup_steps 100 \\\n    --output_dir \"/tmp/deepspeed_zero_stage2_accelerate_test\" \\\n    --seed 25 \\\n    --logging_steps 100 \\\n    --with_tracking \\\n    --report_to \"wandb\" \\\n    --report_name \"blenderbot_400M_finetuning\"\n```\n\nWhen using DeepSpeed config, if user has specified optimizer and scheduler in config, the user will have to use accelerate.utils.DummyOptim and accelerate.utils.DummyScheduler. Those are the only minor changes that the user has to do. Below we show an example of the minimal changes required when using DeepSpeed config:\n\n```\n- optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.learning_rate)\n+ optimizer = accelerate.utils.DummyOptim(optimizer_grouped_parameters, lr=args.learning_rate)\n\n- lr_scheduler = get_scheduler(\n-     name=args.lr_scheduler_type,\n-     optimizer=optimizer,\n-     num_warmup_steps=args.num_warmup_steps,\n-     num_training_steps=args.max_train_steps,\n- )\n\n+ lr_scheduler = accelerate.utils.DummyScheduler(\n+     optimizer, total_num_steps=args.max_train_steps, warmup_num_steps=args.num_warmup_steps\n+ )\n```\n\nMethod\n\nBatch Size Max\n\nEval Size Max\n\nTrain time per epoch (seconds)\n\nEval time per epoch (seconds)\n\nDDP (Distributed Data Parallel)\n\n100\n\n50\n\n27.36\n\n48.41\n\nDeepSpeed ZeRO Stage 2\n\n200\n\n100\n\n19.06\n\n39.27\n\nTable 2: Benchmarking DeepSpeed ZeRO Stage-2 on BlenderBot (400M) model\n\nIn our Single-Node Multi-GPU setup, the maximum batch size that DDP supports without OOM error is 100. In contrast, DeepSpeed Zero-Stage 2 enables batch size of 200 without running into OOM errors. Therefore, DeepSpeed enables to fit 2X more data per GPU when compared to DDP. We observe ~1.44X speedup in training and ~1.23X speedup in evaluation as we are able to fit more data on the same available hardware. As this model is of medium size, the speedup isn't that exciting but this will improve with bigger models. You can chat with the Chatbot trained using the entire data at 🤗 Space smangrul/Chat-E. You can give bot a persona, ground conversation to a particular emotion, use to in goal-oriented tasks or in a free flow manner. Below is a fun conversation with the chatbot 💬. You can find snapshots of more conversations using different contexts here.\n\n### CPU/Disk Offloading to enable training humongous models that won’t fit the GPU memory\n\nOn a single 24GB NVIDIA Titan RTX GPU, one cannot train GPT-XL Model (1.5B parameters) even with a batch size of 1. We will look at how we can use DeepSpeed ZeRO Stage-3 with CPU offloading of optimizer states, gradients and parameters to train GPT-XL Model.\n\nWe will leverage the DeepSpeed Zero Stage-3 CPU offload config zero3_offload_config_accelerate.json (given below) for training. The rest of the process of using the config with 🤗 accelerate is similar to the above experiment.\n\n```\n{\n    \"fp16\": {\n        \"enabled\": true,\n        \"loss_scale\": 0,\n        \"loss_scale_window\": 1000,\n        \"initial_scale_power\": 16,\n        \"hysteresis\": 2,\n        \"min_loss_scale\": 1\n    },\n    \"optimizer\": {\n        \"type\": \"AdamW\",\n        \"params\": {\n            \"lr\": \"auto\",\n            \"weight_decay\": \"auto\"\n        }\n    },\n    \"scheduler\": {\n        \"type\": \"WarmupDecayLR\",\n        \"params\": {\n            \"warmup_min_lr\": \"auto\",\n            \"warmup_max_lr\": \"auto\",\n            \"warmup_num_steps\": \"auto\",\n            \"total_num_steps\": \"auto\"\n        }\n    },\n    \"zero_optimization\": {\n        \"stage\": 3,\n        \"offload_optimizer\": {\n            \"device\": \"cpu\",\n            \"pin_memory\": true\n        },\n        \"offload_param\": {\n            \"device\": \"cpu\",\n            \"pin_memory\": true\n        },\n        \"overlap_comm\": true,\n        \"contiguous_gradients\": true,\n        \"reduce_bucket_size\": \"auto\",\n        \"stage3_prefetch_bucket_size\": \"auto\",\n        \"stage3_param_persistence_threshold\": \"auto\",\n        \"sub_group_size\": 1e9,\n        \"stage3_max_live_parameters\": 1e9,\n        \"stage3_max_reuse_distance\": 1e9,\n        \"stage3_gather_16bit_weights_on_model_save\": true\n    },\n    \"gradient_accumulation_steps\": 1,\n    \"gradient_clipping\": \"auto\",\n    \"steps_per_print\": 2000,\n    \"train_batch_size\": \"auto\",\n    \"train_micro_batch_size_per_gpu\": \"auto\",\n    \"wall_clock_breakdown\": false\n}\n```\n\nZeRO Stage-3 CPU Offload DeepSpeed Config File Example\n\n```\ncompute_environment: LOCAL_MACHINE\ndeepspeed_config:\n deepspeed_config_file: /path/to/zero3_offload_config_accelerate.json\n zero3_init_flag: true\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false\n```\n\nNow, run below command for training:\n\n```\naccelerate launch run_clm_no_trainer.py \\\n--config_name \"gpt2-xl\" \\\n--tokenizer_name \"gpt2-xl\" \\\n--dataset_name \"wikitext\" \\\n--dataset_config_name \"wikitext-2-raw-v1\" \\\n--block_size 128 \\\n--output_dir \"/tmp/clm_deepspeed_stage3_offload__accelerate\" \\\n--learning_rate 5e-4 \\\n--per_device_train_batch_size 16 \\\n--per_device_eval_batch_size 1 \\\n--num_train_epochs 1 \\\n--with_tracking \\\n--report_to \"wandb\"\\\n```\n\nMethod\n\nBatch Size Max\n\nTrain time per epoch (seconds)\n\nNotes\n\nDDP (Distributed Data Parallel)\n\n\\-\n\n\\-\n\nOOM Error\n\nDeepSpeed ZeRO Stage 3\n\n16\n\n6608.35\n\n—\n\nTable 3: Benchmarking DeepSpeed ZeRO Stage-3 CPU Offload on GPT-XL (1.5B) model\n\nDDP will result in OOM error even with batch size 1. On the other hand, with DeepSpeed ZeRO Stage-3 CPU offload, we can train with a batch size of 16.\n\nFinally, please, remember that, 🤗 Accelerate only integrates DeepSpeed, therefore if you have any problems or questions with regards to DeepSpeed usage, please, file an issue with DeepSpeed GitHub.\n\n## References\n\n[1] Train Large, Then Compress: Rethinking Model Size for Efficient Training and Inference of Transformers\n\n[2] ZeRO: Memory Optimizations Toward Training Trillion Parameter Models\n\n[3] DeepSpeed: Extreme-scale model training for everyone - Microsoft Research\n\n[4] Fit More and Train Faster With ZeRO via DeepSpeed and FairScale\n\n[5] Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel\n\n[6] Recipes for building an open-domain chatbot",
   "summaryZh": "该文章介绍了利用DeepSpeed加速大模型训练的方法，但由于摘要信息缺失，未提供实质性的技术或应用突破。",
   "summaryGeneratedAt": "2026-09-06T03:12:14.255241Z",
   "summaryModel": "gemini:gemini-3.5-flash-lite",
@@ -52,5 +51,1385 @@
     "summaryZh": "该文章介绍了利用DeepSpeed加速大模型训练的方法，但由于摘要信息缺失，未提供实质性的技术或应用突破。",
     "glossary": [],
     "duplicateKey": "deepspeed-training-acceleration"
-  }
+  },
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-zero.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/parallelism-zero.png",
+      "alt": "ZeRO Data Parallelism",
+      "id": "image_82773f1d47e0d27c"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/83_accelerate_deepspeed/cls_run.png",
+      "originalUrl": "https://huggingface.co/blog/assets/83_accelerate_deepspeed/cls_run.png",
+      "alt": "Wandb Run",
+      "id": "image_f7a2ecf0bc68335e"
+    },
+    {
+      "src": "https://huggingface.co/blog/assets/83_accelerate_deepspeed/chatbot.png",
+      "originalUrl": "https://huggingface.co/blog/assets/83_accelerate_deepspeed/chatbot.png",
+      "alt": "Chatbot",
+      "id": "image_5314ecc98a047346"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "In this post we will look at how we can leverage the Accelerate library for training large models which enables users to leverage the ZeRO features of DeeSpeed.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 63,
+          "kind": "a",
+          "href": "https://github.com/huggingface/accelerate"
+        },
+        {
+          "start": 53,
+          "end": 63,
+          "kind": "strong"
+        },
+        {
+          "start": 151,
+          "end": 159,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai"
+        },
+        {
+          "start": 151,
+          "end": 159,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Motivation 🤗",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Tired of Out of Memory (OOM) errors while trying to train large models? We've got you covered. Large models are very performant [1] but difficult to train with the available hardware. To get the most of the available hardware for training large models one can leverage Data Parallelism using ZeRO - Zero Redundancy Optimizer [2].",
+      "spans": [
+        {
+          "start": 0,
+          "end": 328,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Below is a short description of Data Parallelism using ZeRO with diagram from this blog post",
+      "spans": [
+        {
+          "start": 83,
+          "end": 92,
+          "kind": "a",
+          "href": "https://www.microsoft.com/en-us/research/blog/zero-deepspeed-new-system-optimizations-enable-training-models-with-over-100-billion-parameters/"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "(Source: link)",
+      "spans": [
+        {
+          "start": 9,
+          "end": 13,
+          "kind": "a",
+          "href": "https://www.microsoft.com/en-us/research/blog/zero-deepspeed-new-system-optimizations-enable-training-models-with-over-100-billion-parameters/"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "a. Stage 1 : Shards optimizer states across data parallel workers/GPUs",
+      "spans": [
+        {
+          "start": 3,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "b. Stage 2 : Shards optimizer states + gradients across data parallel workers/GPUs",
+      "spans": [
+        {
+          "start": 3,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "c. Stage 3: Shards optimizer states + gradients + model parameters across data parallel workers/GPUs",
+      "spans": [
+        {
+          "start": 3,
+          "end": 10,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "d. Optimizer Offload: Offloads the gradients + optimizer states to CPU/Disk building on top of ZERO Stage 2",
+      "spans": [
+        {
+          "start": 3,
+          "end": 20,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "e. Param Offload: Offloads the model parameters to CPU/Disk building on top of ZERO Stage 3",
+      "spans": [
+        {
+          "start": 3,
+          "end": 16,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "In this blogpost we will look at how to leverage Data Parallelism using ZeRO using Accelerate. DeepSpeed, FairScale and PyTorch FullyShardedDataParallel (FSDP) have implemented the core ideas of the ZERO paper. These have already been integrated in 🤗 transformers Trainer and 🤗 accelerate accompanied by great blogs Fit More and Train Faster With ZeRO via DeepSpeed and FairScale [4] and Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel [5]. We defer the explanation of what goes behind the scenes to those blogs and mainly focus on leveraging DeepSpeed ZeRO using Accelerate.",
+      "spans": [
+        {
+          "start": 95,
+          "end": 104,
+          "kind": "a",
+          "href": "https://github.com/microsoft/deepspeed"
+        },
+        {
+          "start": 95,
+          "end": 104,
+          "kind": "strong"
+        },
+        {
+          "start": 106,
+          "end": 115,
+          "kind": "a",
+          "href": "https://github.com/facebookresearch/fairscale/"
+        },
+        {
+          "start": 106,
+          "end": 115,
+          "kind": "strong"
+        },
+        {
+          "start": 120,
+          "end": 159,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/introducing-pytorch-fully-sharded-data-parallel-api/"
+        },
+        {
+          "start": 120,
+          "end": 159,
+          "kind": "strong"
+        },
+        {
+          "start": 251,
+          "end": 263,
+          "kind": "code"
+        },
+        {
+          "start": 278,
+          "end": 288,
+          "kind": "code"
+        },
+        {
+          "start": 316,
+          "end": 379,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zero-deepspeed-fairscale"
+        },
+        {
+          "start": 388,
+          "end": 461,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/pytorch-fsdp"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Accelerate 🚀: Leverage DeepSpeed ZeRO without any code changes",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Hardware setup: 2X24GB NVIDIA Titan RTX GPUs. 60GB RAM.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "We will look at the task of finetuning encoder-only model for text-classification. We will use pretrained microsoft/deberta-v2-xlarge-mnli (900M params) for finetuning on MRPC GLUE dataset.",
+      "spans": [
+        {
+          "start": 106,
+          "end": 138,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "The code is available here run_cls_no_trainer.py. It is similar to the official text-classification example here with the addition of logic to measure train and eval time. Let's compare performance between Distributed Data Parallel (DDP) and DeepSpeed ZeRO Stage-2 in a Multi-GPU Setup.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 48,
+          "kind": "a",
+          "href": "https://github.com/pacman100/accelerate-deepspeed-test/blob/main/src/modeling/run_cls_no_trainer.py"
+        },
+        {
+          "start": 108,
+          "end": 112,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/blob/main/examples/pytorch/text-classification/run_glue_no_trainer.py"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "To enable DeepSpeed ZeRO Stage-2 without any code changes, please run accelerate config and leverage the Accelerate DeepSpeed Plugin.",
+      "spans": [
+        {
+          "start": 70,
+          "end": 87,
+          "kind": "code"
+        },
+        {
+          "start": 105,
+          "end": 132,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/deepspeed#accelerate-deepspeed-plugin"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "ZeRO Stage-2 DeepSpeed Plugin Example",
+      "spans": [
+        {
+          "start": 0,
+          "end": 37,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Now, run below command for training:",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "In our Single-Node Multi-GPU setup, the maximum batch size that DDP supports without OOM error is 8. In contrast, DeepSpeed Zero-Stage 2 enables batch size of 40 without running into OOM errors. Therefore, DeepSpeed enables to fit 5X more data per GPU when compared to DDP. Below is the snapshot of the plots from wandb run along with benchmarking table comparing DDP vs DeepSpeed.",
+      "spans": [
+        {
+          "start": 231,
+          "end": 233,
+          "kind": "strong"
+        },
+        {
+          "start": 320,
+          "end": 323,
+          "kind": "a",
+          "href": "https://wandb.ai/smangrul/DDP_vs_DeepSpeed_cls_task?workspace=user-smangrul"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Method",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0021",
+      "source": "Batch Size Max",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0022",
+      "source": "Train time per epoch (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0023",
+      "source": "Eval time per epoch (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0024",
+      "source": "F1 score",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0025",
+      "source": "Accuracy",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0026",
+      "source": "DDP (Distributed Data Parallel)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0027",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0028",
+      "source": "103.57",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0029",
+      "source": "2.04",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0030",
+      "source": "0.931",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0031",
+      "source": "0.904",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0032",
+      "source": "DeepSpeed ZeRO Stage 2",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "40",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "28.98",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "1.79",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "0.936",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "0.912",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "Table 1: Benchmarking DeepSpeed ZeRO Stage-2 on DeBERTa-XL (900M) model",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "With this bigger batch size, we observe ~3.5X speed up in total training time without any drop in performance metrics, all this without changing any code. Yay! 🤗.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 45,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "To be able to tweak more options, you will need to use a DeepSpeed config file and minimal code changes. Let's see how to do this.",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Accelerate 🚀: Leverage a DeepSpeed Config file to tweak more options",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "First, We will look at the task of finetuning a sequence-to-sequence model for training our own Chatbot. Specifically, we will finetune facebook/blenderbot-400M-distill on the smangrul/MuDoConv (Multi-Domain Conversation) dataset. The dataset contains conversations from 10 different data sources covering personas, grounding in specific emotional contexts, goal-oriented (e.g., restaurant reservation) and general wikipedia topics (e.g, Cricket).",
+      "spans": [
+        {
+          "start": 136,
+          "end": 168,
+          "kind": "code"
+        },
+        {
+          "start": 176,
+          "end": 193,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/smangrul/MuDoConv"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "The code is available here run_seq2seq_no_trainer.py. Current practice to effectively measure the Engagingness and Humanness of Chatbots is via Human evlauations which are expensive [6]. As such for this example, the metric being tracked is BLEU score (which isn't ideal but is the conventional metric for such tasks). One can adapt the code to train larger T5 models if you have access to GPUs that support bfloat16 precision else you will run into NaN loss values. We will run a quick benchmark on 10000 train samples and 1000 eval samples as we are interested in DeepSpeed vs DDP.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 52,
+          "kind": "a",
+          "href": "https://github.com/pacman100/accelerate-deepspeed-test/blob/main/src/modeling/run_seq2seq_no_trainer.py"
+        },
+        {
+          "start": 98,
+          "end": 110,
+          "kind": "code"
+        },
+        {
+          "start": 115,
+          "end": 124,
+          "kind": "code"
+        },
+        {
+          "start": 408,
+          "end": 416,
+          "kind": "code"
+        },
+        {
+          "start": 450,
+          "end": 453,
+          "kind": "code"
+        },
+        {
+          "start": 500,
+          "end": 505,
+          "kind": "code"
+        },
+        {
+          "start": 524,
+          "end": 528,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "We will leverage the DeepSpeed Zero Stage-2 config zero2_config_accelerate.json (given below) For training. for detailed information on the various config features, please refer DeeSpeed documentation.",
+      "spans": [
+        {
+          "start": 51,
+          "end": 79,
+          "kind": "a",
+          "href": "https://github.com/pacman100/accelerate-deepspeed-test/blob/main/src/modeling/configs/zero2_config_accelerate.json"
+        },
+        {
+          "start": 178,
+          "end": 186,
+          "kind": "a",
+          "href": "https://www.deepspeed.ai"
+        }
+      ]
+    },
+    {
+      "id": "b0045",
+      "source": "To enable DeepSpeed ZeRO Stage-2 with above config, please run accelerate config and provide the config file path when asked. For more details, refer the 🤗 accelerate official documentation for DeepSpeed Config File.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 156,
+          "end": 166,
+          "kind": "code"
+        },
+        {
+          "start": 194,
+          "end": 215,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/accelerate/deepspeed#deepspeed-config-file"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "ZeRO Stage-2 DeepSpeed Config File Example",
+      "spans": [
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Now, run below command for training:",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "When using DeepSpeed config, if user has specified optimizer and scheduler in config, the user will have to use accelerate.utils.DummyOptim and accelerate.utils.DummyScheduler. Those are the only minor changes that the user has to do. Below we show an example of the minimal changes required when using DeepSpeed config:",
+      "spans": [
+        {
+          "start": 51,
+          "end": 60,
+          "kind": "code"
+        },
+        {
+          "start": 65,
+          "end": 74,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 139,
+          "kind": "code"
+        },
+        {
+          "start": 144,
+          "end": 175,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Method",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "Batch Size Max",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "Eval Size Max",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "Train time per epoch (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "Eval time per epoch (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "DDP (Distributed Data Parallel)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "100",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "50",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "27.36",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "48.41",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "DeepSpeed ZeRO Stage 2",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "200",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "100",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "19.06",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "39.27",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "Table 2: Benchmarking DeepSpeed ZeRO Stage-2 on BlenderBot (400M) model",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "In our Single-Node Multi-GPU setup, the maximum batch size that DDP supports without OOM error is 100. In contrast, DeepSpeed Zero-Stage 2 enables batch size of 200 without running into OOM errors. Therefore, DeepSpeed enables to fit 2X more data per GPU when compared to DDP. We observe ~1.44X speedup in training and ~1.23X speedup in evaluation as we are able to fit more data on the same available hardware. As this model is of medium size, the speedup isn't that exciting but this will improve with bigger models. You can chat with the Chatbot trained using the entire data at 🤗 Space smangrul/Chat-E. You can give bot a persona, ground conversation to a particular emotion, use to in goal-oriented tasks or in a free flow manner. Below is a fun conversation with the chatbot 💬. You can find snapshots of more conversations using different contexts here.",
+      "spans": [
+        {
+          "start": 234,
+          "end": 236,
+          "kind": "strong"
+        },
+        {
+          "start": 289,
+          "end": 294,
+          "kind": "strong"
+        },
+        {
+          "start": 320,
+          "end": 325,
+          "kind": "strong"
+        },
+        {
+          "start": 590,
+          "end": 605,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/smangrul/Chat-E"
+        },
+        {
+          "start": 854,
+          "end": 858,
+          "kind": "a",
+          "href": "https://github.com/pacman100/accelerate-deepspeed-test/tree/main/src/chatbot_snapshots"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "CPU/Disk Offloading to enable training humongous models that won’t fit the GPU memory",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "On a single 24GB NVIDIA Titan RTX GPU, one cannot train GPT-XL Model (1.5B parameters) even with a batch size of 1. We will look at how we can use DeepSpeed ZeRO Stage-3 with CPU offloading of optimizer states, gradients and parameters to train GPT-XL Model.",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "We will leverage the DeepSpeed Zero Stage-3 CPU offload config zero3_offload_config_accelerate.json (given below) for training. The rest of the process of using the config with 🤗 accelerate is similar to the above experiment.",
+      "spans": [
+        {
+          "start": 63,
+          "end": 99,
+          "kind": "a",
+          "href": "https://github.com/pacman100/accelerate-deepspeed-test/blob/main/src/modeling/configs/zero3_offload_config_accelerate.json"
+        },
+        {
+          "start": 179,
+          "end": 189,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "ZeRO Stage-3 CPU Offload DeepSpeed Config File Example",
+      "spans": [
+        {
+          "start": 0,
+          "end": 54,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0070",
+      "source": "Now, run below command for training:",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Method",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "Batch Size Max",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "Train time per epoch (seconds)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "Notes",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "DDP (Distributed Data Parallel)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "-",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0078",
+      "source": "OOM Error",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0079",
+      "source": "DeepSpeed ZeRO Stage 3",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0080",
+      "source": "16",
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "6608.35",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "Table 3: Benchmarking DeepSpeed ZeRO Stage-3 CPU Offload on GPT-XL (1.5B) model",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "DDP will result in OOM error even with batch size 1. On the other hand, with DeepSpeed ZeRO Stage-3 CPU offload, we can train with a batch size of 16.",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Finally, please, remember that, 🤗 Accelerate only integrates DeepSpeed, therefore if you have any problems or questions with regards to DeepSpeed usage, please, file an issue with DeepSpeed GitHub.",
+      "spans": [
+        {
+          "start": 34,
+          "end": 44,
+          "kind": "code"
+        },
+        {
+          "start": 180,
+          "end": 196,
+          "kind": "a",
+          "href": "https://github.com/microsoft/DeepSpeed/issues"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "[1] Train Large, Then Compress: Rethinking Model Size for Efficient Training and Inference of Transformers",
+      "spans": [
+        {
+          "start": 4,
+          "end": 106,
+          "kind": "a",
+          "href": "http://nlp.cs.berkeley.edu/pubs/Li-Wallace-Shen-Lin-Keutzer-Klein-Gonzalez_2020_Transformers_paper.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0088",
+      "source": "[2] ZeRO: Memory Optimizations Toward Training Trillion Parameter Models",
+      "spans": [
+        {
+          "start": 4,
+          "end": 72,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/1910.02054v3.pdf"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "[3] DeepSpeed: Extreme-scale model training for everyone - Microsoft Research",
+      "spans": [
+        {
+          "start": 4,
+          "end": 77,
+          "kind": "a",
+          "href": "https://www.microsoft.com/en-us/research/blog/deepspeed-extreme-scale-model-training-for-everyone/"
+        }
+      ]
+    },
+    {
+      "id": "b0090",
+      "source": "[4] Fit More and Train Faster With ZeRO via DeepSpeed and FairScale",
+      "spans": [
+        {
+          "start": 4,
+          "end": 67,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/zero-deepspeed-fairscale"
+        }
+      ]
+    },
+    {
+      "id": "b0091",
+      "source": "[5] Accelerate Large Model Training using PyTorch Fully Sharded Data Parallel",
+      "spans": [
+        {
+          "start": 4,
+          "end": 77,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/pytorch-fsdp"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "[6] Recipes for building an open-domain chatbot",
+      "spans": [
+        {
+          "start": 4,
+          "end": 47,
+          "kind": "a",
+          "href": "https://arxiv.org/pdf/2004.13637.pdf"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "7b61b2ea6db233f0200fc83eba3d3b2c1708e57e2cf375d2daec8be5586a5d89",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "compute_environment: LOCAL_MACHINE\ndeepspeed_config:\n gradient_accumulation_steps: 1\n gradient_clipping: 1.0\n offload_optimizer_device: none\n offload_param_device: none\n zero3_init_flag: false\n zero_stage: 2\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false"
+    },
+    {
+      "id": "c0002",
+      "source": "accelerate launch run_cls_no_trainer.py \\\n  --model_name_or_path \"microsoft/deberta-v2-xlarge-mnli\" \\\n  --task_name \"mrpc\" \\\n  --ignore_mismatched_sizes \\\n  --max_length 128 \\\n  --per_device_train_batch_size 40 \\\n  --learning_rate 2e-5 \\\n  --num_train_epochs 3 \\\n  --output_dir \"/tmp/mrpc/deepspeed_stage2/\" \\\n  --with_tracking \\\n  --report_to \"wandb\" \\"
+    },
+    {
+      "id": "c0003",
+      "source": "{\n    \"fp16\": {\n        \"enabled\": \"true\",\n        \"loss_scale\": 0,\n        \"loss_scale_window\": 1000,\n        \"initial_scale_power\": 15,\n        \"hysteresis\": 2,\n        \"min_loss_scale\": 1\n    },\n    \"optimizer\": {\n        \"type\": \"AdamW\",\n        \"params\": {\n            \"lr\": \"auto\",\n            \"weight_decay\": \"auto\",\n            \"torch_adam\": true,\n            \"adam_w_mode\": true\n        }\n    },\n    \"scheduler\": {\n        \"type\": \"WarmupDecayLR\",\n        \"params\": {\n            \"warmup_min_lr\": \"auto\",\n            \"warmup_max_lr\": \"auto\",\n            \"warmup_num_steps\": \"auto\",\n            \"total_num_steps\": \"auto\"\n        }\n    },\n    \"zero_optimization\": {\n        \"stage\": 2,\n        \"allgather_partitions\": true,\n        \"allgather_bucket_size\": 2e8,\n        \"overlap_comm\": true,\n        \"reduce_scatter\": true,\n        \"reduce_bucket_size\": 2e8,\n        \"contiguous_gradients\": true\n    },\n    \"gradient_accumulation_steps\": 1,\n    \"gradient_clipping\": \"auto\",\n    \"steps_per_print\": 2000,\n    \"train_batch_size\": \"auto\",\n    \"train_micro_batch_size_per_gpu\": \"auto\",\n    \"wall_clock_breakdown\": false\n}"
+    },
+    {
+      "id": "c0004",
+      "source": "compute_environment: LOCAL_MACHINE\ndeepspeed_config:\n deepspeed_config_file: /path/to/zero2_config_accelerate.json\n zero3_init_flag: false\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false"
+    },
+    {
+      "id": "c0005",
+      "source": "accelerate launch run_seq2seq_no_trainer.py \\\n    --dataset_name \"smangrul/MuDoConv\" \\\n    --max_source_length 128 \\\n    --source_prefix \"chatbot: \" \\\n    --max_target_length 64 \\\n    --val_max_target_length 64 \\\n    --val_min_target_length 20 \\\n    --n_val_batch_generations 5 \\\n    --n_train 10000 \\\n    --n_val 1000 \\\n    --pad_to_max_length \\\n    --num_beams 10 \\\n    --model_name_or_path \"facebook/blenderbot-400M-distill\" \\\n    --per_device_train_batch_size 200 \\\n    --per_device_eval_batch_size 100 \\\n    --learning_rate 1e-6 \\\n    --weight_decay 0.0 \\\n    --num_train_epochs 1 \\\n    --gradient_accumulation_steps 1 \\\n    --num_warmup_steps 100 \\\n    --output_dir \"/tmp/deepspeed_zero_stage2_accelerate_test\" \\\n    --seed 25 \\\n    --logging_steps 100 \\\n    --with_tracking \\\n    --report_to \"wandb\" \\\n    --report_name \"blenderbot_400M_finetuning\""
+    },
+    {
+      "id": "c0006",
+      "source": "- optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=args.learning_rate)\n+ optimizer = accelerate.utils.DummyOptim(optimizer_grouped_parameters, lr=args.learning_rate)\n\n- lr_scheduler = get_scheduler(\n-     name=args.lr_scheduler_type,\n-     optimizer=optimizer,\n-     num_warmup_steps=args.num_warmup_steps,\n-     num_training_steps=args.max_train_steps,\n- )\n\n+ lr_scheduler = accelerate.utils.DummyScheduler(\n+     optimizer, total_num_steps=args.max_train_steps, warmup_num_steps=args.num_warmup_steps\n+ )"
+    },
+    {
+      "id": "c0007",
+      "source": "{\n    \"fp16\": {\n        \"enabled\": true,\n        \"loss_scale\": 0,\n        \"loss_scale_window\": 1000,\n        \"initial_scale_power\": 16,\n        \"hysteresis\": 2,\n        \"min_loss_scale\": 1\n    },\n    \"optimizer\": {\n        \"type\": \"AdamW\",\n        \"params\": {\n            \"lr\": \"auto\",\n            \"weight_decay\": \"auto\"\n        }\n    },\n    \"scheduler\": {\n        \"type\": \"WarmupDecayLR\",\n        \"params\": {\n            \"warmup_min_lr\": \"auto\",\n            \"warmup_max_lr\": \"auto\",\n            \"warmup_num_steps\": \"auto\",\n            \"total_num_steps\": \"auto\"\n        }\n    },\n    \"zero_optimization\": {\n        \"stage\": 3,\n        \"offload_optimizer\": {\n            \"device\": \"cpu\",\n            \"pin_memory\": true\n        },\n        \"offload_param\": {\n            \"device\": \"cpu\",\n            \"pin_memory\": true\n        },\n        \"overlap_comm\": true,\n        \"contiguous_gradients\": true,\n        \"reduce_bucket_size\": \"auto\",\n        \"stage3_prefetch_bucket_size\": \"auto\",\n        \"stage3_param_persistence_threshold\": \"auto\",\n        \"sub_group_size\": 1e9,\n        \"stage3_max_live_parameters\": 1e9,\n        \"stage3_max_reuse_distance\": 1e9,\n        \"stage3_gather_16bit_weights_on_model_save\": true\n    },\n    \"gradient_accumulation_steps\": 1,\n    \"gradient_clipping\": \"auto\",\n    \"steps_per_print\": 2000,\n    \"train_batch_size\": \"auto\",\n    \"train_micro_batch_size_per_gpu\": \"auto\",\n    \"wall_clock_breakdown\": false\n}"
+    },
+    {
+      "id": "c0008",
+      "source": "compute_environment: LOCAL_MACHINE\ndeepspeed_config:\n deepspeed_config_file: /path/to/zero3_offload_config_accelerate.json\n zero3_init_flag: true\ndistributed_type: DEEPSPEED\nfsdp_config: {}\nmachine_rank: 0\nmain_process_ip: null\nmain_process_port: null\nmain_training_function: main\nmixed_precision: fp16\nnum_machines: 1\nnum_processes: 2\nuse_cpu: false"
+    },
+    {
+      "id": "c0009",
+      "source": "accelerate launch run_clm_no_trainer.py \\\n--config_name \"gpt2-xl\" \\\n--tokenizer_name \"gpt2-xl\" \\\n--dataset_name \"wikitext\" \\\n--dataset_config_name \"wikitext-2-raw-v1\" \\\n--block_size 128 \\\n--output_dir \"/tmp/clm_deepspeed_stage3_offload__accelerate\" \\\n--learning_rate 5e-4 \\\n--per_device_train_batch_size 16 \\\n--per_device_eval_batch_size 1 \\\n--num_train_epochs 1 \\\n--with_tracking \\\n--report_to \"wandb\"\\"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "7b61b2ea6db233f0200fc83eba3d3b2c1708e57e2cf375d2daec8be5586a5d89",
+  "mediaLayout": [
+    {
+      "mediaId": "image_82773f1d47e0d27c",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 0
+    },
+    {
+      "mediaId": "image_f7a2ecf0bc68335e",
+      "type": "image",
+      "afterBlockId": "b0019",
+      "order": 1
+    },
+    {
+      "mediaId": "image_5314ecc98a047346",
+      "type": "image",
+      "afterBlockId": "b0065",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "articleKind": "page",
+  "bodyFormatVersion": 3,
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-05T07:43:47.240358Z",
+  "mediaLayoutCheckedAt": "2026-10-05T07:43:47.240376Z"
 }
