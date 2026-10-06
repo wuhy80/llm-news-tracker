@@ -2,6 +2,10 @@
 
 一个零后端、零运行费用的大模型行业情报站。它用 GitHub Actions 定时聚合公开信息源，将结果保存为 JSON，并通过 GitHub Pages 展示日、周、月三个维度的动态。
 
+<!-- resource-usage:start -->
+_资源占用看板由 `resource-usage.yml` 每周一自动写入。_
+<!-- resource-usage:end -->
+
 ## 关注范围
 
 - 行业落地：企业采用、产品集成、商业案例与生产部署
