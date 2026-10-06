@@ -27,8 +27,9 @@ class GrowthTests(unittest.TestCase):
 
         self.assertAlmostEqual(usage.growth_per_day(history, "repoBytes", NOW), 100.0)
 
-    def test_runway_covers_zero_growth_over_limit_days_and_months(self):
-        self.assertEqual(usage.human_runway(0, 1024, None), "增长为 0，无法估算")
+    def test_runway_covers_unknown_zero_over_limit_days_and_months(self):
+        self.assertEqual(usage.human_runway(0, 1024, None), "样本不足")
+        self.assertEqual(usage.human_runway(0, 1024, 0), "增长为 0 或下降")
         self.assertEqual(usage.human_runway(2048, 1024, 10), "**已超出**")
         self.assertIn("天", usage.human_runway(1024 - 100, 1024, 10))
         self.assertIn("个月", usage.human_runway(1024 - 10_000_000, 1024, 1000))

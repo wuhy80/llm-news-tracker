@@ -169,8 +169,12 @@ def human_runway(current: float | None, limit: float, growth: float | None) -> s
         return "—"
     if current >= limit:
         return "**已超出**"
-    if not growth or growth <= 0:
-        return "增长为 0，无法估算"
+    # Unknown and zero are different answers: one means "not enough history yet",
+    # the other means the number is genuinely flat.
+    if growth is None:
+        return "样本不足"
+    if growth <= 0:
+        return "增长为 0 或下降"
     days = (limit - current) / growth
     if days >= 60:
         return f"约 {days / 30.4:,.1f} 个月"
