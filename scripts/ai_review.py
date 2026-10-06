@@ -114,6 +114,20 @@ def is_community_item(item: dict) -> bool:
     return item.get("articleKind") == "community" or "reddit" in source or "linux do" in source or "linux.do" in source
 
 
+# Release feeds publish one of these per commit, and the reviewer was rating them
+# as worth reading: a sample of level four and five items included
+# "v0.40.0-rc4: MLX: version bump (#18720)" and
+# "b11434: hexagon: ssm-conv updates (#29971)". They carry no new information, so
+# they are capped the same way an acknowledged rehash is.
+PULL_REQUEST_REF = re.compile(r"\(#\d+\)")
+VERSION_ONLY_TITLE = re.compile(r"^[^\d]{0,24}v?\d+(?:\.\d+)+(?:[-+][\w.-]+)?$", re.IGNORECASE)
+
+
+def is_routine_release(item: dict) -> bool:
+    title = str(item.get("title") or "").strip()
+    return bool(PULL_REQUEST_REF.search(title) or VERSION_ONLY_TITLE.match(title))
+
+
 def compact_text(value: object, limit: int) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
 
@@ -244,6 +258,8 @@ def normalize_review(raw: dict, item: dict, provider: str, model: str, reviewed_
         # a third of the feed, so they rank below official posts of similar
         # quality. Still level three: worth reading, below the important tier.
         score_ceiling = min(score_ceiling, 59)
+    if is_routine_release(item):
+        score_ceiling = min(score_ceiling, 49)
     dimensions = cap_dimensions(dimensions, score_ceiling)
     score = sum(dimensions.values())
     importance_level = level_for_score(score)

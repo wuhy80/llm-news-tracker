@@ -160,8 +160,12 @@ function itemLevel(item) {
     ? Math.max(1, Math.min(5, review(item).importanceLevel))
     : levelForScore(itemScore(item));
 }
+// The 精选 default. The reviewer rates about half the archive at level four or
+// five, so a threshold of three was showing two thirds of everything and
+// filtered almost nothing.
+const FEATURED_MIN_LEVEL = 4;
 function aiModeMatch(item) {
-  return state.aiMode === "all" || (review(item)?.isRelevant !== false && itemLevel(item) >= 3);
+  return state.aiMode === "all" || (review(item)?.isRelevant !== false && itemLevel(item) >= FEATURED_MIN_LEVEL);
 }
 function importanceMatch(item) {
   return state.importance === "all" || itemLevel(item) >= Number(state.importance);

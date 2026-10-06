@@ -168,6 +168,44 @@ class AIReviewTests(unittest.TestCase):
 
         self.assertEqual((result["importanceScore"], result["importanceLevel"]), (59, 3))
 
+    def test_a_routine_release_note_is_capped_like_a_rehash(self):
+        raw = {
+            "isRelevant": True,
+            "category": "release",
+            "dimensions": {name: maximum for name, maximum in ai_review.DIMENSION_LIMITS.items()},
+            "evidenceLevel": "clear",
+            "informationType": "original",
+            "tags": [],
+            "reasonZh": "例行版本更新。",
+            "summaryZh": "版本号更新。",
+            "duplicateKey": "release-bump",
+        }
+        item = {"title": "v0.40.0-rc4: MLX: version bump (#18720)", "source": "Ollama Releases",
+                "score": 60, "tags": []}
+
+        result = ai_review.normalize_review(raw, item, "gemini", "model", "2026-01-01T00:00:00Z")
+
+        self.assertEqual((result["importanceScore"], result["importanceLevel"]), (49, 2))
+
+    def test_an_ordinary_release_title_is_not_capped(self):
+        raw = {
+            "isRelevant": True,
+            "category": "release",
+            "dimensions": {name: maximum for name, maximum in ai_review.DIMENSION_LIMITS.items()},
+            "evidenceLevel": "clear",
+            "informationType": "original",
+            "tags": [],
+            "reasonZh": "发布了一个新模型。",
+            "summaryZh": "新模型发布。",
+            "duplicateKey": "real-release",
+        }
+        item = {"title": "Introducing Qwen 3.8 with a new coder variant", "source": "Qwen · 通义千问",
+                "score": 60, "tags": []}
+
+        result = ai_review.normalize_review(raw, item, "gemini", "model", "2026-01-01T00:00:00Z")
+
+        self.assertEqual(result["importanceLevel"], 5)
+
     def test_glossary_is_removed_below_level_four(self):
         raw = {
             "isRelevant": True,
