@@ -168,6 +168,24 @@ class AIReviewTests(unittest.TestCase):
 
         self.assertEqual((result["importanceScore"], result["importanceLevel"]), (59, 3))
 
+    def test_announcements_that_end_in_a_version_are_not_routine(self):
+        # An earlier pattern allowed a 24-character prefix before the number and
+        # quietly demoted "Introducing Qwen1.5" to level two.
+        for title in ("Introducing Qwen1.5",
+                      "Introducing Qwen 3.8 with a new coder variant",
+                      "Take on your most ambitious work with GPT-6 Astra on Amazon Bedrock"):
+            with self.subTest(title=title):
+                self.assertFalse(ai_review.is_routine_release({"title": title}))
+
+    def test_routine_release_titles_are_still_caught(self):
+        for title in ("v0.40.0-rc4: MLX: version bump (#18720)",
+                      "b11434: hexagon: ssm-conv updates (#29971)",
+                      "v0.31.0",
+                      "v0.6.0",
+                      "langgraph==1.2.13"):
+            with self.subTest(title=title):
+                self.assertTrue(ai_review.is_routine_release({"title": title}))
+
     def test_a_routine_release_note_is_capped_like_a_rehash(self):
         raw = {
             "isRelevant": True,

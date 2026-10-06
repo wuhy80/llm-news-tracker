@@ -119,13 +119,21 @@ def is_community_item(item: dict) -> bool:
 # "v0.40.0-rc4: MLX: version bump (#18720)" and
 # "b11434: hexagon: ssm-conv updates (#29971)". They carry no new information, so
 # they are capped the same way an acknowledged rehash is.
+#
+# The version patterns are deliberately strict. An earlier version allowed a
+# 24-character prefix before the number, which also matched "Introducing Qwen1.5"
+# and silently demoted a real announcement to level two. Missing a routine title
+# costs nothing; demoting a real release does not.
 PULL_REQUEST_REF = re.compile(r"\(#\d+\)")
-VERSION_ONLY_TITLE = re.compile(r"^[^\d]{0,24}v?\d+(?:\.\d+)+(?:[-+][\w.-]+)?$", re.IGNORECASE)
+BARE_VERSION = re.compile(r"^v?\d+(?:\.\d+)+(?:[-+][\w.-]+)?$", re.IGNORECASE)
+PINNED_PACKAGE = re.compile(r"^[\w.-]+==\d+(?:\.\d+)+(?:[-+][\w.-]+)?$")
 
 
 def is_routine_release(item: dict) -> bool:
     title = str(item.get("title") or "").strip()
-    return bool(PULL_REQUEST_REF.search(title) or VERSION_ONLY_TITLE.match(title))
+    return bool(PULL_REQUEST_REF.search(title)
+                or BARE_VERSION.match(title)
+                or PINNED_PACKAGE.match(title))
 
 
 def compact_text(value: object, limit: int) -> str:
