@@ -182,9 +182,25 @@ class AIReviewTests(unittest.TestCase):
                       "b11434: hexagon: ssm-conv updates (#29971)",
                       "v0.31.0",
                       "v0.6.0",
-                      "langgraph==1.2.13"):
+                      "langgraph==1.2.13",
+                      "b11456",
+                      "B11456",
+                      "build 11456",
+                      "build-11456"):
             with self.subTest(title=title):
                 self.assertTrue(ai_review.is_routine_release({"title": title}))
+
+    def test_a_short_b_or_a_real_title_is_not_a_build_number(self):
+        # b2024 deliberately absent: b plus four digits is a build number, whatever
+        # it might have meant in another life.
+        for title in ("b12",
+                      "b1",
+                      "b999",
+                      "llama.cpp b11456 版本发布",
+                      "b11456: ggml-cuda: per-thread stream for buffer-init padding",
+                      "Introducing Qwen1.5"):
+            with self.subTest(title=title):
+                self.assertFalse(ai_review.is_routine_release({"title": title}))
 
     def test_a_routine_release_note_is_capped_like_a_rehash(self):
         raw = {
