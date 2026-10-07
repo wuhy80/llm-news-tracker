@@ -125,19 +125,39 @@ def is_community_item(item: dict) -> bool:
 # and silently demoted a real announcement to level two. Missing a routine title
 # costs nothing; demoting a real release does not.
 PULL_REQUEST_REF = re.compile(r"\(#\d+\)")
-BARE_VERSION = re.compile(r"^v?\d+(?:\.\d+)+(?:[-+][\w.-]+)?$", re.IGNORECASE)
 PINNED_PACKAGE = re.compile(r"^[\w.-]+==\d+(?:\.\d+)+(?:[-+][\w.-]+)?$")
+VERSION_TAG = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?([-+][\w.-]+)?$", re.IGNORECASE)
+
+
+def is_routine_version(title: str) -> bool:
+    """A patch release or a pre-release is routine; a minor or major bump is not.
+
+    Release feeds title their items with the bare tag, so this decides whether a
+    real release reaches the reviewer at full strength. An earlier rule capped
+    every bare version, which hid v0.35.0 and would have hidden v1.0.0 too.
+    """
+    match = VERSION_TAG.match(title)
+    if not match:
+        return False
+    patch, suffix = match.group(3), match.group(4)
+    if suffix:
+        return True                      # -rc1, -alpha, -beta
+    return patch is not None and patch != "0"
+
+
 # llama.cpp tags every master build as b<number>, and its release feed publishes
 # exactly that: 54 bare build numbers arrived in six days, most of them rated
-# level five. A build number is not a release anyone needs to read about. Four
-# digits minimum, so a short word like "b12" is not mistaken for one.
-BARE_BUILD = re.compile(r"^(?:b\d{4,}|build[ -]?\d{3,})$", re.IGNORECASE)
+# level five. A build number is not a release anyone needs to read about. It is
+# matched as a prefix because the feed sometimes appends a commit subject without
+# a pull-request reference, and four digits minimum so a short word like "b12" is
+# not mistaken for one.
+BARE_BUILD = re.compile(r"^(?:b\d{4,}|build[ -]?\d{3,})\b", re.IGNORECASE)
 
 
 def is_routine_release(item: dict) -> bool:
     title = str(item.get("title") or "").strip()
     return bool(PULL_REQUEST_REF.search(title)
-                or BARE_VERSION.match(title)
+                or is_routine_version(title)
                 or PINNED_PACKAGE.match(title)
                 or BARE_BUILD.match(title))
 
