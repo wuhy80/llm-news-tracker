@@ -36,7 +36,10 @@ class RecapTests(unittest.TestCase):
     def make_tree(self, root):
         self.write_snapshot(root, "2026/10/06/a.json", "v0.40.0-rc4: MLX: version bump (#18720)", 100, 5)
         self.write_snapshot(root, "2026/10/06/b.json", "Introducing Qwen 3.8 with a new coder variant", 100, 5)
-        self.write_snapshot(root, "2026/10/06/c.json", "v0.6.0", 40, 2)
+        # A routine patch that is already inside the ceiling: matched, not changed.
+        # It used to be "v0.6.0", which the rules no longer treat as routine at all,
+        # since a minor bump is a release rather than a patch.
+        self.write_snapshot(root, "2026/10/06/c.json", "v0.6.2", 40, 2)
         return root
 
     def test_only_routine_titles_above_the_ceiling_are_changed(self):
