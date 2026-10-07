@@ -129,9 +129,11 @@ BARE_VERSION = re.compile(r"^v?\d+(?:\.\d+)+(?:[-+][\w.-]+)?$", re.IGNORECASE)
 PINNED_PACKAGE = re.compile(r"^[\w.-]+==\d+(?:\.\d+)+(?:[-+][\w.-]+)?$")
 # llama.cpp tags every master build as b<number>, and its release feed publishes
 # exactly that: 54 bare build numbers arrived in six days, most of them rated
-# level five. A build number is not a release anyone needs to read about. Four
-# digits minimum, so a short word like "b12" is not mistaken for one.
-BARE_BUILD = re.compile(r"^(?:b\d{4,}|build[ -]?\d{3,})$", re.IGNORECASE)
+# level five. A build number is not a release anyone needs to read about. It is
+# matched as a prefix because the feed sometimes appends a commit subject without
+# a pull-request reference, and four digits minimum so a short word like "b12" is
+# not mistaken for one.
+BARE_BUILD = re.compile(r"^(?:b\d{4,}|build[ -]?\d{3,})\b", re.IGNORECASE)
 
 
 def is_routine_release(item: dict) -> bool:

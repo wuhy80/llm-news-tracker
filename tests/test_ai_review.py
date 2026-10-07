@@ -186,7 +186,8 @@ class AIReviewTests(unittest.TestCase):
                       "b11456",
                       "B11456",
                       "build 11456",
-                      "build-11456"):
+                      "build-11456",
+                      "b11456: ggml-cuda: per-thread stream for buffer-init padding"):
             with self.subTest(title=title):
                 self.assertTrue(ai_review.is_routine_release({"title": title}))
 
@@ -197,7 +198,7 @@ class AIReviewTests(unittest.TestCase):
                       "b1",
                       "b999",
                       "llama.cpp b11456 版本发布",
-                      "b11456: ggml-cuda: per-thread stream for buffer-init padding",
+                      "Building a local inference box",
                       "Introducing Qwen1.5"):
             with self.subTest(title=title):
                 self.assertFalse(ai_review.is_routine_release({"title": title}))
