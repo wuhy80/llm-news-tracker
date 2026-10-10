@@ -145,10 +145,11 @@ def prepare_routing(root, providers, worker, now=None):
     if report.get('evaluationDate') == today:
         # The order selects the workers, and today's evaluation ran before this
         # provider existed, so a newly configured provider would never be started.
-        # Append it now so it takes part immediately; tomorrow's evaluation scores it
-        # properly and places it on merit.
+        # Append the ones the evaluation never saw, which is not the same as the ones
+        # it dropped: a provider that failed the fixture must stay out.
         order = [p for p in report.get('order') or [] if p in providers]
-        missing = [p for p in providers if p not in order]
+        evaluated = {result.get('provider') for result in report.get('results') or []}
+        missing = [p for p in providers if p not in order and p not in evaluated]
         if not missing:
             return report
         report['order'] = order + missing

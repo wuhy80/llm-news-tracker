@@ -38,11 +38,29 @@ class ProviderTests(unittest.TestCase):
             (root / 'provider-ranking.json').write_text(json.dumps({
                 'schemaVersion': 1, 'evaluationDate': today,
                 'order': ['gemini', 'groq'], 'selectedModels': {'gemini': 'gemini-3.8-flash'},
+                'results': [{'provider': 'gemini', 'model': 'gemini-3.8-flash', 'status': 'passed'},
+                            {'provider': 'groq', 'model': 'qwen/qwen3.8-27b', 'status': 'quality_failed'}],
             }), encoding='utf-8')
 
             report = routing.prepare_routing(root, ['gemini', 'groq', 'nowcoding'], MagicMock())
 
+        # nowcoding was never evaluated, so it joins the run immediately.
         self.assertEqual(report['order'], ['gemini', 'groq', 'nowcoding'])
+
+    def test_a_provider_that_failed_the_fixture_is_not_promoted_by_the_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            (root / 'provider-ranking.json').write_text(json.dumps({
+                'schemaVersion': 1, 'evaluationDate': today, 'order': ['gemini'],
+                'results': [{'provider': 'gemini', 'status': 'passed'},
+                            {'provider': 'groq', 'status': 'quality_failed'}],
+            }), encoding='utf-8')
+
+            report = routing.prepare_routing(root, ['gemini', 'groq'], MagicMock())
+
+        # groq was evaluated and failed; the cache must not promote it back in.
+        self.assertEqual(report['order'], ['gemini'])
 
     def test_a_cached_order_is_returned_untouched_when_nothing_is_missing(self):
         with tempfile.TemporaryDirectory() as directory:
