@@ -27,6 +27,22 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_an_article_started_by_a_running_provider_stays_with_it(self):
+        # Ownership has to outlive one process, or a run that stops mid-article
+        # hands the rest to another provider and the article comes out in two voices.
+        coordinator = tr.ArticleCoordinator()
+        coordinator.running = {'gemini'}
+        coordinator.data = {'items': [{'id': 'aaa'}, {'id': 'bbb'}, {'id': 'ccc'}]}
+        records = {'aaa': {'provider': 'gemini'}, 'bbb': {'provider': 'groq'}, 'ccc': {}}
+
+        with patch.object(tr, 'translation_path', side_effect=lambda item: Path(f"/tmp/{item['id']}.json")), \
+             patch.object(tr, 'read_json', side_effect=lambda path: records[Path(path).stem]):
+            coordinator.seed_owners()
+
+        # gemini is running, so its article is owned; groq is absent, so its article
+        # stays unowned and anyone may finish it rather than waiting forever.
+        self.assertEqual(coordinator.owners, {'aaa': 'gemini'})
+
     def test_every_provider_is_paced_and_openai_shaped(self):
         # RateControl indexes MIN_INTERVAL by provider name, so a provider without
         # an entry raises KeyError the first time it is paced.

@@ -650,6 +650,29 @@ class ArticleCoordinator:
         self.condition = threading.Condition()
         self.owners = {}
         self.prepared = False
+        # Providers running in this process; ownership is seeded from the records
+        # of these only, so an article is not stranded on a provider that is absent.
+        self.running = set()
+
+    def seed_owners(self):
+        """Keep an article on the provider that already started translating it.
+
+        Ownership used to span one process, so a run that stopped mid-article
+        handed the rest to whichever provider claimed it next and the article came
+        out in two voices. A record naming a provider that is running now starts
+        out owned by it. A record naming a provider that is not running stays
+        unowned, so anyone may finish it rather than it waiting forever.
+        """
+        for item in self.data['items']:
+            try:
+                record = read_json(translation_path(item))
+            except (KeyError, ValueError):
+                # An item without a usable publishedAt cannot have a record, and a
+                # single malformed item is not a reason to abandon the whole run.
+                continue
+            provider = (record or {}).get('provider')
+            if provider in self.running:
+                self.owners[item['id']] = provider
 
     def prepare(self):
         with self.condition:
@@ -659,6 +682,7 @@ class ArticleCoordinator:
                 self.requests = sync_requests()
                 self.data['items'] = resolve_items(self.data.get('items', []), self.requests)
                 publish_queue(self.requests, self.data['items'])
+                self.seed_owners()
                 self.prepared = True
             return self.data, self.requests
 
@@ -1035,6 +1059,9 @@ def main() -> int:
     atomic_write_json(RUNTIME_FILE, runtime)
     results = []
     coordinator = ArticleCoordinator()
+    # Seeded before any worker calls prepare(), so an article already started by one
+    # of these providers stays with it for the rest of its translation.
+    coordinator.running = set(providers)
     runtime.update(executionMode='parallel', maxConcurrentProviders=len(providers))
     runtime['providers'] = {p: {'runStatus': 'running'} for p in providers}
     atomic_write_json(RUNTIME_FILE, runtime)

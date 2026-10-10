@@ -333,6 +333,19 @@ function applyReadingPreferences() {
   if (elements.wordWiseToggle) elements.wordWiseToggle.checked = readingState.wordWise;
 }
 
+function translationCredit() {
+  let element = document.getElementById("translationCredit");
+  if (!element) {
+    element = document.createElement("p");
+    element.id = "translationCredit";
+    element.className = "reader-translation-credit";
+    // Sits after the body, not inside it, so renderBody's replaceChildren cannot
+    // wipe it when the article is redrawn.
+    elements.articleBody.after(element);
+  }
+  return element;
+}
+
 function updateTranslationToolbar() {
   const translations = translatedBlocks();
   window.LLMTranslationQueue?.mount(document.getElementById("requestTranslation"), readingState.item, readingState.translation?.status === "complete");
@@ -348,6 +361,17 @@ function updateTranslationToolbar() {
     elements.translationProgress.textContent = complete ? `译文完成 · ${total} 段` : `翻译进行中 · ${translated}/${total} 段`;
   } else {
     elements.translationProgress.textContent = wordWise.length ? "Word Wise 词汇提示" : "译文准备中";
+  }
+  // The record names the provider and model that produced the translation.
+  const record = readingState.translation;
+  const model = String(record?.model || record?.requestedModel || "").trim();
+  const provider = String(record?.provider || "").trim();
+  const credit = translationCredit();
+  if (model) {
+    credit.textContent = `译文由 ${model}${provider && provider !== "local" ? `（${provider}）` : ""} 生成 · 机器翻译，仅供参考`;
+    credit.hidden = false;
+  } else {
+    credit.hidden = true;
   }
   applyReadingPreferences();
 }
