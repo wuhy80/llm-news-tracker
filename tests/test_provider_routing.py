@@ -8,6 +8,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import translate_articles as tr
@@ -27,6 +28,33 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_a_provider_added_after_todays_evaluation_still_runs(self):
+        # The order is what selects the workers. A provider configured after today's
+        # evaluation is missing from the cached order, and used to be dropped from
+        # the run entirely until the next day.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            (root / 'provider-ranking.json').write_text(json.dumps({
+                'schemaVersion': 1, 'evaluationDate': today,
+                'order': ['gemini', 'groq'], 'selectedModels': {'gemini': 'gemini-3.8-flash'},
+            }), encoding='utf-8')
+
+            report = routing.prepare_routing(root, ['gemini', 'groq', 'nowcoding'], MagicMock())
+
+        self.assertEqual(report['order'], ['gemini', 'groq', 'nowcoding'])
+
+    def test_a_cached_order_is_returned_untouched_when_nothing_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            cached = {'schemaVersion': 1, 'evaluationDate': today, 'order': ['gemini', 'groq']}
+            (root / 'provider-ranking.json').write_text(json.dumps(cached), encoding='utf-8')
+
+            report = routing.prepare_routing(root, ['gemini', 'groq'], MagicMock())
+
+        self.assertEqual(report['order'], ['gemini', 'groq'])
+
     def test_an_article_started_by_a_running_provider_stays_with_it(self):
         # Ownership has to outlive one process, or a run that stops mid-article
         # hands the rest to another provider and the article comes out in two voices.

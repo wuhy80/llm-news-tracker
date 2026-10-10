@@ -143,6 +143,16 @@ def prepare_routing(root, providers, worker, now=None):
     path = root / 'provider-ranking.json'
     report = read(path)
     if report.get('evaluationDate') == today:
+        # The order selects the workers, and today's evaluation ran before this
+        # provider existed, so a newly configured provider would never be started.
+        # Append it now so it takes part immediately; tomorrow's evaluation scores it
+        # properly and places it on merit.
+        order = [p for p in report.get('order') or [] if p in providers]
+        missing = [p for p in providers if p not in order]
+        if not missing:
+            return report
+        report['order'] = order + missing
+        atomic_write_json(path, report)
         return report
     previous = report
     report = {'schemaVersion': 1, 'evaluationDate': today, 'startedAt': now.isoformat(),
