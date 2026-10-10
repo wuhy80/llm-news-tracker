@@ -429,7 +429,8 @@ def request_translation(token: str, model: str, chunk: list[dict[str, str]], end
             "User-Agent": "LLM-Pulse/1.0",
         },
     )
-    provider = direct or ('bigmodel' if endpoint == BIGMODEL_ENDPOINT else 'openrouter')
+    provider = direct or next((name for name, spec in PROVIDERS.items()
+                               if spec['endpoint'] == endpoint), 'openrouter')
     with track_request(provider, model) as accounting:
         with urllib.request.urlopen(request, timeout=180) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
@@ -726,6 +727,20 @@ def run_provider(provider: str = "openrouter", coordinator=None) -> int:
             coordinator.release(provider)
 
 
+def pool_for(provider: str, health_file: Path, model: str):
+    """A provider that declares its models uses them directly.
+
+    Only OpenRouter (models: []) needs the live zero-price catalog. Using that pool
+    for any other provider selects an OpenRouter model name and sends it to a
+    different endpoint, which is never what the provider table asked for.
+    """
+    if provider == 'bigmodel':
+        return BigModelPool(health_file)
+    if PROVIDERS[provider]['models']:
+        return DirectModelPool(health_file, model)
+    return ModelPool(health_file, model)
+
+
 def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "4")))
@@ -810,8 +825,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         return 0
 
     try:
-        pool = (BigModelPool(health_file) if provider == "bigmodel" else
-                DirectModelPool(health_file, model) if provider in ('groq', 'gemini') else ModelPool(health_file, model))
+        pool = pool_for(provider, health_file, model)
         model = pool.select()
         print(f"[translate:model] {provider}: selected {model}")
     except Exception as error:

@@ -28,6 +28,28 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_a_provider_that_declares_models_never_uses_the_openrouter_catalog(self):
+        # ModelPool selects from OpenRouter's zero-price catalog, and constructing it
+        # fetches that catalog over the network, so the classes are mocked here. Using
+        # it for another provider sent an OpenRouter model name to that provider's
+        # endpoint, which is how a relay ended up being asked for
+        # google/gemma-4-31b-it:free instead of the model its table entry names.
+        health = Path('/tmp/health.json')
+        with patch.object(tr, 'ModelPool') as catalog, \
+             patch.object(tr, 'DirectModelPool') as direct, \
+             patch.object(tr, 'BigModelPool') as bigmodel:
+            for provider in ('gemini', 'groq', 'nowcoding'):
+                with self.subTest(provider=provider):
+                    tr.pool_for(provider, health, routing.PROVIDERS[provider]['models'][0])
+                    self.assertEqual(direct.call_count, 1)
+                    direct.reset_mock()
+            tr.pool_for('bigmodel', health, 'glm-4.7-flash')
+            tr.pool_for('openrouter', health, '')
+
+        self.assertEqual(bigmodel.call_count, 1)
+        self.assertEqual(catalog.call_count, 1)
+        self.assertEqual(direct.call_count, 0)
+
     def test_a_provider_added_after_todays_evaluation_still_runs(self):
         # The order is what selects the workers. A provider configured after today's
         # evaluation is missing from the cached order, and used to be dropped from
