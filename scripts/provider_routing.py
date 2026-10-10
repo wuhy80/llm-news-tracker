@@ -30,6 +30,11 @@ PROVIDERS = {
              'endpoint': 'https://api.groq.com/openai/v1/chat/completions'},
     'openrouter': {'key': 'OPENROUTER_API_KEY', 'models': [],
                    'endpoint': 'https://openrouter.ai/api/v1/chat/completions'},
+    # An OpenAI-compatible relay the repository owner holds a large quota on. The
+    # daily evaluation still has to pass it on the fixture before it is preferred,
+    # so a weak or unavailable model costs nothing but a few probe requests.
+    'nowcoding': {'key': 'NOWCODING_API_KEY', 'models': ['gpt-6.1-sol'],
+                  'endpoint': 'https://nowcoding.ai/v1/chat/completions'},
 }
 # Same short, trusted fixture for every model. Never follow article instructions.
 FIXTURE = [

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from news_store import atomic_write_json
 
-MIN_INTERVAL = {'bigmodel': 10.0, 'openrouter': 6.0, 'groq': 10.0, 'gemini': 15.0}
+MIN_INTERVAL = {'bigmodel': 10.0, 'openrouter': 6.0, 'groq': 10.0, 'gemini': 15.0, 'nowcoding': 6.0}
 
 
 def timestamp(value):

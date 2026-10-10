@@ -27,6 +27,25 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_every_provider_is_paced_and_openai_shaped(self):
+        # RateControl indexes MIN_INTERVAL by provider name, so a provider without
+        # an entry raises KeyError the first time it is paced.
+        from api_rate_control import MIN_INTERVAL
+
+        for provider, spec in routing.PROVIDERS.items():
+            with self.subTest(provider=provider):
+                self.assertIn(provider, MIN_INTERVAL)
+                self.assertTrue(spec['endpoint'].endswith('/chat/completions'))
+                self.assertTrue(spec['key'].endswith('_API_KEY'))
+                self.assertTrue(spec['models'] or provider == 'openrouter')
+
+    def test_nowcoding_points_at_the_relay_and_its_model(self):
+        spec = routing.PROVIDERS['nowcoding']
+
+        self.assertEqual(spec['key'], 'NOWCODING_API_KEY')
+        self.assertEqual(spec['endpoint'], 'https://nowcoding.ai/v1/chat/completions')
+        self.assertEqual(spec['models'], ['gpt-6.1-sol'])
+
     def test_groq_output_budget_defers_long_blocks_without_mutating_them(self):
         chunk = tr.article_blocks('A' * 501)
         original = json.dumps(chunk)
