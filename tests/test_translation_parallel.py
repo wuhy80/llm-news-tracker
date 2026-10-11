@@ -80,7 +80,10 @@ class ParallelTests(unittest.TestCase):
         def candidates(items, *args):
             if threading.current_thread().name.startswith('ThreadPoolExecutor'):
                 selected.set()
-            return [(items[0], {}, [], Path('a'), dict(record))] if items else []
+            # The candidate carries the live record object: claim-time checks read
+            # in-place mutations, mirroring how the cache stays fresh per batch.
+            blocks = [{'id': 'b1', 'source': 'A short note.', 'kind': 'paragraph'}]
+            return [(items[0], {}, blocks, Path('a'), record)] if items else []
         with patch.object(tr, 'select_candidates', side_effect=candidates):
             coordinator.claim('bigmodel', 'm', set(), time.monotonic()+5)
             with ThreadPoolExecutor(1) as executor:

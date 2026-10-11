@@ -211,12 +211,18 @@ def completed_ids(record: dict) -> set[str]:
     }
 
 
-def pending_chunk(blocks: list[dict[str, str]], record: dict, max_chars: int, max_blocks: int) -> list[dict[str, str]]:
+def pending_blocks(blocks: list[dict[str, str]], record: dict, now: datetime) -> list[dict[str, str]]:
+    """Translatable blocks ready for a request: untranslated and past their retry time."""
     completed = completed_ids(record)
-    now = datetime.now(timezone.utc)
-    pending = [block for block in translatable_blocks(blocks) if block["id"] not in completed
-               and (parse_time(record.get("blockFailures", {}).get(block["id"], {}).get("nextAttemptAt"))
-                    or datetime.min.replace(tzinfo=timezone.utc)) <= now]
+    failures = record.get("blockFailures") or {}
+    return [block for block in translatable_blocks(blocks)
+            if block["id"] not in completed
+            and (parse_time((failures.get(block["id"]) or {}).get("nextAttemptAt"))
+                 or datetime.min.replace(tzinfo=timezone.utc)) <= now]
+
+
+def pending_chunk(blocks: list[dict[str, str]], record: dict, max_chars: int, max_blocks: int) -> list[dict[str, str]]:
+    pending = pending_blocks(blocks, record, datetime.now(timezone.utc))
     # Previously rejected blocks are retried alone, not bundled with good text.
     if pending and pending[0]["id"] in record.get("blockFailures", {}):
         return pending[:1]
@@ -506,12 +512,41 @@ def select_candidates(
         model_changed = bool(requested_model) and record.get("requestedModel") != requested_model
         if retry_at and retry_at > now and not model_changed:
             continue
+        if not has_claimable_work(blocks, record, now):
+            # Nothing to translate and nothing to finalize: claiming this article
+            # would burn a scan cycle only to defer it again.
+            continue
         candidates.append((item, snapshot, blocks, path, record))
     candidates.sort(key=lambda entry: entry[0].get("publishedAt", ""), reverse=True)
     candidates.sort(key=lambda entry: -int(entry[0].get("aiReview", {}).get("importanceLevel", 0)))
     candidates.sort(key=lambda entry: entry[4].get("translatedBlocks", 0) == 0)
     candidates.sort(key=lambda entry: priorities.get(entry[0]["id"], len(priorities)))
     return candidates
+
+
+def has_claimable_work(blocks: list[dict[str, str]], record: dict, now: datetime) -> bool:
+    """False only when a claim would be pure overhead: nothing left to translate
+    and nothing to finalize — every remaining block is cooling down."""
+    if pending_blocks(blocks, record, now):
+        return True
+    expected = {block["id"] for block in translatable_blocks(blocks)}
+    return bool(expected) and expected.issubset(completed_ids(record))
+
+
+def claimable(entry: tuple, model: str, now: datetime) -> bool:
+    """Re-check scan-time decisions against record state that mutates in place.
+
+    A cached candidate can complete, fail into an article-level backoff, or have
+    its blocks deferred by this batch after the scan ran; the record object is
+    shared, so these checks stay correct without rescanning from disk.
+    """
+    record = entry[4]
+    if record.get("status") == "complete":
+        return False
+    retry_at = parse_time(record.get("nextAttemptAt"))
+    if retry_at and retry_at > now and record.get("requestedModel") == model:
+        return False
+    return has_claimable_work(entry[2], record, now)
 
 
 def merge_word_wise(existing: list, incoming: list[dict[str, str]], limit: int = 24) -> list[dict[str, str]]:
@@ -651,6 +686,10 @@ class ArticleCoordinator:
         self.condition = threading.Condition()
         self.owners = {}
         self.prepared = False
+        # Candidate scans per model, built once per batch: a scan reads every
+        # article snapshot and costs seconds, so rescanning per claim would
+        # spend a provider's window on disk I/O instead of requests.
+        self.candidates = {}
         # Providers running in this process; ownership is seeded from the records
         # of these only, so an article is not stranded on a provider that is absent.
         self.running = set()
@@ -695,10 +734,16 @@ class ArticleCoordinator:
     def claim(self, provider, model, deferred, deadline):
         with self.condition:
             while time.monotonic() < deadline:
-                items = [item for item in self.data['items']
-                         if item['id'] not in deferred
-                         and self.owners.get(item['id'], provider) == provider]
-                candidates = select_candidates(items, datetime.now(timezone.utc), model, list(self.requests))
+                scanned = self.candidates.get(model)
+                if scanned is None:
+                    scanned = select_candidates(
+                        self.data['items'], datetime.now(timezone.utc), model, list(self.requests))
+                    self.candidates[model] = scanned
+                now = datetime.now(timezone.utc)
+                candidates = [entry for entry in scanned
+                              if entry[0]['id'] not in deferred
+                              and self.owners.get(entry[0]['id'], provider) == provider
+                              and claimable(entry, model, now)]
                 if candidates:
                     # Prefer finishing the current article before claiming another.
                     candidate = next((c for c in candidates if self.owners.get(c[0]['id']) == provider), candidates[0])
