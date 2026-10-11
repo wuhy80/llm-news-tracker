@@ -916,6 +916,8 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     completed_articles = 0
     deferred_articles = set()
     transient_failures = 0
+    content_fail_streak = 0
+    degraded = False
     # An hourly schedule gives the workhorse provider most of the slot; the cap
     # keeps one batch from spanning into the next hour's run.
     duration_seconds = max(60, min(2700, int(os.getenv(
@@ -933,7 +935,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         sessions never share mutable objects with each other; the network call
         itself is the only thing that leaves the worker thread."""
         nonlocal model, translated_blocks_count, model_blocks_count, completed_articles, fatal_error
-        nonlocal transient_failures
+        nonlocal transient_failures, content_fail_streak, degraded
         item, blocks, path, record, chunk, requested_model, call_started = ctx
         api_success = False
         accepted_count = 0
@@ -1047,6 +1049,14 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
             control.finished(requested_model, success=api_success)
             record_attempt(STATE_FILE.parent, provider, requested_model, accepted_count,
                            len(chunk), time.monotonic() - call_started, outcome)
+            if accepted_count:
+                content_fail_streak = 0
+            else:
+                content_fail_streak += 1
+                if content_fail_streak == 15:
+                    degraded = True
+                    print(f"::warning::{provider}: {content_fail_streak} requests in a row returned "
+                          "nothing usable; stopping this batch as degraded")
         atomic_write_json(path, record)
         atomic_write_json(state_file, state)
         return None
@@ -1055,6 +1065,10 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         for fut in [f for f in inflight if f.done()]:
             if settle_attempt(inflight.pop(fut), fut) == 'break':
                 stop = True
+        if degraded:
+            # The model serves nothing usable; submitting more would only burn
+            # the budget. Drain the rest and report the degraded state.
+            stop = True
         if stop:
             break
         now = datetime.now(timezone.utc)
@@ -1171,6 +1185,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
                  runStatus="unavailable" if fatal_error else "rate_limited" if state.get("nextAttemptAt")
                  else "progress" if translated_blocks_count else "waiting")
     state['runStopReason'] = ('error' if fatal_error else
+        'model_degraded' if degraded else
         'rate_limited' if state.get('nextAttemptAt') else
         'daily_limit' if state.get('requestsToday', 0) >= args.daily_limit else
         'request_limit' if requests_made >= request_limit else
