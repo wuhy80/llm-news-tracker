@@ -812,9 +812,9 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         # other provider owns its endpoint and uses one of its declared models.
         model, endpoint = resolve_provider_target(provider, preferred or '')
         if provider == 'nowcoding':
-            # The owner's relay has no meaningful quota; let it spend the hourly
-            # window instead of the shared 1,000-request daily budget.
-            args.request_limit = min(args.request_limit, int(os.getenv('NOWCODING_TRANSLATION_REQUEST_LIMIT', '500')))
+            # The owner's relay has no meaningful quota; the dedicated budgets
+            # replace the shared OpenRouter-sized ones instead of narrowing them.
+            args.request_limit = int(os.getenv('NOWCODING_TRANSLATION_REQUEST_LIMIT', '500'))
             args.daily_limit = int(os.getenv('NOWCODING_TRANSLATION_DAILY_LIMIT', '8000'))
     elif preferred:
         model = preferred
