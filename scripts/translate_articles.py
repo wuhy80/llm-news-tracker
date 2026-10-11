@@ -915,6 +915,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     model_blocks_count = 0
     completed_articles = 0
     deferred_articles = set()
+    transient_failures = 0
     # An hourly schedule gives the workhorse provider most of the slot; the cap
     # keeps one batch from spanning into the next hour's run.
     duration_seconds = max(60, min(2700, int(os.getenv(
@@ -932,6 +933,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         sessions never share mutable objects with each other; the network call
         itself is the only thing that leaves the worker thread."""
         nonlocal model, translated_blocks_count, model_blocks_count, completed_articles, fatal_error
+        nonlocal transient_failures
         item, blocks, path, record, chunk, requested_model, call_started = ctx
         api_success = False
         accepted_count = 0
@@ -939,6 +941,7 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         try:
             response, actual_model, headers = future.result()
             api_success = True
+            transient_failures = 0
             if hasattr(control, 'observe'):
                 control.observe(requested_model, headers)
             translated, word_wise, failures = normalize_partial_response(response, chunk)
@@ -1005,8 +1008,16 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
                 atomic_write_json(state_file, state)
                 return None
             if code in {404, 410, 500, 502, 503, 504} or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
-                # Model/service failure is not an article failure. Retry the same
-                # pending text using another free model, within the same budget.
+                # Model/service failure is not an article failure. Free tiers
+                # with alternatives switch models; a single-model relay retries
+                # the same model in place, because one transient 502 must not
+                # poison its pool for an hour and idle the rest of the batch.
+                if PROVIDERS[provider]['models'] and provider not in ('groq', 'gemini') and code not in {404, 410}:
+                    transient_failures += 1
+                    state.update(lastStatus="model_error", lastError=message)
+                    atomic_write_json(state_file, state)
+                    time.sleep(min(60, 15 * transient_failures))
+                    return None
                 pool.failed(requested_model, message, permanent=code in {404, 410})
                 state.update(lastStatus="model_error", lastError=message)
                 atomic_write_json(state_file, state)
