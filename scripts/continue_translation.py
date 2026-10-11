@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -61,7 +62,14 @@ def main():
     path = root / 'data/translations/runtime.json'
     run_url = f'https://github.com/{repo}/actions/runs/{run_id}'
     result = 0
+    started = time.monotonic()
     for batch in range(3):
+        if batch and time.monotonic() - started > 1500:
+            # An hourly schedule slots one job per hour; continuation batches
+            # only fit when the first one finished early. Each batch can run a
+            # provider for up to 45 minutes, so a late start would otherwise
+            # push the job past its 90-minute timeout.
+            break
         print(f'[translate:batch] starting {batch + 1}/3', flush=True)
         code = subprocess.run([sys.executable, str(root / 'scripts/translate_articles.py')], cwd=root).returncode
         result = max(result, int(code != 0))

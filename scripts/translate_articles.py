@@ -811,6 +811,11 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         # bigmodel, groq and gemini are handled above with their own limits; every
         # other provider owns its endpoint and uses one of its declared models.
         model, endpoint = resolve_provider_target(provider, preferred or '')
+        if provider == 'nowcoding':
+            # The owner's relay has no meaningful quota; let it spend the hourly
+            # window instead of the shared 1,000-request daily budget.
+            args.request_limit = min(args.request_limit, int(os.getenv('NOWCODING_TRANSLATION_REQUEST_LIMIT', '500')))
+            args.daily_limit = int(os.getenv('NOWCODING_TRANSLATION_DAILY_LIMIT', '8000'))
     elif preferred:
         model = preferred
     state = load_state(state_file)
@@ -861,7 +866,9 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     model_blocks_count = 0
     completed_articles = 0
     deferred_articles = set()
-    duration_seconds = max(60, min(1200, int(os.getenv(
+    # An hourly schedule gives the workhorse provider most of the slot; the cap
+    # keeps one batch from spanning into the next hour's run.
+    duration_seconds = max(60, min(2700, int(os.getenv(
         provider.upper() + '_TRANSLATION_RUN_SECONDS', '1200' if provider == 'groq' else '600'))))
     deadline = time.monotonic() + duration_seconds
     while requests_made < request_limit and time.monotonic() < deadline:
