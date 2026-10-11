@@ -11,7 +11,7 @@ import re
 import time
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as wait_futures, as_completed
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -866,8 +866,12 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     state = load_state(state_file)
     now = datetime.now(timezone.utc)
     reset_daily_state(state, now)
+    # Parallel sessions overlap request latency for providers that allow it;
+    # 1 keeps the previous strictly serial behavior.
+    sessions = max(1, int(os.getenv(
+        provider.upper() + '_TRANSLATION_SESSIONS', '3' if provider == 'nowcoding' else '1')))
     control = (TokenRateControl if provider in ('groq', 'gemini') else RateControl)(
-        state_file.with_name(f"rate-{provider}.json"), provider, args.interval)
+        state_file.with_name(f"rate-{provider}.json"), provider, args.interval, sessions)
     if old_shared_pool_pause(state):
         state.pop("nextAttemptAt", None)
         atomic_write_json(state_file, state)
@@ -916,18 +920,158 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     duration_seconds = max(60, min(2700, int(os.getenv(
         provider.upper() + '_TRANSLATION_RUN_SECONDS', '1200' if provider == 'groq' else '600'))))
     deadline = time.monotonic() + duration_seconds
-    while requests_made < request_limit and time.monotonic() < deadline:
+    executor = ThreadPoolExecutor(max_workers=sessions)
+    inflight = {}
+    stop = False
+
+    def settle_attempt(ctx, future):
+        """Apply one finished request — its translations or its failure, quota,
+        health and metrics. Returns 'break' when no further attempt may start.
+
+        Only this function touches state, records and quota files, so parallel
+        sessions never share mutable objects with each other; the network call
+        itself is the only thing that leaves the worker thread."""
+        nonlocal model, translated_blocks_count, model_blocks_count, completed_articles, fatal_error
+        item, blocks, path, record, chunk, requested_model, call_started = ctx
+        api_success = False
+        accepted_count = 0
+        outcome = 'error'
+        try:
+            response, actual_model, headers = future.result()
+            api_success = True
+            if hasattr(control, 'observe'):
+                control.observe(requested_model, headers)
+            translated, word_wise, failures = normalize_partial_response(response, chunk)
+            accepted_count = len(translated)
+            outcome = 'success' if accepted_count == len(chunk) else 'content_error'
+            for block in translated:
+                block.update(provider=provider, model=actual_model)
+            if translated:
+                apply_chunk(record, translated, word_wise, actual_model)
+                record["provider"] = provider
+                pool.succeeded(requested_model)
+            if failures:
+                defer_blocks(record, failures, actual_model)
+                print(f"[translate:deferred] {item['id']}: {len(failures)} blocks; keeping {len(translated)} good blocks")
+            translated_blocks_count += len(translated)
+            model_blocks_count += len(translated)
+            if record.get("status") == "complete":
+                completed_articles += 1
+            state["lastStatus"] = "success" if translated else "content_error"
+            state["lastModel"] = actual_model
+            for header, field in (
+                ("x-ratelimit-limit", "reportedLimit"),
+                ("x-ratelimit-remaining", "reportedRemaining"),
+                ("x-ratelimit-reset", "reportedReset"),
+            ):
+                if headers.get(header):
+                    state[field] = headers[header]
+            state.pop("lastError", None)
+            state.pop("nextAttemptAt", None)
+            print(
+                f"[translate:{record['status']}] {item['id']} "
+                f"{record['translatedBlocks']}/{record['totalBlocks']} blocks via {actual_model}"
+            )
+        except Exception as error:
+            failed_at = datetime.now(timezone.utc)
+            message = error_message(error)
+            if is_content_error(provider, error):
+                control.observe(requested_model, error.headers)
+                outcome = 'content_error'
+                error = ValueError('Provider could not generate valid translation JSON')
+            code = error.code if isinstance(error, urllib.error.HTTPError) else None
+            if code in {402, 429} or (provider in ('groq', 'gemini') and code in {400, 401, 403, 404, 410, 500, 502, 503, 504}):
+                outcome = 'rate_limited' if code == 429 else 'error'
+                limited = (control.penalize_error(requested_model, error) if hasattr(control, 'penalize_error') else
+                    control.penalize(requested_model, code, error.headers,
+                    getattr(error, "translation_limit_source", ""), getattr(error, "translation_provider_code", "")))
+                state.update(lastStatus="rate_limited", lastError=message)
+                print(f"[translate:rate] {provider}: {limited}")
+                if limited.scope.startswith("model:"):
+                    pool.failed(requested_model, message, retry_at=limited.until)
+                    try:
+                        model = pool.select()
+                        return None
+                    except RuntimeError:
+                        pass
+                state["nextAttemptAt"] = limited.until.isoformat()
+                atomic_write_json(state_file, state)
+                return 'break'
+            if isinstance(error, (ValueError, KeyError, TypeError)):
+                defer_blocks(record, {b["id"]: {"reason": type(error).__name__, "sourceHash": b["sourceHash"]}
+                                      for b in chunk}, requested_model)
+                state.update(lastStatus="content_error", lastError="Invalid translation response; blocks deferred")
+                atomic_write_json(path, record)
+                atomic_write_json(state_file, state)
+                return None
+            if code in {404, 410, 500, 502, 503, 504} or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
+                # Model/service failure is not an article failure. Retry the same
+                # pending text using another free model, within the same budget.
+                pool.failed(requested_model, message, permanent=code in {404, 410})
+                state.update(lastStatus="model_error", lastError=message)
+                atomic_write_json(state_file, state)
+                try:
+                    previous = requested_model
+                    model = pool.select()
+                    print(f"[translate:model] {previous} failed; switching to {model}")
+                    return None
+                except RuntimeError as unavailable:
+                    print(f"::error::{unavailable}")
+                    fatal_error = True
+                    return 'break'
+            if code in {401, 403}:
+                state.update(lastStatus="auth_error", lastError=message)
+                atomic_write_json(state_file, state)
+                print(f"::error::{provider} authentication/permission failure; stopping this provider")
+                fatal_error = True
+                return 'break'
+            record["failureCount"] = int(record.get("failureCount", 0)) + 1
+            record["lastError"] = message
+            record["nextAttemptAt"] = article_backoff(record["failureCount"], failed_at).isoformat().replace("+00:00", "Z")
+            record["updatedAt"] = utc_now()
+            state["lastStatus"] = "error"
+            state["lastError"] = record["lastError"]
+            print(f"[translate:warn] {item['id']}: {record['lastError']}")
+        finally:
+            control.finished(requested_model, success=api_success)
+            record_attempt(STATE_FILE.parent, provider, requested_model, accepted_count,
+                           len(chunk), time.monotonic() - call_started, outcome)
+        atomic_write_json(path, record)
+        atomic_write_json(state_file, state)
+        return None
+
+    while requests_made < request_limit and time.monotonic() < deadline and not stop:
+        for fut in [f for f in inflight if f.done()]:
+            if settle_attempt(inflight.pop(fut), fut) == 'break':
+                stop = True
+        if stop:
+            break
         now = datetime.now(timezone.utc)
         reset_daily_state(state, now)
         if state.get("requestsToday", 0) >= args.daily_limit:
             break
+        if len(inflight) >= sessions:
+            # Every session is busy: wait for one to finish, then harvest it.
+            wait_futures(list(inflight), timeout=1.0, return_when=FIRST_COMPLETED)
+            continue
         if coordinator is None:
             candidates = select_candidates(data.get("items", []), now, model, list(requests))
-            candidates = [c for c in candidates if c[0]["id"] not in deferred_articles]
+            candidates = [c for c in candidates if c[0]["id"] not in deferred_articles
+                          and c[0]["id"] not in {ctx[0]["id"] for ctx in inflight.values()}]
             candidate = candidates[0] if candidates else None
         else:
-            candidate = coordinator.claim(provider, model, deferred_articles, deadline)
+            # With attempts in flight, never hold the claim long: settling
+            # finished work matters more than waiting for the next article.
+            # An article with an attempt in flight is excluded — its record does
+            # not know about that attempt yet, so claiming it again would send
+            # the same pending blocks twice.
+            busy = deferred_articles | {ctx[0]["id"] for ctx in inflight.values()}
+            claim_deadline = min(deadline, time.monotonic() + 2.0) if inflight else deadline
+            candidate = coordinator.claim(provider, model, busy, claim_deadline)
         if candidate is None:
+            if inflight:
+                wait_futures(list(inflight), timeout=1.0, return_when=FIRST_COMPLETED)
+                continue
             break
         item, _, blocks, path, record = candidate
         chunk = pending_chunk(blocks, record, max(500, args.chunk_chars), max(1, args.chunk_blocks))
@@ -976,11 +1120,13 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
                     pass
             state["nextAttemptAt"] = limited.until.isoformat()
             atomic_write_json(state_file, state)
+            stop = True
             break
         except Exception as error:
             state.update(lastStatus="quota_check_error", lastError=type(error).__name__)
             print(f"::error::{provider}: quota/admission check failed; no inference sent ({type(error).__name__})")
             fatal_error = True
+            stop = True
             break
 
         attempt_at = utc_now()
@@ -993,114 +1139,16 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         record["lastAttemptAt"] = attempt_at
         atomic_write_json(path, record)
         requests_made += 1
+        inflight[executor.submit(request_translation, token, model, chunk, endpoint)] = (
+            item, blocks, path, record, chunk, model, time.monotonic())
 
-        requested_model = model
-        api_success = False
-        accepted_count = 0
-        outcome = 'error'
-        call_started = time.monotonic()
-        try:
-            response, actual_model, headers = request_translation(token, model, chunk, endpoint)
-            api_success = True
-            if hasattr(control, 'observe'):
-                control.observe(model, headers)
-            translated, word_wise, failures = normalize_partial_response(response, chunk)
-            accepted_count = len(translated)
-            outcome = 'success' if accepted_count == len(chunk) else 'content_error'
-            for block in translated:
-                block.update(provider=provider, model=actual_model)
-            if translated:
-                apply_chunk(record, translated, word_wise, actual_model)
-                record["provider"] = provider
-                pool.succeeded(model)
-            if failures:
-                defer_blocks(record, failures, actual_model)
-                print(f"[translate:deferred] {item['id']}: {len(failures)} blocks; keeping {len(translated)} good blocks")
-            translated_blocks_count += len(translated)
-            model_blocks_count += len(translated)
-            if record.get("status") == "complete":
-                completed_articles += 1
-            state["lastStatus"] = "success" if translated else "content_error"
-            state["lastModel"] = actual_model
-            for header, field in (
-                ("x-ratelimit-limit", "reportedLimit"),
-                ("x-ratelimit-remaining", "reportedRemaining"),
-                ("x-ratelimit-reset", "reportedReset"),
-            ):
-                if headers.get(header):
-                    state[field] = headers[header]
-            state.pop("lastError", None)
-            state.pop("nextAttemptAt", None)
-            print(
-                f"[translate:{record['status']}] {item['id']} "
-                f"{record['translatedBlocks']}/{record['totalBlocks']} blocks via {actual_model}"
-            )
-        except Exception as error:
-            failed_at = datetime.now(timezone.utc)
-            message = error_message(error)
-            if is_content_error(provider, error):
-                control.observe(model, error.headers)
-                outcome = 'content_error'
-                error = ValueError('Provider could not generate valid translation JSON')
-            code = error.code if isinstance(error, urllib.error.HTTPError) else None
-            if code in {402, 429} or (provider in ('groq', 'gemini') and code in {400, 401, 403, 404, 410, 500, 502, 503, 504}):
-                outcome = 'rate_limited' if code == 429 else 'error'
-                limited = (control.penalize_error(model, error) if hasattr(control, 'penalize_error') else
-                    control.penalize(model, code, error.headers,
-                    getattr(error, "translation_limit_source", ""), getattr(error, "translation_provider_code", "")))
-                state.update(lastStatus="rate_limited", lastError=message)
-                print(f"[translate:rate] {provider}: {limited}")
-                if limited.scope.startswith("model:"):
-                    pool.failed(model, message, retry_at=limited.until)
-                    try:
-                        model = pool.select()
-                        continue
-                    except RuntimeError:
-                        pass
-                state["nextAttemptAt"] = limited.until.isoformat()
-                atomic_write_json(state_file, state)
-                break
-            if isinstance(error, (ValueError, KeyError, TypeError)):
-                defer_blocks(record, {b["id"]: {"reason": type(error).__name__, "sourceHash": b["sourceHash"]}
-                                      for b in chunk}, model)
-                state.update(lastStatus="content_error", lastError="Invalid translation response; blocks deferred")
-                atomic_write_json(path, record)
-                atomic_write_json(state_file, state)
-                continue
-            if code in {404, 410, 500, 502, 503, 504} or isinstance(error, TimeoutError) or (isinstance(error, urllib.error.URLError) and not code):
-                # Model/service failure is not an article failure. Retry the same
-                # pending text using another free model, within the same budget.
-                pool.failed(model, message, permanent=code in {404, 410})
-                state.update(lastStatus="model_error", lastError=message)
-                atomic_write_json(state_file, state)
-                try:
-                    previous = model
-                    model = pool.select()
-                    print(f"[translate:model] {previous} failed; switching to {model}")
-                    continue
-                except RuntimeError as unavailable:
-                    print(f"::error::{unavailable}")
-                    fatal_error = True
-                    break
-            if code in {401, 403}:
-                state.update(lastStatus="auth_error", lastError=message)
-                atomic_write_json(state_file, state)
-                print(f"::error::{provider} authentication/permission failure; stopping this provider")
-                fatal_error = True
-                break
-            record["failureCount"] = int(record.get("failureCount", 0)) + 1
-            record["lastError"] = message
-            record["nextAttemptAt"] = article_backoff(record["failureCount"], failed_at).isoformat().replace("+00:00", "Z")
-            record["updatedAt"] = utc_now()
-            state["lastStatus"] = "error"
-            state["lastError"] = record["lastError"]
-            print(f"[translate:warn] {item['id']}: {record['lastError']}")
-        finally:
-            control.finished(requested_model, success=api_success)
-            record_attempt(STATE_FILE.parent, provider, requested_model, accepted_count,
-                           len(chunk), time.monotonic() - call_started, outcome)
-        atomic_write_json(path, record)
-        atomic_write_json(state_file, state)
+    # Drain: past the deadline, the budget or a stop signal, settle every
+    # attempt that was already sent instead of discarding its result.
+    while inflight:
+        done, _ = wait_futures(list(inflight), timeout=2.0, return_when=FIRST_COMPLETED)
+        for fut in done:
+            settle_attempt(inflight.pop(fut), fut)
+    executor.shutdown(wait=True)
 
     print(
         f"[translate] requests {requests_made}/{request_limit}; translated {translated_blocks_count} blocks; "

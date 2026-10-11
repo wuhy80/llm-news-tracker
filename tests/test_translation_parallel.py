@@ -71,6 +71,47 @@ class ParallelTests(unittest.TestCase):
             for filename in ('state.json', 'bigmodel-state.json'):
                 self.assertEqual(json.loads((root/filename).read_text())['requestsToday'], 1)
 
+    def test_parallel_sessions_overlap_requests_for_one_provider(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            records = []
+            for ident in ('one', 'two', 'three'):
+                records.append(({'id': ident}, {}, tr.article_blocks(ident + ' English paragraph.'),
+                    root / (ident + '.json'), {'status': 'partial', 'totalBlocks': 1,
+                    'translatedBlocks': 0, 'blocks': []}))
+            coordinator = tr.ArticleCoordinator()
+            barrier = threading.Barrier(3)
+            active, peak = set(), [0]
+            guard = threading.Lock()
+            def candidates(items, *args):
+                ids = {item['id'] for item in items}
+                return [r for r in records if r[0]['id'] in ids and r[-1]['status'] != 'complete']
+            def request(token, model, chunk, endpoint):
+                with guard:
+                    active.add(chunk[0]['source'])
+                    peak[0] = max(peak[0], len(active))
+                # Fails unless three requests of this one provider are in flight.
+                barrier.wait(timeout=5)
+                with guard:
+                    active.remove(chunk[0]['source'])
+                return {'translations': [{'id': chunk[0]['id'], 'translationZh': '合格的中文译文。'}]}, model, {}
+            for name, value in {'remove_stale_records': 0, 'load_news': {'items': [r[0] for r in records]},
+                                'sync_requests': {}, 'publish_queue': None, 'build_translation_index': {}}.items():
+                stack.enter_context(patch.object(tr, name, return_value=value))
+            stack.enter_context(patch.object(tr, 'resolve_items', side_effect=lambda items, _: items))
+            stack.enter_context(patch.object(tr, 'select_candidates', side_effect=candidates))
+            stack.enter_context(patch.object(tr, 'request_translation', side_effect=request))
+            stack.enter_context(patch.object(tr, 'RateControl'))
+            for name, filename in [('STATE_FILE', 'state.json'), ('MODEL_HEALTH_FILE', 'health.json'), ('INDEX_FILE', 'index.json')]:
+                stack.enter_context(patch.object(tr, name, root / filename))
+            stack.enter_context(patch.dict(os.environ,
+                {'NOWCODING_API_KEY': 'n', 'NOWCODING_TRANSLATION_SESSIONS': '3'}, clear=True))
+            stack.enter_context(patch.object(sys, 'argv', ['translate', '--request-limit', '3', '--interval', '0']))
+            self.assertEqual(tr.run_provider('nowcoding', coordinator), 0)
+            self.assertEqual(peak[0], 3)
+            self.assertTrue(all(r[-1]['status'] == 'complete' for r in records))
+            self.assertEqual(json.loads((root/'nowcoding-state.json').read_text())['runRequests'], 3)
+
     def test_waiting_worker_takes_released_partial_article_with_fresh_state(self):
         coordinator = tr.ArticleCoordinator()
         coordinator.data = {'items': [{'id': 'a'}]}

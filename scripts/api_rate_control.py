@@ -61,9 +61,11 @@ class RateLimited(RuntimeError):
 
 
 class RateControl:
-    def __init__(self, path, provider, interval=0):
+    def __init__(self, path, provider, interval=0, sessions=1):
         self.path, self.provider = Path(path), provider
-        self.minimum = max(MIN_INTERVAL[provider], interval)
+        # Parallel sessions keep several requests in flight against the same
+        # account, so the between-starts floor shrinks by the session count.
+        self.minimum = max(MIN_INTERVAL[provider] / max(1, sessions), interval)
         try:
             self.data = json.loads(self.path.read_text())
         except (OSError, ValueError):

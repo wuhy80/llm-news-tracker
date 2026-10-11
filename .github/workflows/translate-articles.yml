@@ -58,6 +58,8 @@ on:
 permissions:
   contents: write
   issues: read
+  # The chain step dispatches the next run while productive work remains.
+  actions: write
 
 concurrency:
   group: archive-writes
@@ -119,6 +121,8 @@ jobs:
           NOWCODING_TRANSLATION_REQUEST_LIMIT: ${{ vars.NOWCODING_TRANSLATION_REQUEST_LIMIT || '500' }}
           NOWCODING_TRANSLATION_DAILY_LIMIT: ${{ vars.NOWCODING_TRANSLATION_DAILY_LIMIT || '8000' }}
           NOWCODING_TRANSLATION_RUN_SECONDS: ${{ vars.NOWCODING_TRANSLATION_RUN_SECONDS || '2700' }}
+          # Parallel in-flight requests for the owner's relay; 1 = serial.
+          NOWCODING_TRANSLATION_SESSIONS: ${{ vars.NOWCODING_TRANSLATION_SESSIONS || '3' }}
           # Prefer a capable multilingual model instead of the random free router.
           # The live zero-price catalog and persisted health override retired models.
           ARTICLE_TRANSLATION_MODEL: ${{ inputs.model || vars.ARTICLE_TRANSLATION_MODEL || 'qwen/qwen3.8-27b:free' }}
@@ -175,6 +179,8 @@ jobs:
           NOWCODING_TRANSLATION_REQUEST_LIMIT: ${{ vars.NOWCODING_TRANSLATION_REQUEST_LIMIT || '500' }}
           NOWCODING_TRANSLATION_DAILY_LIMIT: ${{ vars.NOWCODING_TRANSLATION_DAILY_LIMIT || '8000' }}
           NOWCODING_TRANSLATION_RUN_SECONDS: ${{ vars.NOWCODING_TRANSLATION_RUN_SECONDS || '2700' }}
+          # Parallel in-flight requests for the owner's relay; 1 = serial.
+          NOWCODING_TRANSLATION_SESSIONS: ${{ vars.NOWCODING_TRANSLATION_SESSIONS || '3' }}
           # Prefer a capable multilingual model instead of the random free router.
           # The live zero-price catalog and persisted health override retired models.
           ARTICLE_TRANSLATION_MODEL: ${{ inputs.model || vars.ARTICLE_TRANSLATION_MODEL || 'qwen/qwen3.8-27b:free' }}
@@ -228,3 +234,33 @@ jobs:
       - name: Summarize daily token usage
         if: ${{ always() }}
         run: python scripts/token_usage.py >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Chain the next run while productive work remains
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PYCODE'
+          import json, os, subprocess
+          from pathlib import Path
+          runtime = json.loads(Path('data/translations/runtime.json').read_text(encoding='utf-8'))
+          productive = runtime.get('status') == 'finished' and any(
+              p.get('runStatus') == 'progress'
+              and p.get('runStopReason') in ('request_limit', 'time_limit')
+              and (p.get('runModelBlocks') or 0) > 0
+              for p in (runtime.get('providers') or {}).values())
+          if not productive:
+              print('[chain] not chaining: no productive budget-limited work remains')
+              raise SystemExit(0)
+          # A queued run of this workflow already continues the chain; chaining
+          # again would only replace it.
+          queued = subprocess.run(['gh', 'run', 'list', '--repo', os.environ['GITHUB_REPOSITORY'],
+                                   '--workflow', 'Translate important articles', '--status', 'queued',
+                                   '--json', 'databaseId'], capture_output=True, text=True)
+          if queued.returncode == 0 and json.loads(queued.stdout or '[]'):
+              print('[chain] not chaining: a queued run already continues the work')
+              raise SystemExit(0)
+          subprocess.run(['gh', 'workflow', 'run', 'Translate important articles',
+                          '--repo', os.environ['GITHUB_REPOSITORY']], check=True)
+          print('[chain] dispatched the next translation run')
+          PYCODE
