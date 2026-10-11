@@ -28,6 +28,25 @@ def response(chunk, good=True):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_a_declared_provider_owns_its_endpoint_and_model(self):
+        # A relay was sent ARTICLE_TRANSLATION_MODEL, which is an OpenRouter model, to
+        # OPENROUTER_ENDPOINT while carrying its own key. OpenRouter answered with a
+        # missing-authentication error and the relay looked broken.
+        with patch.dict(os.environ, {
+            'ARTICLE_TRANSLATION_MODEL': 'qwen/qwen3.8-27b:free',
+            'ARTICLE_TRANSLATION_ENDPOINT': 'https://openrouter.ai/api/v1/chat/completions',
+        }):
+            self.assertEqual(tr.resolve_provider_target('nowcoding', 'qwen/qwen3.8-27b:free'),
+                             ('gpt-6.1-sol', 'https://nowcoding.ai/v1/chat/completions'))
+
+            # A passing evaluation still wins when it names one of the provider's models.
+            self.assertEqual(tr.resolve_provider_target('nowcoding', 'gpt-6.1-sol'),
+                             ('gpt-6.1-sol', 'https://nowcoding.ai/v1/chat/completions'))
+
+            # OpenRouter is the only provider that takes both from the environment.
+            self.assertEqual(tr.resolve_provider_target('openrouter', 'qwen/qwen3.8-27b:free'),
+                             ('qwen/qwen3.8-27b:free', 'https://openrouter.ai/api/v1/chat/completions'))
+
     def test_a_provider_that_declares_models_never_uses_the_openrouter_catalog(self):
         # ModelPool selects from OpenRouter's zero-price catalog, and constructing it
         # fetches that catalog over the network, so the classes are mocked here. Using

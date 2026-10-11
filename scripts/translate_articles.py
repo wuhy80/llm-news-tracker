@@ -741,6 +741,22 @@ def pool_for(provider: str, health_file: Path, model: str):
     return ModelPool(health_file, model)
 
 
+def resolve_provider_target(provider: str, preferred: str) -> tuple[str, str]:
+    """The model and endpoint a provider must use.
+
+    A provider that declares its models owns its endpoint, and the evaluation's pick
+    only counts when it is one of them. Only OpenRouter takes both from the
+    environment. Without this, a newly added provider was sent an OpenRouter model
+    name to OpenRouter's endpoint while carrying its own key, which is why a relay
+    answered with OpenRouter's missing-authentication error.
+    """
+    spec = PROVIDERS[provider]
+    if spec['models']:
+        return (preferred if preferred in spec['models'] else spec['models'][0]), spec['endpoint']
+    endpoint = os.getenv("ARTICLE_TRANSLATION_ENDPOINT", OPENROUTER_ENDPOINT).strip() or OPENROUTER_ENDPOINT
+    return preferred, endpoint
+
+
 def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request-limit", type=int, default=int(os.getenv("ARTICLE_TRANSLATION_REQUEST_LIMIT", "4")))
@@ -791,7 +807,11 @@ def _run_provider(provider: str = "openrouter", coordinator=None) -> int:
         args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 1200), min(args.chunk_blocks, 4)
         if provider == 'groq':
             args.chunk_chars, args.chunk_blocks = min(args.chunk_chars, 500), 1
-    elif preferred and provider == 'openrouter':
+    elif provider != 'openrouter':
+        # bigmodel, groq and gemini are handled above with their own limits; every
+        # other provider owns its endpoint and uses one of its declared models.
+        model, endpoint = resolve_provider_target(provider, preferred or '')
+    elif preferred:
         model = preferred
     state = load_state(state_file)
     now = datetime.now(timezone.utc)
