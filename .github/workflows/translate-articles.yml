@@ -71,6 +71,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # News collection shares the archive-writes concurrency group, and a
+      # newer run of this workflow cancels its older queued run, which is how
+      # chained runs starved Update news for days. Once this run won the
+      # queue, step aside if a collection run is still waiting behind it.
+      - name: Yield the archive queue to pending news collection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PYCODE'
+          import json, os, subprocess, time
+          waiting = False
+          for status in ('queued', 'pending'):
+              out = subprocess.run(['gh', 'run', 'list', '--repo', os.environ['GITHUB_REPOSITORY'],
+                                    '--workflow', 'Update news', '--status', status,
+                                    '--json', 'databaseId'], capture_output=True, text=True)
+              if out.returncode == 0 and json.loads(out.stdout or '[]'):
+                  waiting = True
+          if not waiting:
+              print('[yield] no pending Update news run')
+              raise SystemExit(0)
+          print('[yield] Update news is waiting for the archive queue; cancelling this run')
+          subprocess.run(['gh', 'run', 'cancel', os.environ['GITHUB_RUN_ID'],
+                          '--repo', os.environ['GITHUB_REPOSITORY']], check=False)
+          # Give the cancellation a moment to land so this run finishes as
+          # cancelled instead of racing its own remaining steps.
+          time.sleep(10)
+          raise SystemExit(1)
+          PYCODE
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -257,12 +286,24 @@ jobs:
           if not productive:
               print('[chain] not chaining: no productive budget-limited work remains')
               raise SystemExit(0)
+          def waiting_runs(workflow):
+              # Both statuses matter: queued runs sit behind a finished slot,
+              # pending runs wait for the concurrency group itself. GitHub only
+              # keeps the newest queued run alive in a group, so dispatching
+              # while Update news waits would cancel the collection run again.
+              for status in ('queued', 'pending'):
+                  out = subprocess.run(['gh', 'run', 'list', '--repo', os.environ['GITHUB_REPOSITORY'],
+                                        '--workflow', workflow, '--status', status,
+                                        '--json', 'databaseId'], capture_output=True, text=True)
+                  if out.returncode == 0 and json.loads(out.stdout or '[]'):
+                      return True
+              return False
+          if waiting_runs('Update news'):
+              print('[chain] not chaining: Update news is waiting for the archive queue')
+              raise SystemExit(0)
           # A queued run of this workflow already continues the chain; chaining
           # again would only replace it.
-          queued = subprocess.run(['gh', 'run', 'list', '--repo', os.environ['GITHUB_REPOSITORY'],
-                                   '--workflow', 'Translate important articles', '--status', 'queued',
-                                   '--json', 'databaseId'], capture_output=True, text=True)
-          if queued.returncode == 0 and json.loads(queued.stdout or '[]'):
+          if waiting_runs('Translate important articles'):
               print('[chain] not chaining: a queued run already continues the work')
               raise SystemExit(0)
           subprocess.run(['gh', 'workflow', 'run', 'Translate important articles',
