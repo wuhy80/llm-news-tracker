@@ -36,7 +36,7 @@ const state = {
 };
 const el = Object.fromEntries([
   "feedList", "feedItemTemplate", "itemCount", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
-  "resultCount", "loadMore", "rangeLabel", "previousRange", "nextRange", "sortSelect", "importanceSelect", "translationSelect", "trendRadar",
+  "resultCount", "loadMore", "rangeLabel", "rangeLabelText", "datePopover", "previousRange", "nextRange", "sortSelect", "importanceSelect", "translationSelect", "trendRadar",
   "trendList", "watchTags", "sourceList", "updateStatus", "sourceStatus", "searchPanel", "searchInput",
   "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink", "historyList", "historySummary", "clearHistory"
 ].map((id) => [id, document.getElementById(id)]));
@@ -81,14 +81,15 @@ function formatDate(date, withYear = false) {
 function updateRangeLabel() {
   const { start, end } = getRange();
   const today = startOfDay(new Date());
+  const target = el.rangeLabelText || el.rangeLabel;
   if (state.period === "day") {
-    el.rangeLabel.textContent = start.getTime() === today.getTime() ? "今天" : formatDate(start, start.getFullYear() !== today.getFullYear());
+    target.textContent = start.getTime() === today.getTime() ? "今天" : formatDate(start, start.getFullYear() !== today.getFullYear());
   } else if (state.period === "week") {
-    el.rangeLabel.textContent = `${formatDate(start)} – ${formatDate(end, start.getFullYear() !== end.getFullYear())}`;
+    target.textContent = `${formatDate(start)} – ${formatDate(end, start.getFullYear() !== end.getFullYear())}`;
   } else if (state.period === "month") {
-    el.rangeLabel.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(start);
+    target.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(start);
   } else {
-    el.rangeLabel.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric" }).format(start);
+    target.textContent = new Intl.DateTimeFormat("zh-CN", { year: "numeric" }).format(start);
   }
 }
 function shiftRange(direction) {
@@ -490,7 +491,6 @@ function setupEvents() {
   }));
   el.previousRange.addEventListener("click", () => shiftRange(-1));
   el.nextRange.addEventListener("click", () => shiftRange(1));
-  el.rangeLabel.addEventListener("click", () => { state.anchor = new Date(); resetVisible(); loadRangeData(); });
   el.sortSelect.addEventListener("change", () => { state.sort = el.sortSelect.value; resetVisible(); render(); });
   el.importanceSelect.addEventListener("change", () => { state.importance = el.importanceSelect.value; resetVisible(); render(); });
   el.translationSelect.addEventListener("change", () => { state.translation = el.translationSelect.value; resetVisible(); render(); });
@@ -528,6 +528,19 @@ function configureRepositoryLink() {
   const owner = host.split(".")[0];
   const repo = window.location.pathname.split("/").filter(Boolean)[0] || `${owner}.github.io`;
   el.githubLink.href = `https://github.com/${owner}/${repo}`;
+}
+
+function initDatePicker() {
+  window.LLMDatePicker?.create({
+    toggle: el.rangeLabel,
+    popover: el.datePopover,
+    getPeriod: () => state.period,
+    getAnchor: () => state.anchor,
+    getDayCounts: () => state.manifest?.days || null,
+    getLatestDate: () => state.manifest?.latestDate || null,
+    onSelect: (date) => { state.anchor = date; resetVisible(); loadRangeData(); },
+    onToday: () => { state.anchor = new Date(); resetVisible(); loadRangeData(); }
+  });
 }
 
 function utcDateKey(date) {
@@ -736,6 +749,7 @@ async function loadData() {
   document.getElementById("footerYear").textContent = new Date().getFullYear();
   configureRepositoryLink();
   setupEvents();
+  initDatePicker();
   renderHistory();
   loadData();
 })();
