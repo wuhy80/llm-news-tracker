@@ -546,6 +546,13 @@ def main() -> int:
             "reviewedThisRun": completed,
         }
         save_news(data, NEWS_FILE)
+        # Newly reviewed level-1 items are removed right away, before the next
+        # run would spend the reader budget downloading their bodies.
+        from purge_low_importance import build_plan, apply_plan
+        plan = build_plan()
+        if plan["dropped"]:
+            apply_plan(plan)
+            print(f"[ai-review] purged {plan['dropped']} importance-1 articles")
     print(f"[ai] completed {completed}/{len(candidates)} candidate reviews")
     return 0
 

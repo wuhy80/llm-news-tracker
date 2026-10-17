@@ -66,8 +66,20 @@ def main() -> int:
     parser.add_argument("--reader-limit", type=int, default=int(os.getenv("ARTICLE_READER_LIMIT", "30")))
     args = parser.parse_args()
     data = load_news(NEWS_FILE)
+    # Importance-1 articles are purged before this step's downloads whenever
+    # they appear in the archive (stock cleanup and re-imported items alike).
+    from purge_low_importance import build_plan, apply_plan
+    plan = build_plan()
+    if plan["dropped"]:
+        apply_plan(plan)
+        data = load_news(NEWS_FILE)
+        print(f"[articles] purged {plan['dropped']} importance-1 articles")
     now = datetime.now(timezone.utc)
-    candidates = [item for item in data.get("items", []) if needs_archive(item, now)][:max(0, args.limit)]
+    # Importance-1 items are purged from the archive and never translated; do
+    # not spend the reader budget downloading their bodies either.
+    candidates = [item for item in data.get("items", [])
+                  if (item.get("aiReview") or {}).get("importanceLevel") != 1
+                  and needs_archive(item, now)][:max(0, args.limit)]
     if not candidates:
         print("[articles] no snapshots need backfilling")
         return 0

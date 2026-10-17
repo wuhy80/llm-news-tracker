@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Drop importance-1 articles from the archive and block their URLs.
+
+Level-1 items are never translated and the archive owner does not want their
+bodies downloaded at all. The purge removes them from the daily shards;
+news_store.save_news (called here, as build_news_data does) rebuilds the
+manifest and locator shards and prunes the snapshots that fall out. Media
+directories and zh-CN translation records of the purged articles are removed
+too. Purged URLs go into data/news-blocklist.json so fetch_news does not
+re-import them from feeds during the 120-day feed window.
+
+Dry run by default; --apply performs the rewrite.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+NEWS_DIR = DATA_DIR / "news"
+MEDIA_DIR = DATA_DIR / "article-media"
+TRANSLATIONS_DIR = DATA_DIR / "translations" / "zh-CN"
+BLOCKLIST_FILE = DATA_DIR / "news-blocklist.json"
+BLOCKLIST_CAP = 100_000
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import news_store
+from article_store import publication_path
+
+
+def is_importance_one(item: dict) -> bool:
+    review = item.get("aiReview")
+    return isinstance(review, dict) and review.get("importanceLevel") == 1
+
+
+def shard_paths(news_dir: Path) -> list[Path]:
+    return sorted(path for path in news_dir.rglob("*.json") if path.is_file())
+
+
+def load_blocklist(blocklist_file: Path = BLOCKLIST_FILE) -> set[str]:
+    try:
+        payload = json.loads(blocklist_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    urls = payload.get("blockedUrls")
+    return set(urls) if isinstance(urls, list) else set()
+
+
+def save_blocklist(urls: set[str], blocklist_file: Path = BLOCKLIST_FILE) -> None:
+    news_store.atomic_write_json(blocklist_file, {"blockedUrls": sorted(urls)[:BLOCKLIST_CAP]})
+
+
+def build_plan(news_dir: Path) -> dict:
+    plan = {"shards": 0, "items": 0, "dropped": 0, "changes": [], "purged": []}
+    for path in shard_paths(news_dir):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        items = payload.get("items")
+        if not isinstance(items, list):
+            continue
+        plan["shards"] += 1
+        plan["items"] += len(items)
+        kept = []
+        for item in items:
+            if is_importance_one(item):
+                plan["dropped"] += 1
+                plan["purged"].append({"id": item.get("id"),
+                                       "publishedAt": item.get("publishedAt"),
+                                       "url": item.get("url")})
+                continue
+            kept.append(item)
+        if len(kept) != len(items):
+            plan["changes"].append({"path": str(path), "kept": kept})
+    return plan
+
+
+def apply_plan(plan: dict, manifest_file: Path = None, articles_dir: Path = None,
+               media_dir: Path = MEDIA_DIR, translations_dir: Path = TRANSLATIONS_DIR,
+               blocklist_file: Path = BLOCKLIST_FILE) -> None:
+    from news_store import MANIFEST_FILE, ARTICLES_DIR
+    manifest_file = manifest_file or MANIFEST_FILE
+    articles_dir = articles_dir or ARTICLES_DIR
+    for change in plan["changes"]:
+        path = Path(change["path"])
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        payload["items"] = change["kept"]
+        news_store.atomic_write_json(path, payload)
+    # Rebuild manifest, locator shards and prune snapshots that fell out.
+    news_store.save_news(news_store.load_news(manifest_file, articles_dir),
+                         manifest_file, articles_dir)
+    removed_media = removed_translations = 0
+    for entry in plan["purged"]:
+        article_id, published_at = entry.get("id"), entry.get("publishedAt")
+        if not article_id or not published_at:
+            continue
+        media = media_dir / publication_path(published_at) / str(article_id)
+        if media.exists():
+            shutil.rmtree(media, ignore_errors=True)
+            removed_media += 1
+        record = translations_dir / publication_path(published_at) / f"{article_id}.json"
+        if record.exists():
+            record.unlink()
+            removed_translations += 1
+    blocked = load_blocklist(blocklist_file)
+    for entry in plan["purged"]:
+        url = str(entry.get("url") or "").strip()
+        if url:
+            blocked.add(url)
+    save_blocklist(blocked, blocklist_file)
+    print(f"[purge] removed media dirs: {removed_media}; translation records: {removed_translations}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="rewrite the archive (default: dry run)")
+    parser.add_argument("--news-dir", type=Path, default=None, help="override the daily shard directory (for tests)")
+    args = parser.parse_args(argv)
+    news_dir = args.news_dir if args.news_dir is not None else NEWS_DIR
+    plan = build_plan(news_dir)
+    print(f"[purge] scanned {plan['shards']} shards / {plan['items']} items; "
+          f"importance-1 articles: {plan['dropped']}")
+    if not args.apply:
+        for entry in plan["purged"][:10]:
+            print(f"  would purge {entry['publishedAt']} {entry['id']} {str(entry.get('url'))[:80]}")
+        print("[purge] dry run; pass --apply to rewrite the archive")
+        return 0
+    if not plan["changes"]:
+        print("[purge] nothing to remove")
+        return 0
+    apply_plan(plan)
+    print(f"[purge] dropped {plan['dropped']} articles; "
+          f"blocklist now holds {len(load_blocklist())} urls")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
