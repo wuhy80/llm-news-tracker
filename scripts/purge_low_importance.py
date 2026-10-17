@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Drop importance-1 articles from the archive and block their URLs.
+"""Drop importance-1 articles and routine releases from the archive.
 
 Level-1 items are never translated and the archive owner does not want their
-bodies downloaded at all. The purge removes them from the daily shards;
-news_store.save_news (called here, as build_news_data does) rebuilds the
+bodies downloaded at all. Routine releases (patch bumps, pre-releases, bare
+build numbers, pinned package bumps — the same titles ai_review.is_routine_release
+caps at review time) carry no information worth an archive slot either, so they
+are removed with the same pipeline. The purge removes both kinds from the daily
+shards; news_store.save_news (called here, as build_news_data does) rebuilds the
 manifest and locator shards and prunes the snapshots that fall out. Media
 directories and zh-CN translation records of the purged articles are removed
-too. Purged URLs go into data/news-blocklist.json so fetch_news does not
+too. Purged URLs go into the manifest blockedUrls so fetch_news does not
 re-import them from feeds during the 120-day feed window.
 
 Dry run by default; --apply performs the rewrite.
@@ -28,6 +31,7 @@ BLOCKLIST_FILE = DATA_DIR / "news-blocklist.json"
 BLOCKLIST_CAP = 100_000
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ai_review
 import news_store
 from article_store import publication_path
 
@@ -37,13 +41,22 @@ def is_importance_one(item: dict) -> bool:
     return isinstance(review, dict) and review.get("importanceLevel") == 1
 
 
+def purge_reason(item: dict) -> str | None:
+    """Why the item leaves the archive, or None when it stays."""
+    if is_importance_one(item):
+        return "importance-1"
+    if ai_review.is_routine_release(item):
+        return "routine-release"
+    return None
+
+
 def shard_paths(news_dir: Path) -> list[Path]:
     return sorted(path for path in news_dir.rglob("*.json") if path.is_file())
 
 
 def build_plan(news_dir: Path | None = None) -> dict:
     news_dir = NEWS_DIR if news_dir is None else news_dir
-    plan = {"shards": 0, "items": 0, "dropped": 0, "changes": [], "purged": []}
+    plan = {"shards": 0, "items": 0, "dropped": 0, "routine": 0, "changes": [], "purged": []}
     for path in shard_paths(news_dir):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -56,11 +69,15 @@ def build_plan(news_dir: Path | None = None) -> dict:
         plan["items"] += len(items)
         kept = []
         for item in items:
-            if is_importance_one(item):
+            reason = purge_reason(item)
+            if reason:
                 plan["dropped"] += 1
+                if reason == "routine-release":
+                    plan["routine"] += 1
                 plan["purged"].append({"id": item.get("id"),
                                        "publishedAt": item.get("publishedAt"),
-                                       "url": item.get("url")})
+                                       "url": item.get("url"),
+                                       "reason": reason})
                 continue
             kept.append(item)
         if len(kept) != len(items):
@@ -117,10 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     news_dir = args.news_dir if args.news_dir is not None else NEWS_DIR
     plan = build_plan(news_dir)
     print(f"[purge] scanned {plan['shards']} shards / {plan['items']} items; "
-          f"importance-1 articles: {plan['dropped']}")
+          f"importance-1 articles: {plan['dropped'] - plan['routine']}; "
+          f"routine releases: {plan['routine']}")
     if not args.apply:
         for entry in plan["purged"][:10]:
-            print(f"  would purge {entry['publishedAt']} {entry['id']} {str(entry.get('url'))[:80]}")
+            print(f"  would purge [{entry.get('reason')}] {entry['publishedAt']} {entry['id']} {str(entry.get('url'))[:80]}")
         print("[purge] dry run; pass --apply to rewrite the archive")
         return 0
     if not plan["changes"]:
