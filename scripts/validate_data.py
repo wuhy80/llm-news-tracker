@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from article_store import ROOT
+from news_store import SEARCH_INDEX_VERSION
 
 DATA_DIR = ROOT / "data"
 MANIFEST_FILE = DATA_DIR / "news.json"
@@ -109,6 +110,19 @@ def validate(root: Path = DATA_DIR) -> dict[str, int]:
         errors.append("locator ids do not match daily index ids")
     if manifest.get("itemCount") != len(seen_ids):
         errors.append("manifest itemCount does not match daily indexes")
+
+    search_index_path = root / "search-index.json"
+    try:
+        search_index = read_json(search_index_path)
+        search_ids = {entry.get("id") for entry in search_index.get("items", [])}
+        if search_index.get("schemaVersion") != SEARCH_INDEX_VERSION:
+            errors.append("search-index.json schemaVersion is out of date")
+        if search_ids != seen_ids:
+            errors.append("search index ids do not match daily index ids")
+        if search_index.get("count") != len(seen_ids):
+            errors.append("search index count does not match daily indexes")
+    except (OSError, json.JSONDecodeError) as error:
+        errors.append(f"cannot read {search_index_path.relative_to(root)}: {error}")
 
     if errors:
         detail = "\n".join(f"- {error}" for error in errors[:50])

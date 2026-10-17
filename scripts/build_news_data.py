@@ -7,8 +7,8 @@ from news_store import load_news, save_news
 def main() -> int:
     result = save_news(load_news())
     print(
-        f"[data] synchronized {result['items']} articles across {result['days']} daily indexes "
-        f"and {result['prefixes']} locator shards"
+        f"[data] synchronized {result['items']} articles across {result['days']} daily indexes, "
+        f"{result['prefixes']} locator shards and {result['searchIndex']} search entries"
     )
     return 0
 

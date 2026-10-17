@@ -46,7 +46,9 @@ class NewsStoreTests(unittest.TestCase):
             day = json.loads((root / "data/news/2026/08/27.json").read_text(encoding="utf-8"))
             article = json.loads((articles / "2026/08/27/0123456789ab.json").read_text(encoding="utf-8"))
             locator = json.loads((root / "data/article-index/01.json").read_text(encoding="utf-8"))
-            self.assertEqual(result, {"items": 1, "days": 1, "prefixes": 1, "unlistedCommunity": 0})
+            search_index = json.loads((root / "data/search-index.json").read_text(encoding="utf-8"))
+            self.assertEqual(result, {"items": 1, "days": 1, "prefixes": 1, "unlistedCommunity": 0,
+                                      "searchIndex": 1})
             self.assertNotIn("items", stored_manifest)
             self.assertEqual(stored_manifest["days"], {"2026-08-27": 1})
             self.assertNotIn("glossary", day["items"][0]["aiReview"])
@@ -55,6 +57,54 @@ class NewsStoreTests(unittest.TestCase):
             self.assertEqual(article["bodyFormatVersion"], news_store.BODY_FORMAT_VERSION)
             self.assertEqual(article["aiReview"]["glossary"][0]["term"], "Agent")
             self.assertEqual(locator, {"0123456789ab": "2026/08/27"})
+            self.assertEqual(search_index["count"], 1)
+            self.assertEqual(search_index["items"], [{
+                "id": "0123456789ab",
+                "title": "Example article",
+                "url": "https://example.com/article",
+                "source": "Example",
+                "sourceDomain": "example.com",
+                "publishedAt": "2026-08-27T03:10:20Z",
+                "category": "agent",
+                "tags": ["Agent"],
+                "score": 91,
+                "level": 5,
+                "summaryZh": "这是一篇完整的中文摘要。",
+            }])
+
+    def test_search_index_trims_long_summaries_and_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "data/news.json"
+            articles = root / "data/articles"
+            snapshot = articles / "2021/09/14/abcdef012345.json"
+            snapshot.parent.mkdir(parents=True)
+            snapshot.write_text(json.dumps({"id": "abcdef012345", "fetchedAt": "2021-09-15T00:00:00Z",
+                                            "contentKind": "page", "body": "x" * 300}), encoding="utf-8")
+            item = {
+                "id": "abcdef012345", "title": "Legacy article", "summary": "x" * 400,
+                "url": "https://example.com/legacy", "source": "Example",
+                "sourceDomain": "example.com", "publishedAt": "2021-09-14T00:00:00Z",
+                "category": "release", "tags": [], "score": 20, "signal": "low",
+            }
+
+            news_store.save_news({"items": [item]}, manifest, articles)
+
+            search_index = json.loads((root / "data/search-index.json").read_text(encoding="utf-8"))
+            self.assertEqual(search_index["schemaVersion"], news_store.SEARCH_INDEX_VERSION)
+            self.assertEqual(search_index["items"], [{
+                "id": "abcdef012345",
+                "title": "Legacy article",
+                "url": "https://example.com/legacy",
+                "source": "Example",
+                "sourceDomain": "example.com",
+                "publishedAt": "2021-09-14T00:00:00Z",
+                "category": "release",
+                "score": 20,
+                "level": 1,
+                "kind": "page",
+                "summaryZh": "x" * news_store.SEARCH_SUMMARY_CHARS,
+            }])
 
     def test_load_news_hydrates_full_review_from_article(self):
         with tempfile.TemporaryDirectory() as directory:

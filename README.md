@@ -57,9 +57,14 @@ data/news.json                         # 小型清单：日期、数量、来源
 data/news/YYYY/MM/DD.json              # 首页使用的每日轻量索引
 data/articles/YYYY/MM/DD/<id>.json     # 完整文章：元数据、正文、摘要、AI 审阅、重点词
 data/article-index/<id前两位>.json     # 兼容不带日期的历史文章链接
+data/search-index.json                 # 全站搜索索引：每篇文章的标题、摘要、来源与等级
 ```
 
 首页只加载当前日、周或月涉及的每日索引，文章页只加载一篇完整记录。可运行 `python scripts/build_news_data.py` 重建索引，运行 `python scripts/validate_data.py` 检查清单、分片、文章与定位表是否一致。
+
+### 全站搜索
+
+首页搜索框使用 `data/search-index.json`：打开搜索时才按需加载（压缩后约 2 MB），输入即跨全部历史日期检索标题、中文摘要、来源与标签，不受"日/周/月/年"时段和 AI 精选筛选的限制；分类、等级与翻译状态筛选仍然生效。索引由 `news_store.save_news` 在每次数据同步时自动重建，摘要截断为前 160 字符；索引不可用时搜索回退为仅在当前时段过滤。
 
 ### 重要等级
 

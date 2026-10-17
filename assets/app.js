@@ -30,12 +30,14 @@ const state = {
   sort: "hot",
   translation: "all",
   translations: {},
+  searchIndex: null,
+  searchIndexRequest: null,
   visible: PAGE_SIZE,
   saved: new Set(JSON.parse(localStorage.getItem("llm-pulse-saved") || "[]")),
   history: window.LLMReadingHistory.load()
 };
 const el = Object.fromEntries([
-  "feedList", "feedItemTemplate", "itemCount", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
+  "feedList", "feedItemTemplate", "itemCount", "countDelta", "signalCount", "levelDistribution", "orgCount", "topTopic", "topTopicMeta",
   "resultCount", "loadMore", "rangeLabel", "rangeLabelText", "datePopover", "previousRange", "nextRange", "sortSelect", "importanceSelect", "translationSelect", "trendRadar",
   "trendList", "watchTags", "sourceList", "updateStatus", "sourceStatus", "searchPanel", "searchInput",
   "searchButton", "closeSearch", "mobileSearch", "themeButton", "githubLink", "historyList", "historySummary", "clearHistory"
@@ -182,14 +184,68 @@ function translationStatus(item) {
 function translationMatch(item) {
   return state.translation === "all" || translationStatus(item) === state.translation;
 }
+// The search index covers every listed article since 2021. null = not loaded
+// yet, false = unavailable (the file predates the site or failed to load), and
+// an array = ready. While it is unavailable, search degrades to the current
+// date range only.
+function isGlobalSearch() {
+  return Boolean(state.query.trim()) && Array.isArray(state.searchIndex);
+}
+function searchIndexPending() {
+  return Boolean(state.query.trim()) && !state.searchIndex && state.searchIndexRequest;
+}
+function expandSearchEntry(entry) {
+  const item = {
+    id: entry.id,
+    title: entry.title,
+    url: entry.url,
+    source: entry.source,
+    sourceDomain: entry.sourceDomain || hostname(entry.url),
+    publishedAt: entry.publishedAt,
+    category: entry.category || "industry",
+    tags: Array.isArray(entry.tags) ? entry.tags : [],
+    score: entry.score || 0,
+    signal: "normal"
+  };
+  if (entry.kind) item.articleKind = entry.kind;
+  if (entry.summaryZh) item.summaryZh = entry.summaryZh;
+  const itemReview = {};
+  if (Number.isInteger(entry.level)) itemReview.importanceLevel = entry.level;
+  if (Number.isFinite(entry.reviewScore)) itemReview.importanceScore = entry.reviewScore;
+  if (entry.summaryZh) itemReview.summaryZh = entry.summaryZh;
+  if (Object.keys(itemReview).length) item.aiReview = itemReview;
+  return item;
+}
+function ensureSearchIndex() {
+  if (state.searchIndex || state.searchIndexRequest) return;
+  state.searchIndexRequest = fetch("data/search-index.json", { cache: "no-store" })
+    .then(async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      state.searchIndex = Array.isArray(data.items) ? data.items.map(expandSearchEntry) : [];
+    })
+    .catch((error) => {
+      console.warn("Site search index unavailable, falling back to the current range", error);
+      state.searchIndex = false;
+    })
+    .finally(() => {
+      state.searchIndexRequest = null;
+      if (state.query.trim()) render();
+    });
+}
 function filteredItems() {
   const query = state.query.trim().toLocaleLowerCase();
-  const filtered = rangeItems().filter((item) => {
+  const globalMode = isGlobalSearch();
+  const pool = globalMode ? state.searchIndex : rangeItems();
+  // A site-wide query ignores the curated feed preset: search is expected to
+  // surface every match, including articles below level four.
+  const filtered = pool.filter((item) => {
     const categoryMatch = state.category === "all" || itemCategory(item) === state.category;
     const sourceMatch = state.source === "all" || item.source === state.source;
     const itemReview = review(item);
     const haystack = [item.title, itemSummary(item), item.source, itemReview?.reasonZh, ...itemTags(item)].join(" ").toLocaleLowerCase();
-    return aiModeMatch(item) && importanceMatch(item) && translationMatch(item) && categoryMatch && sourceMatch && (!query || haystack.includes(query));
+    return (!query || haystack.includes(query)) && importanceMatch(item) && translationMatch(item)
+      && categoryMatch && sourceMatch && (globalMode || aiModeMatch(item));
   });
   return filtered.sort((a, b) => state.sort === "latest"
     ? new Date(b.publishedAt) - new Date(a.publishedAt)
@@ -249,11 +305,15 @@ function escapeSelector(value) {
 }
 function renderFeed(items) {
   el.feedList.replaceChildren();
-  el.resultCount.textContent = `${items.length} 条`;
+  if (searchIndexPending()) el.resultCount.textContent = "全站索引加载中…";
+  else if (isGlobalSearch()) el.resultCount.textContent = `全站搜索 ${items.length} 条`;
+  else el.resultCount.textContent = `${items.length} 条`;
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.innerHTML = "<strong>当前范围没有匹配动态</strong><br><span>可以切换时间维度、分类或搜索词</span>";
+    empty.innerHTML = isGlobalSearch()
+      ? "<strong>没有找到匹配的文章</strong><br><span>试试更短的关键词，或检查分类与等级筛选</span>"
+      : "<strong>当前范围没有匹配动态</strong><br><span>可以切换时间维度、分类或搜索词</span>";
     el.feedList.append(empty);
     el.loadMore.hidden = true;
     return;
@@ -384,6 +444,7 @@ function renderTrends(items) {
       el.searchPanel.hidden = false;
       el.searchInput.value = topic;
       state.query = topic;
+      ensureSearchIndex();
       resetVisible();
       render();
       window.scrollTo({ top: el.searchPanel.offsetTop - 110, behavior: "smooth" });
@@ -441,12 +502,14 @@ function selectSource(source) {
 function render() {
   updateRangeLabel();
   const items = filteredItems();
+  el.countDelta.textContent = isGlobalSearch() ? "全站搜索" : "当前时段";
   renderFeed(items);
   renderMetrics(items);
   renderTrends(rangeItems().filter(aiModeMatch));
 }
 function openSearch() {
   el.searchPanel.hidden = false;
+  ensureSearchIndex();
   el.searchInput.focus();
   el.searchPanel.scrollIntoView({ behavior: "smooth", block: "center" });
 }
@@ -497,7 +560,7 @@ function setupEvents() {
   el.searchButton.addEventListener("click", openSearch);
   el.mobileSearch.addEventListener("click", openSearch);
   el.closeSearch.addEventListener("click", closeSearch);
-  el.searchInput.addEventListener("input", () => { state.query = el.searchInput.value; resetVisible(); render(); });
+  el.searchInput.addEventListener("input", () => { state.query = el.searchInput.value; ensureSearchIndex(); resetVisible(); render(); });
   document.addEventListener("keydown", (event) => {
     if (event.key === "/" && document.activeElement?.tagName !== "INPUT") { event.preventDefault(); openSearch(); }
     if (event.key === "Escape" && !el.searchPanel.hidden) closeSearch();

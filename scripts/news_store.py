@@ -24,8 +24,9 @@ INDEX_REVIEW_FIELDS = (
 )
 
 
-def atomic_write_json(path: Path, payload: object) -> None:
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+def atomic_write_json(path: Path, payload: object, indent: int | None = 2) -> None:
+    separators = None if indent is not None else (",", ":")
+    text = json.dumps(payload, ensure_ascii=False, indent=indent, separators=separators) + "\n"
     try:
         if path.read_text(encoding="utf-8") == text:
             return
@@ -170,6 +171,80 @@ def _remove_stale_json(directory: Path, expected: set[Path]) -> None:
             pass
 
 
+SEARCH_INDEX_VERSION = 1
+# The browser downloads the whole index on first search, so the summaries are
+# trimmed to matching-relevant length and the file is written without
+# indentation to keep it around 4 MB instead of 7 MB.
+SEARCH_SUMMARY_CHARS = 160
+
+
+def _finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def score_level(score: float) -> int:
+    if score >= 85:
+        return 5
+    if score >= 70:
+        return 4
+    if score >= 50:
+        return 3
+    if score >= 30:
+        return 2
+    return 1
+
+
+def search_entry(record: dict) -> dict:
+    """Flat per-article entry for data/search-index.json.
+
+    Level and score are precomputed so the client can rank results without the
+    full aiReview block. Fields the reader page cannot render are dropped.
+    """
+    review = record.get("aiReview")
+    review = review if isinstance(review, dict) else {}
+    stored_score = record.get("score") if _finite_number(record.get("score")) else 0
+    review_score = review.get("importanceScore")
+    score = review_score if _finite_number(review_score) else stored_score
+    level = review.get("importanceLevel")
+    entry = {
+        "id": record.get("id", ""),
+        "title": record.get("title", ""),
+        "url": record.get("url", ""),
+        "source": record.get("source", ""),
+        "publishedAt": record.get("publishedAt", ""),
+        "category": record.get("category") or "industry",
+        "score": score,
+        "level": level if isinstance(level, int) else score_level(score),
+    }
+    if record.get("sourceDomain"):
+        entry["sourceDomain"] = record["sourceDomain"]
+    tags = record.get("tags")
+    if isinstance(tags, list) and tags:
+        entry["tags"] = tags
+    if record.get("articleKind"):
+        entry["kind"] = record["articleKind"]
+    summary = record.get("summaryZh") or review.get("summaryZh") or record.get("summary") or ""
+    if summary:
+        entry["summaryZh"] = summary[:SEARCH_SUMMARY_CHARS]
+    return entry
+
+
+def save_search_index(listed: list[dict], manifest_file: Path, generated_at: str) -> int:
+    search_index_file = manifest_file.parent / "search-index.json"
+    entries = [search_entry(record) for record in listed]
+    atomic_write_json(
+        search_index_file,
+        {
+            "schemaVersion": SEARCH_INDEX_VERSION,
+            "generatedAt": generated_at,
+            "count": len(entries),
+            "items": entries,
+        },
+        indent=None,
+    )
+    return len(entries)
+
+
 COMMUNITY_SOURCE_HINTS = ("reddit", "linux do", "linux.do")
 # Forum posts are mostly one-liners, so a thin one is not worth a slot in the
 # feed. This is a listing floor, not a fetch floor: article_store.MIN_BODY_CHARS
@@ -267,5 +342,6 @@ def save_news(
     if isinstance(data.get("blockedUrls"), list):
         manifest["blockedUrls"] = data["blockedUrls"]
     atomic_write_json(manifest_file, manifest)
+    search_entries = save_search_index(listed, manifest_file, generated_at)
     return {"items": len(listed), "days": len(by_day), "prefixes": len(locators),
-            "unlistedCommunity": unlisted_community}
+            "unlistedCommunity": unlisted_community, "searchIndex": search_entries}
