@@ -898,17 +898,6 @@ def news_content_changed(previous: list[dict], current: list[dict]) -> bool:
     return stable(previous) != stable(current)
 
 
-def load_blocked_urls() -> set[str]:
-    """Urls purged by purge_low_importance: feeds would re-import them for up
-    to 120 days, and re-reviewing them every run would waste model quota."""
-    path = ROOT / "data" / "news-blocklist.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    urls = payload.get("blockedUrls")
-    return {str(url) for url in urls} if isinstance(urls, list) else set()
-
 
 
 def main() -> int:
@@ -927,12 +916,14 @@ def main() -> int:
             except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError) as error:
                 print(f"[warn] {source['name']}: {error}", file=sys.stderr)
 
-    blocked_urls = load_blocked_urls()
-    if blocked_urls:
-        print(f"[blocklist] skipping {len(blocked_urls)} purged urls")
     previous_data = load_news(OUTPUT) if OUTPUT.exists() else {"items": []}
     previous_items = migrate_legacy_anthropic_items(previous_data.get("items", []))
     previous_data["items"] = previous_items
+    # Urls purged by purge_low_importance: feeds would re-import them for up
+    # to 120 days, and re-reviewing them every run would waste model quota.
+    blocked_urls = set(previous_data.get("blockedUrls") or [])
+    if blocked_urls:
+        print(f"[blocklist] skipping {len(blocked_urls)} purged urls")
     previous_by_id, previous_by_url = previous_indexes(previous_items)
     merged = dict(previous_by_id)
     resolved_urls = resolve_google_news_urls([raw["url"] for raw in collected])

@@ -264,6 +264,8 @@ def save_news(
     }
     if isinstance(data.get("aiReview"), dict):
         manifest["aiReview"] = data["aiReview"]
+    if isinstance(data.get("blockedUrls"), list):
+        manifest["blockedUrls"] = data["blockedUrls"]
     atomic_write_json(manifest_file, manifest)
     return {"items": len(listed), "days": len(by_day), "prefixes": len(locators),
             "unlistedCommunity": unlisted_community}

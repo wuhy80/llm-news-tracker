@@ -41,19 +41,6 @@ def shard_paths(news_dir: Path) -> list[Path]:
     return sorted(path for path in news_dir.rglob("*.json") if path.is_file())
 
 
-def load_blocklist(blocklist_file: Path = BLOCKLIST_FILE) -> set[str]:
-    try:
-        payload = json.loads(blocklist_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    urls = payload.get("blockedUrls")
-    return set(urls) if isinstance(urls, list) else set()
-
-
-def save_blocklist(urls: set[str], blocklist_file: Path = BLOCKLIST_FILE) -> None:
-    news_store.atomic_write_json(blocklist_file, {"blockedUrls": sorted(urls)[:BLOCKLIST_CAP]})
-
-
 def build_plan(news_dir: Path | None = None) -> dict:
     news_dir = NEWS_DIR if news_dir is None else news_dir
     plan = {"shards": 0, "items": 0, "dropped": 0, "changes": [], "purged": []}
@@ -82,8 +69,7 @@ def build_plan(news_dir: Path | None = None) -> dict:
 
 
 def apply_plan(plan: dict, manifest_file: Path = None, articles_dir: Path = None,
-               media_dir: Path = MEDIA_DIR, translations_dir: Path = TRANSLATIONS_DIR,
-               blocklist_file: Path = BLOCKLIST_FILE) -> None:
+               media_dir: Path = MEDIA_DIR, translations_dir: Path = TRANSLATIONS_DIR) -> None:
     from news_store import MANIFEST_FILE, ARTICLES_DIR
     manifest_file = manifest_file or MANIFEST_FILE
     articles_dir = articles_dir or ARTICLES_DIR
@@ -96,13 +82,19 @@ def apply_plan(plan: dict, manifest_file: Path = None, articles_dir: Path = None
         payload["items"] = change["kept"]
         news_store.atomic_write_json(path, payload)
     # Rebuild manifest, locator shards and prune snapshots that fell out.
-    news_store.save_news(news_store.load_news(manifest_file, articles_dir),
-                         manifest_file, articles_dir)
+    data = news_store.load_news(manifest_file, articles_dir)
+    # Purged urls land in the manifest so fetch_news skips them during the
+    # 120-day feed window; the manifest is on the commit path, a standalone
+    # file would not be.
+    blocked = set(data.get("blockedUrls") or [])
     removed_media = removed_translations = 0
     for entry in plan["purged"]:
         article_id, published_at = entry.get("id"), entry.get("publishedAt")
         if not article_id or not published_at:
             continue
+        url = str(entry.get("url") or "").strip()
+        if url:
+            blocked.add(url)
         media = media_dir / publication_path(published_at) / str(article_id)
         if media.exists():
             shutil.rmtree(media, ignore_errors=True)
@@ -111,13 +103,10 @@ def apply_plan(plan: dict, manifest_file: Path = None, articles_dir: Path = None
         if record.exists():
             record.unlink()
             removed_translations += 1
-    blocked = load_blocklist(blocklist_file)
-    for entry in plan["purged"]:
-        url = str(entry.get("url") or "").strip()
-        if url:
-            blocked.add(url)
-    save_blocklist(blocked, blocklist_file)
-    print(f"[purge] removed media dirs: {removed_media}; translation records: {removed_translations}")
+    data["blockedUrls"] = sorted(blocked)[:BLOCKLIST_CAP]
+    news_store.save_news(data, manifest_file, articles_dir)
+    print(f"[purge] removed media dirs: {removed_media}; translation records: {removed_translations}; "
+          f"blocklist holds {len(data['blockedUrls'])} urls")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,8 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[purge] nothing to remove")
         return 0
     apply_plan(plan)
-    print(f"[purge] dropped {plan['dropped']} articles; "
-          f"blocklist now holds {len(load_blocklist())} urls")
+    print(f"[purge] dropped {plan['dropped']} articles")
     return 0
 
 

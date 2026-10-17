@@ -39,7 +39,6 @@ class PurgeLowImportanceTests(unittest.TestCase):
         self.index_dir = self.root / "data" / "article-index"
         self.media_dir = self.root / "data" / "article-media"
         self.translations = self.root / "data" / "translations" / "zh-CN"
-        self.blocklist = self.root / "data" / "news-blocklist.json"
 
         shard_dir = self.news_dir / "2022" / "05"
         shard_dir.mkdir(parents=True)
@@ -58,15 +57,13 @@ class PurgeLowImportanceTests(unittest.TestCase):
         self.translation = self.translations / "2022" / "05" / "01" / (self.level1["id"] + ".json")
         self.translation.parent.mkdir(parents=True)
         self.translation.write_text(json.dumps({"articleId": self.level1["id"]}), encoding="utf-8")
-        self.blocklist.write_text(json.dumps({"blockedUrls": ["https://example.com/already-blocked"]}), encoding="utf-8")
 
     def plan(self):
         return purge.build_plan(self.news_dir)
 
     def apply(self, plan):
         purge.apply_plan(plan, manifest_file=self.manifest, articles_dir=self.articles,
-                         media_dir=self.media_dir, translations_dir=self.translations,
-                         blocklist_file=self.blocklist)
+                         media_dir=self.media_dir, translations_dir=self.translations)
 
     def test_plan_drops_only_importance_one(self):
         plan = self.plan()
@@ -87,42 +84,19 @@ class PurgeLowImportanceTests(unittest.TestCase):
         manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
         self.assertEqual(manifest["itemCount"], 2)
 
-    def test_blocklist_gains_purged_url_and_keeps_existing(self):
+    def test_manifest_blocklist_gains_purged_url(self):
         self.apply(self.plan())
-        blocked = json.loads(self.blocklist.read_text(encoding="utf-8"))["blockedUrls"]
-        self.assertIn("https://example.com/level-one", blocked)
-        self.assertIn("https://example.com/already-blocked", blocked)
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertIn("https://example.com/level-one", manifest["blockedUrls"])
+        # save_news rebuilds from shards; the list must survive the rebuild.
+        reloaded = load_news(self.manifest, self.articles)
+        self.assertIn("https://example.com/level-one", reloaded["blockedUrls"])
 
     def test_second_run_is_a_noop(self):
         self.apply(self.plan())
         plan = self.plan()
         self.assertEqual(plan["dropped"], 0)
         self.assertEqual(plan["changes"], [])
-
-    def test_fetch_news_blocklist_loader(self):
-        import fetch_news
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            data_dir = root / "data"
-            data_dir.mkdir()
-            (data_dir / "news-blocklist.json").write_text(
-                json.dumps({"blockedUrls": ["https://example.com/x", "https://example.com/y"]}),
-                encoding="utf-8")
-            original_root = fetch_news.ROOT
-            try:
-                fetch_news.ROOT = root
-                self.assertEqual(fetch_news.load_blocked_urls(),
-                                 {"https://example.com/x", "https://example.com/y"})
-            finally:
-                fetch_news.ROOT = original_root
-        # A missing file yields an empty set instead of raising.
-        with tempfile.TemporaryDirectory() as directory:
-            original_root = fetch_news.ROOT
-            try:
-                fetch_news.ROOT = Path(directory)
-                self.assertEqual(fetch_news.load_blocked_urls(), set())
-            finally:
-                fetch_news.ROOT = original_root
 
 
 if __name__ == "__main__":
