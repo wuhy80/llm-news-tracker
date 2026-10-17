@@ -1,0 +1,439 @@
+{
+  "schemaVersion": 3,
+  "id": "4ee77ab91d47",
+  "title": "Scaling AI-based Data Processing with Hugging Face + Dask",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/dask-scaling",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2024-10-09T00:00:00Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 66,
+  "signal": "normal",
+  "originalUrl": "https://huggingface.co/blog/dask-scaling",
+  "resolvedUrl": "https://huggingface.co/blog/dask-scaling",
+  "fetchedAt": "2026-08-30T10:39:59.650105Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "The Hugging Face platform has many datasets and pre-trained models that make using and training state-of-the-art machine learning models increasingly accessible. However, it can be hard to scale AI tasks because AI datasets are often large (100s GBs to TBs) and using Hugging Face transformers for model inference can sometimes be computationally expensive.\n\nDask, a Python library for distributed computing, can handle out-of-core computing (processing data that doesn’t fit in memory) by breaking datasets into manageable chunks. This makes it easy to do things like:\n\n- Efficient data loading and preprocessing of TB-scale datasets with an easy to use API that mimics pandas\n\n- Parallel model inference (with the option of multi-node GPU inference)\n\nIn this post we show an example of data processing from the FineWeb dataset, using the FineWeb-Edu classifier to identify web pages with high educational value. We’ll show:\n\n- How to process 100 rows locally with pandas\n\n- Scaling to 211 million rows with Dask across multiple GPUs on the cloud\n\n## Processing 100 Rows with Pandas\n\nThe FineWeb dataset consists of 15 trillion tokens of English web data from Common Crawl, a non-profit that hosts a public web crawl dataset updated monthly. This dataset is often used for a variety of tasks such as large language model training, classification, content filtering, and information retrieval across a variety of sectors.\n\nIt can take > 1 minute to download and read in a single file with pandas on a laptop.\n\n```\nimport pandas as pd\n\ndf = pd.read_parquet(\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/000_00000.parquet\"\n)\n```\n\nNext, we’ll use the HF FineWeb-Edu classifier to judge the educational value of the web pages in our dataset. Web pages are ranked on a scale from 0 to 5, with 0 being not educational and 5 being highly educational. We can use pandas to do this on a smaller, 100-row subset of the data, which takes ~10 seconds on a M1 Mac with a GPU.\n\n```\nfrom transformers import pipeline\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=25,                    # Choose batch size based on data size and hardware\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\"\n    )\n    \n    return pd.Series([r[\"score\"] for r in results])\n\ndf = df[:100]\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = compute_scores(df.text)\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]\n```\n\nNote that we also added a step to check the available hardware inside the compute_scores function, because it will be distributed when we scale with Dask in the next step. This makes it easy to go from testing locally on a single machine (either on a CPU or maybe you have a MacBook with an Apple silicon GPU) to distributing across multiple machines (like NVIDIA GPUs).\n\n## Scaling to 211 Million Rows with Dask\n\nThe entire 2024 February/March crawl is 432 GB on disk, or ~715 GB in memory, split up across 250 Parquet files. Even on a machine with enough memory for the whole dataset, this would be prohibitively slow to do serially.\n\nTo scale up, we can use Dask DataFrame, which helps you process large tabular data by parallelizing pandas. It closely resembles the pandas API, making it easy to go from testing on a single dataset to scaling out to the full dataset. Dask works well with Parquet, the default format on Hugging Face datasets, to enable rich data types, efficient columnar filtering, and compression.\n\n```\nimport dask.dataframe as dd\n\ndf = dd.read_parquet(\n    # Load the full dataset lazily with Dask\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/*.parquet\" \n)\n```\n\nWe’ll apply the compute_scores function for text classification in parallel on our Dask DataFrame using map_partitions, which applies our function in parallel on each pandas DataFrame in the larger Dask DataFrame. The meta argument is specific to Dask, and indicates the data structure (column names and data types) of the output.\n\n```\nfrom transformers import pipeline\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device,\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=768,\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\",\n    )\n\n    return pd.Series([r[\"score\"] for r in results])\n\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = df.text.map_partitions(compute_scores, meta=pd.Series([0]))\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]\n```\n\nNote that we’ve picked a batch_size that works well for this example, but you’ll likely want to customize this depending on the hardware, data, and model you’re using in your own workflows (see the HF docs on pipeline batching).\n\nNow that we’ve identified the rows of the dataset we’re interested in, we can save the result for other downstream analyses. Dask DataFrame automatically supports distributed writing to Parquet. Hugging Face uses commits to track dataset changes and allows writing a Dask DataFrame in parallel.\n\n```\nrepo_id = \"<your-hf-user>/<your-dataset-name>\"  # Update with your dataset location\ndf.to_parquet(f\"hf://datasets/{repo_id}\")\n```\n\nSince this creates one commit per file, it is recommended to squash the history after the upload:\n\n```\nfrom huggingface_hub import HfApi\n\nHfApi().super_squash_history(repo_id=repo_id, repo_type=\"dataset\")\n```\n\nAlternatively you can use this custom function which uploads multiple files per commit.\n\n### Multi-GPU Parallel Model Inference\n\nThere are a number of ways to deploy Dask on a variety of hardware. Here, we’ll use Coiled to deploy Dask on the cloud so we can spin up VMs as needed, and then clean them up when we’re done.\n\n```\ncluster = coiled.Cluster(\n    region=\"us-east-1\",                 # Same region as data\n    n_workers=100,                      \n    spot_policy=\"spot_with_fallback\",   # Use spot instances, if available\n    worker_vm_types=\"g5.xlarge\",        # NVIDIA A10 Tensor Core GPU\n    worker_options={\"nthreads\": 1},\n)\nclient = cluster.get_client()\n```\n\nUnder the hood Coiled handles:\n\n- Provisioning cloud VMs with GPU hardware. In this case, g5.xlarge instances on AWS.\n\n- Setting up the appropriate NVIDIA drivers, CUDA runtime, etc.\n\n- Automatically installing the same packages you have locally on the cloud VM with package sync. This includes Python files in your working directory.\n\nThe workflow took ~5 hours to complete and we had good GPU hardware utilization.\n\nGPU utilization and memory usage are both near their maximum capacity, which means we're utilizing the available hardware well.\n\nPutting it all together, here is the complete workflow:\n\n```\nimport dask.dataframe as dd\nfrom transformers import pipeline\nfrom huggingface_hub import HfApi\nimport os\nimport coiled\n\ncluster = coiled.Cluster(\n    region=\"us-east-1\",\n    n_workers=100,\n    spot_policy=\"spot_with_fallback\",\n    worker_vm_types=\"g5.xlarge\",\n    worker_options={\"nthreads\": 1},\n)\nclient = cluster.get_client()\ncluster.send_private_envs(\n    {\"HF_TOKEN\": \"<your-hf-token>\"}             #  Send credentials over encrypted connection\n)\n\ndf = dd.read_parquet(\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/*.parquet\"\n)\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=768,\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\"\n    )\n\n    return pd.Series([r[\"score\"] for r in results])\n\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = df.text.map_partitions(compute_scores, meta=pd.Series([0]))\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]\n\nrepo_id = \"<your-hf-user>/<your-dataset-name>\"  # Replace with your dataset location\ndf.to_parquet(f\"hf://datasets/{repo_id}\")\n\nHfApi().super_squash_history(repo_id=repo_id, repo_type=\"dataset\")  # optional: squash commit history\n```\n\n## Conclusion\n\nHugging Face + Dask is a powerful combination. In this example, we scaled up our classification task from 100 rows to 211 million rows by using Dask + Coiled to run the workflow in parallel across multiple GPUs on the cloud.\n\nThis same type of workflow can be used for other use cases like:\n\n- Filtering genomic data to select genes of interest\n\n- Extracting information from unstructured text and turning them into structured datasets\n\n- Cleaning text data scraped from the internet or Common Crawl\n\n- Running multimodal model inference to analyze large audio, image, or video datasets",
+  "summaryZh": "本文探讨了如何利用分布式计算库Dask配合Hugging Face平台，高效处理海量AI预训练数据集。文章以包含15万亿token的FineWeb数据集为例，展示了如何从本地单机pandas处理扩展到利用云端多GPU通过Dask进行TB级数据的并行清洗与过滤。",
+  "summaryGeneratedAt": "2026-09-05T15:21:04.588385Z",
+  "summaryModel": "gemini:gemini-3.5-flash-lite",
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dask-scaling/gpu-util.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/dask-scaling/gpu-util.png",
+      "alt": "Median GPU utilization is 100% and median memory usage is 21.5 GB, just under the 24 GB available on the GPU.",
+      "id": "image_0398e3e24d500ad3"
+    }
+  ],
+  "videos": [],
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "The Hugging Face platform has many datasets and pre-trained models that make using and training state-of-the-art machine learning models increasingly accessible. However, it can be hard to scale AI tasks because AI datasets are often large (100s GBs to TBs) and using Hugging Face transformers for model inference can sometimes be computationally expensive.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Dask, a Python library for distributed computing, can handle out-of-core computing (processing data that doesn’t fit in memory) by breaking datasets into manageable chunks. This makes it easy to do things like:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "a",
+          "href": "https://www.dask.org/?utm_source=hf-blog"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "Efficient data loading and preprocessing of TB-scale datasets with an easy to use API that mimics pandas",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Parallel model inference (with the option of multi-node GPU inference)",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "In this post we show an example of data processing from the FineWeb dataset, using the FineWeb-Edu classifier to identify web pages with high educational value. We’ll show:",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "How to process 100 rows locally with pandas",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Scaling to 211 million rows with Dask across multiple GPUs on the cloud",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Processing 100 Rows with Pandas",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "The FineWeb dataset consists of 15 trillion tokens of English web data from Common Crawl, a non-profit that hosts a public web crawl dataset updated monthly. This dataset is often used for a variety of tasks such as large language model training, classification, content filtering, and information retrieval across a variety of sectors.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 19,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/HuggingFaceFW/fineweb"
+        },
+        {
+          "start": 76,
+          "end": 88,
+          "kind": "a",
+          "href": "http://commoncrawl.org/"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "It can take > 1 minute to download and read in a single file with pandas on a laptop.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Next, we’ll use the HF FineWeb-Edu classifier to judge the educational value of the web pages in our dataset. Web pages are ranked on a scale from 0 to 5, with 0 being not educational and 5 being highly educational. We can use pandas to do this on a smaller, 100-row subset of the data, which takes ~10 seconds on a M1 Mac with a GPU.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/HuggingFaceFW/fineweb-edu-classifier"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "Note that we also added a step to check the available hardware inside the compute_scores function, because it will be distributed when we scale with Dask in the next step. This makes it easy to go from testing locally on a single machine (either on a CPU or maybe you have a MacBook with an Apple silicon GPU) to distributing across multiple machines (like NVIDIA GPUs).",
+      "spans": [
+        {
+          "start": 74,
+          "end": 88,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Scaling to 211 Million Rows with Dask",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "The entire 2024 February/March crawl is 432 GB on disk, or ~715 GB in memory, split up across 250 Parquet files. Even on a machine with enough memory for the whole dataset, this would be prohibitively slow to do serially.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "To scale up, we can use Dask DataFrame, which helps you process large tabular data by parallelizing pandas. It closely resembles the pandas API, making it easy to go from testing on a single dataset to scaling out to the full dataset. Dask works well with Parquet, the default format on Hugging Face datasets, to enable rich data types, efficient columnar filtering, and compression.",
+      "spans": [
+        {
+          "start": 24,
+          "end": 38,
+          "kind": "a",
+          "href": "https://docs.dask.org/en/stable/dataframe.html?utm_source=hf-blog"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "We’ll apply the compute_scores function for text classification in parallel on our Dask DataFrame using map_partitions, which applies our function in parallel on each pandas DataFrame in the larger Dask DataFrame. The meta argument is specific to Dask, and indicates the data structure (column names and data types) of the output.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 104,
+          "end": 118,
+          "kind": "code"
+        },
+        {
+          "start": 218,
+          "end": 222,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Note that we’ve picked a batch_size that works well for this example, but you’ll likely want to customize this depending on the hardware, data, and model you’re using in your own workflows (see the HF docs on pipeline batching).",
+      "spans": [
+        {
+          "start": 25,
+          "end": 35,
+          "kind": "code"
+        },
+        {
+          "start": 198,
+          "end": 226,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/en/main_classes/pipelines#pipeline-batching"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Now that we’ve identified the rows of the dataset we’re interested in, we can save the result for other downstream analyses. Dask DataFrame automatically supports distributed writing to Parquet. Hugging Face uses commits to track dataset changes and allows writing a Dask DataFrame in parallel.",
+      "spans": [
+        {
+          "start": 163,
+          "end": 193,
+          "kind": "a",
+          "href": "https://docs.dask.org/en/stable/dataframe-parquet.html?utm_source=hf-blog"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Since this creates one commit per file, it is recommended to squash the history after the upload:",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Alternatively you can use this custom function which uploads multiple files per commit.",
+      "spans": [
+        {
+          "start": 26,
+          "end": 46,
+          "kind": "a",
+          "href": "https://gist.github.com/lhoestq/8f73187a4e4b97b9bb40b561e35f6ccb"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Multi-GPU Parallel Model Inference",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "There are a number of ways to deploy Dask on a variety of hardware. Here, we’ll use Coiled to deploy Dask on the cloud so we can spin up VMs as needed, and then clean them up when we’re done.",
+      "spans": [
+        {
+          "start": 30,
+          "end": 41,
+          "kind": "a",
+          "href": "https://docs.dask.org/en/stable/deploying.html?utm_source=hf-blog"
+        },
+        {
+          "start": 84,
+          "end": 90,
+          "kind": "a",
+          "href": "https://docs.coiled.io/user_guide/ml.html?utm_source=hf-blog"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Under the hood Coiled handles:",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "Provisioning cloud VMs with GPU hardware. In this case, g5.xlarge instances on AWS.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 82,
+          "kind": "a",
+          "href": "https://aws.amazon.com/ec2/instance-types/g5/"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "Setting up the appropriate NVIDIA drivers, CUDA runtime, etc.",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Automatically installing the same packages you have locally on the cloud VM with package sync. This includes Python files in your working directory.",
+      "spans": [
+        {
+          "start": 81,
+          "end": 93,
+          "kind": "a",
+          "href": "https://docs.coiled.io/user_guide/software/sync.html?utm_source=hf-blog"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "The workflow took ~5 hours to complete and we had good GPU hardware utilization.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "GPU utilization and memory usage are both near their maximum capacity, which means we're utilizing the available hardware well.",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Putting it all together, here is the complete workflow:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Conclusion",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "Hugging Face + Dask is a powerful combination. In this example, we scaled up our classification task from 100 rows to 211 million rows by using Dask + Coiled to run the workflow in parallel across multiple GPUs on the cloud.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "This same type of workflow can be used for other use cases like:",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Filtering genomic data to select genes of interest",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Extracting information from unstructured text and turning them into structured datasets",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Cleaning text data scraped from the internet or Common Crawl",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Running multimodal model inference to analyze large audio, image, or video datasets",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "935b9e8209360f8a4302e9e303e74b4be4cc631c28e4491a3891d71f7065060e",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import pandas as pd\n\ndf = pd.read_parquet(\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/000_00000.parquet\"\n)"
+    },
+    {
+      "id": "c0002",
+      "source": "from transformers import pipeline\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=25,                    # Choose batch size based on data size and hardware\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\"\n    )\n    \n    return pd.Series([r[\"score\"] for r in results])\n\ndf = df[:100]\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = compute_scores(df.text)\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]"
+    },
+    {
+      "id": "c0003",
+      "source": "import dask.dataframe as dd\n\ndf = dd.read_parquet(\n    # Load the full dataset lazily with Dask\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/*.parquet\" \n)"
+    },
+    {
+      "id": "c0004",
+      "source": "from transformers import pipeline\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device,\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=768,\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\",\n    )\n\n    return pd.Series([r[\"score\"] for r in results])\n\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = df.text.map_partitions(compute_scores, meta=pd.Series([0]))\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]"
+    },
+    {
+      "id": "c0005",
+      "source": "repo_id = \"<your-hf-user>/<your-dataset-name>\"  # Update with your dataset location\ndf.to_parquet(f\"hf://datasets/{repo_id}\")"
+    },
+    {
+      "id": "c0006",
+      "source": "from huggingface_hub import HfApi\n\nHfApi().super_squash_history(repo_id=repo_id, repo_type=\"dataset\")"
+    },
+    {
+      "id": "c0007",
+      "source": "cluster = coiled.Cluster(\n    region=\"us-east-1\",                 # Same region as data\n    n_workers=100,                      \n    spot_policy=\"spot_with_fallback\",   # Use spot instances, if available\n    worker_vm_types=\"g5.xlarge\",        # NVIDIA A10 Tensor Core GPU\n    worker_options={\"nthreads\": 1},\n)\nclient = cluster.get_client()"
+    },
+    {
+      "id": "c0008",
+      "source": "import dask.dataframe as dd\nfrom transformers import pipeline\nfrom huggingface_hub import HfApi\nimport os\nimport coiled\n\ncluster = coiled.Cluster(\n    region=\"us-east-1\",\n    n_workers=100,\n    spot_policy=\"spot_with_fallback\",\n    worker_vm_types=\"g5.xlarge\",\n    worker_options={\"nthreads\": 1},\n)\nclient = cluster.get_client()\ncluster.send_private_envs(\n    {\"HF_TOKEN\": \"<your-hf-token>\"}             #  Send credentials over encrypted connection\n)\n\ndf = dd.read_parquet(\n    \"hf://datasets/HuggingFaceFW/fineweb/data/CC-MAIN-2024-10/*.parquet\"\n)\n\ndef compute_scores(texts):\n    import torch\n\n    # Select which hardware to use\n    if torch.cuda.is_available():\n        device = torch.device(\"cuda\")\n    elif torch.backends.mps.is_available():\n        device = torch.device(\"mps\")\n    else:\n        device = torch.device(\"cpu\")\n\n    pipe = pipeline(\n        \"text-classification\",\n        model=\"HuggingFaceFW/fineweb-edu-classifier\",\n        device=device\n    )\n    results = pipe(\n        texts.to_list(),\n        batch_size=768,\n        padding=\"longest\",\n        truncation=True,\n        function_to_apply=\"none\"\n    )\n\n    return pd.Series([r[\"score\"] for r in results])\n\nmin_edu_score = 3\ndf[\"edu-classifier-score\"] = df.text.map_partitions(compute_scores, meta=pd.Series([0]))\ndf = df[df[\"edu-classifier-score\"] >= min_edu_score]\n\nrepo_id = \"<your-hf-user>/<your-dataset-name>\"  # Replace with your dataset location\ndf.to_parquet(f\"hf://datasets/{repo_id}\")\n\nHfApi().super_squash_history(repo_id=repo_id, repo_type=\"dataset\")  # optional: squash commit history"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "935b9e8209360f8a4302e9e303e74b4be4cc631c28e4491a3891d71f7065060e",
+  "mediaLayout": [
+    {
+      "mediaId": "image_0398e3e24d500ad3",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaFormatVersion": 2,
+  "hfContentCheckedAt": "2026-10-03T07:05:17.805610Z",
+  "mediaLayoutCheckedAt": "2026-10-03T07:05:17.805625Z",
+  "articleKind": "page",
+  "aiReview": {
+    "version": "ai-editor-v3",
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "reviewedAt": "2026-09-05T15:21:04.588385Z",
+    "isRelevant": true,
+    "relevanceScore": 81,
+    "importanceScore": 81,
+    "importanceLevel": 4,
+    "dimensions": {
+      "relevance": 20,
+      "impact": 18,
+      "novelty": 10,
+      "credibility": 15,
+      "usefulness": 9,
+      "timeliness": 9
+    },
+    "evidenceLevel": "clear",
+    "informationType": "original",
+    "category": "industry",
+    "tags": [
+      "Dask",
+      "FineWeb",
+      "Data Processing",
+      "Distributed Computing"
+    ],
+    "reasonZh": "该文章详细介绍了如何结合Dask与Hugging Face处理超大规模大模型训练数据集，对大规模AI工程实践非常有价值。",
+    "summaryZh": "本文探讨了如何利用分布式计算库Dask配合Hugging Face平台，高效处理海量AI预训练数据集。文章以包含15万亿token的FineWeb数据集为例，展示了如何从本地单机pandas处理扩展到利用云端多GPU通过Dask进行TB级数据的并行清洗与过滤。",
+    "glossary": [
+      {
+        "term": "Dask",
+        "explanationZh": "用于Python的分布式计算库，支持处理超出内存限制的大规模数据集"
+      },
+      {
+        "term": "FineWeb",
+        "explanationZh": "由Common Crawl数据构建的超大规模英文网页数据集，常用于大模型预训练"
+      },
+      {
+        "term": "Parallel Model Inference",
+        "explanationZh": "并行模型推理，指利用多个计算节点同时执行模型推理任务以提高吞吐量"
+      }
+    ],
+    "duplicateKey": "huggingface-dask-scaling-ai-data"
+  }
+}
