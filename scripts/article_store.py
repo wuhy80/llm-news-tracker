@@ -37,6 +37,13 @@ MEDIA_STORAGE_MODE = os.getenv("ARTICLE_MEDIA_STORAGE", "remote").casefold()
 MAX_BODY_CHARS = 30_000
 MIN_BODY_CHARS = 280
 BODY_FORMAT_VERSION = 3
+# JS-rendered mirrors (aiera.com.cn and friends) serve a navigation shell: the
+# server-side HTML holds the site menu and a "正在取这篇稿子" placeholder, so the
+# extractor walks away with the menu instead of the article. The menu clears
+# MIN_BODY_CHARS, so junk used to be archived as a successful read.
+NAV_SHELL_MARKERS = ("关于我们", "联系我们", "免责声明", "频道", "☰", "正在取这篇稿子", "加载中")
+NAV_SHELL_MAX_CHARS = 1200
+JAVASCRIPT_SHELL_DOMAINS = ("aiera.com.cn",)
 READER_PREFIX = "https://r.jina.ai/"
 READER_DELAY_SECONDS = float(os.getenv("ARTICLE_READER_DELAY", "4"))
 READER_LOCK = threading.Lock()
@@ -1099,6 +1106,22 @@ def fetch_community_text(url: str) -> tuple[str, str]:
     return body, resolved_url
 
 
+def is_navigation_shell(body: str) -> bool:
+    """True when a short body is the site menu of a JS-rendered page."""
+    text = (body or "").strip()
+    if not text or len(text) >= NAV_SHELL_MAX_CHARS:
+        return False
+    if "正在取这篇稿子" in text or "加载中" in text:
+        return True
+    hits = sum(1 for marker in NAV_SHELL_MARKERS if marker in text)
+    return hits >= 2
+
+
+def is_javascript_shell_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == domain or host.endswith("." + domain) for domain in JAVASCRIPT_SHELL_DOMAINS)
+
+
 def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
     MEDIA_SOURCE_CONTEXT.value = None
     validate_public_url(url)
@@ -1137,6 +1160,8 @@ def fetch_page_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
         raise ValueError("readable body not found")
     if has_corrupted_text(body):
         raise ValueError("page body contains corrupted text")
+    if is_navigation_shell(body):
+        raise ValueError("page body is a navigation shell")
     FETCHED_VIDEO_REFS[resolved_url] = videos
     record_media_source(resolved_url, document, "html")
     return body, resolved_url, images
@@ -1175,6 +1200,8 @@ def fetch_reader_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
         raise ValueError("reader body not found")
     if has_corrupted_text(body):
         raise ValueError("reader body contains corrupted text")
+    if is_navigation_shell(body):
+        raise ValueError("reader body is a navigation shell")
     record_media_source(url, reader_text, "markdown")
     return body, url, extract_markdown_image_refs(reader_text, url)
 
@@ -1192,6 +1219,13 @@ def error_note(stage: str, error: Exception) -> str:
 
 def archive_item(item: dict, fetch_url: str | None = None, allow_reader: bool = True) -> tuple[str, str]:
     target_url = fetch_url or item["url"]
+    if is_javascript_shell_url(target_url):
+        # Known JS-only mirrors cannot be archived without a browser; keep the
+        # summary instead of spending page and reader budget on their shell.
+        summary = (item.get("summary") or "").strip()
+        write_snapshot(item, summary, "summary", resolved_url=target_url,
+                       error="skipped:javascript-only mirror")
+        return item["id"], "summary"
     errors = []
     if community_api_url(target_url):
         try:

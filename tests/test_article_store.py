@@ -432,6 +432,30 @@ class GoogleNewsTests(unittest.TestCase):
         validate.assert_called_once_with(target)
 
 
+class NavigationShellTests(unittest.TestCase):
+    def test_navigation_shell_detected(self):
+        junk = ("[](https://aiera.com.cn/post/asi-baodian.html)"
+                "ASI 爆点ASI 启示录ASI 坐标ASI 新天地频道 ☰关于我们 "
+                "ASI 爆点ASI 启示录ASI 坐标ASI 新天地")
+        self.assertTrue(article_store.is_navigation_shell(junk))
+
+    def test_real_article_body_is_not_a_shell(self):
+        body = "这是一篇真正的文章正文。" * 60
+        self.assertFalse(article_store.is_navigation_shell(body))
+
+    def test_long_bodies_are_never_shells(self):
+        filler = "正文内容。关于我们。频道。联系我们。" * 200
+        self.assertFalse(article_store.is_navigation_shell(filler))
+
+    def test_javascript_shell_domains(self):
+        self.assertTrue(article_store.is_javascript_shell_url(
+            "https://aiera.com.cn/2026/10/17/other/admin/119063/post/"))
+        self.assertTrue(article_store.is_javascript_shell_url(
+            "https://www.aiera.com.cn/rss"))
+        self.assertFalse(article_store.is_javascript_shell_url(
+            "https://huggingface.co/blog/tricks"))
+
+
 class PublicUrlTests(unittest.TestCase):
     def test_community_urls_use_structured_endpoints(self):
         reddit = article_store.community_api_url(
