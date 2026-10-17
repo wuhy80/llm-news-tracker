@@ -54,7 +54,8 @@ def save_blocklist(urls: set[str], blocklist_file: Path = BLOCKLIST_FILE) -> Non
     news_store.atomic_write_json(blocklist_file, {"blockedUrls": sorted(urls)[:BLOCKLIST_CAP]})
 
 
-def build_plan(news_dir: Path) -> dict:
+def build_plan(news_dir: Path | None = None) -> dict:
+    news_dir = NEWS_DIR if news_dir is None else news_dir
     plan = {"shards": 0, "items": 0, "dropped": 0, "changes": [], "purged": []}
     for path in shard_paths(news_dir):
         try:
