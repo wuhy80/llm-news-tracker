@@ -41,7 +41,16 @@ BODY_FORMAT_VERSION = 3
 # server-side HTML holds the site menu and a "正在取这篇稿子" placeholder, so the
 # extractor walks away with the menu instead of the article. The menu clears
 # MIN_BODY_CHARS, so junk used to be archived as a successful read.
-NAV_SHELL_MARKERS = ("关于我们", "联系我们", "免责声明", "频道", "☰", "正在取这篇稿子", "加载中")
+NAV_SHELL_MARKERS = ("关于我们", "联系我们", "免责声明", "频道", "☰", "正在取这篇稿子", "加载中",
+                     # github.com answers a plain fetch of a release tag with its session
+                     # banner, so the body is GitHub's chrome instead of the release notes:
+                     # a bare "v0.32.0" release page archived 504 characters of it.
+                     "You signed in with another tab or window",
+                     "Reload to refresh your session",
+                     "You signed out in another tab or window",
+                     "Dismiss alert",
+                     "您使用另一个选项卡或窗口登录",
+                     "您在另一个选项卡或窗口中注销")
 NAV_SHELL_MAX_CHARS = 1200
 JAVASCRIPT_SHELL_DOMAINS = ("aiera.com.cn",)
 READER_PREFIX = "https://r.jina.ai/"

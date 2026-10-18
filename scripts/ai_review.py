@@ -130,18 +130,28 @@ VERSION_TAG = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?([-+][\w.-]+)?$", re.
 
 
 def is_routine_version(title: str) -> bool:
-    """A patch release or a pre-release is routine; a minor or major bump is not.
+    """A pre-1.0 release, a patch release or a pre-release is routine.
 
     Release feeds title their items with the bare tag, so this decides whether a
-    real release reaches the reviewer at full strength. An earlier rule capped
-    every bare version, which hid v0.35.0 and would have hidden v1.0.0 too.
+    real release reaches the reviewer at full strength. A project below 1.0 is still
+    pre-release and ships 0.x.y constantly: vLLM's v0.32.0 is the thirty-second such
+    bump and llama.cpp's v0.7.0 the seventh, so neither is news and neither should
+    reach the reviewer at full strength. From 1.0 on, a patch bump is routine but a
+    minor or major bump is not, so v1.0.0 and v1.32.0 still reach the reviewer.
+
+    An earlier rule treated a 0.x.0 bump as a real release because its patch is "0".
+    That let a bare "v0.32.0" through as a high-signal release page whose body was
+    only GitHub's session banner, which is exactly the worthless entry this guard
+    exists to keep out.
     """
     match = VERSION_TAG.match(title)
     if not match:
         return False
-    patch, suffix = match.group(3), match.group(4)
+    major, patch, suffix = match.group(1), match.group(3), match.group(4)
     if suffix:
         return True                      # -rc1, -alpha, -beta
+    if major == "0":
+        return True                      # pre-1.0: every 0.x.y bump is routine
     return patch is not None and patch != "0"
 
 

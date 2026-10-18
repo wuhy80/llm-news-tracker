@@ -194,17 +194,29 @@ class AIReviewTests(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertTrue(ai_review.is_routine_release({"title": title}))
 
-    def test_a_release_bump_is_not_a_routine_patch(self):
-        # A bare version is how the release feeds title a real release, so a minor
-        # or major bump has to survive and reach the reviewer at full strength.
-        for title in ("v0.35.0",
-                      "v0.31.0",
-                      "v1.0.0",
+    def test_a_release_bump_from_one_oh_is_not_a_routine_patch(self):
+        # A bare version is how the release feeds title a real release, so once a
+        # project has reached 1.0 a minor or major bump has to survive and reach the
+        # reviewer at full strength.
+        for title in ("v1.0.0",
                       "v2.0.0",
-                      "v0.31",
+                      "v1.32.0",
                       "v2"):
             with self.subTest(title=title):
                 self.assertFalse(ai_review.is_routine_release({"title": title}))
+
+    def test_a_pre_one_oh_bump_is_routine(self):
+        # vLLM ships v0.32.0 and llama.cpp ships v0.7.0; a project below 1.0 is still
+        # pre-release, so these are the thirty-second and seventh such bumps and not
+        # news. Both used to reach the reviewer at full strength because patch was "0".
+        for title in ("v0.32.0",
+                      "v0.7.0",
+                      "v0.35.0",
+                      "v0.31.0",
+                      "v0.31",
+                      "v0.6.0"):
+            with self.subTest(title=title):
+                self.assertTrue(ai_review.is_routine_release({"title": title}))
 
     def test_a_short_b_or_a_real_title_is_not_a_build_number(self):
         # b2024 deliberately absent: b plus four digits is a build number, whatever

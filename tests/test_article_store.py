@@ -439,6 +439,23 @@ class NavigationShellTests(unittest.TestCase):
                 "ASI 爆点ASI 启示录ASI 坐标ASI 新天地")
         self.assertTrue(article_store.is_navigation_shell(junk))
 
+    def test_github_session_banner_is_a_shell(self):
+        # A plain fetch of a github.com release tag answers with GitHub's session
+        # banner instead of the release notes, so a bare "v0.32.0" release page
+        # archived 504 characters of chrome and looked like a successful read.
+        junk = ("Release v0.32.0 · vllm-project/vllm · GitHub  You signed in with another "
+                "tab or window. Reload to refresh your session. You signed out in another "
+                "tab or window. Reload to refresh your session. You switched accounts on "
+                "another tab or window. Reload to refresh your session. Dismiss alert  "
+                "khluu tagged")
+        self.assertTrue(article_store.is_navigation_shell(junk))
+
+    def test_real_github_release_notes_are_not_a_shell(self):
+        body = ("v0.32.0 Highlights. This release features 814 commits from 363 "
+                "contributors (121 new). The new POST /v1/systemone endpoint answers "
+                "choice, noul and score questions over a structured state.") * 4
+        self.assertFalse(article_store.is_navigation_shell(body))
+
     def test_real_article_body_is_not_a_shell(self):
         body = "这是一篇真正的文章正文。" * 60
         self.assertFalse(article_store.is_navigation_shell(body))
