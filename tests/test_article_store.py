@@ -456,6 +456,36 @@ class NavigationShellTests(unittest.TestCase):
             "https://huggingface.co/blog/tricks"))
 
 
+class RedditVariantTests(unittest.TestCase):
+    def test_community_refs_keep_original_over_thumbnail(self):
+        post = {
+            "url_overridden_by_dest": "https://i.redd.it/thtq5y7zr1wh1.png",
+            "title": "DeepSeek V4.1 Flash 1017 token efficiency",
+            "preview": {"images": [{"source": {
+                "url": "https://preview.redd.it/thtq5y7zr1wh1.png?width=140&height=47&auto=webp&s=aa"}}]},
+        }
+        refs = article_store.community_image_refs(post)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["url"], "https://i.redd.it/thtq5y7zr1wh1.png")
+
+    def test_collapse_images_maps_dropped_variant_to_twin(self):
+        images = [
+            {"src": "https://i.redd.it/abc.png", "id": "image_full"},
+            {"src": "https://preview.redd.it/abc.png?width=140&height=47", "id": "image_thumb"},
+        ]
+        kept, dropped = __import__("dedupe_preview_thumbnails").collapse_images(images)
+        self.assertEqual([e["id"] for e in kept], ["image_full"])
+        self.assertEqual(dropped, {"image_thumb": "image_full"})
+
+    def test_rewrite_layout_moves_the_slot_to_the_twin(self):
+        layout = [{"mediaId": "image_thumb", "type": "image", "order": 0}]
+        unplaced = [{"mediaId": "image_full", "type": "image"}]
+        layout, unplaced = __import__("dedupe_preview_thumbnails").rewrite_layout(
+            layout, unplaced, {"image_thumb": "image_full"})
+        self.assertEqual([e["mediaId"] for e in layout], ["image_full"])
+        self.assertEqual(unplaced, [])
+
+
 class PublicUrlTests(unittest.TestCase):
     def test_community_urls_use_structured_endpoints(self):
         reddit = article_store.community_api_url(

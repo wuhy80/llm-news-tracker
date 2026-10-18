@@ -1039,6 +1039,45 @@ def community_api_url(url: str) -> str | None:
     return None
 
 
+def reddit_media_identity(url: str) -> str | None:
+    """The shared file name of i.redd.it / preview.redd.it variants, if any.
+
+    Reddit serves one upload at https://i.redd.it/<file> and as sized
+    https://preview.redd.it/<file>?width=...&height=... copies; the preview of
+    a link post can also proxy an external image, which has no i.redd.it twin.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"i.redd.it", "preview.redd.it"}:
+        return None
+    name = parsed.path.rsplit("/", 1)[-1].lower()
+    return name or None
+
+
+def reddit_variant_rank(url: str) -> int:
+    parsed = urllib.parse.urlparse(url)
+    rank = 0 if (parsed.hostname or "").lower() == "i.redd.it" else 1
+    return rank + (1 if parsed.query else 0)
+
+
+def dedupe_reddit_variants(refs: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Collapse same-upload variants, keeping the original over thumbnails."""
+    unique: list[dict[str, str]] = []
+    identity: dict[str, int] = {}
+    for ref in refs:
+        key = reddit_media_identity(ref["url"])
+        if key is None:
+            unique.append(ref)
+            continue
+        at = identity.get(key)
+        if at is None:
+            identity[key] = len(unique)
+            unique.append(ref)
+        elif reddit_variant_rank(ref["url"]) < reddit_variant_rank(unique[at]["url"]):
+            unique[at] = ref
+    return unique
+
+
 def community_image_refs(post: dict) -> list[dict[str, str]]:
     refs: list[dict[str, str]] = []
 
@@ -1066,7 +1105,7 @@ def community_image_refs(post: dict) -> list[dict[str, str]]:
         if ref["url"] not in seen:
             seen.add(ref["url"])
             unique.append(ref)
-    return unique[:MAX_IMAGES_PER_ARTICLE]
+    return dedupe_reddit_variants(unique)[:MAX_IMAGES_PER_ARTICLE]
 
 
 def fetch_community_content(url: str) -> tuple[str, str, list[dict[str, str]]]:
