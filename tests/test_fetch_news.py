@@ -238,7 +238,9 @@ class FetchNewsTests(unittest.TestCase):
 
         items = fetch_news.parse_feed(payload, source, now=fetch_news.parse_date("2026-09-02T00:00:00Z"))
 
-        self.assertEqual(items[0]["title"], "Claude Code v2.1.250")
+        # Routine patch-level tags are dropped at ingestion; only a minor or
+        # major bump survives the release feed.
+        self.assertEqual(items, [])
 
 
     def test_arxiv_atom_feed_is_parsed_as_large_model_research(self):
@@ -390,6 +392,55 @@ class FetchNewsTests(unittest.TestCase):
 
         self.assertEqual(short_item["title"], short)
         self.assertEqual(editorial_item["title"], long_editorial)
+
+    def test_release_feed_drops_routine_patch_entries(self):
+        source = {
+            "name": "Claude Code Releases",
+            "url": "https://github.com/anthropics/claude-code/releases.atom",
+            "domain": "github.com",
+            "release_feed": True,
+            "title_prefix": "Claude Code",
+        }
+        payload = b"""<?xml version=\"1.0\"?>
+        <feed xmlns=\"http://www.w3.org/2005/Atom\">
+          <entry>
+            <title>v2.1.303</title>
+            <link href=\"https://github.com/anthropics/claude-code/releases/tag/v2.1.303\" rel=\"alternate\"/>
+            <content>Bug fixes and reliability improvements</content>
+            <published>2026-10-13T00:00:00Z</published>
+          </entry>
+          <entry>
+            <title>v2.2.0</title>
+            <link href=\"https://github.com/anthropics/claude-code/releases/tag/v2.2.0\" rel=\"alternate\"/>
+            <content>New agent features</content>
+            <published>2026-10-13T01:00:00Z</published>
+          </entry>
+        </feed>"""
+
+        items = fetch_news.parse_feed(payload, source, now=fetch_news.parse_date("2026-10-14T00:00:00Z"))
+
+        self.assertEqual([item["title"] for item in items], ["Claude Code v2.2.0"])
+        self.assertTrue(items[0]["releaseFeed"])
+
+    def test_non_release_feed_keeps_version_titles(self):
+        source = {
+            "name": "Some Blog",
+            "url": "https://example.com/feed.xml",
+            "domain": "example.com",
+        }
+        payload = b"""<?xml version=\"1.0\"?>
+        <feed xmlns=\"http://www.w3.org/2005/Atom\">
+          <entry>
+            <title>Claude Code v2.1.303 released today</title>
+            <link href=\"https://example.com/claude-code\" rel=\"alternate\"/>
+            <published>2026-10-13T00:00:00Z</published>
+          </entry>
+        </feed>"""
+
+        items = fetch_news.parse_feed(payload, source, now=fetch_news.parse_date("2026-10-14T00:00:00Z"))
+
+        self.assertEqual(len(items), 1)
+        self.assertFalse(items[0]["releaseFeed"])
 
 
 if __name__ == "__main__":

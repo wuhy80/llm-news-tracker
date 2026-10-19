@@ -19,6 +19,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from article_store import extract_image_refs, resolve_google_news_urls, snapshot_kind, store_feed_snapshot
+from ai_review import is_routine_feed_title
 from news_store import load_news, save_news
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +64,7 @@ SOURCES = [
     {
         "name": "Claude Code Releases",
         "url": "https://github.com/anthropics/claude-code/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "agent",
@@ -140,6 +142,7 @@ SOURCES = [
     {
         "name": "面壁智能 · MiniCPM",
         "url": "https://github.com/OpenBMB/MiniCPM/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "release",
@@ -149,6 +152,7 @@ SOURCES = [
     {
         "name": "llama.cpp Releases",
         "url": "https://github.com/ggml-org/llama.cpp/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "release",
@@ -156,6 +160,7 @@ SOURCES = [
     {
         "name": "vLLM Releases",
         "url": "https://github.com/vllm-project/vllm/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "release",
@@ -163,6 +168,7 @@ SOURCES = [
     {
         "name": "Ollama Releases",
         "url": "https://github.com/ollama/ollama/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "release",
@@ -187,6 +193,7 @@ SOURCES = [
     {
         "name": "LangGraph Releases",
         "url": "https://github.com/langchain-ai/langgraph/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "agent",
@@ -194,6 +201,7 @@ SOURCES = [
     {
         "name": "MCP Specification Releases",
         "url": "https://github.com/modelcontextprotocol/specification/releases.atom",
+        "release_feed": True,
         "domain": "github.com",
         "official": True,
         "hint": "agent",
@@ -572,6 +580,10 @@ def parse_feed(payload: bytes, source: dict, now: datetime | None = None) -> lis
         title_prefix = source.get("title_prefix")
         if title_prefix and not title.casefold().startswith(title_prefix.casefold()):
             title = f"{title_prefix} {title}"
+        # Patch-level releases and bare build numbers from release feeds are churn
+        # nobody needs to read; drop them before they are stored or reviewed.
+        if source.get("release_feed") and is_routine_feed_title(title):
+            continue
         items.append({
             "title": title,
             "url": url,
@@ -581,6 +593,7 @@ def parse_feed(payload: bytes, source: dict, now: datetime | None = None) -> lis
             "sourceDomain": source_domain,
             "official": source.get("official", False),
             "hint": source.get("hint"),
+            "releaseFeed": bool(source.get("release_feed")),
             "readerHtml": reader_html,
             "imageRefs": image_refs,
         })
@@ -817,6 +830,7 @@ def finalize(raw: dict, now: datetime) -> dict:
         "sourceDomain": raw["sourceDomain"],
         "publishedAt": raw["published"].isoformat().replace("+00:00", "Z"),
         "category": category,
+        "releaseFeed": bool(raw.get("releaseFeed")),
         "tags": tags,
         "score": score,
         "signal": "high" if score >= 82 else "medium" if score >= 68 else "normal",

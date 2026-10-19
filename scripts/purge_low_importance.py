@@ -47,6 +47,12 @@ def purge_reason(item: dict) -> str | None:
         return "importance-1"
     if ai_review.is_routine_release(item):
         return "routine-release"
+    # Items stored before fetch_news carried the releaseFeed flag: a "* Releases"
+    # source whose title is a product name plus a patch/pre-release tag is the
+    # same churn, so the purge catches those legacy entries too.
+    source = str(item.get("source") or "")
+    if source.endswith("Releases") and ai_review.is_routine_feed_tag(str(item.get("title") or "")):
+        return "routine-release"
     return None
 
 

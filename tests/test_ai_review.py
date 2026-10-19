@@ -287,6 +287,43 @@ class AIReviewTests(unittest.TestCase):
         self.assertEqual(result["importanceLevel"], 3)
         self.assertEqual(result["glossary"], [])
 
+    def test_routine_feed_tag_detection(self):
+        self.assertTrue(ai_review.is_routine_feed_tag("Claude Code v2.1.303"))
+        self.assertTrue(ai_review.is_routine_feed_tag("vLLM v0.6.3"))
+        self.assertTrue(ai_review.is_routine_feed_tag("v0.40.0-rc4"))
+        self.assertTrue(ai_review.is_routine_feed_tag("Claude Code v0.5.1"))
+        self.assertFalse(ai_review.is_routine_feed_tag("Claude Code v2.2.0"))
+        self.assertFalse(ai_review.is_routine_feed_tag("v1.0.0"))
+        self.assertFalse(ai_review.is_routine_feed_tag("v3.0"))
+        self.assertFalse(ai_review.is_routine_feed_tag("Introducing the new Qwen model"))
+        self.assertFalse(ai_review.is_routine_feed_tag("v0.6.3: big performance win"))
+
+    def test_routine_release_covers_release_feed_items(self):
+        self.assertTrue(ai_review.is_routine_release({"title": "Claude Code v2.1.303", "releaseFeed": True}))
+        self.assertTrue(ai_review.is_routine_release({"title": "b4600", "releaseFeed": True}))
+        self.assertFalse(ai_review.is_routine_release({"title": "Claude Code v2.1.303"}))
+        self.assertFalse(ai_review.is_routine_release({"title": "Claude Code v2.2.0", "releaseFeed": True}))
+
+    def test_normalize_review_caps_release_feed_items(self):
+        raw = {
+            "isRelevant": True,
+            "category": "agent",
+            "dimensions": {"relevance": 25, "impact": 24, "novelty": 13, "credibility": 15, "usefulness": 9, "timeliness": 10},
+            "evidenceLevel": "clear",
+            "informationType": "original",
+            "tags": [],
+            "reasonZh": "这是一次常规补丁版本发布。",
+            "summaryZh": "这是一次常规补丁版本发布，仅包含缺陷修复。",
+            "glossary": [],
+            "duplicateKey": "claude-code-2-1-303",
+        }
+        item = {"title": "Claude Code v2.1.303", "releaseFeed": True, "category": "agent", "tags": []}
+
+        result = ai_review.normalize_review(raw, item, "gemini", "model", "2026-01-01T00:00:00Z")
+
+        self.assertLessEqual(result["importanceScore"], 49)
+        self.assertEqual(result["importanceLevel"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

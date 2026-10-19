@@ -61,6 +61,8 @@ company or product names unless understanding the term itself helps readers unde
 Scoring rules: off-topic items are negligible; rehashes with no new facts are at most low value; unverified rumors
 cannot be high importance; top importance requires impact >=20 and clear evidence. Community posts need code, data,
 primary documents, or reproducible evidence to be high importance. Official origin alone never makes an item important.
+Routine developer-tool releases - patch bumps, master builds, or pre-releases whose notes are only bug fixes,
+reliability or maintenance updates - are negligible no matter how popular the tool is.
 Use evidence in the supplied data only. Do not invent releases, benchmark numbers, companies, or dates."""
 
 
@@ -163,9 +165,44 @@ def is_routine_version(title: str) -> bool:
 # not mistaken for one.
 BARE_BUILD = re.compile(r"^(?:b\d{4,}|build[ -]?\d{3,})\b", re.IGNORECASE)
 
+# Release feeds also prefix the bare tag with the product name, e.g. "Claude Code
+# v2.1.303" on the Claude Code Releases feed. The rules above cannot match those,
+# and the reviewer scored exactly such an entry 88/level five. Items carrying
+# releaseFeed=True may have a product name in front of a dotted tag; the routine
+# test mirrors is_routine_version: pre-1.0 bumps, patch bumps and pre-releases
+# are routine, a minor or major bump (v0.35.0, v3.0, v2.2) is not.
+FEED_TAG_TITLE = re.compile(
+    r"^(?:(?P<prefix>[\w.+-]+(?:\s+[\w.+-]+)*)\s+)?"
+    r"v?(?P<version>\d+(?:\.\d+)+)(?P<suffix>[-+][\w.-]+)?$",
+    re.IGNORECASE,
+)
+
+
+def is_routine_feed_tag(title: str) -> bool:
+    match = FEED_TAG_TITLE.match(title.strip())
+    if not match:
+        return False
+    if match.group("suffix"):
+        return True
+    components = match.group("version").split(".")
+    if components[0] == "0":
+        return True                      # pre-1.0: every 0.x.y bump is routine
+    return len(components) >= 3 and components[-1] != "0"
+
+
+def is_routine_feed_title(title: str) -> bool:
+    """Ingestion-level check for release-feed entries.
+
+    Drops patch/pre-release tags with or without a product prefix, plus bare
+    master-build numbers, before the item is stored or reviewed at all.
+    """
+    return is_routine_feed_tag(title) or bool(BARE_BUILD.match(title.strip()))
+
 
 def is_routine_release(item: dict) -> bool:
     title = str(item.get("title") or "").strip()
+    if item.get("releaseFeed") and is_routine_feed_tag(title):
+        return True
     return bool(PULL_REQUEST_REF.search(title)
                 or is_routine_version(title)
                 or PINNED_PACKAGE.match(title)
