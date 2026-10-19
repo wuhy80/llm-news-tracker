@@ -1,0 +1,438 @@
+{
+  "schemaVersion": 3,
+  "id": "e3d56f1af43a",
+  "title": "TorchNeuron: running HF models on AWS Trainium is easier than ever",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/hf-torchneuron",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-10-19T00:00:00Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 82,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/hf-torchneuron",
+  "resolvedUrl": "https://huggingface.co/blog/hf-torchneuron",
+  "fetchedAt": "2026-10-19T22:29:40.776070Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "TorchNeuron provides a new native backend for PyTorch on AWS Trainium. Transformers, Diffusers and Kernels natively support it, making it easier than ever to run models on Trainium and to share them on the HF hub.\n\n## TorchNeuron\n\nTorchNeuron is a PyTorch plugin that brings a new backend for Trainium enabling support for eager mode, torch.compile and native distributed APIs like FSDP and TP. Read the Pytorch blog to learn more about TorchNeuron.\n\nStarting Oct. 20, 2026, TorchNeuron will be available as a public beta. Researchers and developers will be able to install it with pip install torch-neuronx.\n\n## New backend, native interface in HF libraries\n\nTo date, the Hugging Face experience on AWS Trainium and Inferentia — AI chips designed respectively for cost-effective training and inference at scale — has been delivered through optimum-neuron. This library relies on the torch-neuronx package, which is based on PyTorch XLA. It was the natural choice at the time, but it meant thinking like a compiler: lazy tensors instead of eager execution, static shapes only, a recompilation for every graph break. Optimum Neuron existed to hide that complexity, and maintained custom code (modeling classes, trainers, etc) to do so.\n\nTorchNeuron changes this. It integrates directly into PyTorch and exposes neuron as a native device, with eager execution, PyTorch's own distributed primitives (DTensor, FSDP2) and torch.compile.\n\nFor the Hugging Face libraries, Trainium becomes a device like any other: Transformers, Diffusers, Accelerate, PEFT and TRL run on it directly, with the same classes and scripts you would use on any other accelerator. From now on, we recommend that Neuron users use these libraries directly instead of going through Optimum Neuron.\n\n### Transformers\n\n#### Inference\n\nText generation is now natively supported in Transformers for a wide range of models. With TorchNeuron, 89% of the top 100 most-used text-generation model architectures are supported out of the box, compared to 46% with Optimum Neuron v0.4.5. You just need to pass the device_map=neuron argument in your code and your model will be moved to the Neuron devices.\n\nThe following is an example of text-generation with tensor parallelism, which will enable to fully benefit from your Neuron instance. Note that it uses a static cache for generation as this is strongly recommended with Neuron to prevent frequent recompilations.\n\n```\nimport os\n\nimport torch\nimport torch.distributed as dist\nimport torch_neuronx  # noqa: F401\nfrom torch.distributed import DeviceMesh\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig\nfrom transformers.distributed import DistributedConfig\nfrom transformers.generation.configuration_utils import CompileConfig\n\nMODEL_ID = \"Qwen/Qwen3.8-27B\"\nMAX_SEQ_LEN = 1024\nPREFILL_CHUNK_SIZE = 512\n\ndist.init_process_group(backend=\"neuron\")\nworld_size = dist.get_world_size()\n\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    dtype=torch.bfloat16,\n    distributed_config=DistributedConfig(tp_size=world_size),\n    device_mesh=DeviceMesh(\"neuron\", list(range(world_size))),\n).eval()\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID)\nif tokenizer.pad_token is None:\n    tokenizer.pad_token = tokenizer.eos_token\ntokenizer.padding_side = \"left\"\n\ninputs = tokenizer.apply_chat_template(\n    [{\"role\": \"user\", \"content\": \"The future of AI is\"}],\n    add_generation_prompt=True,\n    padding=True,\n    tokenizer_kwargs={\"pad_to_multiple_of\": PREFILL_CHUNK_SIZE},\n    return_tensors=\"pt\",\n)\n\ngeneration_config = GenerationConfig(\n    max_new_tokens=128,\n    do_sample=False,\n    use_cache=True,\n    pad_token_id=tokenizer.pad_token_id,\n    eos_token_id=tokenizer.eos_token_id,\n    cache_implementation=\"static\",\n    max_cache_len=MAX_SEQ_LEN,\n    prefill_chunk_size=PREFILL_CHUNK_SIZE,\n    compile_config=CompileConfig(backend=\"neuron\", fullgraph=False, dynamic=False),\n)\n\nwith torch.no_grad():\n    output_ids = model.generate(\n        inputs[\"input_ids\"],\n        attention_mask=inputs[\"attention_mask\"],\n        generation_config=generation_config,\n    )\n\nif dist.get_rank() == 0:\n    prompt_len = inputs[\"input_ids\"].shape[1]\n    print(tokenizer.decode(output_ids[0, prompt_len:], skip_special_tokens=True))\n```\n\n#### Training\n\nNow that Neuron is a native PyTorch device, training on Trainium uses the same Hugging Face libraries as any other accelerator: Transformers, Accelerate, PEFT and TRL. You no longer need a dedicated trainer or a Neuron-specific fork of the model code. A standard TRL fine-tuning script runs on a Trainium instance with only a few Neuron-specific settings.\n\nHere is a supervised fine-tuning script built on TRL's SFTTrainer. If you have fine-tuned a model with TRL on GPUs before, it should look familiar.\n\n```\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom transformers.distributed import DistributedConfig\n\nfrom trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser\n\n\ndef main(script_args, training_args, model_args):\n    # The Neuron backend can't compile Dynamo's automatic dynamic shapes yet (https://github.com/huggingface/trl/issues/7660)\n    torch._dynamo.config.automatic_dynamic_shapes = False\n\n    training_args.model_init_kwargs = {\n        \"revision\": model_args.model_revision,\n        \"trust_remote_code\": training_args.trust_remote_code,\n        \"attn_implementation\": model_args.attn_implementation,\n        \"dtype\": model_args.dtype,\n        \"device_map\": None,\n    }\n    if int(os.environ.get(\"WORLD_SIZE\", \"1\")) > 1:\n        # The model is sharded on the TP x FSDP grid as its weights are loaded\n        training_args.model_init_kwargs[\"distributed_config\"] = DistributedConfig(\n            tp_size=int(os.environ.get(\"TP_SIZE\", \"1\")),\n            fsdp_size=int(os.environ.get(\"FSDP_SIZE\", \"1\")),\n        )\n\n    # Prepare dataset\n    train_dataset = load_dataset(\n        script_args.dataset_name,\n        name=script_args.dataset_config,\n        split=script_args.dataset_train_split,\n    )\n    # UltraChat also has a string `prompt` column, which makes TRL treat it as a prompt-completion dataset.\n    train_dataset = train_dataset.select_columns([\"messages\"])\n\n    # Training\n    trainer = SFTTrainer(\n        model=model_args.model_name_or_path,\n        args=training_args,\n        train_dataset=train_dataset,\n    )\n\n    trainer.train()\n    trainer.save_model(training_args.output_dir)\n    trainer.end()\n\n\nif __name__ == \"__main__\":\n    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))\n    script_args, training_args, model_args = parser.parse_args_and_config()\n    main(script_args, training_args, model_args)\n```\n\nParallelism is handled natively by Transformers. You put a DistributedConfig with the tensor-parallel (TP) and FSDP sizes in model_init_kwargs, SFTTrainer passes it to from_pretrained, and the model is sharded as its weights are loaded. The Trainer sees that the model is already distributed and does not wrap it again. You don't need an --fsdp flag or an Accelerate FSDP config.\n\nNothing in the script is tied to Trainium: the same code runs on any hardware. A few things are worth knowing when you run it on Trainium:\n\n- Static shapes. The script disables automatic dynamic shapes in torch.compile and uses wrapped packing to produce sequences of up to 2048 tokens. With TRL ≥ 1.16, batches on Neuron are padded to a multiple of 128 tokens, limiting the number of input shapes. Compiled graphs are reused for subsequent steps with the same shapes.\n\n- torch.compile on. Passing --torch_compile true is all it takes: on a Trainium instance, torch.compile detects the device and picks the Neuron backend automatically, with nothing else to configure.\n\n- Async weight loading off. The built-in asynchronous weight loading in Transformers is not supported on Neuron, so for now we disable it with HF_DEACTIVATE_ASYNC_LOAD=1.\n\nThe command below launches training with torchrun, which starts one process per NeuronCore. TP_SIZE and FSDP_SIZE set the parallelism layout, and their product is the number of processes: here 4 x 8 = 32, matching --nproc_per_node. The 32 processes form a 4 x 8 grid. Tensor parallelism splits each layer across the 4 cores of a TP group, and FSDP shards the parameters, gradients and optimizer state across the 8 TP groups.\n\n```\nTP_SIZE=4 FSDP_SIZE=8 HF_DEACTIVATE_ASYNC_LOAD=1 uv run torchrun --nproc_per_node=32 sft_neuron_example.py \\\n    --model_name_or_path Qwen/Qwen3-8B \\\n    --dataset_name HuggingFaceH4/ultrachat_200k \\\n    --dataset_train_split train_sft \\\n    --output_dir Qwen3-8B-sft-tp4-fsdp8 \\\n    --dtype bfloat16 \\\n    --max_length 2048 \\\n    --packing true \\\n    --packing_strategy wrapped \\\n    --learning_rate 2e-5 \\\n    --warmup_steps 0.03 \\\n    --num_train_epochs 1 \\\n    --logging_steps 2 \\\n    --per_device_train_batch_size 4 \\\n    --gradient_accumulation_steps 4 \\\n    --save_only_model true \\\n    --torch_compile true\n```\n\nWe ran it on 8 Trainium2 chips (32 NeuronCores), which is half a trn2.48xlarge instance.\n\nTraining runs to completion, and trainer.save_model writes a standard Transformers checkpoint. Nothing in it is tied to Neuron: you can push it to the Hugging Face Hub as is and load it on any other hardware.\n\n### Diffusers\n\n#### Inference\n\nMany pipelines from the Diffusers library are compatible with TorchNeuron in eager and compiled mode. FLUX.1-dev, FLUX.2, Qwen-Image, Qwen-Image-2.1 and H3 are also compatible with tensor parallelism to make the most of your Neuron devices. The following is an example showing how you can use TP:\n\n```\nimport torch, torch.distributed as dist, torch_neuronx # TP\nfrom torch.distributed.device_mesh import DeviceMesh # TP\nfrom diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel, TensorParallelConfig\n\n# Distributed devices initialization\ndist.init_process_group(backend=\"neuron\") # TP\ndev = torch.neuron.current_device()\nmesh = DeviceMesh(\"neuron\", list(range(8))) # TP=8\n\n# Pipeline initialization\nmodel = \"Qwen/Qwen-Image-2.1\"\ntransformer = QwenImage21Transformer2DModel.from_pretrained(\n    model,\n    subfolder=\"transformer\",\n    torch_dtype=torch.bfloat16,\n    parallel_config=TensorParallelConfig(mesh=mesh), # TP\n)\npipe = QwenImage21Pipeline.from_pretrained(\n    model,\n    transformer=transformer,\n    torch_dtype=torch.bfloat16,\n)\npipe.vae.to(dev)\npipe.transformer.compile_repeated_blocks(backend=\"neuron\", fullgraph=True, dynamic=False)\n\n# Image generation\nemb, mask, _ = pipe.encode_prompt(prompt=\"A capybara wearing a wizard hat, oil painting\", device=\"cpu\")  # text encoder stays on CPU\nimage = pipe(\n    prompt_embeds=emb.to(dev),\n    prompt_embeds_mask=mask.to(dev) if mask is not None else None,\n    height=1024,\n    width=1024,\n    num_inference_steps=40,\n    generator=torch.Generator(\"cpu\").manual_seed(0), # same noise on every rank\n).images[0]\nif dist.get_rank() == 0:\n    image.save(\"out.png\")\n```\n\nYou can run this piece of code with: NEURON_LOGICAL_NC_CONFIG=2 torchrun --nproc_per_node=8 run.py.\n\nMore and more pipleines will be compatible with TP. If a pipeline you like is not, you can also add support for it following this guide.\n\n### Kernels\n\nMake sure to check out the kernels from the Neuron team as more and more Neuron kernels will become available on the Hub to speed up your models. Neuron kernels can be written using the Neuron Kernel Interface (NKI), which gives lower control to optimize operations. This way, users can run their own custom operations and share them on the hub.\n\nYou can use for example this kernel to speed up your vision transformers with up to a x2.4 speedup on Trainium!\n\n## Acknowledgments\n\nSpecial thanks to the AWS team for their work on TorchNeuron and for their reactivity to our feedback to make the HF integration as good as possible.",
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/hf-torchneuron/kernel.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/hf-torchneuron/kernel.png",
+      "alt": "",
+      "id": "image_7ed88f79f435e833"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "TorchNeuron provides a new native backend for PyTorch on AWS Trainium. Transformers, Diffusers and Kernels natively support it, making it easier than ever to run models on Trainium and to share them on the HF hub.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "TorchNeuron",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "TorchNeuron is a PyTorch plugin that brings a new backend for Trainium enabling support for eager mode, torch.compile and native distributed APIs like FSDP and TP. Read the Pytorch blog to learn more about TorchNeuron.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/index.html"
+        },
+        {
+          "start": 104,
+          "end": 117,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 185,
+          "kind": "a",
+          "href": "https://pytorch.org/blog/introducing-torchneuron-native-pytorch-backend-for-aws-trainium/"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "Starting Oct. 20, 2026, TorchNeuron will be available as a public beta. Researchers and developers will be able to install it with pip install torch-neuronx.",
+      "spans": [
+        {
+          "start": 131,
+          "end": 156,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "New backend, native interface in HF libraries",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "To date, the Hugging Face experience on AWS Trainium and Inferentia — AI chips designed respectively for cost-effective training and inference at scale — has been delivered through optimum-neuron. This library relies on the torch-neuronx package, which is based on PyTorch XLA. It was the natural choice at the time, but it meant thinking like a compiler: lazy tensors instead of eager execution, static shapes only, a recompilation for every graph break. Optimum Neuron existed to hide that complexity, and maintained custom code (modeling classes, trainers, etc) to do so.",
+      "spans": [
+        {
+          "start": 181,
+          "end": 195,
+          "kind": "a",
+          "href": "https://github.com/huggingface/optimum-neuron"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "TorchNeuron changes this. It integrates directly into PyTorch and exposes neuron as a native device, with eager execution, PyTorch's own distributed primitives (DTensor, FSDP2) and torch.compile.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 80,
+          "kind": "code"
+        },
+        {
+          "start": 181,
+          "end": 194,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "For the Hugging Face libraries, Trainium becomes a device like any other: Transformers, Diffusers, Accelerate, PEFT and TRL run on it directly, with the same classes and scripts you would use on any other accelerator. From now on, we recommend that Neuron users use these libraries directly instead of going through Optimum Neuron.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "Text generation is now natively supported in Transformers for a wide range of models. With TorchNeuron, 89% of the top 100 most-used text-generation model architectures are supported out of the box, compared to 46% with Optimum Neuron v0.4.5. You just need to pass the device_map=neuron argument in your code and your model will be moved to the Neuron devices.",
+      "spans": [
+        {
+          "start": 269,
+          "end": 286,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "The following is an example of text-generation with tensor parallelism, which will enable to fully benefit from your Neuron instance. Note that it uses a static cache for generation as this is strongly recommended with Neuron to prevent frequent recompilations.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Training",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "Now that Neuron is a native PyTorch device, training on Trainium uses the same Hugging Face libraries as any other accelerator: Transformers, Accelerate, PEFT and TRL. You no longer need a dedicated trainer or a Neuron-specific fork of the model code. A standard TRL fine-tuning script runs on a Trainium instance with only a few Neuron-specific settings.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Here is a supervised fine-tuning script built on TRL's SFTTrainer. If you have fine-tuned a model with TRL on GPUs before, it should look familiar.",
+      "spans": [
+        {
+          "start": 55,
+          "end": 65,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Parallelism is handled natively by Transformers. You put a DistributedConfig with the tensor-parallel (TP) and FSDP sizes in model_init_kwargs, SFTTrainer passes it to from_pretrained, and the model is sharded as its weights are loaded. The Trainer sees that the model is already distributed and does not wrap it again. You don't need an --fsdp flag or an Accelerate FSDP config.",
+      "spans": [
+        {
+          "start": 59,
+          "end": 76,
+          "kind": "code"
+        },
+        {
+          "start": 125,
+          "end": 142,
+          "kind": "code"
+        },
+        {
+          "start": 144,
+          "end": 154,
+          "kind": "code"
+        },
+        {
+          "start": 168,
+          "end": 183,
+          "kind": "code"
+        },
+        {
+          "start": 338,
+          "end": 344,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Nothing in the script is tied to Trainium: the same code runs on any hardware. A few things are worth knowing when you run it on Trainium:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Static shapes. The script disables automatic dynamic shapes in torch.compile and uses wrapped packing to produce sequences of up to 2048 tokens. With TRL ≥ 1.16, batches on Neuron are padded to a multiple of 128 tokens, limiting the number of input shapes. Compiled graphs are reused for subsequent steps with the same shapes.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 63,
+          "end": 76,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "torch.compile on. Passing --torch_compile true is all it takes: on a Trainium instance, torch.compile detects the device and picks the Neuron backend automatically, with nothing else to configure.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        },
+        {
+          "start": 26,
+          "end": 46,
+          "kind": "code"
+        },
+        {
+          "start": 88,
+          "end": 101,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Async weight loading off. The built-in asynchronous weight loading in Transformers is not supported on Neuron, so for now we disable it with HF_DEACTIVATE_ASYNC_LOAD=1.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        },
+        {
+          "start": 141,
+          "end": 167,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "The command below launches training with torchrun, which starts one process per NeuronCore. TP_SIZE and FSDP_SIZE set the parallelism layout, and their product is the number of processes: here 4 x 8 = 32, matching --nproc_per_node. The 32 processes form a 4 x 8 grid. Tensor parallelism splits each layer across the 4 cores of a TP group, and FSDP shards the parameters, gradients and optimizer state across the 8 TP groups.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 49,
+          "kind": "code"
+        },
+        {
+          "start": 92,
+          "end": 99,
+          "kind": "code"
+        },
+        {
+          "start": 104,
+          "end": 113,
+          "kind": "code"
+        },
+        {
+          "start": 214,
+          "end": 230,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "We ran it on 8 Trainium2 chips (32 NeuronCores), which is half a trn2.48xlarge instance.",
+      "spans": [
+        {
+          "start": 65,
+          "end": 78,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Training runs to completion, and trainer.save_model writes a standard Transformers checkpoint. Nothing in it is tied to Neuron: you can push it to the Hugging Face Hub as is and load it on any other hardware.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Diffusers",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Inference",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Many pipelines from the Diffusers library are compatible with TorchNeuron in eager and compiled mode. FLUX.1-dev, FLUX.2, Qwen-Image, Qwen-Image-2.1 and H3 are also compatible with tensor parallelism to make the most of your Neuron devices. The following is an example showing how you can use TP:",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "You can run this piece of code with: NEURON_LOGICAL_NC_CONFIG=2 torchrun --nproc_per_node=8 run.py.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 98,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "More and more pipleines will be compatible with TP. If a pipeline you like is not, you can also add support for it following this guide.",
+      "spans": [
+        {
+          "start": 125,
+          "end": 135,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/diffusers/main/en/training/distributed_inference#writing-a-tensor-parallelism-plan"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "Kernels",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "Make sure to check out the kernels from the Neuron team as more and more Neuron kernels will become available on the Hub to speed up your models. Neuron kernels can be written using the Neuron Kernel Interface (NKI), which gives lower control to optimize operations. This way, users can run their own custom operations and share them on the hub.",
+      "spans": [
+        {
+          "start": 27,
+          "end": 55,
+          "kind": "a",
+          "href": "https://huggingface.co/aws-neuron/kernels"
+        },
+        {
+          "start": 186,
+          "end": 209,
+          "kind": "a",
+          "href": "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "You can use for example this kernel to speed up your vision transformers with up to a x2.4 speedup on Trainium!",
+      "spans": [
+        {
+          "start": 24,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/aws-neuron/vit-encoder-neuron-kernels"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Acknowledgments",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "Special thanks to the AWS team for their work on TorchNeuron and for their reactivity to our feedback to make the HF integration as good as possible.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "0e3f6d3294b2f375577d9768d24f1349391211ae29826c8f24a0f90f11a47c44",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import os\n\nimport torch\nimport torch.distributed as dist\nimport torch_neuronx  # noqa: F401\nfrom torch.distributed import DeviceMesh\nfrom transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig\nfrom transformers.distributed import DistributedConfig\nfrom transformers.generation.configuration_utils import CompileConfig\n\nMODEL_ID = \"Qwen/Qwen3.8-27B\"\nMAX_SEQ_LEN = 1024\nPREFILL_CHUNK_SIZE = 512\n\ndist.init_process_group(backend=\"neuron\")\nworld_size = dist.get_world_size()\n\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    dtype=torch.bfloat16,\n    distributed_config=DistributedConfig(tp_size=world_size),\n    device_mesh=DeviceMesh(\"neuron\", list(range(world_size))),\n).eval()\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID)\nif tokenizer.pad_token is None:\n    tokenizer.pad_token = tokenizer.eos_token\ntokenizer.padding_side = \"left\"\n\ninputs = tokenizer.apply_chat_template(\n    [{\"role\": \"user\", \"content\": \"The future of AI is\"}],\n    add_generation_prompt=True,\n    padding=True,\n    tokenizer_kwargs={\"pad_to_multiple_of\": PREFILL_CHUNK_SIZE},\n    return_tensors=\"pt\",\n)\n\ngeneration_config = GenerationConfig(\n    max_new_tokens=128,\n    do_sample=False,\n    use_cache=True,\n    pad_token_id=tokenizer.pad_token_id,\n    eos_token_id=tokenizer.eos_token_id,\n    cache_implementation=\"static\",\n    max_cache_len=MAX_SEQ_LEN,\n    prefill_chunk_size=PREFILL_CHUNK_SIZE,\n    compile_config=CompileConfig(backend=\"neuron\", fullgraph=False, dynamic=False),\n)\n\nwith torch.no_grad():\n    output_ids = model.generate(\n        inputs[\"input_ids\"],\n        attention_mask=inputs[\"attention_mask\"],\n        generation_config=generation_config,\n    )\n\nif dist.get_rank() == 0:\n    prompt_len = inputs[\"input_ids\"].shape[1]\n    print(tokenizer.decode(output_ids[0, prompt_len:], skip_special_tokens=True))"
+    },
+    {
+      "id": "c0002",
+      "source": "import os\n\nimport torch\nfrom datasets import load_dataset\nfrom transformers.distributed import DistributedConfig\n\nfrom trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser\n\n\ndef main(script_args, training_args, model_args):\n    # The Neuron backend can't compile Dynamo's automatic dynamic shapes yet (https://github.com/huggingface/trl/issues/7660)\n    torch._dynamo.config.automatic_dynamic_shapes = False\n\n    training_args.model_init_kwargs = {\n        \"revision\": model_args.model_revision,\n        \"trust_remote_code\": training_args.trust_remote_code,\n        \"attn_implementation\": model_args.attn_implementation,\n        \"dtype\": model_args.dtype,\n        \"device_map\": None,\n    }\n    if int(os.environ.get(\"WORLD_SIZE\", \"1\")) > 1:\n        # The model is sharded on the TP x FSDP grid as its weights are loaded\n        training_args.model_init_kwargs[\"distributed_config\"] = DistributedConfig(\n            tp_size=int(os.environ.get(\"TP_SIZE\", \"1\")),\n            fsdp_size=int(os.environ.get(\"FSDP_SIZE\", \"1\")),\n        )\n\n    # Prepare dataset\n    train_dataset = load_dataset(\n        script_args.dataset_name,\n        name=script_args.dataset_config,\n        split=script_args.dataset_train_split,\n    )\n    # UltraChat also has a string `prompt` column, which makes TRL treat it as a prompt-completion dataset.\n    train_dataset = train_dataset.select_columns([\"messages\"])\n\n    # Training\n    trainer = SFTTrainer(\n        model=model_args.model_name_or_path,\n        args=training_args,\n        train_dataset=train_dataset,\n    )\n\n    trainer.train()\n    trainer.save_model(training_args.output_dir)\n    trainer.end()\n\n\nif __name__ == \"__main__\":\n    parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))\n    script_args, training_args, model_args = parser.parse_args_and_config()\n    main(script_args, training_args, model_args)"
+    },
+    {
+      "id": "c0003",
+      "source": "TP_SIZE=4 FSDP_SIZE=8 HF_DEACTIVATE_ASYNC_LOAD=1 uv run torchrun --nproc_per_node=32 sft_neuron_example.py \\\n    --model_name_or_path Qwen/Qwen3-8B \\\n    --dataset_name HuggingFaceH4/ultrachat_200k \\\n    --dataset_train_split train_sft \\\n    --output_dir Qwen3-8B-sft-tp4-fsdp8 \\\n    --dtype bfloat16 \\\n    --max_length 2048 \\\n    --packing true \\\n    --packing_strategy wrapped \\\n    --learning_rate 2e-5 \\\n    --warmup_steps 0.03 \\\n    --num_train_epochs 1 \\\n    --logging_steps 2 \\\n    --per_device_train_batch_size 4 \\\n    --gradient_accumulation_steps 4 \\\n    --save_only_model true \\\n    --torch_compile true"
+    },
+    {
+      "id": "c0004",
+      "source": "import torch, torch.distributed as dist, torch_neuronx # TP\nfrom torch.distributed.device_mesh import DeviceMesh # TP\nfrom diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel, TensorParallelConfig\n\n# Distributed devices initialization\ndist.init_process_group(backend=\"neuron\") # TP\ndev = torch.neuron.current_device()\nmesh = DeviceMesh(\"neuron\", list(range(8))) # TP=8\n\n# Pipeline initialization\nmodel = \"Qwen/Qwen-Image-2.1\"\ntransformer = QwenImage21Transformer2DModel.from_pretrained(\n    model,\n    subfolder=\"transformer\",\n    torch_dtype=torch.bfloat16,\n    parallel_config=TensorParallelConfig(mesh=mesh), # TP\n)\npipe = QwenImage21Pipeline.from_pretrained(\n    model,\n    transformer=transformer,\n    torch_dtype=torch.bfloat16,\n)\npipe.vae.to(dev)\npipe.transformer.compile_repeated_blocks(backend=\"neuron\", fullgraph=True, dynamic=False)\n\n# Image generation\nemb, mask, _ = pipe.encode_prompt(prompt=\"A capybara wearing a wizard hat, oil painting\", device=\"cpu\")  # text encoder stays on CPU\nimage = pipe(\n    prompt_embeds=emb.to(dev),\n    prompt_embeds_mask=mask.to(dev) if mask is not None else None,\n    height=1024,\n    width=1024,\n    num_inference_steps=40,\n    generator=torch.Generator(\"cpu\").manual_seed(0), # same noise on every rank\n).images[0]\nif dist.get_rank() == 0:\n    image.save(\"out.png\")"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "0e3f6d3294b2f375577d9768d24f1349391211ae29826c8f24a0f90f11a47c44",
+  "mediaLayout": [
+    {
+      "mediaId": "image_7ed88f79f435e833",
+      "type": "image",
+      "afterBlockId": "b0031",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-10-19T22:29:40.805010Z",
+  "summaryZh": "TorchNeuron：在 AWS Trainium 上运行 HF 模型比以往更容易。TorchNeuron 为 AWS Trainium 上的 PyTorch 提供了新的本机后端。 Transformers、Diffusers 和 Kernels 本身就支持它，使得在 Trainium 上运行模型并在 HF 集线器上共享它们比以往任何时候都更容易。",
+  "summaryGeneratedAt": "2026-10-19T22:30:41.477484Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
