@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 3,
+  "id": "cfd0ba150143",
+  "title": "Beyond the KV cache: Training and serving i14’s Laplace 3B linear attention model on AWS Trainium2 with native PyTorch",
+  "summary": "Most large language models (LLMs) use transformer architectures with softmax attention. During inference, their key-value (KV) cache grows with the conversation or document context. This can reduce concurrency, increase serving cost, and force agentic applications to discard useful history. i14 designed Laplace 3B as a linear attention alternative. Its recurrent state stays at 29.5 MB per sequence, independent of con",
+  "url": "https://aws.amazon.com/blogs/machine-learning/beyond-the-kv-cache-training-and-serving-i14s-laplace-3b-linear-attention-model-on-aws-trainium2-with-native-pytorch/",
+  "source": "AWS Machine Learning",
+  "sourceDomain": "aws.amazon.com",
+  "publishedAt": "2026-10-20T21:14:10Z",
+  "category": "agent",
+  "tags": [
+    "推理",
+    "Agent"
+  ],
+  "score": 88,
+  "signal": "high",
+  "originalUrl": "https://aws.amazon.com/blogs/machine-learning/beyond-the-kv-cache-training-and-serving-i14s-laplace-3b-linear-attention-model-on-aws-trainium2-with-native-pytorch/",
+  "resolvedUrl": "https://aws.amazon.com/blogs/machine-learning/beyond-the-kv-cache-training-and-serving-i14s-laplace-3b-linear-attention-model-on-aws-trainium2-with-native-pytorch/",
+  "fetchedAt": "2026-10-20T22:15:24.664600Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Most large language models (LLMs) use transformer architectures with softmax attention. During inference, their key-value (KV) cache grows with the conversation or document context. This can reduce concurrency, increase serving cost, and force agentic applications to discard useful history.\n\ni14 designed Laplace 3B as a linear attention alternative. Its recurrent state stays at 29.5 MB per sequence, independent of context length. Working with AWS, i14 used native PyTorch support through TorchNeuron Native to bring this custom architecture to AWS Trainium2 . This preserved its Gated Linear Attention (GLA) design and Muon optimizer.\n\nOn one trn2.48xlarge instance, Laplace 3B trained at about 120,000 tokens per second. The model served 11,544 output tokens per second across 1,280 concurrent sequences. This post explains the model design, the changes i14 made for Trainium2, and the training and inference results.\n\ni14 is an AI research and technology company that develops model architectures, components, and runtimes. Its work draws on AI, computational cognitive science, and research into how biological systems learn over time. i14 applies these ideas to models that can retain long-range context without allowing serving state to grow with every token.\n\n## Why linear attention models?\n\nTransformer softmax attention compares tokens across the context. During training, this computation grows quadratically with sequence length. During inference, the KV cache grows as the model processes more tokens.\n\nLinear attention reorganizes the computation around a recurrent state that is updated for each token. Laplace 3B uses GLA to compress prior context into a fixed-size matrix state. This changes training attention from O( T 2) to O( T ) and keeps inference state fixed at 29.5 MB per sequence.\n\nTransformer softmax attention\n\nBuilds pairwise token scores with O( T 2) scaling\n\nUpdates chunked recurrent state with O( T ) scaling\n\nKV cache grows with context\n\nRecurrent state remains fixed in size\n\nEach sequence consumes more accelerator memory\n\nContext length does not increase recurrent-state allocation\n\nUses widely optimized attention kernels\n\nRequires architecture-specific kernels and compiler tuning\n\nLinear attention compresses history rather than retaining every key and value. You must therefore evaluate retrieval quality for your workloads. The fixed state can benefit long-running agents, large-document analysis, and applications that need persistent memory with predictable serving requirements.\n\n## How i14 adapted Laplace 3B for AWS Trainium2\n\nThe original implementation of Laplace 3B used GPU-optimized Triton kernels. The AWS Generative AI Innovation Center (GenAIIC) team first rewrote the GLA kernel with standard PyTorch operators for Trainium2. After comparing both approaches, the team chose the beta version of TorchNeuron Native, the native PyTorch backend for AWS Trainium , because it performed better.\n\nThe implementation required three changes:\n\n- Using native PyTorch for the GLA attention kernel. The team replaced the GPU-specific fused_chunk_simple_gla Triton kernel with standard PyTorch operators, using 16 chunks of 128 tokens to match the 128 partitions of the NeuronCore on-chip buffer.\n\n- Redesigning how Muon communicates. Two all_to_all collectives in MuonFSDP2 cut per-rank traffic by 24 times and raised throughput by 1.63 times.\n\n- Compiling the sequential backward pass. The team statically unrolled the 16 chunk steps of the GLA recurrence to fit the graph-size and on-chip memory limits of the compiler.\n\nThe engineering challenges section describes each change in detail.\n\n## Why AWS Trainium accelerators?\n\nAWS Trainium is a family of AWS machine learning (ML) accelerators designed for model training and inference. A trn2.48xlarge instance combines 16 Trainium2 chips, 64 logical NeuronCores, high-bandwidth memory, and NeuronLink-v3 connectivity. These resources support the distributed training and inference configurations described in this post.\n\nThree properties of Trainium2 shaped the implementation: software-managed on-chip memory (Challenge 1), a fast chip-to-chip interconnect (Challenge 2), and a static compiler (Challenge 3). The compiler traces the GLA recurrence as a fixed graph.\n\nSoftware-managed on-chip memory. Each NeuronCore has a 28 MiB State Buffer (SBUF) with 128 partitions and a 2 MiB partial-sum buffer (PSUM). The PSUM is wired to a 128×128 systolic Tensor Engine, alongside separate vector and scalar units. The SBUF is not a cache: the compiler schedules every HBM-to-SBUF transfer ahead of time, so the data is in place with no evictions or misses (Figure 1).\n\nFigure 1: NeuronCore-v3 internal architecture. Software-managed SBUF (28 MiB, 128 partitions), Tensor Engine (128×128 systolic array), Vector Engine, Scalar Engine, and GPSIMD cores.\n\n## i14 and the Laplace 3B architecture\n\nLaplace 3B is the 24-layer i14 decoder, where every layer replaces softmax attention with Simple GLA. Figure 2 follows one layer from the input x t at the top to the output x t + 1 at the bottom. This section explains each module: normalization and convolution, the QKVG projection, the GLA mixer, and the feed-forward channel mixer.\n\nNormalization and convolution. Each token’s residual-stream vector x t ∈ ℝ D ( D = 3, 072 ) passes through a LayerNorm and a depth-wise causal Conv1d of width k = 4 with SiLU. This gives every position a 4-gram summary before the mixer. The GLA mixer then does content-based retrieval over the whole history through its decaying state.\n\nQKVG projection. The post-conv output goes through one fused matrix W q k v g ∈ ℝ 9, 216 × 3, 072 , where 9, 216 = H × (2 d k + 2 d v ) . It splits into four per-token streams: queries q t , keys k t , values v t , and a gate g t ( H = 16 , d k = 96 , d v = 192 ). The gate is used after the mixer.\n\nFigure 2: Laplace decoder layer architecture. Green = fixed (no params), gray = learned, yellow = recurrent state, blue = projection.\n\nGLA mixer. Each head h keeps a matrix state S t ( h ) of size d k × d v (96 × 192), a compressed, decaying record of past key-value pairs. At each token, it updates as:\n\nGLA recurrent-state update equation\n\nHere λ h is the fixed per-head decay, and k t v t ⊤ is the rank-1 outer product that writes the current key-value pair into the state. The readout queries the state:\n\nGLA state-readout equation\n\nNext, a self-augmentation step adds a gated copy of the value to each head’s output:\n\nGLA self-augmentation equation\n\nHere σ is the sigmoid and ⊙ is the element-wise product. The gate is the query dotted with a learned per-channel rescaling of the key, where a is the learned scale (aug_balance). At initialization, a = 0 , which gives a half-strength skip of the value. The per-head outputs pass through a Head RMSNorm within each decay tier, are concatenated, gated by S i L U ( g t ) , and projected by W o u t ∈ ℝ D × D back to the residual stream.\n\nDecay schedule. The per-head decay rate λ h controls how fast a head forgets past tokens. It is fixed at initialization (not learned) and set by a geometric schedule. The schedule gives the 16 heads a spread of memory lengths and defines each head’s log-decay rate γ h :\n\nGLA decay schedule equations\n\nDecay schedule’s reach. For this model, T min = 1 and T max = 2, 048 . Head 0 therefore has λ 0 = 0.5 (half-life of one token), and head 15 has λ 15 ≈ 0.9997 (half-life of 2,048 tokens). Heads are grouped into tiers, each sharing a Head RMSNorm.\n\nChannel mixer (FFN). After the attention block and its residual, a second LayerNorm feeds a GLU (SiLU) FFN with inner dimension 8,192. Its three matrices are two up-projections W 1 , W 2 ∈ ℝ 8, 192 × D and one down-projection W 3 ∈ ℝ D × 8, 192 . A second residual follows.\n\nThe state S ( h ) is fixed at d k × d v = 96 × 192 per head regardless of sequence length. As a result, inference is O (1) per token, and training is O ( T ) rather than O ( T 2 ) .\n\n3.028B total (2.718B Muon + 309.6M AdamW)\n\n24 decoder layers, D = 3, 072 hidden dim\n\n16 heads, d k = 96 (half-width Q/K), d v = 192 (full-width V)\n\nSimple GLA with fixed geometric decay ( T min = 1 , T max = 2, 048 )\n\nDepth-wise causal Conv1d, kernel width 4, SiLU\n\nGLU (SiLU), inner dim 8,192\n\nLayerNorm pre-attn + Head RMSNorm (per tier) + LayerNorm pre-FFN\n\n50,304 (padded to multiple of 64)\n\n100B tokens, FineWeb-Edu\n\nMuon for 2D weight matrices; AdamW for embeddings, norms\n\n524,288 tokens/step, cosine LR, 3,815-step warmup\n\n## Engineering challenges\n\nEach of the three changes raised its own engineering challenge.\n\n### Challenge 1: Using native PyTorch on Trainium for GLA\n\nOn GPU, GLA runs as the fused Triton kernel fused_chunk_simple_gla from the flash-linear-attention library. The GenAIIC team re-expressed it with standard PyTorch operators running through TorchNeuron Native , as explicit loops over fixed-size chunks. The chunk count is fixed at compile time and sets the backward-unroll depth. The team uses fla_num_chunks = 16, so each chunk holds C = 128 tokens.\n\nWithin each chunk c , the intra-chunk output is masked linear attention, and the running state S adds earlier context:\n\nChunked GLA intra-chunk output\n\nThe state then advances to the next chunk:\n\nChunked GLA state update\n\nHere λ C is the per-head decay compounded over the chunk. The 16 intra-chunk computations run in parallel, and only the state update is sequential (Figure 3).\n\nFigure 3: GLA chunked recurrence with parallel intra-chunk attention and a sequential state chain.\n\nBecause the SBUF has 128 partitions, each 128-token chunk maps one token per partition, with no padding or cross-partition movement. This alignment increased measured throughput by 14 percent (Figure 4).\n\nFigure 4: Chunk size C = 128 maps one-to-one onto the 128 SBUF partitions.\n\n### Challenge 2: Distributed Muon orthogonalization under FSDP2\n\nMuon orthogonalizes each gradient before the update. For each of the 96 two-dimensional weight matrices (2.718 billion parameters), it runs five Newton–Schulz iterations (Algorithm 1).\n\nThe Newton-Schulz algorithm\n\nThe distributed problem. The Gram matrix A = X X ⊤ correlates every row of the weight with every other row. Under Fully Sharded Data Parallel (FSDP2), each of the 64 ranks holds only 1/64 of the rows. A shard-local X X ⊤ therefore yields only a diagonal block and drops every cross-shard term (Figure 5).\n\nFigure 5: Newton–Schulz under FSDP2: the shard-local Gram block, and gather/broadcast compared with all_to_all.\n\nNaive approach: Gather and broadcast. Every rank gathers the full gradient (5.44 GB), one rank runs Newton–Schulz, and it broadcasts the result. This moves 10.87 GB per step while the other 63 ranks wait.\n\nProduction approach: all_to_all transposition. In MuonFSDP2, one all_to_all gives each rank a few complete matrices, all 64 ranks run Newton–Schulz in parallel, and a second all_to_all returns the results. Per-rank traffic drops to 0.45 GB, 24 times less. Throughput rises from 73,378 to 119,934 tokens per second, 1.63 times higher, with a bit-identical loss curve (Figure 6).\n\nFigure 6: Per-step communication volume: 10.87 GB with all_gather compared with 0.45 GB with all_to_all.\n\nCommunication cost. Newton–Schulz is only about 2 percent of the FLOPs in a training step ( 1.95 × 10 14 of 9.53 × 10 15 ), so communication was the bottleneck. Over NeuronLink-v3 at 1.28 TB/s, the 0.45 GB exchange takes under 0.4 ms of the roughly 4.4-second step.\n\n### Challenge 3: Backward-pass unrolling for a sequential recurrence\n\nThe backward pass differentiates through all 16 sequential state updates. On GPU, autograd builds this graph at runtime. On Trainium2, the compiler must see the whole unrolled 16-step graph in advance, which creates three constraints.\n\nGraph depth grows with chunk count: at 32 chunks ( C = 64 ), the graph overflowed the scheduler. Per-chunk memory grows with chunk size: at 8 chunks ( C = 256 ), intermediates spilled into HBM. Every shape is fixed at trace time, so each loop intermediate needs its own static allocation.\n\nSixteen chunks ( C = 128 ) satisfy all three: the unroll fits the scheduler, intermediates stay on chip, and tiles align with the 128 SBUF partitions.\n\nThe GenAIIC team trained Laplace 3B on one trn2.48xlarge instance using all 64 logical NeuronCores and the all_to_all Muon path. The full recipe is 190,735 steps (100 billion FineWeb-Edu tokens). The following results are through step 84,210, about 44 billion tokens.\n\nThroughput. After compilation warmup, throughput settles at roughly 120,000 tokens per second and holds there through step 84,210.\n\nLoss and gradient stability. The loss (Figure 7a) drops smoothly from about 11.4 to 2.3729 at step 84,210. The gradient norm (Figure 7b) shows the expected early spike then a steady decline to about 0.05, with no post-warmup spikes, divergence, or NaN/Inf values.\n\nFigure 7: Training dynamics. (a) Loss 11.4 → 2.3729. (b) Gradient norm from TensorBoard data.\n\n## Inference optimization on Trainium2\n\nThrough an unmodified vLLM engine, the GenAIIC team served 11,544 output tokens per second at 1,280 concurrent sequences on one trn2.48xlarge instance.\n\nConstant serving state. The 29.5 MB recurrent state per sequence is roughly 82 times smaller than a comparable KV cache at 8,192 tokens. Increasing the prompt from 2,048 to 8,192 tokens added only 0.5% to the cost per output token.\n\nUnmodified vLLM. A wrapper replaces one attribute per decoder layer, the token mixer, to read and write the recurrent state in the vLLM pool. Because the model declares itself attention-free, vLLM allocates one fixed page per sequence. Outputs matched the i14 reference token for token (48/48 steps on 3/3 prompts in BF16).\n\nFinding the bottleneck. A linear fit of decode time against the number of decoder layers L gives:\n\nDecode-time linear fit equation\n\nAt L = 24 , that is 168.1 ms per step, 96.9 percent of it inside the decoder layers. The large projections cost 13.27 ms, near the 12 ms HBM-streaming floor. Most time went to small operators dispatched one at a time under eager PyTorch.\n\nScaling to a full instance. Without tensor parallelism, throughput scales through replicas, with one engine and 20 sequences per logical NeuronCore. Eager throughput grew from 133 output tokens per second on one replica to 6,772 on 64, where host CPU usage reached 82 percent. Compiling the decode step removed per-operator dispatch and raised throughput 1.7 times, to 11,544 (Figure 8).\n\nFigure 8: Whole-instance inference throughput. (a) Replica scaling on eager and compiled decode. (b) Compiled decode lifts throughput from 6,772 to 11,544 output tokens per second.\n\nWhat fixed-batch benchmarks hide. Under real traffic, each new decode batch width is a separately compiled shape whose first use costs about 11 seconds. These steps were only 1.1 percent of the total but consumed 47.5 percent of decode time. Padding to fixed widths removed this cost with bit-exact results. Compiled decode then improved per-replica throughput 3.52 times under staggered arrivals, compared with 1.46 times on fixed batches. Because BF16 reassociation makes compiled output differ slightly from eager, use eager decode when exact reproducibility matters.\n\nThe project produced lessons across both training and inference:\n\n- Native PyTorch can support custom architectures on Trainium2. i14 retained the GLA architecture and used TorchNeuron Native for the final implementation.\n\n- Communication design matters for custom optimizers. The Muon all_to_all design reduced per-rank traffic by 24 times and increased training throughput by 1.63 times.\n\n- Fixed state keeps inference memory predictable. Each sequence uses 29.5 MB regardless of context length.\n\n- Profile before compiling. Operator dispatch, rather than arithmetic or HBM bandwidth, accounted for most decode time.\n\n- Benchmark realistic arrival patterns. Fixed batches hid the cost of compiling new shapes for changing batch widths.\n\nLaplace 3B shows that AWS Trainium2 can support model architectures beyond standard transformers. Using native PyTorch through TorchNeuron Native and the AWS Neuron SDK, i14 trained and served its GLA-based model while preserving a fixed recurrent state.\n\nFor agentic systems, this changes a basic serving constraint. Longer histories don’t require a larger per-sequence state, which can help teams retain more context while keeping memory use predictable.\n\nIf growing context is increasing serving cost, reducing concurrency, or limiting agent memory, try i14 or contact your AWS account team to evaluate Laplace 3B on AWS Trainium2.\n\n- AWS Trainium and Trainium2\n\n- AWS Neuron SDK documentation\n\n- Native PyTorch support on AWS Trainium with TorchNeuron Native\n\n- Gated Linear Attention Transformers with Hardware-Efficient Training\n\n- Muon optimizer reference implementation\n\n- AWS Generative AI Innovation Center",
+  "images": [
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-1.png",
+      "alt": "NeuronCore-v3 internal architecture",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-1.png",
+      "id": "image_dd904cfc42d1febb"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-2.png",
+      "alt": "Laplace decoder layer architecture",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-2.png",
+      "id": "image_ed4c3c26e720671f"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/01-gla-recurrent-state-update.png",
+      "alt": "GLA recurrent-state update equation",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/01-gla-recurrent-state-update.png",
+      "id": "image_14ee4bd9b0ad86b3"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/02-gla-state-readout.png",
+      "alt": "GLA state-readout equation",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/02-gla-state-readout.png",
+      "id": "image_e837198915314622"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/03-gla-self-augmentation.png",
+      "alt": "GLA self-augmentation equation",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/03-gla-self-augmentation.png",
+      "id": "image_4d671504a055cffe"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/04-gla-decay-schedule.png",
+      "alt": "GLA decay schedule equations",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/04-gla-decay-schedule.png",
+      "id": "image_fef43cc293674439"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/05-chunked-gla-intra-chunk-output.png",
+      "alt": "Chunked GLA intra-chunk output",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/05-chunked-gla-intra-chunk-output.png",
+      "id": "image_6b30fc22ec1d3c5d"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/06-chunked-gla-state-update.png",
+      "alt": "Chunked GLA state update",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/06-chunked-gla-state-update.png",
+      "id": "image_2b2f72dc594c2990"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-7.png",
+      "alt": "GLA chunked recurrence decomposition",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-7.png",
+      "id": "image_85f58afbdb363517"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-8.png",
+      "alt": "GLA chunk alignment with SBUF partitions",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-8.png",
+      "id": "image_bb94acaf47c70952"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/07-newton-schulz-algorithm.png",
+      "alt": "The Newton-Schulz algorithm",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/19/07-newton-schulz-algorithm.png",
+      "id": "image_2484ceb515f212bb"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-9.png",
+      "alt": "Newton-Schulz communication patterns under FSDP2",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/10/14/ML-21817-9.png",
+      "id": "image_59b8989e7bc23177"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "e8830ed5214d1bff6411f08230640c5fbf8def4a5640e3d4ba4bb040881889a3",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dd904cfc42d1febb",
+      "type": "image",
+      "afterBlockId": "b0028",
+      "order": 28
+    },
+    {
+      "mediaId": "image_ed4c3c26e720671f",
+      "type": "image",
+      "afterBlockId": "b0033",
+      "order": 34
+    },
+    {
+      "mediaId": "image_14ee4bd9b0ad86b3",
+      "type": "image",
+      "afterBlockId": "b0035",
+      "order": 37
+    },
+    {
+      "mediaId": "image_e837198915314622",
+      "type": "image",
+      "afterBlockId": "b0037",
+      "order": 40
+    },
+    {
+      "mediaId": "image_4d671504a055cffe",
+      "type": "image",
+      "afterBlockId": "b0039",
+      "order": 43
+    },
+    {
+      "mediaId": "image_fef43cc293674439",
+      "type": "image",
+      "afterBlockId": "b0042",
+      "order": 47
+    },
+    {
+      "mediaId": "image_6b30fc22ec1d3c5d",
+      "type": "image",
+      "afterBlockId": "b0062",
+      "order": 68
+    },
+    {
+      "mediaId": "image_2b2f72dc594c2990",
+      "type": "image",
+      "afterBlockId": "b0064",
+      "order": 71
+    },
+    {
+      "mediaId": "image_85f58afbdb363517",
+      "type": "image",
+      "afterBlockId": "b0066",
+      "order": 74
+    },
+    {
+      "mediaId": "image_bb94acaf47c70952",
+      "type": "image",
+      "afterBlockId": "b0068",
+      "order": 77
+    },
+    {
+      "mediaId": "image_2484ceb515f212bb",
+      "type": "image",
+      "afterBlockId": "b0071",
+      "order": 81
+    },
+    {
+      "mediaId": "image_59b8989e7bc23177",
+      "type": "image",
+      "afterBlockId": "b0073",
+      "order": 84
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 12,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-20T22:15:24.704345Z",
+  "articleKind": "feed"
+}
