@@ -1,0 +1,572 @@
+{
+  "schemaVersion": 3,
+  "id": "991db08cf964",
+  "title": "How Specializing the Vocabulary of SLMs Can Cut Inference Cost by 77% in Real Applications",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/Dharma-AI/vocabx-vocabulary-specialization",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-10-21T17:35:36Z",
+  "category": "industry",
+  "tags": [
+    "推理",
+    "行业应用"
+  ],
+  "score": 88,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/Dharma-AI/vocabx-vocabulary-specialization",
+  "resolvedUrl": "https://huggingface.co/blog/Dharma-AI/vocabx-vocabulary-specialization",
+  "fetchedAt": "2026-10-21T21:56:11.317761Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Models specialized for a domain or a task by fine-tuning general open-source models, such as Qwen and Gemma, inherit a vocabulary built for many domains and general applications.\n\nIn an essay grader we run in production, that vocabulary split the text the model writes most into many tokens. This article previews some results from the VocabX paper, which we will publish soon: how we specialized the vocabulary around the cost of each token rather than its frequency, and cut measured inference cost by 77% without changing the base model.\n\nThe tokenizer is usually treated as a fixed property of the base model, inherited and left alone. For a model specialized in a single domain, it can be one of the largest cost levers, and it is set before any training step.\n\nOne of the systems we run in production is an automated grader for Portuguese essays, built on Qwen3-4B. It receives the essay, the prompt and the supporting texts, and returns a JSON assessment with a grade and a comment for each competency.\n\nThe model was already small, at 4 billion parameters, and had already been trained for the task. Its tokenizer, however, was still the original Qwen3-4B one, built for many languages and many kinds of text. In the grader, it was used for a single language, Portuguese, and a single response format. That had two costs: the text the grader writes on every request took more tokens than it needed, and at every generated token the model scored a vocabulary of 151,669 entries, including many this task almost never uses.\n\nWe rebuilt that vocabulary with a method we call VocabX, keeping the same base model, the same data and the same training recipe. The numbers in this article come from the current version of the paper, still under review, and may change before publication.\n\n## A Vocabulary Built for Everyone\n\nThe leading language models read and write in tokens, and the tokenizer decides how text becomes tokens. The tokenizers of the leading general-purpose models are trained on large collections of text from many domains and languages, from source code to contracts to Chinese. For a general-purpose model, that choice makes sense.\n\nFor a model used in a single domain, it creates two kinds of waste at once.\n\nThe first is fragmentation. The tokenizer splits into many pieces exactly what the domain repeats most. In the grader, every response starts with the same JSON envelope, the same competency names, the same evaluation phrases. In contracts, it is the boilerplate clauses. In code, the identifiers. Each of these sequences costs several tokens where one would do, and the model pays for every one of them on every request.\n\nThe second is excess. The vocabulary carries tens of thousands of entries the domain never uses, and the model computes a score for all of them at every token it generates. A model tuned to grade American school biology exams will almost never write in Chinese, yet it computes the probability of every Chinese-language token at every step. The vocabulary splits into many pieces what the domain repeats most, and carries entries the domain never uses.\n\n## Reading Is Cheap, Writing Is Expensive\n\nThe natural reaction is to count tokens and try to reduce the count. But the count is not the bill.\n\nTo see why a generated token costs more, it helps to look at how inference works. It has two phases. In prefill, the model processes the whole input in a single pass through the network: each weight read from GPU memory is reused for every input token, and the limit is compute. In decode, the model generates the response one token at a time, and each token needs a full pass. Each weight read is used only a few times, and the GPU spends most of its time waiting for data to arrive from memory: the limit becomes memory bandwidth.\n\nThis effect is strongest exactly where we operate: small models served with moderate batches. Batching requests splits the weight reads across them and eases the problem, but does not solve it. At every decode step, the model also reads the KV cache, the attention memory that holds the context already processed and grows with it. In the case we measured, the grader, a generated token costs 7.4 times a token read, but the ratio varies with the hardware, the problem, the batch size, the context length and other factors, and it can be larger than that. In general, the direction holds: generating costs more than reading.\n\nThink of a shipping company that charges per box, but charges seven times more for outgoing boxes than for incoming ones. Reducing the total number of boxes helps. Reducing the outgoing boxes helps seven times more. A method that compresses input and output equally misses most of the possible savings.\n\nThe third component of the bill is the vocabulary itself. The model's last layer, the LM head, turns the internal state into a score for every possible token. To do that, it holds one row of parameters per vocabulary entry. In a model the size of Qwen3-4B, that matrix accounts for almost 10% of the parameters. It is a share that large models absorb without noticing, but it weighs on a small model.\n\nAnd the cost is not paid only once. The input layer looks up only the row of the token being read, but the LM head reads and multiplies the entire matrix for every generated token. Since decode is already memory-bound, every extra row is more data to move at every step. An entry the domain never uses costs exactly the same as a frequent one. That is why adding tokens can lower the count and raise the bill at the same time. VocabX does not include this term in its selection criterion, but it controls vocabulary size in two steps: the sub-word merge replaces the base vocabulary with a smaller, domain-specific one, and macros enter under a fixed budget. In the grader, the output layer went from about 152,000 to about 65,000 rows.\n\n## Why Existing Solutions Fell Short\n\nAdapting a model's vocabulary is not a new idea. Reference methods in the literature, such as fast vocabulary transfer (FVT), multi-word tokenization (MWT) and Liquid AI's in-place tokenizer expansion (in-place BPE), which continues BPE training from the original vocabulary, already reduce fragmentation. When we tested them on our problem, we found two limitations.\n\nThey choose tokens by frequency, not by cost. An expression that appears often in the input is worth more to them than one that appears less often in the response, even if the second is the more expensive one to serve.\n\nThey work on a single layer. They either adjust how words are cut into pieces, or merge whole phrases into one token. None of these three does both under the same criterion. And the grader's biggest waste was precisely in long, repeated spans such as the JSON envelope, which a sub-word method only reaches after merging each part, one by one.\n\n## How We Solved It\n\nVocabX addresses both limitations, plus a third problem that appears on the obvious path to solving the first.\n\nFirst, we changed the question. Instead of asking how many tokens a candidate saves, we ask how much cost and time it saves. Each eliminated token is multiplied by the price of the field it appears in: system prompt, user message or model response. In the case we measured, the grader, a token saved in the response is worth 7.4 times one saved in the input, and the vocabulary is built accordingly.\n\nSecond, we work on both layers at once. Back to the shipping company: you can cut boxes by packing each item better, or by recognizing that the same twelve-item kit ships every week and sending the kit in a single box. VocabX does both. At the sub-word layer, it rebuilds how domain words are cut into pieces. At the multi-word layer, it looks for whole spans that repeat, from short expressions to full lines and JSON envelopes, and turns each into a single token, which we call a macro token. Both layers are chosen under the same cost criterion, each with its own budget.\n\nTo find these spans, we use five miners, automatic searches for spans that repeat across the corpus, each specialized in one kind of repetition: long words, whole lines, expressions, complete sentences, and structures with punctuation such as JSON and tags. Averaged over eight corpora, the last one contributed the most, and on code it alone accounted for 17.5 points. Without all five, token reduction on the grader would drop by 55.6 points.\n\nThird, we estimate what the sample cannot see. Choosing tokens by cost requires knowing how much each candidate still saves after the ones already chosen. Measuring that exactly would require reprocessing the entire corpus after every choice, tens of thousands of times. A common way to do this at scale is to measure on a sample of documents, and then a candidate absent from the sample gets zero gain.\n\nAn expression that appears 37 times in 50,000 documents shows up in a 400-document sample only about 26% of the time. In a contracts corpus, only 16.6% of the candidates appear in a 400-document sample; the rest are never evaluated.\n\nA candidate's gain has two parts. One is how much it saves over the entire corpus, and that can be counted exactly, without a sample. The other is how much of that saving is not yet covered by the tokens already chosen, and only that part needs to be estimated. For candidates the sample cannot see, we use a statistical estimate based on the behavior of the ones it can see, instead of zero. A candidate that is rare in the sample but frequent in the corpus is back in the running.\n\nThat change alone, with the same sample and the same budget, raised token reduction on a contracts corpus from 44.7% to 52.8%.\n\n## What Changed in the Grader\n\nTo measure the real effect, we trained seven versions of the grader with the same base model, the same data, the same recipe and the same seed. The only difference between them is the tokenizer. All of them ran the same 500 requests on the same test machine, with an RTX 5090 GPU and the vLLM inference server, and cost was calculated from measured runtime.\n\nThe model's response dropped from 350 to 101 tokens on average. Cost dropped 77.0%. Quality, measured by the bench score, which combines grading accuracy and the accuracy of screening off-topic or rule-breaking essays, rose from 0.703 to 0.810.\n\nGetting there required a course correction. The first version of the vocabulary fused each competency's grade with the surrounding JSON into a single macro token. It was the most compact option, but quality dropped: its bench score was 0.689, below the production grader's 0.703. With the grade inside the macro, each combination of grade and structure became a different variant of the same token, and the model chose both in a single step. Giving the grade its own token cost 2 extra tokens per response, raised the bench score to 0.810 and, in the measurement, was even cheaper: a 77.0% reduction, against 73.3% for the fused version.\n\nThe lesson applies beyond the grader. Compression has a cost when the compressed span carries the very decision the model exists to make. The goal is not the cheapest possible vocabulary, but the cheapest one that preserves the tokens that matter.\n\n## Beyond the Grader\n\nTo find out whether the gain was specific to our case, we compared VocabX with the three reference methods on five public domains (contracts, medical papers, scientific papers, news and Python code) and three model families (Qwen3, Llama-3.1 and Gemma-3). All methods used the same mining and test documents, and the same vocabulary ceiling.\n\nVocabX compressed more than the strongest reference method in all fifteen combinations, by 1.2 to 9.3 points. In estimated inference cost, the pruned version of VocabX also led in all fifteen, with average margins of 10.2 points on Qwen3, 7.5 on Llama-3.1 and 13.6 on Gemma-3. On contracts, the pruned version reached 62.6% token reduction with 113,426 vocabulary entries, against 61.8% for the best in-place BPE configuration, which uses 207,803.\n\n## Paying Only for the Tokens That Matter\n\nVocabX does not make the model smarter. It makes the model stop paying for text it does not need to write piece by piece, and stop scoring a vocabulary it will never use. In our grader, that cut measured inference cost by 77%, with the same base model and the same training recipe.\n\nSpecialization usually starts with data and weights. It can also start one layer earlier, in the vocabulary.\n\nThe full method, the tables for every experiment and the discarded interventions will be in the VocabX paper, which we will publish soon.\n\n## Sources\n\n- Dharma-AI. \"VocabX: Cost-Weighted Vocabulary Adaptation for Domain-Specific Language Models.\" In preparation (2026).\n\n- Gee, Leonidas, et al. \"Fast vocabulary transfer for language model compression.\" EMNLP Industry Track (2022).\n\n- Gee, Leonidas, et al. \"Multi-word tokenization for sequence compression.\" EMNLP Industry Track (2023).\n\n- Smith, Jimmy T.H., et al. \"In-Place Tokenizer Expansion for Pre-trained LLMs.\" arXiv:2607.15232 (2026).\n\n## Further Reading\n\n- Same Cluster, 33 Points More Utilization: What Changed Was the Order\n\n- GPU Management: Why Idle GPUs Are the New Grounded Aircraft\n\n- Why Specialization Is Inevitable\n\n- Specialization Beats Scale: A Strategic Variable Most AI Procurement Decisions Overlook\n\n- Text Degeneration: A Production Failure Mode That Most Benchmarks Do Not Track\n\nExplore Dharma AI on Hugging Face to try our demos, download our open models, and see how specialized AI systems outperform general-purpose models in real enterprise applications.",
+  "images": [
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/TYOhAFobnI4ss3UnNqMHc.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/TYOhAFobnI4ss3UnNqMHc.png",
+      "alt": "Same sentence, fewer tokens: 14 tokens with the base tokenizer, 4 with VocabX",
+      "id": "image_cbc94c75ef68cfc9"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/K5De-hfTaOl9vUJItSijj.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/K5De-hfTaOl9vUJItSijj.png",
+      "alt": "The span the grader writes in every response takes 12 tokens with the base tokenizer and 1 with VocabX",
+      "id": "image_deb937b29fcc7c57"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/Inl5L1IDqWUBbD0Xlq-JB.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/Inl5L1IDqWUBbD0Xlq-JB.png",
+      "alt": "151,669 vocabulary entries in the base tokenizer, 64,767 with VocabX",
+      "id": "image_2bf5e7c190753277"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/q-GjdgYd6GgXnv3-wJQsY.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/q-GjdgYd6GgXnv3-wJQsY.png",
+      "alt": "In the case we measured, writing a token cost 7.4 times reading one",
+      "id": "image_d86a2eb776bf022a"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/B5Wig-4nTEutpFZlGQ6sk.gif",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/B5Wig-4nTEutpFZlGQ6sk.gif",
+      "alt": "Twelve boxes become one, and 7 tokens become one macro token",
+      "id": "image_3b751986526748eb"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/_EdPyU7R3xdomvFxuadPY.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/_EdPyU7R3xdomvFxuadPY.png",
+      "alt": "Two layers, one cost criterion",
+      "id": "image_33530470baeb3c4b"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/zxfdAxNxsvfBCBNeUThx5.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/zxfdAxNxsvfBCBNeUThx5.png",
+      "alt": "None of the 37 occurrences lands in the 400-document sample",
+      "id": "image_7714627a9301ba27"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/PxGLMRrjTPVYDW8rlDuBd.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/PxGLMRrjTPVYDW8rlDuBd.png",
+      "alt": "With an estimate instead of zero: 44.7% to 52.8% token reduction",
+      "id": "image_b45e24a173aa7f3b"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/7CKshmOEsUkemfgL9Mopn.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/7CKshmOEsUkemfgL9Mopn.png",
+      "alt": "Grader results: 77.0% cost reduction, bench score from 0.703 to 0.810",
+      "id": "image_c69f1482ac7a39d9"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/bCCQQjpY6tU5ZAD3hXOeN.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6a725daa5ca641a21ab61956/bCCQQjpY6tU5ZAD3hXOeN.png",
+      "alt": "VocabX average lead: +10.2 (Qwen3), +7.5 (Llama-3.1), +13.6 (Gemma-3) points",
+      "id": "image_6eab06ec209f8708"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Models specialized for a domain or a task by fine-tuning general open-source models, such as Qwen and Gemma, inherit a vocabulary built for many domains and general applications.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 178,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "In an essay grader we run in production, that vocabulary split the text the model writes most into many tokens. This article previews some results from the VocabX paper, which we will publish soon: how we specialized the vocabulary around the cost of each token rather than its frequency, and cut measured inference cost by 77% without changing the base model.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 360,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0003",
+      "source": "The tokenizer is usually treated as a fixed property of the base model, inherited and left alone. For a model specialized in a single domain, it can be one of the largest cost levers, and it is set before any training step.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "One of the systems we run in production is an automated grader for Portuguese essays, built on Qwen3-4B. It receives the essay, the prompt and the supporting texts, and returns a JSON assessment with a grade and a comment for each competency.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "The model was already small, at 4 billion parameters, and had already been trained for the task. Its tokenizer, however, was still the original Qwen3-4B one, built for many languages and many kinds of text. In the grader, it was used for a single language, Portuguese, and a single response format. That had two costs: the text the grader writes on every request took more tokens than it needed, and at every generated token the model scored a vocabulary of 151,669 entries, including many this task almost never uses.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "We rebuilt that vocabulary with a method we call VocabX, keeping the same base model, the same data and the same training recipe. The numbers in this article come from the current version of the paper, still under review, and may change before publication.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "A Vocabulary Built for Everyone",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "The leading language models read and write in tokens, and the tokenizer decides how text becomes tokens. The tokenizers of the leading general-purpose models are trained on large collections of text from many domains and languages, from source code to contracts to Chinese. For a general-purpose model, that choice makes sense.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "For a model used in a single domain, it creates two kinds of waste at once.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "The first is fragmentation. The tokenizer splits into many pieces exactly what the domain repeats most. In the grader, every response starts with the same JSON envelope, the same competency names, the same evaluation phrases. In contracts, it is the boilerplate clauses. In code, the identifiers. Each of these sequences costs several tokens where one would do, and the model pays for every one of them on every request.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "The second is excess. The vocabulary carries tens of thousands of entries the domain never uses, and the model computes a score for all of them at every token it generates. A model tuned to grade American school biology exams will almost never write in Chinese, yet it computes the probability of every Chinese-language token at every step. The vocabulary splits into many pieces what the domain repeats most, and carries entries the domain never uses.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Reading Is Cheap, Writing Is Expensive",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "The natural reaction is to count tokens and try to reduce the count. But the count is not the bill.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "To see why a generated token costs more, it helps to look at how inference works. It has two phases. In prefill, the model processes the whole input in a single pass through the network: each weight read from GPU memory is reused for every input token, and the limit is compute. In decode, the model generates the response one token at a time, and each token needs a full pass. Each weight read is used only a few times, and the GPU spends most of its time waiting for data to arrive from memory: the limit becomes memory bandwidth.",
+      "spans": [
+        {
+          "start": 104,
+          "end": 111,
+          "kind": "em"
+        },
+        {
+          "start": 282,
+          "end": 288,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "This effect is strongest exactly where we operate: small models served with moderate batches. Batching requests splits the weight reads across them and eases the problem, but does not solve it. At every decode step, the model also reads the KV cache, the attention memory that holds the context already processed and grows with it. In the case we measured, the grader, a generated token costs 7.4 times a token read, but the ratio varies with the hardware, the problem, the batch size, the context length and other factors, and it can be larger than that. In general, the direction holds: generating costs more than reading.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Think of a shipping company that charges per box, but charges seven times more for outgoing boxes than for incoming ones. Reducing the total number of boxes helps. Reducing the outgoing boxes helps seven times more. A method that compresses input and output equally misses most of the possible savings.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "The third component of the bill is the vocabulary itself. The model's last layer, the LM head, turns the internal state into a score for every possible token. To do that, it holds one row of parameters per vocabulary entry. In a model the size of Qwen3-4B, that matrix accounts for almost 10% of the parameters. It is a share that large models absorb without noticing, but it weighs on a small model.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "And the cost is not paid only once. The input layer looks up only the row of the token being read, but the LM head reads and multiplies the entire matrix for every generated token. Since decode is already memory-bound, every extra row is more data to move at every step. An entry the domain never uses costs exactly the same as a frequent one. That is why adding tokens can lower the count and raise the bill at the same time. VocabX does not include this term in its selection criterion, but it controls vocabulary size in two steps: the sub-word merge replaces the base vocabulary with a smaller, domain-specific one, and macros enter under a fixed budget. In the grader, the output layer went from about 152,000 to about 65,000 rows.",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Why Existing Solutions Fell Short",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Adapting a model's vocabulary is not a new idea. Reference methods in the literature, such as fast vocabulary transfer (FVT), multi-word tokenization (MWT) and Liquid AI's in-place tokenizer expansion (in-place BPE), which continues BPE training from the original vocabulary, already reduce fragmentation. When we tested them on our problem, we found two limitations.",
+      "spans": [
+        {
+          "start": 172,
+          "end": 200,
+          "kind": "a",
+          "href": "https://www.liquid.ai/blog/tokenizer-expansion"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "They choose tokens by frequency, not by cost. An expression that appears often in the input is worth more to them than one that appears less often in the response, even if the second is the more expensive one to serve.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "They work on a single layer. They either adjust how words are cut into pieces, or merge whole phrases into one token. None of these three does both under the same criterion. And the grader's biggest waste was precisely in long, repeated spans such as the JSON envelope, which a sub-word method only reaches after merging each part, one by one.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "How We Solved It",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "VocabX addresses both limitations, plus a third problem that appears on the obvious path to solving the first.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "First, we changed the question. Instead of asking how many tokens a candidate saves, we ask how much cost and time it saves. Each eliminated token is multiplied by the price of the field it appears in: system prompt, user message or model response. In the case we measured, the grader, a token saved in the response is worth 7.4 times one saved in the input, and the vocabulary is built accordingly.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Second, we work on both layers at once. Back to the shipping company: you can cut boxes by packing each item better, or by recognizing that the same twelve-item kit ships every week and sending the kit in a single box. VocabX does both. At the sub-word layer, it rebuilds how domain words are cut into pieces. At the multi-word layer, it looks for whole spans that repeat, from short expressions to full lines and JSON envelopes, and turns each into a single token, which we call a macro token. Both layers are chosen under the same cost criterion, each with its own budget.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "To find these spans, we use five miners, automatic searches for spans that repeat across the corpus, each specialized in one kind of repetition: long words, whole lines, expressions, complete sentences, and structures with punctuation such as JSON and tags. Averaged over eight corpora, the last one contributed the most, and on code it alone accounted for 17.5 points. Without all five, token reduction on the grader would drop by 55.6 points.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Third, we estimate what the sample cannot see. Choosing tokens by cost requires knowing how much each candidate still saves after the ones already chosen. Measuring that exactly would require reprocessing the entire corpus after every choice, tens of thousands of times. A common way to do this at scale is to measure on a sample of documents, and then a candidate absent from the sample gets zero gain.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 46,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0029",
+      "source": "An expression that appears 37 times in 50,000 documents shows up in a 400-document sample only about 26% of the time. In a contracts corpus, only 16.6% of the candidates appear in a 400-document sample; the rest are never evaluated.",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "A candidate's gain has two parts. One is how much it saves over the entire corpus, and that can be counted exactly, without a sample. The other is how much of that saving is not yet covered by the tokens already chosen, and only that part needs to be estimated. For candidates the sample cannot see, we use a statistical estimate based on the behavior of the ones it can see, instead of zero. A candidate that is rare in the sample but frequent in the corpus is back in the running.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "That change alone, with the same sample and the same budget, raised token reduction on a contracts corpus from 44.7% to 52.8%.",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "What Changed in the Grader",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "To measure the real effect, we trained seven versions of the grader with the same base model, the same data, the same recipe and the same seed. The only difference between them is the tokenizer. All of them ran the same 500 requests on the same test machine, with an RTX 5090 GPU and the vLLM inference server, and cost was calculated from measured runtime.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "The model's response dropped from 350 to 101 tokens on average. Cost dropped 77.0%. Quality, measured by the bench score, which combines grading accuracy and the accuracy of screening off-topic or rule-breaking essays, rose from 0.703 to 0.810.",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "Getting there required a course correction. The first version of the vocabulary fused each competency's grade with the surrounding JSON into a single macro token. It was the most compact option, but quality dropped: its bench score was 0.689, below the production grader's 0.703. With the grade inside the macro, each combination of grade and structure became a different variant of the same token, and the model chose both in a single step. Giving the grade its own token cost 2 extra tokens per response, raised the bench score to 0.810 and, in the measurement, was even cheaper: a 77.0% reduction, against 73.3% for the fused version.",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "The lesson applies beyond the grader. Compression has a cost when the compressed span carries the very decision the model exists to make. The goal is not the cheapest possible vocabulary, but the cheapest one that preserves the tokens that matter.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "Beyond the Grader",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "To find out whether the gain was specific to our case, we compared VocabX with the three reference methods on five public domains (contracts, medical papers, scientific papers, news and Python code) and three model families (Qwen3, Llama-3.1 and Gemma-3). All methods used the same mining and test documents, and the same vocabulary ceiling.",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "VocabX compressed more than the strongest reference method in all fifteen combinations, by 1.2 to 9.3 points. In estimated inference cost, the pruned version of VocabX also led in all fifteen, with average margins of 10.2 points on Qwen3, 7.5 on Llama-3.1 and 13.6 on Gemma-3. On contracts, the pruned version reached 62.6% token reduction with 113,426 vocabulary entries, against 61.8% for the best in-place BPE configuration, which uses 207,803.",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "Paying Only for the Tokens That Matter",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "VocabX does not make the model smarter. It makes the model stop paying for text it does not need to write piece by piece, and stop scoring a vocabulary it will never use. In our grader, that cut measured inference cost by 77%, with the same base model and the same training recipe.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Specialization usually starts with data and weights. It can also start one layer earlier, in the vocabulary.",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "The full method, the tables for every experiment and the discarded interventions will be in the VocabX paper, which we will publish soon.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Sources",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Dharma-AI. \"VocabX: Cost-Weighted Vocabulary Adaptation for Domain-Specific Language Models.\" In preparation (2026).",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Gee, Leonidas, et al. \"Fast vocabulary transfer for language model compression.\" EMNLP Industry Track (2022).",
+      "spans": [
+        {
+          "start": 23,
+          "end": 78,
+          "kind": "a",
+          "href": "https://aclanthology.org/2022.emnlp-industry.41/"
+        }
+      ]
+    },
+    {
+      "id": "b0047",
+      "source": "Gee, Leonidas, et al. \"Multi-word tokenization for sequence compression.\" EMNLP Industry Track (2023).",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "Smith, Jimmy T.H., et al. \"In-Place Tokenizer Expansion for Pre-trained LLMs.\" arXiv:2607.15232 (2026).",
+      "spans": [
+        {
+          "start": 27,
+          "end": 76,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2607.15232"
+        }
+      ]
+    },
+    {
+      "id": "b0049",
+      "source": "Further Reading",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Same Cluster, 33 Points More Utilization: What Changed Was the Order",
+      "spans": [
+        {
+          "start": 0,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Dharma-AI/gpu-management-pt2"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "GPU Management: Why Idle GPUs Are the New Grounded Aircraft",
+      "spans": [
+        {
+          "start": 0,
+          "end": 59,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Dharma-AI/gpu-management"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Why Specialization Is Inevitable",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Dharma-AI/why-specialization-is-inevitable"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Specialization Beats Scale: A Strategic Variable Most AI Procurement Decisions Overlook",
+      "spans": [
+        {
+          "start": 0,
+          "end": 87,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Dharma-AI/specialization-beats-scale"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Text Degeneration: A Production Failure Mode That Most Benchmarks Do Not Track",
+      "spans": [
+        {
+          "start": 0,
+          "end": 78,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/Dharma-AI/text-degeneration-a-production-failure-mode"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "Explore Dharma AI on Hugging Face to try our demos, download our open models, and see how specialized AI systems outperform general-purpose models in real enterprise applications.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 33,
+          "kind": "a",
+          "href": "https://huggingface.co/Dharma-AI"
+        },
+        {
+          "start": 0,
+          "end": 179,
+          "kind": "em"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "4df3527a82b196ad3257b9cb08b4644cd65cc4730319541741fc58d9db888bef",
+  "codeContent": [],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "4df3527a82b196ad3257b9cb08b4644cd65cc4730319541741fc58d9db888bef",
+  "mediaLayout": [
+    {
+      "mediaId": "image_cbc94c75ef68cfc9",
+      "type": "image",
+      "afterBlockId": "b0002",
+      "order": 0
+    },
+    {
+      "mediaId": "image_deb937b29fcc7c57",
+      "type": "image",
+      "afterBlockId": "b0010",
+      "order": 1
+    },
+    {
+      "mediaId": "image_2bf5e7c190753277",
+      "type": "image",
+      "afterBlockId": "b0011",
+      "order": 2
+    },
+    {
+      "mediaId": "image_d86a2eb776bf022a",
+      "type": "image",
+      "afterBlockId": "b0015",
+      "order": 3
+    },
+    {
+      "mediaId": "image_3b751986526748eb",
+      "type": "image",
+      "afterBlockId": "b0026",
+      "order": 4
+    },
+    {
+      "mediaId": "image_33530470baeb3c4b",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 5
+    },
+    {
+      "mediaId": "image_7714627a9301ba27",
+      "type": "image",
+      "afterBlockId": "b0029",
+      "order": 6
+    },
+    {
+      "mediaId": "image_b45e24a173aa7f3b",
+      "type": "image",
+      "afterBlockId": "b0031",
+      "order": 7
+    },
+    {
+      "mediaId": "image_c69f1482ac7a39d9",
+      "type": "image",
+      "afterBlockId": "b0033",
+      "order": 8
+    },
+    {
+      "mediaId": "image_6eab06ec209f8708",
+      "type": "image",
+      "afterBlockId": "b0039",
+      "order": 9
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 10,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 10,
+    "savedImages": 10,
+    "sourceImageOccurrences": 10,
+    "placedImageOccurrences": 10,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-10-21T21:56:11.374805Z",
+  "summaryZh": "本文来自Hugging Face，围绕“How Specializing the Vocabulary of SLMs Can Cut Inference Cost by 77% in Real Applications”介绍行业落地方面的最新进展，重点涉及推理、行业应用。下方为系统保存的原文正文。",
+  "summaryGeneratedAt": "2026-10-21T21:58:03.147489Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
