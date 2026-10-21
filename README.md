@@ -1,4 +1,6 @@
 # 模型脉动 · LLM Pulse
+[![部署状态](https://github.com/wuhy80/llm-news-tracker/actions/workflows/deploy-pages.yml/badge.svg)](https://github.com/wuhy80/llm-news-tracker/actions/workflows/deploy-pages.yml)
+[![在线访问](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E8%AE%BF%E9%97%AE-wuhy80.github.io-2ea44f?logo=github&logoColor=white)](https://wuhy80.github.io/llm-news-tracker/)
 
 一个零后端、零运行费用的大模型行业情报站。它用 GitHub Actions 定时聚合公开信息源，将结果保存为 JSON，并通过 GitHub Pages 展示日、周、月三个维度的动态。
 
