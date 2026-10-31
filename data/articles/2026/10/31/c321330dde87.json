@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 3,
+  "id": "c321330dde87",
+  "title": "Betelgeuse: Running Qwen 3.8 Flash Next at 22 tok/s sustained (spiking to 48 tok/s) on an RTX 3060 12GB + 16GB DDR4 RAM…",
+  "summary": "About two months ago I posted here about trying to predict which MoE experts get used on the next token to speed up CPU/GPU offload on Qwen 3.6 35B. Quick confession on that older post before anything else: I ended up throwing that prototype away. To get the big numbers I was seeing back then, I was basically cheating with gate pruning (dropping cold experts when their router weights were low). It made the tok/s coun",
+  "url": "https://www.reddit.com/r/LocalLLaMA/comments/1xk8s6z/betelgeuse_running_qwen_38_flash_next_at_22_toks/",
+  "source": "Reddit · LocalLLaMA",
+  "sourceDomain": "reddit.com",
+  "publishedAt": "2026-10-31T12:20:02Z",
+  "category": "release",
+  "tags": [
+    "Qwen",
+    "模型发布"
+  ],
+  "score": 69,
+  "signal": "medium",
+  "originalUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1xk8s6z/betelgeuse_running_qwen_38_flash_next_at_22_toks/",
+  "resolvedUrl": "https://www.reddit.com/r/LocalLLaMA/comments/1xk8s6z/betelgeuse_running_qwen_38_flash_next_at_22_toks/",
+  "fetchedAt": "2026-10-31T21:49:13.723378Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "About two months ago I posted here about trying to predict which MoE experts get used on the next token to speed up CPU/GPU offload on Qwen 3.6 35B.\n\nQuick confession on that older post before anything else: I ended up throwing that prototype away. To get the big numbers I was seeing back then, I was basically cheating with gate pruning (dropping cold experts when their router weights were low). It made the tok/s counter go brrr, but on an already low-bit quant it quietly degraded output quality and reasoning. I didn't want to ship something that lobotomizes the model just to look fast in a screenshot, so I scrapped it.\n\nWhen Qwen 3.8 Flash Next dropped, I wanted to see if we could actually run the 68GB GSQ-RCO-IQ2_XS build at real usable speeds on a normal budget gaming PC— without dropping a single expert .\n\nFor context, here is the exact box I tested this on (I actually pulled my extra RAM sticks out specifically to test what a regular 16GB PC gets):\n\n- RAM: 16GB DDR4, single-channel (~19 GB/s)\n\n- OS: CachyOS / Arch Linux (tested inside a strict MemoryMax=12G cgroup)\n\n- Storage: Consumer PCIe NVMe SSD (~2.1 GB/s)\n\nIf you try to load a 68GB MoE on 12GB VRAM + 16GB RAM in stock llama.cpp , you already know what happens: mmap thrashes the OS page cache to death, you get ~1,500 major page faults per token, and generation crawls at 1.47 tok/s .\n\nThen I tested Strata . Strata is super cool and hits 40+ tok/s if you have 48GB–64GB of RAM to mlock 24GB+ of experts in system memory. But on a 16GB RAM setup, it refuses to load unless you force --low-ram mmap , where it drops down to 8.11 tok/s because it's bound by cold SSD reads.\n\nSo over the last week I built Betelgeuse ( bel-cli / bel-server , a fork of llama.cpp , and I'm also opening a clean upstream PR for llama.cpp even if it probably won't get merged lol).\n\n# What it actually does under the hood:\n\n- Zero gate pruning / 100% bit-exact: Every single one of the 10 routed experts per layer across all 48 layers is computed at full precision. We verified 28,080 router records and 576 generated tokens byte-for-byte against golden stock output ( 0.000e+00 diff).\n\n- Arrival-Slack VRAM Slot Pool (~5,000 slots in VRAM): All 49 dense layers + GDN + QSA + LM head stay in ~3.2 GB of VRAM. The remaining VRAM holds ~5,000 expert slots distributed non-uniformly (240 slots/layer on early layers 0–4 where there is 0ms of compute slack, 92 on middle layers, 60 on tail layers).\n\n- In-Stream GPU Doorbell + 1-Split CUDA Graph Replay: Instead of ggml_backend_sched splitting the graph 48 times per token to ask the CPU which experts missed (which burns ~360ms/token in cudaStreamSynchronize ), a custom in-stream CUDA kernel resolves hits in ~2 µs on-device and only rings a mapped host doorbell when an expert is missing. Per-layer token embeddings ( per_layer_token_embd ) are also staged to CUDA0 so the entire decode pass runs as 1 single CUDA Graph replay .\n\n- RAM Victim Cache + io_uring Pager: When an expert gets evicted from the VRAM pool, it moves into a dedicated host RAM victim cache instead of getting thrown away.VRAM and RAM stay 100% exclusive instead of duplicating the same hot experts in the OS page cache. Physical NVMe reads drop from ~71 MB/token down to 12.43 MB/token .\n\n- No duplicate 35GB expert bloat on disk: Instead of keeping 35GB of dead expert tensors inside Shard 1 .gguf AND another 35GB in experts.bin , we stripped the expert payloads out of Shard 1 so the main GGUF is only 3.2 GB ( Dense.gguf ) + 35.3 GB ( experts.bin , 4KB-aligned single-read blobs) + **26.8 GB (** PLE.gguf n-gram shard) .\n\n# Measured Results (RTX 3060 12GB + 16GB DDR4, MemoryMax=12G)\n\nEngine Cold Decode (Run 1) Warm Decode (Run 2) Peak Bursts Prompt Processing (PP) Physical SSD Reads Output Parity\n\nStrata ( --low-ram mmap )\n\nBetelgeuse ( bel-server )\n\nOn warm runs it holds 21.8–22.03 tok/s sustained across long coding prompts, and when generation hits stretches where all 10 routed experts are resident in the VRAM/victim pools, it spikes up to 48 tok/s .\n\n- GitHub (Betelgeuse Engine — bel-cli & bel-server ): [https://github.com/Betelgeuse-AI/Betelgeuse]\n\n- HuggingFace (Pre-packed Alpha-Orionis-XS 3.2GB Dense + Experts bundle): https://huggingface.co/Betelgeuse-AI/Alpha-Orionis-XS\n\n- Upstream llama.cpp PR: [https://github.com/ggml-org/llama.cpp/pull/31469]\n\n- Even on the massive Q8_K_XL quant (~190GB total), bel-server runs at 8 tok/s cold and 12 tok/s warm (with bursts up to 21 tok/s) on the exact same 12GB 3060 + 16GB DDR4 box, where stock llama.cpp immediately OOMs or crawls at <0.1 tok/s.\n\n- Zero experts are dropped or thresholded (0.000e+00 diff across 28,080 router records and 576 tokens vs unmodified stock). The speedup comes from eliminating the 48 per-layer CPU/GPU scheduler splits (KICK/WAIT doorbell around the shared expert), keeping the RAM victim cache strictly exclusive of VRAM (MOE_DROP_MMAP), and pre-staging cold misses via the upgraded oracle + 4KB-aligned io_uring pack.\n\nWhat I'm working on next:\n\nWe're currently bringing this exact streaming + victim-cache architecture over to DeepSeek V4.1 Flash (1017) —early testing under development is already sitting around ~25 tok/s on the same hardware class.\n\nHappy to answer any questions or have people poke holes in the benchmarks! Leave us a Star :)",
+  "images": [
+    {
+      "src": "https://external-preview.redd.it/MHBxZnUwMjVuc3loMf6cJBR025efvWrD2XCjAiBgMTC0twf5SvBtR0_E6AIp.png?width=640&crop=smart&auto=webp&s=9df97dd7f80d1a38f8f509937180724668483df1",
+      "alt": "Betelgeuse: Running Qwen 3.8 Flash Next at 22 tok/s sustained (spiking to 48 tok/s) on an RTX 3060 12GB + 16GB DDR4 RAM 100% bit-exact!",
+      "originalUrl": "https://external-preview.redd.it/MHBxZnUwMjVuc3loMf6cJBR025efvWrD2XCjAiBgMTC0twf5SvBtR0_E6AIp.png?width=640&crop=smart&auto=webp&s=9df97dd7f80d1a38f8f509937180724668483df1",
+      "id": "image_9ec094ef05490009"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "e69ad8405482b04815d8fb04fe25721aa76744c762f3935641c991542e813a91",
+  "mediaLayout": [
+    {
+      "mediaId": "image_9ec094ef05490009",
+      "type": "image",
+      "afterBlockId": null,
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-10-31T21:49:13.735244Z",
+  "summaryZh": "Betelgeuse：在 RTX 3060 12GB + 16GB DDR4 RAM 上以 22 tok/s 持续运行 Qwen 3.8 Flash Next（峰值至 48 tok/s）…。大约两个月前，我在这里发布了有关尝试预测哪些 MoE 专家会在下一个令牌上使用以加速 Qwen 3.6 35B 上的 CPU/GPU 卸载的文章。首先对那篇旧文章进行快速坦白：我最终扔掉了那个原型。",
+  "summaryGeneratedAt": "2026-10-31T21:54:31.199413Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "feed"
+}
