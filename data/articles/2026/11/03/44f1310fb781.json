@@ -1,0 +1,571 @@
+{
+  "schemaVersion": 3,
+  "id": "44f1310fb781",
+  "title": "Transformers Model Integration Contracts",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/transformers-mic",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-03T00:00:00Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 83,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/transformers-mic",
+  "resolvedUrl": "https://huggingface.co/blog/transformers-mic",
+  "fetchedAt": "2026-11-03T14:28:09.338031Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "On July 30, 2026, Transformers enabled PyTorch's scaled dot-product attention (SDPA) for T5. As a side effect, UMT5's decoder could attend to future tokens. During training, it could peek at the answer it was supposed to predict. Nothing crashed, and the bug stayed in main for almost two months.\n\nWhen we later replayed those commits, a small UMT5 model running on CPU flagged it on every one of them. This post is about that model and the tests built around it.\n\n## Why bugs reach main\n\nTransformers supports over 750 model types, and its test suite is big: 88,000+ CPU tests on main, plus 200,000+ GPU tests in a daily run. Model tests are only part of it: we also test pipelines, training, distributed execution, quantization and attention kernels.\n\nThe integration tests load real checkpoints and exercise the model's API on real hardware. Running all of that on every PR would mean keeping a lot of GPUs busy all day long, which isn't practical. By the time a scheduled run finds a regression, it may already be in main.\n\nOur approach is to shrink the model instead. We build a fixture: a small model made from the real checkpoint's configuration, with fewer and narrower layers but every kind of layer it has, and its tokenizer and processor files unchanged. It is published once, then reused. We run \"fast integration tests\" against it on a cheap CPU runner. In our CPU study, the experimental UMT5 fixture used 66 MB of weights; the source checkpoint is 1,227 MB.\n\nThis also covers very large models: some don't fit on our standard GPU runners, but their fixtures run on CPU.\n\nModel integrators already build tiny test models (Transformers' tiny-random-* checkpoints). We wanted a common recipe, and checks that go beyond loading the model and running a forward pass. The UMT5 bug would have passed a forward pass just fine.\n\nFixtures won't replace full integration tests, but on PRs they give us a chance to catch bugs before they reach main.\n\n## Introducing Model Integration Contracts\n\ntransformers-mic is a proposed standard for packaging these tests. A Model Integration Contract (MIC) has three parts:\n\n- a fixture: the shrunk model described above, published once and pinned\n\n- a usage path: a runnable Markdown example of something people do with the model, such as generating text or running a training step\n\n- baselines: the outputs recorded when running that example, reviewed by a human\n\nThe contract holds if running the usage path on the fixture still produces the baselines.\n\nA contract covers an architecture and a usage path, not a single checkpoint: compatible checkpoints can share a fixture, while each keeps its own expected results. We publish them in huggingface-mic.\n\nFor example, the SmolLM contract generates from prompts such as \"The capital of France is\" and compares its token IDs with a recorded answer. After loading the model and tokenizer, the generation code is, simplified to one prompt:\n\n```\ninputs = tokenizer(\"The capital of France is\", return_tensors=\"pt\")\noutputs = model.generate(**inputs, max_new_tokens=4, do_sample=False)\nnew_tokens = outputs[:, inputs[\"input_ids\"].shape[1]:]\nprint(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))\n```\n\nIt also compares training loss, checks that gradients are finite and verifies that an optimizer step changes the weights. See the full usage.md.\n\nA fleet dataset on the Hub pins each MIC to a frozen revision, along with the package versions used to record its baselines. Each CI run records the fleet revision it used, so we can reproduce it later.\n\nOn a PR, we pick MICs based on the files the patch changes.\n\n## The UMT5 regression\n\nWe replayed frozen MICs over five months of Transformers commits. The small UMT5 fixture flagged the regression from its introduction on July 30, 2026 until its fix on September 28. Label log-probabilities differed from the reviewed baseline by 1.22 and training loss by about 0.20.\n\nOne detail mattered: the contract used SDPA, the default attention path. Running only the eager attention variant missed the bug. A fixture only helps if it goes through the same code as the real checkpoint.\n\nWe then reverted the fix on a proof branch in Transformers' CI. The check failed with the same differences, and the selected T5 contract's runner step took 13.4 seconds on CPU, excluding setup.\n\nThe replay results and the CI demo have the measurements and reproduction details.\n\n## How models are shrunk\n\nThe first recipe was simple: make the dimensions smaller and keep fewer layers. That wasn't enough for mixed architectures. Keeping two layers is no use if both use sliding attention and the full-attention layers disappear.\n\nThe recipe now has four steps:\n\n- Shrink the configuration. Start from a real checkpoint and reduce hidden sizes, attention heads and depth. Keep the different layer kinds, including mixtures of sliding and full attention or dense and MoE layers. Some architectures need extra rules to keep their components compatible. We also look at the model's own Transformers tests: the ModelTester in test_modeling_<model>.py already picks a small config by hand, so we take its sizes for any width our generic rule doesn't know by name.\n\n- Keep preprocessing unchanged. Preserve vocabulary, special tokens and input dimensions, and copy tokenizer and processor files byte for byte. Loading and preprocessing are part of what we want to test.\n\n- Build and validate the weights. Try seeded random weights and change the inputs to check that the model responds. If it doesn't, try training it on the contract's small batch of examples. Reload the saved model and check that outputs, loss and gradients are finite. Reject failed builds.\n\n- Freeze and record. Save the accepted weights and measure repeatable outputs on a known-good Transformers build. Review the baselines for each supported platform and precision, then publish a pinned snapshot. CI reuses it; it does not rebuild the fixture for every PR.\n\nWe also keep the original weights file format. Otherwise we would skip the conversion code that runs when a user loads the real checkpoint. The full recipe has more detail.\n\nThe Llama 4 Scout shrink report shows what this looks like on a big model. 108.6 billion parameters become 44.7 million. The vision stack goes from 34 layers to 2 and the language stack from 48 to 4, keeping the checked layer kinds and MoE routing style.\n\n### Building MICs with agents\n\nOur CLI, tmic, creates the contract and builds the fixture. For a new model, an LLM drafts the usage code and manifest, and CPU and GPU runs measure the candidate baselines. The LLM drafts; it doesn't approve. Changed expectations require human review.\n\nTo try it on your machine, use your source checkpoint in place of org/model:\n\n```\npip install \"transformers-mic[runtime]\" \"hf-doc-builder @ git+https://github.com/huggingface/doc-builder.git\"\nhf auth login\ntmic run org/model --local-only --fixtures-only --no-history --bill-to ''\n```\n\nIt drafts the contract, builds the fixture and records its baselines on your machine, asking you to review each step, and stops before uploading anything. For a new model, the draft comes from an LLM through Inference Providers, billed to your own account (--bill-to ''). The CLI docs cover the individual steps.\n\nWe used agents to build MICs across model families. When they hit an edge case, we fixed the recipe itself rather than the one fixture, with help from model experts. The published models and remaining gaps are in the coverage space.\n\n## Random vs Overfit\n\nWith random weights, our Whisper fixture barely responded to changes in the audio. It ran, but that made it a poor test of the audio path.\n\nSo we trained it on a few tones paired with words such as \"red\" and \"green\". We weren't teaching it speech recognition, just making audio changes visible in its outputs. In our weight-initialization study, the random Whisper fixtures caught 18 of 24 injected faults. The overfit fixtures caught all 24.\n\nThat gives us two ways to build the weights:\n\n- Start with random weights and a fixed seed.\n\n- Overfit on a few examples, like \"The capital of France is\" => \"Paris\".\n\nThe Whisper result doesn't settle which is better. Those were synthetic faults, and we haven't found a real regression caught only by the overfit version. Both versions missed an assisted-decoding bug that the real Whisper checkpoint exposed.\n\nSo we keep random weights when they pass the checks, and overfit when we need better sensitivity or readable answers. Training takes seconds, but it is one more step that can fail to converge, and one more thing to maintain. The comparison has the results for both.\n\n## Open questions\n\nAs of November 1, 2026, the MIC job in Transformers CI reports failures without blocking PRs. Whether it should block depends on things we haven't measured yet:\n\n- How many real bugs does it catch on PRs, not just in replays?\n\n- How often does it send us chasing false alarms?\n\n- How much work do baseline reviews take?\n\nWe also don't know how many bugs, like the Whisper assisted-decoding one, only show up with real weights, or whether overfitting catches real bugs that random weights miss.\n\nCoverage is still partial, across model families and the APIs people use. When a regression slips through, we can add the missing usage path and replay it on the broken and fixed versions. We'll keep existing tests until their coverage is accounted for.\n\nFinally, we'd like to link original Hub model pages to their MICs, so a developer or an agent using a checkpoint could start from an example tested on that checkpoint, its environment and its expected outputs.\n\nWant to help? Pick an uncovered model from the coverage space, try the tmic workflow, and contribute a usage path or review a generated contract.",
+  "images": [
+    {
+      "src": "https://huggingface.co/blog/assets/transformers-mic/ci-test-suite.svg",
+      "originalUrl": "https://huggingface.co/blog/assets/transformers-mic/ci-test-suite.svg",
+      "alt": "Transformers testing: 88,000+ CPU tests on main and 200,000+ GPU tests daily. Hardware includes CPUs, NVIDIA GPUs, AMD GPUs, Intel XPUs and Gaudi 3. PRs run selected tests.",
+      "id": "image_ea51ec1bedc7235b"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "On July 30, 2026, Transformers enabled PyTorch's scaled dot-product attention (SDPA) for T5. As a side effect, UMT5's decoder could attend to future tokens. During training, it could peek at the answer it was supposed to predict. Nothing crashed, and the bug stayed in main for almost two months.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "When we later replayed those commits, a small UMT5 model running on CPU flagged it on every one of them. This post is about that model and the tests built around it.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Why bugs reach main",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Transformers supports over 750 model types, and its test suite is big: 88,000+ CPU tests on main, plus 200,000+ GPU tests in a daily run. Model tests are only part of it: we also test pipelines, training, distributed execution, quantization and attention kernels.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers"
+        },
+        {
+          "start": 71,
+          "end": 137,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "The integration tests load real checkpoints and exercise the model's API on real hardware. Running all of that on every PR would mean keeping a lot of GPUs busy all day long, which isn't practical. By the time a scheduled run finds a regression, it may already be in main.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Our approach is to shrink the model instead. We build a fixture: a small model made from the real checkpoint's configuration, with fewer and narrower layers but every kind of layer it has, and its tokenizer and processor files unchanged. It is published once, then reused. We run \"fast integration tests\" against it on a cheap CPU runner. In our CPU study, the experimental UMT5 fixture used 66 MB of weights; the source checkpoint is 1,227 MB.",
+      "spans": [
+        {
+          "start": 56,
+          "end": 63,
+          "kind": "strong"
+        },
+        {
+          "start": 346,
+          "end": 355,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/evidence.md#on-cpu"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "This also covers very large models: some don't fit on our standard GPU runners, but their fixtures run on CPU.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Model integrators already build tiny test models (Transformers' tiny-random-* checkpoints). We wanted a common recipe, and checks that go beyond loading the model and running a forward pass. The UMT5 bug would have passed a forward pass just fine.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 77,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Fixtures won't replace full integration tests, but on PRs they give us a chance to catch bugs before they reach main.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Introducing Model Integration Contracts",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "transformers-mic is a proposed standard for packaging these tests. A Model Integration Contract (MIC) has three parts:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "a fixture: the shrunk model described above, published once and pinned",
+      "spans": [
+        {
+          "start": 2,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "a usage path: a runnable Markdown example of something people do with the model, such as generating text or running a training step",
+      "spans": [
+        {
+          "start": 2,
+          "end": 12,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "baselines: the outputs recorded when running that example, reviewed by a human",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "The contract holds if running the usage path on the fixture still produces the baselines.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "A contract covers an architecture and a usage path, not a single checkpoint: compatible checkpoints can share a fixture, while each keeps its own expected results. We publish them in huggingface-mic.",
+      "spans": [
+        {
+          "start": 183,
+          "end": 198,
+          "kind": "a",
+          "href": "https://huggingface.co/huggingface-mic"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "For example, the SmolLM contract generates from prompts such as \"The capital of France is\" and compares its token IDs with a recorded answer. After loading the model and tokenizer, the generation code is, simplified to one prompt:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "It also compares training loss, checks that gradients are finite and verifies that an optimizer step changes the weights. See the full usage.md.",
+      "spans": [
+        {
+          "start": 135,
+          "end": 143,
+          "kind": "a",
+          "href": "https://huggingface.co/huggingface-mic/smollm-mic/blob/main/integrations/transformers/usage.md"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "A fleet dataset on the Hub pins each MIC to a frozen revision, along with the package versions used to record its baselines. Each CI run records the fleet revision it used, so we can reproduce it later.",
+      "spans": [
+        {
+          "start": 2,
+          "end": 15,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/huggingface-mic/transformers-fleet"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "On a PR, we pick MICs based on the files the patch changes.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "The UMT5 regression",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "We replayed frozen MICs over five months of Transformers commits. The small UMT5 fixture flagged the regression from its introduction on July 30, 2026 until its fix on September 28. Label log-probabilities differed from the reviewed baseline by 1.22 and training loss by about 0.20.",
+      "spans": [
+        {
+          "start": 137,
+          "end": 150,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/commit/560f36cc561fa154d224b7a6dfcba1d57a621d7b"
+        },
+        {
+          "start": 168,
+          "end": 180,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers/commit/d7ba937671edb174fd80d33f9ecbd38f6559dfca"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "One detail mattered: the contract used SDPA, the default attention path. Running only the eager attention variant missed the bug. A fixture only helps if it goes through the same code as the real checkpoint.",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "We then reverted the fix on a proof branch in Transformers' CI. The check failed with the same differences, and the selected T5 contract's runner step took 13.4 seconds on CPU, excluding setup.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "The replay results and the CI demo have the measurements and reproduction details.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 18,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/evidence.md#shadow-backfill"
+        },
+        {
+          "start": 27,
+          "end": 34,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/evidence.md#transformers-ci-proof"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "How models are shrunk",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "The first recipe was simple: make the dimensions smaller and keep fewer layers. That wasn't enough for mixed architectures. Keeping two layers is no use if both use sliding attention and the full-attention layers disappear.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "The recipe now has four steps:",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Shrink the configuration. Start from a real checkpoint and reduce hidden sizes, attention heads and depth. Keep the different layer kinds, including mixtures of sliding and full attention or dense and MoE layers. Some architectures need extra rules to keep their components compatible. We also look at the model's own Transformers tests: the ModelTester in test_modeling_<model>.py already picks a small config by hand, so we take its sizes for any width our generic rule doesn't know by name.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "strong"
+        },
+        {
+          "start": 342,
+          "end": 353,
+          "kind": "code"
+        },
+        {
+          "start": 357,
+          "end": 381,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Keep preprocessing unchanged. Preserve vocabulary, special tokens and input dimensions, and copy tokenizer and processor files byte for byte. Loading and preprocessing are part of what we want to test.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Build and validate the weights. Try seeded random weights and change the inputs to check that the model responds. If it doesn't, try training it on the contract's small batch of examples. Reload the saved model and check that outputs, loss and gradients are finite. Reject failed builds.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Freeze and record. Save the accepted weights and measure repeatable outputs on a known-good Transformers build. Review the baselines for each supported platform and precision, then publish a pinned snapshot. CI reuses it; it does not rebuild the fixture for every PR.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "We also keep the original weights file format. Otherwise we would skip the conversion code that runs when a user loads the real checkpoint. The full recipe has more detail.",
+      "spans": [
+        {
+          "start": 140,
+          "end": 155,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/fixtures.md#recipe"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "The Llama 4 Scout shrink report shows what this looks like on a big model. 108.6 billion parameters become 44.7 million. The vision stack goes from 34 layers to 2 and the language stack from 48 to 4, keeping the checked layer kinds and MoE routing style.",
+      "spans": [
+        {
+          "start": 4,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface-mic-mic-coverage.static.hf.space/shrink/Llama-4-Scout-17B-16E-Instruct-mic.html"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Building MICs with agents",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Our CLI, tmic, creates the contract and builds the fixture. For a new model, an LLM drafts the usage code and manifest, and CPU and GPU runs measure the candidate baselines. The LLM drafts; it doesn't approve. Changed expectations require human review.",
+      "spans": [
+        {
+          "start": 9,
+          "end": 13,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "To try it on your machine, use your source checkpoint in place of org/model:",
+      "spans": [
+        {
+          "start": 66,
+          "end": 75,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "It drafts the contract, builds the fixture and records its baselines on your machine, asking you to review each step, and stops before uploading anything. For a new model, the draft comes from an LLM through Inference Providers, billed to your own account (--bill-to ''). The CLI docs cover the individual steps.",
+      "spans": [
+        {
+          "start": 257,
+          "end": 269,
+          "kind": "code"
+        },
+        {
+          "start": 276,
+          "end": 284,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/cli.md#automated-mode"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "We used agents to build MICs across model families. When they hit an edge case, we fixed the recipe itself rather than the one fixture, with help from model experts. The published models and remaining gaps are in the coverage space.",
+      "spans": [
+        {
+          "start": 217,
+          "end": 231,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/huggingface-mic/mic-coverage"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Random vs Overfit",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "With random weights, our Whisper fixture barely responded to changes in the audio. It ran, but that made it a poor test of the audio path.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "So we trained it on a few tones paired with words such as \"red\" and \"green\". We weren't teaching it speech recognition, just making audio changes visible in its outputs. In our weight-initialization study, the random Whisper fixtures caught 18 of 24 injected faults. The overfit fixtures caught all 24.",
+      "spans": [
+        {
+          "start": 177,
+          "end": 204,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/fixtures.md#choosing-the-weights"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "That gives us two ways to build the weights:",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Start with random weights and a fixed seed.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Overfit on a few examples, like \"The capital of France is\" => \"Paris\".",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "The Whisper result doesn't settle which is better. Those were synthetic faults, and we haven't found a real regression caught only by the overfit version. Both versions missed an assisted-decoding bug that the real Whisper checkpoint exposed.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "So we keep random weights when they pass the checks, and overfit when we need better sensitivity or readable answers. Training takes seconds, but it is one more step that can fail to converge, and one more thing to maintain. The comparison has the results for both.",
+      "spans": [
+        {
+          "start": 229,
+          "end": 239,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/fixtures.md#overfit-versus-random-what-can-we-conclude"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "Open questions",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "As of November 1, 2026, the MIC job in Transformers CI reports failures without blocking PRs. Whether it should block depends on things we haven't measured yet:",
+      "spans": [
+        {
+          "start": 28,
+          "end": 54,
+          "kind": "a",
+          "href": "https://transformers-ci.huggingface.cool/d/mic-failures/mic-failures?from=now-4w&to=now&timezone=browser"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "How many real bugs does it catch on PRs, not just in replays?",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "How often does it send us chasing false alarms?",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "How much work do baseline reviews take?",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "We also don't know how many bugs, like the Whisper assisted-decoding one, only show up with real weights, or whether overfitting catches real bugs that random weights miss.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Coverage is still partial, across model families and the APIs people use. When a regression slips through, we can add the missing usage path and replay it on the broken and fixed versions. We'll keep existing tests until their coverage is accounted for.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "Finally, we'd like to link original Hub model pages to their MICs, so a developer or an agent using a checkpoint could start from an example tested on that checkpoint, its environment and its expected outputs.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "Want to help? Pick an uncovered model from the coverage space, try the tmic workflow, and contribute a usage path or review a generated contract.",
+      "spans": [
+        {
+          "start": 47,
+          "end": 61,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/huggingface-mic/mic-coverage"
+        },
+        {
+          "start": 71,
+          "end": 84,
+          "kind": "a",
+          "href": "https://github.com/huggingface/transformers-mic/blob/main/docs/cli.md#automated-mode"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "aecd3d2951db0929aacb8b17032457e690231dbff36fa9ad98b216525bc2954f",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "inputs = tokenizer(\"The capital of France is\", return_tensors=\"pt\")\noutputs = model.generate(**inputs, max_new_tokens=4, do_sample=False)\nnew_tokens = outputs[:, inputs[\"input_ids\"].shape[1]:]\nprint(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))"
+    },
+    {
+      "id": "c0002",
+      "source": "pip install \"transformers-mic[runtime]\" \"hf-doc-builder @ git+https://github.com/huggingface/doc-builder.git\"\nhf auth login\ntmic run org/model --local-only --fixtures-only --no-history --bill-to ''"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "aecd3d2951db0929aacb8b17032457e690231dbff36fa9ad98b216525bc2954f",
+  "mediaLayout": [
+    {
+      "mediaId": "image_ea51ec1bedc7235b",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 0
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 1,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 1,
+    "placedImageOccurrences": 1,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-11-03T14:28:09.362652Z",
+  "summaryZh": "Transformers 模型集成合约。2026 年 7 月 30 日，Transformers 为 T5 启用了 PyTorch 的缩放点积注意力（SDPA）。作为副作用，UMT5 的解码器可能会关注未来的代币。",
+  "summaryGeneratedAt": "2026-11-03T14:29:47.915983Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
