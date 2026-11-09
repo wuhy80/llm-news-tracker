@@ -5,16 +5,16 @@
 一个零后端、零运行费用的大模型行业情报站。它用 GitHub Actions 定时聚合公开信息源，将结果保存为 JSON，并通过 GitHub Pages 展示日、周、月三个维度的动态。
 
 <!-- resource-usage:start -->
-_自动更新：2026-11-02 11:59 UTC（每周一，由 `resource-usage.yml` 写入）_
+_自动更新：2026-11-09 12:32 UTC（每周一，由 `resource-usage.yml` 写入）_
 
 | 资源 | 当前 | 上限 | 余量 | 按近期增速预计可用 |
 | --- | --- | --- | --- | --- |
-| GitHub Pages 站点 | 379.4 MB | 1.0 GiB | 644.6 MB | 约 6.8 个月 |
-| 仓库体积 | 1.0 GiB | 1.0 GiB（建议） | -29.7 MB | **已超出** |
-| 媒体文件 | 337.7 MB（2,674 个） | — | — | — |
-| 文章记录 | 10,931 篇（100.1 MB） | — | — | — |
+| GitHub Pages 站点 | 444.4 MB | 1.0 GiB | 579.6 MB | 约 3.9 个月 |
+| 仓库体积 | 1.1 GiB | 1.0 GiB（建议） | -101.9 MB | **已超出** |
+| 媒体文件 | 401.1 MB（3,034 个） | — | — | — |
+| 文章记录 | 11,865 篇（105.5 MB） | — | — | — |
 
-近 14 天增速：站点 3.1 MB/天，仓库 10.1 MB/天。仓库超过 1 GiB 后 GitHub 会提示性能下降，硬性上限为 5.0 GiB；`.github/workflows/rewrite-history.yml` 每季度自动清理历史中的失效媒体。
+近 14 天增速：站点 4.9 MB/天，仓库 10.4 MB/天。仓库超过 1 GiB 后 GitHub 会提示性能下降，硬性上限为 5.0 GiB；`.github/workflows/rewrite-history.yml` 每季度自动清理历史中的失效媒体。
 <!-- resource-usage:end -->
 
 ## 关注范围
