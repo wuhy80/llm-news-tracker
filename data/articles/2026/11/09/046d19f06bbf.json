@@ -1,0 +1,692 @@
+{
+  "schemaVersion": 3,
+  "id": "046d19f06bbf",
+  "title": "Your Experts Have Partners. There's HOPE for Keeping Them Together",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/amazon/higher-order-pruning-experts",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-09T12:34:29Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 83,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/amazon/higher-order-pruning-experts",
+  "resolvedUrl": "https://huggingface.co/blog/amazon/higher-order-pruning-experts",
+  "fetchedAt": "2026-11-09T22:39:39.670467Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "## Higher-Order Pruning of Experts in Mixture-of-Experts Language Models\n\n### Introduction\n\nMixture-of-Experts (MoE) models have enabled state-of-the-art LLMs to be scaled to hundreds of billions of parameters, but they come with a fundamental and costly caveat: every expert MLP must occupy memory at inference time, even though the vast majority are idle for any given token. For example, Qwen3.5-122B has 256 experts in each of its 48 MoE layers, and 95% of its ~250 GB parameter memory footprint is taken up entirely by these expert MLPs alone. However, for any given token, only 8 experts in each layer are actually used.\n\nExpert pruning is one of the most direct fixes to this memory bottleneck. That is, permanently delete the least useful experts. Pruning avoids the latency issues which make dynamic loading/off-loading of experts impractical; it does not require any training; and it composes with quantization. Given these attractive benefits and the simplicity of the idea, it's easy to see why expert pruning has become a go-to approach for shrinking MoEs. The difficulty lies in deciding which experts are safest to remove.\n\nExisting pruning methods score each expert independently, assigning every expert a scalar importance score (based on a calibration dataset), and cutting out the least important experts (in each layer independently). These are first-order methods, because they assume each expert's contribution is independent of all others. In reality, experts form cooperative groups. We observe consistent clusters of co-activated experts in our own experiments, and independent work has shown that expert cooperation is a stable property of MoEs and is important for model performance. Ignoring these interactions leads to suboptimal pruning, especially at aggressive rates.\n\nOur newest paper derives HOPE (Higher-Order Pruning of Experts), a second-order method that accounts for pairwise expert interactions. At 50% pruning, HOPE achieves the best average rank of any method, with gains of up to +6.1% on agentic coding tasks over the next-best pruning method.\n\nIn this post, we explain how HOPE works, show where it outperforms existing methods, and walk through how to use it for your own models. For readers unfamiliar with MoE architectures, see Mixture of Experts (MoEs) in Transformers.\n\n### Experts don't work alone\n\nIn a standard MoE, each layer has EEE experts, and each input token xxx is routed independently to KKK such experts ( K=8 K = 8 K=8 is a typical choice). Routing is performed by a single layer which produces softmax-normalized gate weights gk(x)g_{k}(x)gk​(x) for each expert kkk, wherein the KKK experts with the highest gate weights are selected to form the active set of experts, T(x)⊂{1,..,E}T(x) \\subset\\{1,..,E\\}T(x)⊂{1,..,E}. The output of the layer is then ∑k∈T(x)gk(x)fk(x)\\sum\\limits_{k\\in T(x)}g_{k}(x)f_{k}(x)k∈T(x)∑​gk​(x)fk​(x), where fk(x)f_{k}(x)fk​(x) is the output of expert kkk for token xxx.\n\nLeft: typical MoE layer, where each token is routed to the top-K experts. Right: first-order methods rank and delete experts based on a scalar importance score, but the best pruning decisions will also consider the strength of interactions between experts.\n\nImportantly, experts in the selected set T(x)T(x)T(x) are not independent. Experts form stable cooperative groups that get consistently co-activated together. This has been observed before in the literature, as well: expert co-selection patterns emerge early in training and stabilize throughout.\n\nThis means that when we prune experts from an MoE layer, pruning decisions need to consider the higher-order effects between these experts. Removing expert A might seem fine on its own, but if expert B—which frequently cooperates with and relies on A—is highly important, then removing A would dismantle a cooperative group just through a single deletion. First-order methods miss this entirely, because they score A and B separately.\n\nThis effect compounds at high pruning rates. When we remove up to 50% of experts, we risk breaking many cooperative links. This is where second-order pruning is most advantageous.\n\n### How HOPE identifies a prune-set\n\n(See Appendix A in our corresponding paper for the full derivation of the HOPE objective)\n\nWhen we delete a set of PPP experts from some MoE layer, the selected set of experts T(x)T(x)T(x) (for any token xxx) can change. The pruned experts that would have been selected are replaced by the experts with the next-highest gate weights. The resulting change in layer output is the pruning error. Our goal is to find the prune-set PPP (of some predefined pruning budget ∣P∣\\vert P\\vert∣P∣) that minimizes the resulting pruning error (over tokens xxx from our calibration set).\n\nUnfortunately, minimizing the pruning error over PPP directly is intractable. The pruning error depends on the identities of the replacement experts, which in turn depend on the prune-set PPP itself. HOPE sidesteps this by defining a tractable surrogate ZZZ, which strictly upper-bounds the dominant component of the pruning error:\n\nZ=[∑j∈P∩T(x)gj(x)∥fj(x)∥2]2≥true errorZ = \\bigl[\\sum\\limits_{j \\in P\\cap T(x)} g_{j}(x)\\Vert f_j(x)\\Vert_{2}\\bigr]^{2} \\geq \\text{true error}Z=[j∈P∩T(x)∑​gj​(x)∥fj​(x)∥2​]2≥true error\n\nBecause ZZZ is a squared sum, expanding it naturally produces cross-terms gi(x)gj(x)∥fi(x)∥2∥fj(x)∥2g_{i}(x)g_{j}(x)\\Vert f_{i}(x)\\Vert_{2}\\Vert f_{j}(x)\\Vert_{2}gi​(x)gj​(x)∥fi​(x)∥2​∥fj​(x)∥2​ between pairs of experts. These are the interaction terms that first-order methods discard.\n\nTo find the optimal prune-set, HOPE minimizes E[Z]\\mathbb{E}[Z]E[Z] over the calibration set, which can be reformulated as the following quadratic program:\n\nP∗=arg min⁡p p⊤Fps.t.p∈{0,1}E,∑k=1Epk=∣P∣P^{*} = \\argmin_{p}\\; p^{\\top}Fp \\quad \\text{s.t.} \\quad p \\in \\{0,1\\}^{E}, \\sum\\limits_{k=1}^{E}p_{k} = \\vert P\\vertP∗=pargmin​p⊤Fps.t.p∈{0,1}E,k=1∑E​pk​=∣P∣\n\nwhere F∈RE×EF\\in\\mathbb{R}^{E\\times E}F∈RE×E is defined as:\n\nFi,j=1∣Xi,j∣∑x∈Xi,jgi(x)gj(x)∥fi(x)∥2∥fj(x)∥2whereXi,j={x:i,j∈T(x)}F_{i,j} = \\frac{1}{\\vert \\mathcal{X}_{i,j}\\vert} \\sum\\limits_{x\\in\\mathcal{X}_{i,j}} g_{i}(x)g_{j}(x)\\Vert f_{i}(x)\\Vert_{2}\\Vert f_{j}(x)\\Vert_{2}\\quad\\text{where}\\quad \\mathcal{X}_{i,j} = \\{x: i,j \\in T(x)\\}Fi,j​=∣Xi,j​∣1​x∈Xi,j​∑​gi​(x)gj​(x)∥fi​(x)∥2​∥fj​(x)∥2​whereXi,j​={x:i,j∈T(x)}\n\nThis F-matrix is collected on the calibration dataset, and the optimal prune-set is obtained by solving the resulting quadratic program (QP) with a continuous relaxation (then rounding to binary solutions). Each entry Fi,jF_{i,j}Fi,j​ captures the average gate-weighted output product of experts iii and jjj, across tokens where both are co-activated. Whereas the diagonal Fk,kF_{k,k}Fk,k​ measures individual expert importance, the off-diagonal entries ( Fi,jF_{i,j}Fi,j​ for i≠ji\\neq ji=j) measure pairwise cooperative contribution.\n\nWhat does FFF look like in practice? It shows the structure of expert cooperation, which depends on layer:\n\nVisualization of the interaction matrix F for GLM-4.5-Air (128 experts per layer, 106B parameters total) at three representative layers (early, middle, late). Experts have been clustered to reveal block structure. Bright blocks along the diagonal indicate groups of experts with strong pairwise interaction scores.\n\nIn terms of practical cost, HOPE requires the same calibration pass as any other expert-pruning method (one forward pass over calibration data). The only addition is solving the quadratic program, which is non-convex, but can be solved efficiently via a standard QP solver (1–2 seconds each layer). The total additional overhead is negligible compared to first-order methods, as the time for calibration dominates.\n\n#### Connection to REAP\n\nNotably, HOPE has a strong connection to Router-weighted Expert Activation Pruning (REAP), a state-of-the-art first-order expert-pruning method. HOPE's F-matrix encodes individual expert importance scores on the diagonal, and this diagonal effectively recovers the scores used by REAP to independently rank experts for pruning (differing only by the variance of expert contributions). The diagonal of FFF recovers REAP's expert rankings almost perfectly (Spearman ρ=0.988\\rho = 0.988ρ=0.988). Thus, any improvement HOPE achieves over REAP is attributable to the second-order interaction terms in the off-diagonal entries of the FFF-matrix.\n\n### Results\n\nWe evaluated HOPE as an expert pruning method using 3 models (Qwen3.5-122B, Qwen3.5-35B, and GLM-4.5-Air), with 2 calibration datasets (Evol-CodeAlpaca and SWE-Bench Verified trajectories). We used the Tulu3 suite and SWE-Bench Pro (agentic coding) to test the resulting pruned models, comparing HOPE to 4 first-order baselines (REAP, MAN, EAN, and Frequency) across pruning rates spanning from 10% to 50%.\n\nHOPE achieves the best overall rank across conditions and dominates at aggressive pruning rates. Left: average rank (lower = better) across all models, calibration sets, and benchmarks. Right: SWE-Bench Pro performance on Qwen3.5-35B.\n\nAcross all conditions, HOPE achieved the best average rank (2.07 out of 5 methods), with the highest rate of top-1 finishes (39% of conditions) and top-2 finishes (67%). In a head-to-head comparison, HOPE beats every other baseline in the majority of conditions.\n\nAs expected, HOPE's advantage grows at higher pruning rates. As more experts are removed, more cooperative links are broken, and the off-diagonal terms of FFF become more important. At 50% pruning, HOPE's average rank improves to 1.58 (vs. 2.42 for the next-best method, REAP). This is also the most deployment-relevant setting, where memory savings are large enough to accommodate longer contexts, deeper reasoning, and more tool calls.\n\nHOPE's advantage is most pronounced on SWE-Bench Pro, an agentic coding benchmark where models must solve real GitHub issues autonomously. These problems involve compositionally diverse tasks (e.g. coding, tool calls, reasoning, etc.) over many turns and likely exercise diverse expert combinations—exactly the regime where preserving cooperative structure matters most. On Qwen3.5-35B-A3B at 50% pruning, HOPE achieved 42.3 on SWE-Bench Pro, matching the unpruned model's 41.8 (while REAP dropped to 36.2, a 13% regression).\n\nNotably, pruned models can occasionally match or exceed the unpruned baseline, likely because the removal of low-relevance experts reduces noise on the target tasks. This effect is not unique to HOPE and has been observed across pruning methods. Furthermore, our experiments showed that code-focused calibration with any pruning method (including HOPE) did not severely degrade non-coding benchmarks, and HOPE performed well across the Tulu3 suite regardless of calibration set.\n\n#### HOPE retains more cooperating experts\n\nAverage strength of cooperation (measured by F-matrix value) with retained experts, split by experts on which HOPE and REAP disagree.\n\nHOPE's advantage stems from optimizing over the entire interaction matrix FFF. To understand how this affects pruning decisions in practice, we examine the experts where HOPE and REAP disagree. For each disputed expert, we compute its cooperative score (i.e. its average F-value with other retained experts). Experts retained only by HOPE consistently have higher cooperative scores than experts retained only by REAP. In other words, as part of the QP optimization, HOPE sacrifices some individually high-scoring experts in favor of preserving cooperative clusters. The gains in benchmark performance (shown above) validate that this trade-off is advantageous.\n\n### How to run HOPE\n\nWe created a basic package to run HOPE. It has three steps: 1) calibrate; 2) solve; 3) prune. Our package has been tested on Qwen3, Qwen3-Next, Qwen3.5, and GLM-4.5.\n\n#### Step 1: Calibrate\n\n```\nhope calibrate \\\n    --model-path Qwen/Qwen3.5-35B-A3B \\\n    --prompts calibration_prompts.txt \\\n    --out-path observations.h5\n```\n\nThe calibration step runs a single forward pass over calibration data, whether it be agentic rollouts or single-turn traces. This uses HuggingFace transformers to hook into the forward pass of each individual MoE layer. For each token, this records which experts are selected, their gate weights, output norms, and pairwise co-activation statistics. The output of this step is the F-matrix, stored in an HDF5 file.\n\n#### Step 2: Solve QP\n\n```\nhope solve \\\n    --obs-path observations.h5 \\\n    --prune-frac 0.50 \\\n    --out-path pruneset.json\n```\n\nThis command materializes the F-matrix and solves the binary quadratic program via a continuous relaxation. This takes a few seconds per layer, and the output is a JSON file which contains the prune-set. This is technically the final output of the HOPE algorithm.\n\n#### Step 3: Prune\n\n```\nhope prune \\\n    --model-path Qwen/Qwen3.5-35B-A3B \\\n    --pruneset-path pruneset.json \\\n    --out-path ./Qwen3.5-35B-A3B-pruned-50\n```\n\nTo complete the pipeline, we run this command to actually create the smaller model checkpoint from the prune-set. The pruned model is a standard HuggingFace checkpoint which is smaller on disk and in memory (no changes to vLLM or SGLang model definitions needed).\n\nWe also released a more compact Python API:\n\n```\nfrom hope.calibrate import calibrate\nfrom hope.solve import solve\nfrom hope.prune import prune_model\n\ncalibrate(\"Qwen/Qwen3.5-35B-A3B\", calibration_prompts, \"observations.h5\")\nsolve(\"observations.h5\", prune_frac=0.50, out_path=\"pruneset.json\")\nprune_model(\"Qwen/Qwen3.5-35B-A3B\", \"pruneset.json\", \"./Qwen3.5-35B-A3B-pruned-50\")\n```\n\n### Limitations of HOPE\n\nHOPE's advantage is most pronounced at higher pruning rates (40–50%). At lower pruning rates (10–20%), first-order methods like REAP and MAN are sometimes competitive, and HOPE's advantage shrinks. Additionally, as with most expert-pruning algorithms, HOPE prunes each layer independently and does not account for cross-layer interactions. In our paper, we presented a theoretical framework for cross-layer HOPE, but the results remain preliminary. Finally, HOPE captures pairwise interactions, but even higher-order interactions (triplets and beyond) could provide additional signal, although they are combinatorially difficult to estimate.\n\n### More information\n\nFor more information, see our corresponding paper and codebase.\n\nPaper: https://arxiv.org/abs/2609.18916\n\nCode: https://github.com/awslabs/HOPE\n\nTo see how HOPE can be applied to next-generation hybrid architectures, see our corresponding repository.\n\nCitation:\n\n```\n@article{tseng2026hope,\n    title={Higher-Order Pruning of Experts in Mixture-of-Experts Language Models},\n    author={Tseng, Alex M. and Kaul, Prannay and Zancato, Luca and Xia, Wei and Soatto, Stefano},\n    journal={arXiv preprint arXiv:2609.18916},\n    year={2026},\n}\n```",
+  "images": [
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/ZTLrZSA4pDn81OVRHtCXq.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/ZTLrZSA4pDn81OVRHtCXq.png",
+      "alt": "pruning_cartoon",
+      "id": "image_4193310d2149b262"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/xyjeUqqFm2FtQtKVdZhwq.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/xyjeUqqFm2FtQtKVdZhwq.png",
+      "alt": "fmatrix",
+      "id": "image_6f84cce98c540aa6"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/5ArwjL0FoYK6nW1eazSzF.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/5ArwjL0FoYK6nW1eazSzF.png",
+      "alt": "results",
+      "id": "image_4e8ba061ef01a88f"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/S2fm99InMXuhOUFqEbI_2.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/S2fm99InMXuhOUFqEbI_2.png",
+      "alt": "exp_interaction_breakdown",
+      "id": "image_4ea0d687c3e762a3"
+    },
+    {
+      "src": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/b8EewrlBWbGA0DlrBKa2E.png",
+      "originalUrl": "https://cdn-uploads.huggingface.co/production/uploads/6ab2f79bd8000a811c648a32/b8EewrlBWbGA0DlrBKa2E.png",
+      "alt": "pipeline",
+      "id": "image_a52d137dc74ac0cc"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Higher-Order Pruning of Experts in Mixture-of-Experts Language Models",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Introduction",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Mixture-of-Experts (MoE) models have enabled state-of-the-art LLMs to be scaled to hundreds of billions of parameters, but they come with a fundamental and costly caveat: every expert MLP must occupy memory at inference time, even though the vast majority are idle for any given token. For example, Qwen3.5-122B has 256 experts in each of its 48 MoE layers, and 95% of its ~250 GB parameter memory footprint is taken up entirely by these expert MLPs alone. However, for any given token, only 8 experts in each layer are actually used.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Expert pruning is one of the most direct fixes to this memory bottleneck. That is, permanently delete the least useful experts. Pruning avoids the latency issues which make dynamic loading/off-loading of experts impractical; it does not require any training; and it composes with quantization. Given these attractive benefits and the simplicity of the idea, it's easy to see why expert pruning has become a go-to approach for shrinking MoEs. The difficulty lies in deciding which experts are safest to remove.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "strong"
+        },
+        {
+          "start": 263,
+          "end": 292,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2510.13999"
+        },
+        {
+          "start": 474,
+          "end": 479,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Existing pruning methods score each expert independently, assigning every expert a scalar importance score (based on a calibration dataset), and cutting out the least important experts (in each layer independently). These are first-order methods, because they assume each expert's contribution is independent of all others. In reality, experts form cooperative groups. We observe consistent clusters of co-activated experts in our own experiments, and independent work has shown that expert cooperation is a stable property of MoEs and is important for model performance. Ignoring these interactions leads to suboptimal pruning, especially at aggressive rates.",
+      "spans": [
+        {
+          "start": 226,
+          "end": 237,
+          "kind": "strong"
+        },
+        {
+          "start": 484,
+          "end": 531,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2505.20225"
+        },
+        {
+          "start": 536,
+          "end": 570,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2510.16411"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Our newest paper derives HOPE (Higher-Order Pruning of Experts), a second-order method that accounts for pairwise expert interactions. At 50% pruning, HOPE achieves the best average rank of any method, with gains of up to +6.1% on agentic coding tasks over the next-best pruning method.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2609.18916"
+        },
+        {
+          "start": 25,
+          "end": 29,
+          "kind": "strong"
+        },
+        {
+          "start": 67,
+          "end": 79,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "In this post, we explain how HOPE works, show where it outperforms existing methods, and walk through how to use it for your own models. For readers unfamiliar with MoE architectures, see Mixture of Experts (MoEs) in Transformers.",
+      "spans": [
+        {
+          "start": 188,
+          "end": 229,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/moe-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Experts don't work alone",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "In a standard MoE, each layer has EEE experts, and each input token xxx is routed independently to KKK such experts ( K=8 K = 8 K=8 is a typical choice). Routing is performed by a single layer which produces softmax-normalized gate weights gk(x)g_{k}(x)gk​(x) for each expert kkk, wherein the KKK experts with the highest gate weights are selected to form the active set of experts, T(x)⊂{1,..,E}T(x) \\subset\\{1,..,E\\}T(x)⊂{1,..,E}. The output of the layer is then ∑k∈T(x)gk(x)fk(x)\\sum\\limits_{k\\in T(x)}g_{k}(x)f_{k}(x)k∈T(x)∑​gk​(x)fk​(x), where fk(x)f_{k}(x)fk​(x) is the output of expert kkk for token xxx.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Left: typical MoE layer, where each token is routed to the top-K experts. Right: first-order methods rank and delete experts based on a scalar importance score, but the best pruning decisions will also consider the strength of interactions between experts.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 256,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Importantly, experts in the selected set T(x)T(x)T(x) are not independent. Experts form stable cooperative groups that get consistently co-activated together. This has been observed before in the literature, as well: expert co-selection patterns emerge early in training and stabilize throughout.",
+      "spans": [
+        {
+          "start": 182,
+          "end": 206,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2505.20225"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "This means that when we prune experts from an MoE layer, pruning decisions need to consider the higher-order effects between these experts. Removing expert A might seem fine on its own, but if expert B—which frequently cooperates with and relies on A—is highly important, then removing A would dismantle a cooperative group just through a single deletion. First-order methods miss this entirely, because they score A and B separately.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "This effect compounds at high pruning rates. When we remove up to 50% of experts, we risk breaking many cooperative links. This is where second-order pruning is most advantageous.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "How HOPE identifies a prune-set",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "(See Appendix A in our corresponding paper for the full derivation of the HOPE objective)",
+      "spans": [
+        {
+          "start": 19,
+          "end": 42,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2609.18916"
+        },
+        {
+          "start": 0,
+          "end": 89,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "When we delete a set of PPP experts from some MoE layer, the selected set of experts T(x)T(x)T(x) (for any token xxx) can change. The pruned experts that would have been selected are replaced by the experts with the next-highest gate weights. The resulting change in layer output is the pruning error. Our goal is to find the prune-set PPP (of some predefined pruning budget ∣P∣\\vert P\\vert∣P∣) that minimizes the resulting pruning error (over tokens xxx from our calibration set).",
+      "spans": [
+        {
+          "start": 154,
+          "end": 164,
+          "kind": "em"
+        },
+        {
+          "start": 287,
+          "end": 300,
+          "kind": "strong"
+        },
+        {
+          "start": 400,
+          "end": 409,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Unfortunately, minimizing the pruning error over PPP directly is intractable. The pruning error depends on the identities of the replacement experts, which in turn depend on the prune-set PPP itself. HOPE sidesteps this by defining a tractable surrogate ZZZ, which strictly upper-bounds the dominant component of the pruning error:",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Z=[∑j∈P∩T(x)gj(x)∥fj(x)∥2]2≥true errorZ = \\bigl[\\sum\\limits_{j \\in P\\cap T(x)} g_{j}(x)\\Vert f_j(x)\\Vert_{2}\\bigr]^{2} \\geq \\text{true error}Z=[j∈P∩T(x)∑​gj​(x)∥fj​(x)∥2​]2≥true error",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Because ZZZ is a squared sum, expanding it naturally produces cross-terms gi(x)gj(x)∥fi(x)∥2∥fj(x)∥2g_{i}(x)g_{j}(x)\\Vert f_{i}(x)\\Vert_{2}\\Vert f_{j}(x)\\Vert_{2}gi​(x)gj​(x)∥fi​(x)∥2​∥fj​(x)∥2​ between pairs of experts. These are the interaction terms that first-order methods discard.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "To find the optimal prune-set, HOPE minimizes E[Z]\\mathbb{E}[Z]E[Z] over the calibration set, which can be reformulated as the following quadratic program:",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "P∗=arg min⁡p p⊤Fps.t.p∈{0,1}E,∑k=1Epk=∣P∣P^{*} = \\argmin_{p}\\; p^{\\top}Fp \\quad \\text{s.t.} \\quad p \\in \\{0,1\\}^{E}, \\sum\\limits_{k=1}^{E}p_{k} = \\vert P\\vertP∗=pargmin​p⊤Fps.t.p∈{0,1}E,k=1∑E​pk​=∣P∣",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "where F∈RE×EF\\in\\mathbb{R}^{E\\times E}F∈RE×E is defined as:",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Fi,j=1∣Xi,j∣∑x∈Xi,jgi(x)gj(x)∥fi(x)∥2∥fj(x)∥2whereXi,j={x:i,j∈T(x)}F_{i,j} = \\frac{1}{\\vert \\mathcal{X}_{i,j}\\vert} \\sum\\limits_{x\\in\\mathcal{X}_{i,j}} g_{i}(x)g_{j}(x)\\Vert f_{i}(x)\\Vert_{2}\\Vert f_{j}(x)\\Vert_{2}\\quad\\text{where}\\quad \\mathcal{X}_{i,j} = \\{x: i,j \\in T(x)\\}Fi,j​=∣Xi,j​∣1​x∈Xi,j​∑​gi​(x)gj​(x)∥fi​(x)∥2​∥fj​(x)∥2​whereXi,j​={x:i,j∈T(x)}",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "This F-matrix is collected on the calibration dataset, and the optimal prune-set is obtained by solving the resulting quadratic program (QP) with a continuous relaxation (then rounding to binary solutions). Each entry Fi,jF_{i,j}Fi,j​ captures the average gate-weighted output product of experts iii and jjj, across tokens where both are co-activated. Whereas the diagonal Fk,kF_{k,k}Fk,k​ measures individual expert importance, the off-diagonal entries ( Fi,jF_{i,j}Fi,j​ for i≠ji\\neq ji=j) measure pairwise cooperative contribution.",
+      "spans": [
+        {
+          "start": 399,
+          "end": 409,
+          "kind": "em"
+        },
+        {
+          "start": 510,
+          "end": 521,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "What does FFF look like in practice? It shows the structure of expert cooperation, which depends on layer:",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "Visualization of the interaction matrix F for GLM-4.5-Air (128 experts per layer, 106B parameters total) at three representative layers (early, middle, late). Experts have been clustered to reveal block structure. Bright blocks along the diagonal indicate groups of experts with strong pairwise interaction scores.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 314,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "In terms of practical cost, HOPE requires the same calibration pass as any other expert-pruning method (one forward pass over calibration data). The only addition is solving the quadratic program, which is non-convex, but can be solved efficiently via a standard QP solver (1–2 seconds each layer). The total additional overhead is negligible compared to first-order methods, as the time for calibration dominates.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Connection to REAP",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Notably, HOPE has a strong connection to Router-weighted Expert Activation Pruning (REAP), a state-of-the-art first-order expert-pruning method. HOPE's F-matrix encodes individual expert importance scores on the diagonal, and this diagonal effectively recovers the scores used by REAP to independently rank experts for pruning (differing only by the variance of expert contributions). The diagonal of FFF recovers REAP's expert rankings almost perfectly (Spearman ρ=0.988\\rho = 0.988ρ=0.988). Thus, any improvement HOPE achieves over REAP is attributable to the second-order interaction terms in the off-diagonal entries of the FFF-matrix.",
+      "spans": [
+        {
+          "start": 41,
+          "end": 89,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2510.13999"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Results",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "We evaluated HOPE as an expert pruning method using 3 models (Qwen3.5-122B, Qwen3.5-35B, and GLM-4.5-Air), with 2 calibration datasets (Evol-CodeAlpaca and SWE-Bench Verified trajectories). We used the Tulu3 suite and SWE-Bench Pro (agentic coding) to test the resulting pruned models, comparing HOPE to 4 first-order baselines (REAP, MAN, EAN, and Frequency) across pruning rates spanning from 10% to 50%.",
+      "spans": [
+        {
+          "start": 329,
+          "end": 333,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2510.13999"
+        },
+        {
+          "start": 335,
+          "end": 338,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2606.15716"
+        },
+        {
+          "start": 340,
+          "end": 343,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2504.05586"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "HOPE achieves the best overall rank across conditions and dominates at aggressive pruning rates. Left: average rank (lower = better) across all models, calibration sets, and benchmarks. Right: SWE-Bench Pro performance on Qwen3.5-35B.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 234,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Across all conditions, HOPE achieved the best average rank (2.07 out of 5 methods), with the highest rate of top-1 finishes (39% of conditions) and top-2 finishes (67%). In a head-to-head comparison, HOPE beats every other baseline in the majority of conditions.",
+      "spans": [
+        {
+          "start": 60,
+          "end": 64,
+          "kind": "strong"
+        },
+        {
+          "start": 125,
+          "end": 128,
+          "kind": "strong"
+        },
+        {
+          "start": 164,
+          "end": 167,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "As expected, HOPE's advantage grows at higher pruning rates. As more experts are removed, more cooperative links are broken, and the off-diagonal terms of FFF become more important. At 50% pruning, HOPE's average rank improves to 1.58 (vs. 2.42 for the next-best method, REAP). This is also the most deployment-relevant setting, where memory savings are large enough to accommodate longer contexts, deeper reasoning, and more tool calls.",
+      "spans": [
+        {
+          "start": 13,
+          "end": 60,
+          "kind": "strong"
+        },
+        {
+          "start": 230,
+          "end": 234,
+          "kind": "strong"
+        },
+        {
+          "start": 240,
+          "end": 244,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "HOPE's advantage is most pronounced on SWE-Bench Pro, an agentic coding benchmark where models must solve real GitHub issues autonomously. These problems involve compositionally diverse tasks (e.g. coding, tool calls, reasoning, etc.) over many turns and likely exercise diverse expert combinations—exactly the regime where preserving cooperative structure matters most. On Qwen3.5-35B-A3B at 50% pruning, HOPE achieved 42.3 on SWE-Bench Pro, matching the unpruned model's 41.8 (while REAP dropped to 36.2, a 13% regression).",
+      "spans": [
+        {
+          "start": 39,
+          "end": 52,
+          "kind": "strong"
+        },
+        {
+          "start": 420,
+          "end": 424,
+          "kind": "strong"
+        },
+        {
+          "start": 473,
+          "end": 477,
+          "kind": "strong"
+        },
+        {
+          "start": 501,
+          "end": 505,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "Notably, pruned models can occasionally match or exceed the unpruned baseline, likely because the removal of low-relevance experts reduces noise on the target tasks. This effect is not unique to HOPE and has been observed across pruning methods. Furthermore, our experiments showed that code-focused calibration with any pruning method (including HOPE) did not severely degrade non-coding benchmarks, and HOPE performed well across the Tulu3 suite regardless of calibration set.",
+      "spans": [
+        {
+          "start": 204,
+          "end": 244,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2504.06792"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "HOPE retains more cooperating experts",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "Average strength of cooperation (measured by F-matrix value) with retained experts, split by experts on which HOPE and REAP disagree.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 133,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "HOPE's advantage stems from optimizing over the entire interaction matrix FFF. To understand how this affects pruning decisions in practice, we examine the experts where HOPE and REAP disagree. For each disputed expert, we compute its cooperative score (i.e. its average F-value with other retained experts). Experts retained only by HOPE consistently have higher cooperative scores than experts retained only by REAP. In other words, as part of the QP optimization, HOPE sacrifices some individually high-scoring experts in favor of preserving cooperative clusters. The gains in benchmark performance (shown above) validate that this trade-off is advantageous.",
+      "spans": [
+        {
+          "start": 235,
+          "end": 252,
+          "kind": "em"
+        },
+        {
+          "start": 357,
+          "end": 382,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "How to run HOPE",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "We created a basic package to run HOPE. It has three steps: 1) calibrate; 2) solve; 3) prune. Our package has been tested on Qwen3, Qwen3-Next, Qwen3.5, and GLM-4.5.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 26,
+          "kind": "a",
+          "href": "https://github.com/awslabs/HOPE"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "Step 1: Calibrate",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "The calibration step runs a single forward pass over calibration data, whether it be agentic rollouts or single-turn traces. This uses HuggingFace transformers to hook into the forward pass of each individual MoE layer. For each token, this records which experts are selected, their gate weights, output norms, and pairwise co-activation statistics. The output of this step is the F-matrix, stored in an HDF5 file.",
+      "spans": [
+        {
+          "start": 147,
+          "end": 159,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Step 2: Solve QP",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "This command materializes the F-matrix and solves the binary quadratic program via a continuous relaxation. This takes a few seconds per layer, and the output is a JSON file which contains the prune-set. This is technically the final output of the HOPE algorithm.",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Step 3: Prune",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "To complete the pipeline, we run this command to actually create the smaller model checkpoint from the prune-set. The pruned model is a standard HuggingFace checkpoint which is smaller on disk and in memory (no changes to vLLM or SGLang model definitions needed).",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "We also released a more compact Python API:",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Limitations of HOPE",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "HOPE's advantage is most pronounced at higher pruning rates (40–50%). At lower pruning rates (10–20%), first-order methods like REAP and MAN are sometimes competitive, and HOPE's advantage shrinks. Additionally, as with most expert-pruning algorithms, HOPE prunes each layer independently and does not account for cross-layer interactions. In our paper, we presented a theoretical framework for cross-layer HOPE, but the results remain preliminary. Finally, HOPE captures pairwise interactions, but even higher-order interactions (triplets and beyond) could provide additional signal, although they are combinatorially difficult to estimate.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "More information",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "For more information, see our corresponding paper and codebase.",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Paper: https://arxiv.org/abs/2609.18916",
+      "spans": [
+        {
+          "start": 0,
+          "end": 6,
+          "kind": "strong"
+        },
+        {
+          "start": 7,
+          "end": 39,
+          "kind": "a",
+          "href": "https://arxiv.org/abs/2609.18916"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "Code: https://github.com/awslabs/HOPE",
+      "spans": [
+        {
+          "start": 0,
+          "end": 4,
+          "kind": "strong"
+        },
+        {
+          "start": 6,
+          "end": 37,
+          "kind": "a",
+          "href": "https://github.com/awslabs/HOPE"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "To see how HOPE can be applied to next-generation hybrid architectures, see our corresponding repository.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 104,
+          "kind": "a",
+          "href": "https://github.com/awslabs/hybrid-model-factory/"
+        }
+      ]
+    },
+    {
+      "id": "b0056",
+      "source": "Citation:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "6808c96b65d28e6b11d3c2426521dead8d3f066025a9f33bc33844aaec2be4a0",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "hope calibrate \\\n    --model-path Qwen/Qwen3.5-35B-A3B \\\n    --prompts calibration_prompts.txt \\\n    --out-path observations.h5"
+    },
+    {
+      "id": "c0002",
+      "source": "hope solve \\\n    --obs-path observations.h5 \\\n    --prune-frac 0.50 \\\n    --out-path pruneset.json"
+    },
+    {
+      "id": "c0003",
+      "source": "hope prune \\\n    --model-path Qwen/Qwen3.5-35B-A3B \\\n    --pruneset-path pruneset.json \\\n    --out-path ./Qwen3.5-35B-A3B-pruned-50"
+    },
+    {
+      "id": "c0004",
+      "source": "from hope.calibrate import calibrate\nfrom hope.solve import solve\nfrom hope.prune import prune_model\n\ncalibrate(\"Qwen/Qwen3.5-35B-A3B\", calibration_prompts, \"observations.h5\")\nsolve(\"observations.h5\", prune_frac=0.50, out_path=\"pruneset.json\")\nprune_model(\"Qwen/Qwen3.5-35B-A3B\", \"pruneset.json\", \"./Qwen3.5-35B-A3B-pruned-50\")"
+    },
+    {
+      "id": "c0005",
+      "source": "@article{tseng2026hope,\n    title={Higher-Order Pruning of Experts in Mixture-of-Experts Language Models},\n    author={Tseng, Alex M. and Kaul, Prannay and Zancato, Luca and Xia, Wei and Soatto, Stefano},\n    journal={arXiv preprint arXiv:2609.18916},\n    year={2026},\n}"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "6808c96b65d28e6b11d3c2426521dead8d3f066025a9f33bc33844aaec2be4a0",
+  "mediaLayout": [
+    {
+      "mediaId": "image_4193310d2149b262",
+      "type": "image",
+      "afterBlockId": "b0009",
+      "order": 0
+    },
+    {
+      "mediaId": "image_6f84cce98c540aa6",
+      "type": "image",
+      "afterBlockId": "b0025",
+      "order": 1
+    },
+    {
+      "mediaId": "image_4e8ba061ef01a88f",
+      "type": "image",
+      "afterBlockId": "b0031",
+      "order": 2
+    },
+    {
+      "mediaId": "image_4ea0d687c3e762a3",
+      "type": "image",
+      "afterBlockId": "b0037",
+      "order": 3
+    },
+    {
+      "mediaId": "image_a52d137dc74ac0cc",
+      "type": "image",
+      "afterBlockId": "b0040",
+      "order": 4
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 5,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 5,
+    "savedImages": 5,
+    "sourceImageOccurrences": 5,
+    "placedImageOccurrences": 5,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-11-09T22:39:39.739284Z",
+  "summaryZh": "您的专家有合作伙伴。希望将它们保持在一起。## 在专家混合语言模型中对专家进行高阶剪枝专家混合 (MoE) 模型使最先进的 LLM 能够扩展到数千亿个参数，但它们有一个基本且昂贵的警告：每个专家 MLP 都必须在推理时占用内存，即使绝大多数对于任何给定的令牌都是空闲的。",
+  "summaryGeneratedAt": "2026-11-09T22:42:34.725086Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
