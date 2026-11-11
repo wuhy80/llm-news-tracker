@@ -1,0 +1,2259 @@
+{
+  "schemaVersion": 3,
+  "id": "e3284682ea90",
+  "title": "Token Pooling-Aware Training for Multi-Vector Embedding Models",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/token-pooling",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-11T00:00:00Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 82,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/token-pooling",
+  "resolvedUrl": "https://huggingface.co/blog/token-pooling",
+  "fetchedAt": "2026-11-11T19:44:26.975195Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Multi-vector embedding models give each query token its own opportunity to find a match in a document. This makes them wonderfully expressive for search, but those document vectors add up quickly. A corpus with millions of documents can contain hundreds of millions of vectors!\n\nToken pooling makes these representations smaller by merging similar token vectors. The more aggressively I compress them, however, the easier it becomes to lose something useful. Pooling-aware training teaches the encoder to preserve the information that matters when its vectors are merged, helping you retrieve better from the same storage budget.\n\nIn this post, I'll explain how pooling works, train a model for compressed retrieval with Sentence Transformers, and explore the resulting quality and storage tradeoff. With pool_factor=4, my normally trained model retains 94.6% of its unpooled NanoBEIR nDCG@10, with a 4x reduction in document vectors. Token pooling-aware training raises that retention to 97.8% at the same storage budget! Let's see how.\n\nThis post builds on pooling-aware training studied in Stefan Josef's Learn to Pool and LightOn's pooling regularization study, which also explores targeted training and adaptive budgets. Here, I'll focus on understanding the method and putting it to work with a short, reproducible Sentence Transformers example.\n\nPooling-aware training improves retrieval quality at the same vector budget. Details below.\n\n## Table of Contents\n\n- Why Multi-Vector Retrieval Needs So Many Vectors\n\nToken Pooling\n\n- Choosing a Pooling Budget\n\n- Calibrating Adaptive Pooling\n\nToken Pooling-Aware Training\n\n- A Loss Wrapper in Sentence Transformers\n\n- Optional Kernel Acceleration\n\n- Using the Trained Model\n\n- Evaluation Results\n\n- Combining Compression Techniques\n\n- References\n\n- Code and Models\n\n## Why Multi-Vector Retrieval Needs So Many Vectors\n\nA single-vector embedding model compresses an entire document into one vector. Multi-vector models such as ColBERT instead keep a collection of contextual token vectors, allowing different parts of a query to match different parts of a document.\n\nFor example, a query about a laptop with a long battery life can find evidence about the laptop in one part of a document and battery endurance in another. With MaxSim scoring, each query vector selects its best matching document vector, and those scores are added together:\n\nMaxSim⁡(Q,D)=∑q∈Qmax⁡d∈Dq⊤d \\operatorname{MaxSim}(Q, D) = \\sum_{q \\in Q} \\max_{d \\in D} q^\\top d MaxSim(Q,D)=q∈Q∑​d∈Dmax​q⊤d\n\nEven with the 2-bit or 4-bit residual quantization supported by Fast-PLAID, storing hundreds of vectors per document adds up. At 4 bits per residual coordinate, 200 vectors of 128 dimensions require 12.8 KB of quantized residuals per document, or 12.8 GB across a million documents. Pooling each document to 50 vectors reduces that to 3.2 GB, at the same dimensionality and precision.\n\nThe useful observation is that many document vectors can be similar. Several tokens might describe closely related concepts, creating an opportunity to represent them together.\n\n## Token Pooling\n\nHierarchicalTokenPooling groups similar token embeddings using Ward hierarchical clustering. Starting with one group per token vector, it repeatedly merges the two groups that cause the smallest increase in how spread out the vectors are within their groups. This spread is measured by the sum of squared distances from each vector to its group's mean, so Ward's method favors compact groups of similar vectors.\n\nThese merges build a hierarchy of progressively larger groups, letting us choose a level of compression that fits our budget. We then represent each group by its mean and normalize the resulting vectors again, ready for MaxSim scoring.\n\nYou can make compression proportional to document length:\n\n```\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\npooling = HierarchicalTokenPooling(pool_factor=4)\n```\n\nWith pool_factor=4, documents retain approximately one quarter of their original vectors, so longer documents can keep proportionally more capacity. By default, the first token is protected from merging and pooling applies only to document embeddings, leaving query embeddings unchanged.\n\n### Choosing a Pooling Budget\n\nHierarchicalTokenPooling offers three alternative controls:\n\nSetting\n\nWhat it expresses\n\nmax_tokens=16\n\nA maximum of 16 vectors per document, including protected tokens.\n\npool_factor=4\n\nApproximately one quarter of each document's original vectors.\n\ndistance_threshold=...\n\nA shared Ward merge-distance threshold, allowing vector counts to vary with embedding geometry.\n\nThis distinction matters when document lengths vary. With pool_factor=4, a longer document can retain approximately one quarter of its vectors, allowing its representation to grow with its content. With distance_threshold, the vector count can grow when more distinct embeddings need to be preserved.\n\n### Calibrating Adaptive Pooling\n\nAdaptive pooling uses a shared distance threshold to merge similar embeddings more aggressively while preserving more vectors for documents with distinct content. It can be used with any multi-vector model, including one trained without a pooling-aware objective.\n\nRather than choosing a threshold manually, you can calibrate it for a target average vector count. Given a representative sample of your corpus in calibration_documents:\n\n```\nfrom sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"lightonai/LateOn\")\ncalibration_embeddings = model.encode_document(calibration_documents)\nthreshold = HierarchicalTokenPooling.calibrate_distance_threshold(calibration_embeddings, target_tokens=16)\npooling = HierarchicalTokenPooling(distance_threshold=threshold)\n\n# Apply pooling, targeting an average of 16 vectors per document\ndocument_embeddings = model.encode_document(documents_to_index, token_pooling=pooling)\n```\n\nCalibration only needs document embeddings and returns a threshold you can reuse when indexing. The target is an average, so individual documents can receive more or fewer than 16 vectors. The achieved average can also change on another corpus.\n\n## Token Pooling-Aware Training\n\nPooling can already be useful on an ordinary multi-vector model. The difficulty appears when a document contains a distinction that matters for retrieval, but merging its vectors makes that distinction harder to recover. The original training objective never required the model to work with these compressed representations. But, you can teach it to do exactly that.\n\nIf you've used Matryoshka embeddings, the training principle will feel familiar. Matryoshka applies a retrieval objective at several embedding widths, teaching smaller prefixes to remain useful. Pooling-aware training applies the objective to representations with fewer token vectors.\n\nFor my example, each training batch contributes two losses:\n\n- Retrieval using the original document embeddings.\n\n- Retrieval after compressing documents to approximately one quarter of their original vectors.\n\nI average them:\n\nL=12Lunpooled+12Lpooled \\mathcal{L} = \\tfrac{1}{2}\\mathcal{L}_{\\mathrm{unpooled}} + \\tfrac{1}{2}\\mathcal{L}_{\\mathrm{pooled}} L=21​Lunpooled​+21​Lpooled​\n\nThe first term teaches the model to retrieve with its full representations. The second teaches it to arrange its token embeddings so that useful matches survive pooling. Both objectives update the same encoder, giving it feedback about retrieval before and after compression.\n\nWard clustering makes discrete decisions about which tokens belong together. During training, HierarchicalTokenPooling uses a straight-through estimator to pass gradients from pooled vectors back to their member tokens, without differentiating the cluster assignments. The encoder can then learn from retrieval errors made with its pooled representations.\n\n### A Loss Wrapper in Sentence Transformers\n\nMultiVectorTokenPoolingLoss wraps an existing multi-vector retrieval loss and applies it using your chosen poolers:\n\n```\nfrom sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.losses import (\n    CachedMultiVectorMultipleNegativesRankingLoss,\n    MultiVectorTokenPoolingLoss,\n)\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"answerdotai/ModernBERT-base\", similarity_fn_name=\"maxsim\")\npooling = HierarchicalTokenPooling(pool_factor=4)\n\nbase_loss = CachedMultiVectorMultipleNegativesRankingLoss(model, mini_batch_size=64)\nloss = MultiVectorTokenPoolingLoss(\n    model,\n    base_loss,\n    token_poolings=[None, pooling],\n    weights=[0.5, 0.5],\n)\n```\n\nCachedMultiVectorMultipleNegativesRankingLoss supplies the retrieval objective. It teaches each query to score its relevant document above the negative documents in the batch. By default, it uses model.similarity, using the model's similarity setting (MaxSim in this example) and kernel settings. A model configured with similarity_fn_name=\"meanmaxsim\" would also use MeanMaxSim during training.\n\nGradient caching allows the encoder to process small mini-batches while retaining a larger set of in-batch negatives. My training script uses mini-batches of 64 with a training batch size of 256.\n\nMultiVectorTokenPoolingLoss adds the compression objective. Here, None means that one variant uses the original embeddings, while pooling supplies the factor-4 variant. The two weights average their losses. Pooling variants reuse the computed token embeddings, so each additional pooler adds clustering and scoring work without requiring a separate encoder pass for that variant.\n\nThe poolers can also be custom BaseTokenPooling implementations that preserve gradients through their input embeddings. You can adapt the training objective to the representation you want to deploy.\n\nReplace the factor-4 pooler with your chosen deployment configuration, or include several poolers and choose weights for their losses.\n\nThe complete training script includes the dataset, trainer, validation loss, and small retrieval evaluations during training. From a checkout of the repository, run both variants locally with uv:\n\n```\nuv run examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py --baseline\nuv run examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py\n```\n\nThe script declares its training and kernel dependencies, so uv installs them for you. Compatible kernels are enabled automatically.\n\nYou can also train on a cloud GPU with Hugging Face Jobs. Install the CLI and log in with a token that can run Jobs and upload models:\n\n```\npip install -U huggingface_hub\nhf auth login\n\nhf jobs uv run \\\n    --flavor a10g-small \\\n    --timeout 4h \\\n    --secrets HF_TOKEN \\\n    -- https://raw.githubusercontent.com/huggingface/sentence-transformers/main/examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py\n```\n\nThis runs the pooling-aware variant on an A10G GPU with a four-hour time limit. Passing HF_TOKEN as a secret lets the script upload the trained model to your Hub account when training finishes. To run the ordinary-loss baseline as well, repeat the command with --baseline after the script URL.\n\n### Optional Kernel Acceleration\n\nYou can accelerate MaxSim scoring, Ward clustering, and supported backbone operations with kernels. Install the training and kernel dependencies:\n\n```\npip install -U \"sentence-transformers[train,kernels]\"\n```\n\nIn the training example above, replace the model and pooler initialization before constructing the loss:\n\n```\nmodel = MultiVectorEncoder(\n    \"answerdotai/ModernBERT-base\",\n    device=\"cuda\",\n    similarity_fn_name=\"maxsim\",\n    use_kernels=True,\n)\npooling = HierarchicalTokenPooling(pool_factor=4)\n```\n\nHierarchical poolers inherit the model's kernel settings by default, so you only need to enable kernels on the model.\n\nSentence Transformers selects compatible kernels for your setup and uses the existing implementation wherever a replacement isn't available. For example, the default MaxSim kernel scores queries against documents without building the full token similarity matrix in memory, but it does require CUDA and Triton.\n\nThe default Ward clustering kernel considerably speeds up hierarchical clustering by running on CUDA instead of the CPU. We're talking about 30-150x faster than SciPy depending on the setting.\n\n## Using the Trained Model\n\nLet's load the pooling-aware model and retrieve with compressed document embeddings. Kernel settings aren't saved with the model, so add use_kernels=True when loading if you'd like to use them for inference too:\n\n```\nfrom sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"tomaarsen/mve-ModernBERT-base-token-pooling\")\npooling = HierarchicalTokenPooling(pool_factor=4)\n\nqueries = [\"Which planet is known as the Red Planet?\"]\ndocuments = [\n    \"Venus is often called Earth's twin because of its similar size and proximity.\",\n    \"Mars, known for its reddish appearance, is often referred to as the Red Planet.\",\n    \"Jupiter, the largest planet in our solar system, has a prominent red spot.\",\n]\n\nquery_embeddings = model.encode_query(queries)\ndocument_embeddings = model.encode_document(documents, token_pooling=pooling)\n\nprint([len(embedding) for embedding in document_embeddings])\n# [5, 6, 5]\nprint(model.similarity(query_embeddings, document_embeddings))\n# tensor([[16.0037, 25.9879, 22.8159]], device='cuda:0')\n\n# For comparison, the same model without token pooling:\n# [18, 21, 19]\n# tensor([[16.6115, 27.6060, 24.1766]], device='cuda:0')\n```\n\nThe pooler compresses the document embeddings after the encoder's forward pipeline, reducing the total from 58 vectors to 16 while leaving query embeddings unchanged. Mars still receives the highest similarity score, followed by Jupiter and Venus, so the ranking is preserved despite storing far fewer document vectors.\n\nYou can change pool_factor at inference to explore a different storage budget with the same trained model. For repeated use, you can also pass token_pooling=pooling when initializing MultiVectorEncoder to make it the runtime default. The pooler's tasks still control which inputs are compressed (e.g. only documents).\n\n## Evaluation Results\n\nTo investigate, I trained two models from answerdotai/ModernBERT-base, each with a fresh 128-dimensional token projection:\n\n- tomaarsen/mve-ModernBERT-base-token-pooling-baseline, using only the cached contrastive loss.\n\n- tomaarsen/mve-ModernBERT-base-token-pooling, using the cached contrastive loss wrapped with the unpooled and factor-4 objectives above.\n\nBoth runs use one epoch over the same 120,000 MS MARCO triplets, seed 42, and matching initialization and optimization settings. The training token cap is 300, and short queries are expanded to at least 32 token positions to provide additional contextual query vectors. Only the loss differs between the two experiments, and I didn't run a hyperparameter search.\n\nI evaluated both models on NanoBEIR@13, reporting mean nDCG@10 (%). The figure compares ordinary and pooling-aware training with pool factors of 2, 3, 4, and 6, alongside unpooled retrieval. The table also includes fixed caps and adaptive thresholds, showing how the training benefits transfer to other pooling settings.\n\nPooling at inference\n\nMean vectors\n\nOrdinary model\n\nPooling-aware model\n\nGain (points)\n\nUnpooled\n\n193.22\n\n51.84\n\n52.39\n\n\\+0.55\n\npool_factor=2\n\n96.86\n\n50.10\n\n51.74\n\n\\+1.64\n\npool_factor=3\n\n64.74\n\n49.70\n\n51.45\n\n\\+1.76\n\npool_factor=4\n\n48.68\n\n49.03\n\n51.23\n\n\\+2.20\n\npool_factor=5\n\n39.04\n\n48.13\n\n50.28\n\n\\+2.15\n\npool_factor=6\n\n32.62\n\n47.07\n\n49.85\n\n\\+2.78\n\nmax_tokens=64\n\n54.76\n\n49.27\n\n50.89\n\n\\+1.63\n\nmax_tokens=32\n\n29.58\n\n48.25\n\n50.12\n\n\\+1.87\n\nmax_tokens=16\n\n15.60\n\n46.61\n\n49.26\n\n\\+2.65\n\nmax_tokens=8\n\n7.99\n\n43.12\n\n46.61\n\n\\+3.48\n\nmax_tokens=4\n\n4.00\n\n37.22\n\n43.00\n\n\\+5.78\n\ndistance_threshold (calibrated)\n\n54.76\n\n50.10\n\n51.24\n\n\\+1.14\n\ndistance_threshold (calibrated)\n\n29.58\n\n48.38\n\n50.96\n\n\\+2.58\n\ndistance_threshold (calibrated)\n\n15.60\n\n47.23\n\n49.63\n\n\\+2.41\n\nFor adaptive pooling, I calibrated a separate threshold for each encoder and NanoBEIR corpus, using its unpooled document embeddings to match the average vector counts under caps of 64, 32, and 16. Short documents bring those averages below their respective caps.\n\nAt the trained pool_factor=4, nDCG@10 improves from 49.03 to 51.23, while storing 74.8% fewer document vectors than unpooled retrieval. This increases score retention from 94.6% to 97.8%, where retention is the pooled mean nDCG@10 divided by each model's own unpooled mean. Unpooled retrieval also improves, from 51.84 to 52.39.\n\nThe gains extend to fixed caps and adaptive pooling, even though training used only the full representation and proportional pooling. At an average of 29.58 vectors per document, adaptive pooling retains 97.3% of the pooling-aware model's unpooled score while storing 84.7% fewer document vectors. The normally trained model retains 93.3% at the same budget.\n\n## Combining Compression Techniques\n\nIf index size is your main concern, I would reach for these options in this order:\n\n- Embedding quantization to 4, 2, or 1 bit(s), for example via Fast-PLAID, to reduce storage per coordinate.\n\n- Token pooling to reduce the number of document vectors, optionally with pooling-aware fine-tuning as shown in this blog.\n\n- Matryoshka token embeddings to reduce the dimensionality of each token vector, optionally with fine-tuning to preserve retrieval quality at smaller widths.\n\nIf the model's default dimensionality is larger than 128, I would consider Matryoshka truncation and fine-tuning earlier as well. These approaches can be combined, so evaluate the resulting index size and retrieval quality with your search engine and corpus.\n\nMultiVectorMatryoshkaLoss trains token embeddings to remain useful after truncation. You can wrap it with MultiVectorTokenPoolingLoss to train for both smaller dimensions and fewer document vectors, reusing the encoder's embeddings across the compression settings.\n\nTry the complete training example, choose a budget that matters for your application, and compare it with a matched ordinary-loss run. The accompanying evaluation script measures unpooled retrieval, caps of 64, 32, 16, 8, and 4 vectors, and pool factors of 2 through 6, so you can plot the quality and storage tradeoff for your own model.\n\nWith a few extra lines in the training objective, a smaller document representation becomes something the model actively learns to use. That opens up an exciting amount of room to make multi-vector retrieval more practical!\n\n## References\n\n- Stefan Josef. Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression.\n\n- Benjamin Clavié, Antoine Chaffin, and Griffin Adams. Reducing the Footprint of Multi-Vector Retrieval with Minimal Performance Impact via Token Pooling.\n\n- Antoine Chaffin. After the party comes the free lunch: regularizing ColBERT models to enhance pooling capabilities and reduce index footprint.\n\n- Luyu Gao, Yunyi Zhang, Jiawei Han, and Jamie Callan. Scaling Deep Contrastive Learning Batch Size under Memory Limited Setup.\n\n- Introduction to Matryoshka Embedding Models.\n\n## Code and Models\n\n- Token pooling-aware training example and README\n\n- Complete training script\n\n- NanoBEIR evaluation script\n\nExample checkpoints:\n\n- tomaarsen/mve-ModernBERT-base-token-pooling\n\n- tomaarsen/mve-ModernBERT-base-token-pooling-baseline\n\n- Pretrained multi-vector models compatible with Sentence Transformers\n\n- Matryoshka-aware training for multi-vector models\n\n- Fast-PLAID",
+  "images": [
+    {
+      "src": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/token-pooling/mve_token_pooling_results.png",
+      "originalUrl": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/blog/token-pooling/mve_token_pooling_results.png",
+      "alt": "Mean NanoBEIR nDCG@10 versus stored document vectors for pool factors 2, 3, 4, and 6 and unpooled retrieval, comparing ordinary and pooling-aware training.",
+      "id": "image_c9da2f8a5dd50584"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Multi-vector embedding models give each query token its own opportunity to find a match in a document. This makes them wonderfully expressive for search, but those document vectors add up quickly. A corpus with millions of documents can contain hundreds of millions of vectors!",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Token pooling makes these representations smaller by merging similar token vectors. The more aggressively I compress them, however, the easier it becomes to lose something useful. Pooling-aware training teaches the encoder to preserve the information that matters when its vectors are merged, helping you retrieve better from the same storage budget.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "In this post, I'll explain how pooling works, train a model for compressed retrieval with Sentence Transformers, and explore the resulting quality and storage tradeoff. With pool_factor=4, my normally trained model retains 94.6% of its unpooled NanoBEIR nDCG@10, with a 4x reduction in document vectors. Token pooling-aware training raises that retention to 97.8% at the same storage budget! Let's see how.",
+      "spans": [
+        {
+          "start": 174,
+          "end": 187,
+          "kind": "code"
+        },
+        {
+          "start": 270,
+          "end": 272,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0004",
+      "source": "This post builds on pooling-aware training studied in Stefan Josef's Learn to Pool and LightOn's pooling regularization study, which also explores targeted training and adaptive budgets. Here, I'll focus on understanding the method and putting it to work with a short, reproducible Sentence Transformers example.",
+      "spans": [
+        {
+          "start": 69,
+          "end": 82,
+          "kind": "a",
+          "href": "https://stefan-jo.github.io/learn-to-pool/downloads/paper.pdf"
+        },
+        {
+          "start": 87,
+          "end": 125,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lightonai/lateon-hpool-regularization"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "Pooling-aware training improves retrieval quality at the same vector budget. Details below.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 91,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0006",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Why Multi-Vector Retrieval Needs So Many Vectors",
+      "spans": [
+        {
+          "start": 0,
+          "end": 48,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#why-multi-vector-retrieval-needs-so-many-vectors"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Token Pooling",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#token-pooling"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Choosing a Pooling Budget",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#choosing-a-pooling-budget"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "Calibrating Adaptive Pooling",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#calibrating-adaptive-pooling"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Token Pooling-Aware Training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#token-pooling-aware-training"
+        }
+      ]
+    },
+    {
+      "id": "b0012",
+      "source": "A Loss Wrapper in Sentence Transformers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 39,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#a-loss-wrapper-in-sentence-transformers"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Optional Kernel Acceleration",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#optional-kernel-acceleration"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Using the Trained Model",
+      "spans": [
+        {
+          "start": 0,
+          "end": 23,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#using-the-trained-model"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "Evaluation Results",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#evaluation-results"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Combining Compression Techniques",
+      "spans": [
+        {
+          "start": 0,
+          "end": 32,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#combining-compression-techniques"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "References",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#references"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Code and Models",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/token-pooling#code-and-models"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Why Multi-Vector Retrieval Needs So Many Vectors",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "A single-vector embedding model compresses an entire document into one vector. Multi-vector models such as ColBERT instead keep a collection of contextual token vectors, allowing different parts of a query to match different parts of a document.",
+      "spans": [
+        {
+          "start": 79,
+          "end": 98,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/multi-vector-encoder"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "For example, a query about a laptop with a long battery life can find evidence about the laptop in one part of a document and battery endurance in another. With MaxSim scoring, each query vector selects its best matching document vector, and those scores are added together:",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "MaxSim⁡(Q,D)=∑q∈Qmax⁡d∈Dq⊤d \\operatorname{MaxSim}(Q, D) = \\sum_{q \\in Q} \\max_{d \\in D} q^\\top d MaxSim(Q,D)=q∈Q∑​d∈Dmax​q⊤d",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Even with the 2-bit or 4-bit residual quantization supported by Fast-PLAID, storing hundreds of vectors per document adds up. At 4 bits per residual coordinate, 200 vectors of 128 dimensions require 12.8 KB of quantized residuals per document, or 12.8 GB across a million documents. Pooling each document to 50 vectors reduces that to 3.2 GB, at the same dimensionality and precision.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 74,
+          "kind": "a",
+          "href": "https://github.com/lightonai/fast-plaid"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "The useful observation is that many document vectors can be similar. Several tokens might describe closely related concepts, creating an opportunity to represent them together.",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "Token Pooling",
+      "spans": []
+    },
+    {
+      "id": "b0026",
+      "source": "HierarchicalTokenPooling groups similar token embeddings using Ward hierarchical clustering. Starting with one group per token vector, it repeatedly merges the two groups that cause the smallest increase in how spread out the vectors are within their groups. This spread is measured by the sum of squared distances from each vector to its group's mean, so Ward's method favors compact groups of similar vectors.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "a",
+          "href": "https://sbert.net/docs/package_reference/multi_vector_encoder/modules.html#hierarchicaltokenpooling"
+        },
+        {
+          "start": 63,
+          "end": 91,
+          "kind": "a",
+          "href": "https://scikit-learn.org/stable/modules/clustering.html#hierarchical-clustering"
+        }
+      ]
+    },
+    {
+      "id": "b0027",
+      "source": "These merges build a hierarchy of progressively larger groups, letting us choose a level of compression that fits our budget. We then represent each group by its mean and normalize the resulting vectors again, ready for MaxSim scoring.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "You can make compression proportional to document length:",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "With pool_factor=4, documents retain approximately one quarter of their original vectors, so longer documents can keep proportionally more capacity. By default, the first token is protected from merging and pooling applies only to document embeddings, leaving query embeddings unchanged.",
+      "spans": [
+        {
+          "start": 5,
+          "end": 18,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Choosing a Pooling Budget",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "HierarchicalTokenPooling offers three alternative controls:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Setting",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0033",
+      "source": "What it expresses",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0034",
+      "source": "max_tokens=16",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0035",
+      "source": "A maximum of 16 vectors per document, including protected tokens.",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0036",
+      "source": "pool_factor=4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0037",
+      "source": "Approximately one quarter of each document's original vectors.",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0038",
+      "source": "distance_threshold=...",
+      "spans": [
+        {
+          "start": 0,
+          "end": 22,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0039",
+      "source": "A shared Ward merge-distance threshold, allowing vector counts to vary with embedding geometry.",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0040",
+      "source": "This distinction matters when document lengths vary. With pool_factor=4, a longer document can retain approximately one quarter of its vectors, allowing its representation to grow with its content. With distance_threshold, the vector count can grow when more distinct embeddings need to be preserved.",
+      "spans": [
+        {
+          "start": 58,
+          "end": 71,
+          "kind": "code"
+        },
+        {
+          "start": 203,
+          "end": 221,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Calibrating Adaptive Pooling",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Adaptive pooling uses a shared distance threshold to merge similar embeddings more aggressively while preserving more vectors for documents with distinct content. It can be used with any multi-vector model, including one trained without a pooling-aware objective.",
+      "spans": [
+        {
+          "start": 207,
+          "end": 262,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Rather than choosing a threshold manually, you can calibrate it for a target average vector count. Given a representative sample of your corpus in calibration_documents:",
+      "spans": [
+        {
+          "start": 147,
+          "end": 168,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "Calibration only needs document embeddings and returns a threshold you can reuse when indexing. The target is an average, so individual documents can receive more or fewer than 16 vectors. The achieved average can also change on another corpus.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Token Pooling-Aware Training",
+      "spans": []
+    },
+    {
+      "id": "b0046",
+      "source": "Pooling can already be useful on an ordinary multi-vector model. The difficulty appears when a document contains a distinction that matters for retrieval, but merging its vectors makes that distinction harder to recover. The original training objective never required the model to work with these compressed representations. But, you can teach it to do exactly that.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "If you've used Matryoshka embeddings, the training principle will feel familiar. Matryoshka applies a retrieval objective at several embedding widths, teaching smaller prefixes to remain useful. Pooling-aware training applies the objective to representations with fewer token vectors.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 36,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/matryoshka"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "For my example, each training batch contributes two losses:",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Retrieval using the original document embeddings.",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "Retrieval after compressing documents to approximately one quarter of their original vectors.",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "I average them:",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "L=12Lunpooled+12Lpooled \\mathcal{L} = \\tfrac{1}{2}\\mathcal{L}_{\\mathrm{unpooled}} + \\tfrac{1}{2}\\mathcal{L}_{\\mathrm{pooled}} L=21​Lunpooled​+21​Lpooled​",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "The first term teaches the model to retrieve with its full representations. The second teaches it to arrange its token embeddings so that useful matches survive pooling. Both objectives update the same encoder, giving it feedback about retrieval before and after compression.",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Ward clustering makes discrete decisions about which tokens belong together. During training, HierarchicalTokenPooling uses a straight-through estimator to pass gradients from pooled vectors back to their member tokens, without differentiating the cluster assignments. The encoder can then learn from retrieval errors made with its pooled representations.",
+      "spans": [
+        {
+          "start": 94,
+          "end": 118,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0055",
+      "source": "A Loss Wrapper in Sentence Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "MultiVectorTokenPoolingLoss wraps an existing multi-vector retrieval loss and applies it using your chosen poolers:",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://sbert.net/docs/package_reference/multi_vector_encoder/losses.html#multivectortokenpoolingloss"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "CachedMultiVectorMultipleNegativesRankingLoss supplies the retrieval objective. It teaches each query to score its relevant document above the negative documents in the batch. By default, it uses model.similarity, using the model's similarity setting (MaxSim in this example) and kernel settings. A model configured with similarity_fn_name=\"meanmaxsim\" would also use MeanMaxSim during training.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 45,
+          "kind": "code"
+        },
+        {
+          "start": 196,
+          "end": 212,
+          "kind": "code"
+        },
+        {
+          "start": 321,
+          "end": 352,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0058",
+      "source": "Gradient caching allows the encoder to process small mini-batches while retaining a larger set of in-batch negatives. My training script uses mini-batches of 64 with a training batch size of 256.",
+      "spans": []
+    },
+    {
+      "id": "b0059",
+      "source": "MultiVectorTokenPoolingLoss adds the compression objective. Here, None means that one variant uses the original embeddings, while pooling supplies the factor-4 variant. The two weights average their losses. Pooling variants reuse the computed token embeddings, so each additional pooler adds clustering and scoring work without requiring a separate encoder pass for that variant.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "code"
+        },
+        {
+          "start": 66,
+          "end": 70,
+          "kind": "code"
+        },
+        {
+          "start": 130,
+          "end": 137,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "The poolers can also be custom BaseTokenPooling implementations that preserve gradients through their input embeddings. You can adapt the training objective to the representation you want to deploy.",
+      "spans": [
+        {
+          "start": 31,
+          "end": 47,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0061",
+      "source": "Replace the factor-4 pooler with your chosen deployment configuration, or include several poolers and choose weights for their losses.",
+      "spans": []
+    },
+    {
+      "id": "b0062",
+      "source": "The complete training script includes the dataset, trainer, validation loss, and small retrieval evaluations during training. From a checkout of the repository, run both variants locally with uv:",
+      "spans": [
+        {
+          "start": 13,
+          "end": 28,
+          "kind": "a",
+          "href": "https://github.com/huggingface/sentence-transformers/blob/main/examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py"
+        },
+        {
+          "start": 192,
+          "end": 194,
+          "kind": "a",
+          "href": "https://docs.astral.sh/uv/getting-started/installation/"
+        }
+      ]
+    },
+    {
+      "id": "b0063",
+      "source": "The script declares its training and kernel dependencies, so uv installs them for you. Compatible kernels are enabled automatically.",
+      "spans": []
+    },
+    {
+      "id": "b0064",
+      "source": "You can also train on a cloud GPU with Hugging Face Jobs. Install the CLI and log in with a token that can run Jobs and upload models:",
+      "spans": [
+        {
+          "start": 39,
+          "end": 56,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/hub/jobs-quickstart"
+        }
+      ]
+    },
+    {
+      "id": "b0065",
+      "source": "This runs the pooling-aware variant on an A10G GPU with a four-hour time limit. Passing HF_TOKEN as a secret lets the script upload the trained model to your Hub account when training finishes. To run the ordinary-loss baseline as well, repeat the command with --baseline after the script URL.",
+      "spans": [
+        {
+          "start": 88,
+          "end": 96,
+          "kind": "code"
+        },
+        {
+          "start": 261,
+          "end": 271,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0066",
+      "source": "Optional Kernel Acceleration",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "You can accelerate MaxSim scoring, Ward clustering, and supported backbone operations with kernels. Install the training and kernel dependencies:",
+      "spans": [
+        {
+          "start": 91,
+          "end": 98,
+          "kind": "a",
+          "href": "https://sbert.net/docs/multi_vector_encoder/usage/kernels.html"
+        }
+      ]
+    },
+    {
+      "id": "b0068",
+      "source": "In the training example above, replace the model and pooler initialization before constructing the loss:",
+      "spans": []
+    },
+    {
+      "id": "b0069",
+      "source": "Hierarchical poolers inherit the model's kernel settings by default, so you only need to enable kernels on the model.",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Sentence Transformers selects compatible kernels for your setup and uses the existing implementation wherever a replacement isn't available. For example, the default MaxSim kernel scores queries against documents without building the full token similarity matrix in memory, but it does require CUDA and Triton.",
+      "spans": [
+        {
+          "start": 158,
+          "end": 179,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/sentence-transformers/late-interaction-kernels"
+        }
+      ]
+    },
+    {
+      "id": "b0071",
+      "source": "The default Ward clustering kernel considerably speeds up hierarchical clustering by running on CUDA instead of the CPU. We're talking about 30-150x faster than SciPy depending on the setting.",
+      "spans": [
+        {
+          "start": 12,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/kernels/sentence-transformers/ward-clustering"
+        }
+      ]
+    },
+    {
+      "id": "b0072",
+      "source": "Using the Trained Model",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "Let's load the pooling-aware model and retrieve with compressed document embeddings. Kernel settings aren't saved with the model, so add use_kernels=True when loading if you'd like to use them for inference too:",
+      "spans": [
+        {
+          "start": 137,
+          "end": 153,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0074",
+      "source": "The pooler compresses the document embeddings after the encoder's forward pipeline, reducing the total from 58 vectors to 16 while leaving query embeddings unchanged. Mars still receives the highest similarity score, followed by Jupiter and Venus, so the ranking is preserved despite storing far fewer document vectors.",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "You can change pool_factor at inference to explore a different storage budget with the same trained model. For repeated use, you can also pass token_pooling=pooling when initializing MultiVectorEncoder to make it the runtime default. The pooler's tasks still control which inputs are compressed (e.g. only documents).",
+      "spans": [
+        {
+          "start": 15,
+          "end": 26,
+          "kind": "code"
+        },
+        {
+          "start": 143,
+          "end": 164,
+          "kind": "code"
+        },
+        {
+          "start": 183,
+          "end": 201,
+          "kind": "code"
+        },
+        {
+          "start": 247,
+          "end": 252,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "Evaluation Results",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "To investigate, I trained two models from answerdotai/ModernBERT-base, each with a fresh 128-dimensional token projection:",
+      "spans": [
+        {
+          "start": 42,
+          "end": 69,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "tomaarsen/mve-ModernBERT-base-token-pooling-baseline, using only the cached contrastive loss.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/tomaarsen/mve-ModernBERT-base-token-pooling-baseline"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "tomaarsen/mve-ModernBERT-base-token-pooling, using the cached contrastive loss wrapped with the unpooled and factor-4 objectives above.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/tomaarsen/mve-ModernBERT-base-token-pooling"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Both runs use one epoch over the same 120,000 MS MARCO triplets, seed 42, and matching initialization and optimization settings. The training token cap is 300, and short queries are expanded to at least 32 token positions to provide additional contextual query vectors. Only the loss differs between the two experiments, and I didn't run a hyperparameter search.",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "I evaluated both models on NanoBEIR@13, reporting mean nDCG@10 (%). The figure compares ordinary and pooling-aware training with pool factors of 2, 3, 4, and 6, alongside unpooled retrieval. The table also includes fixed caps and adaptive thresholds, showing how the training benefits transfer to other pooling settings.",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "Pooling at inference",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "Mean vectors",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "Ordinary model",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "Pooling-aware model",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "Gain (points)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "Unpooled",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "193.22",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "51.84",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "52.39",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "+0.55",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "pool_factor=2",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "96.86",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "50.10",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "51.74",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "+1.64",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "pool_factor=3",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "64.74",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "49.70",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "51.45",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "+1.76",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "pool_factor=4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "48.68",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "49.03",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "51.23",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "+2.20",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "pool_factor=5",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "39.04",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "48.13",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "50.28",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "+2.15",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "pool_factor=6",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "32.62",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "47.07",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "49.85",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "+2.78",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "max_tokens=64",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "54.76",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "49.27",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "50.89",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "+1.63",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 7,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "max_tokens=32",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "29.58",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "48.25",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "50.12",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "+1.87",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 8,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "max_tokens=16",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "15.60",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "46.61",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "49.26",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0131",
+      "source": "+2.65",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 9,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0132",
+      "source": "max_tokens=8",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0133",
+      "source": "7.99",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "43.12",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "46.61",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "+3.48",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 10,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "max_tokens=4",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "4.00",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "37.22",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "43.00",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "+5.78",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 11,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "distance_threshold (calibrated)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "54.76",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "50.10",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "51.24",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "+1.14",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 12,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "distance_threshold (calibrated)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 13,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "29.58",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 13,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "48.38",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 13,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "50.96",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 13,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "+2.58",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 13,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "distance_threshold (calibrated)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 18,
+          "kind": "code"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 14,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "15.60",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 14,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "47.23",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 14,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "49.63",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 14,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "+2.41",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 14,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "For adaptive pooling, I calibrated a separate threshold for each encoder and NanoBEIR corpus, using its unpooled document embeddings to match the average vector counts under caps of 64, 32, and 16. Short documents bring those averages below their respective caps.",
+      "spans": []
+    },
+    {
+      "id": "b0158",
+      "source": "At the trained pool_factor=4, nDCG@10 improves from 49.03 to 51.23, while storing 74.8% fewer document vectors than unpooled retrieval. This increases score retention from 94.6% to 97.8%, where retention is the pooled mean nDCG@10 divided by each model's own unpooled mean. Unpooled retrieval also improves, from 51.84 to 52.39.",
+      "spans": [
+        {
+          "start": 15,
+          "end": 28,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0159",
+      "source": "The gains extend to fixed caps and adaptive pooling, even though training used only the full representation and proportional pooling. At an average of 29.58 vectors per document, adaptive pooling retains 97.3% of the pooling-aware model's unpooled score while storing 84.7% fewer document vectors. The normally trained model retains 93.3% at the same budget.",
+      "spans": []
+    },
+    {
+      "id": "b0160",
+      "source": "Combining Compression Techniques",
+      "spans": []
+    },
+    {
+      "id": "b0161",
+      "source": "If index size is your main concern, I would reach for these options in this order:",
+      "spans": []
+    },
+    {
+      "id": "b0162",
+      "source": "Embedding quantization to 4, 2, or 1 bit(s), for example via Fast-PLAID, to reduce storage per coordinate.",
+      "spans": [
+        {
+          "start": 61,
+          "end": 71,
+          "kind": "a",
+          "href": "https://github.com/lightonai/fast-plaid"
+        }
+      ]
+    },
+    {
+      "id": "b0163",
+      "source": "Token pooling to reduce the number of document vectors, optionally with pooling-aware fine-tuning as shown in this blog.",
+      "spans": []
+    },
+    {
+      "id": "b0164",
+      "source": "Matryoshka token embeddings to reduce the dimensionality of each token vector, optionally with fine-tuning to preserve retrieval quality at smaller widths.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 27,
+          "kind": "a",
+          "href": "https://sbert.net/examples/multi_vector_encoder/training/matryoshka/README.html"
+        }
+      ]
+    },
+    {
+      "id": "b0165",
+      "source": "If the model's default dimensionality is larger than 128, I would consider Matryoshka truncation and fine-tuning earlier as well. These approaches can be combined, so evaluate the resulting index size and retrieval quality with your search engine and corpus.",
+      "spans": []
+    },
+    {
+      "id": "b0166",
+      "source": "MultiVectorMatryoshkaLoss trains token embeddings to remain useful after truncation. You can wrap it with MultiVectorTokenPoolingLoss to train for both smaller dimensions and fewer document vectors, reusing the encoder's embeddings across the compression settings.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 106,
+          "end": 133,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0167",
+      "source": "Try the complete training example, choose a budget that matters for your application, and compare it with a matched ordinary-loss run. The accompanying evaluation script measures unpooled retrieval, caps of 64, 32, 16, 8, and 4 vectors, and pool factors of 2 through 6, so you can plot the quality and storage tradeoff for your own model.",
+      "spans": [
+        {
+          "start": 8,
+          "end": 33,
+          "kind": "a",
+          "href": "https://sbert.net/examples/multi_vector_encoder/training/token_pooling/README.html"
+        },
+        {
+          "start": 152,
+          "end": 169,
+          "kind": "a",
+          "href": "https://github.com/huggingface/sentence-transformers/blob/main/examples/multi_vector_encoder/training/token_pooling/evaluate_token_pooling.py"
+        }
+      ]
+    },
+    {
+      "id": "b0168",
+      "source": "With a few extra lines in the training objective, a smaller document representation becomes something the model actively learns to use. That opens up an exciting amount of room to make multi-vector retrieval more practical!",
+      "spans": []
+    },
+    {
+      "id": "b0169",
+      "source": "References",
+      "spans": []
+    },
+    {
+      "id": "b0170",
+      "source": "Stefan Josef. Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression.",
+      "spans": [
+        {
+          "start": 14,
+          "end": 90,
+          "kind": "a",
+          "href": "https://stefan-jo.github.io/learn-to-pool"
+        }
+      ]
+    },
+    {
+      "id": "b0171",
+      "source": "Benjamin Clavié, Antoine Chaffin, and Griffin Adams. Reducing the Footprint of Multi-Vector Retrieval with Minimal Performance Impact via Token Pooling.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 151,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2409.14683"
+        }
+      ]
+    },
+    {
+      "id": "b0172",
+      "source": "Antoine Chaffin. After the party comes the free lunch: regularizing ColBERT models to enhance pooling capabilities and reduce index footprint.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 141,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/lightonai/lateon-hpool-regularization"
+        }
+      ]
+    },
+    {
+      "id": "b0173",
+      "source": "Luyu Gao, Yunyi Zhang, Jiawei Han, and Jamie Callan. Scaling Deep Contrastive Learning Batch Size under Memory Limited Setup.",
+      "spans": [
+        {
+          "start": 53,
+          "end": 124,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2101.06983"
+        }
+      ]
+    },
+    {
+      "id": "b0174",
+      "source": "Introduction to Matryoshka Embedding Models.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/matryoshka"
+        }
+      ]
+    },
+    {
+      "id": "b0175",
+      "source": "Code and Models",
+      "spans": []
+    },
+    {
+      "id": "b0176",
+      "source": "Token pooling-aware training example and README",
+      "spans": [
+        {
+          "start": 0,
+          "end": 47,
+          "kind": "a",
+          "href": "https://sbert.net/examples/multi_vector_encoder/training/token_pooling/README.html"
+        }
+      ]
+    },
+    {
+      "id": "b0177",
+      "source": "Complete training script",
+      "spans": [
+        {
+          "start": 0,
+          "end": 24,
+          "kind": "a",
+          "href": "https://github.com/huggingface/sentence-transformers/blob/main/examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py"
+        }
+      ]
+    },
+    {
+      "id": "b0178",
+      "source": "NanoBEIR evaluation script",
+      "spans": [
+        {
+          "start": 0,
+          "end": 26,
+          "kind": "a",
+          "href": "https://github.com/huggingface/sentence-transformers/blob/main/examples/multi_vector_encoder/training/token_pooling/evaluate_token_pooling.py"
+        }
+      ]
+    },
+    {
+      "id": "b0179",
+      "source": "Example checkpoints:",
+      "spans": []
+    },
+    {
+      "id": "b0180",
+      "source": "tomaarsen/mve-ModernBERT-base-token-pooling",
+      "spans": [
+        {
+          "start": 0,
+          "end": 43,
+          "kind": "a",
+          "href": "https://huggingface.co/tomaarsen/mve-ModernBERT-base-token-pooling"
+        }
+      ]
+    },
+    {
+      "id": "b0181",
+      "source": "tomaarsen/mve-ModernBERT-base-token-pooling-baseline",
+      "spans": [
+        {
+          "start": 0,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/tomaarsen/mve-ModernBERT-base-token-pooling-baseline"
+        }
+      ]
+    },
+    {
+      "id": "b0182",
+      "source": "Pretrained multi-vector models compatible with Sentence Transformers",
+      "spans": [
+        {
+          "start": 0,
+          "end": 68,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/sentence-transformers/multivectorencoder-integrations"
+        }
+      ]
+    },
+    {
+      "id": "b0183",
+      "source": "Matryoshka-aware training for multi-vector models",
+      "spans": [
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://sbert.net/examples/multi_vector_encoder/training/matryoshka/README.html"
+        }
+      ]
+    },
+    {
+      "id": "b0184",
+      "source": "Fast-PLAID",
+      "spans": [
+        {
+          "start": 0,
+          "end": 10,
+          "kind": "a",
+          "href": "https://github.com/lightonai/fast-plaid"
+        }
+      ]
+    }
+  ],
+  "inlineContentBodyHash": "fe87ba9befe9fe6968c77be8ad203cdc9b5b77ec3cb78992268b0a9b8d8af53d",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "from sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\npooling = HierarchicalTokenPooling(pool_factor=4)"
+    },
+    {
+      "id": "c0002",
+      "source": "from sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"lightonai/LateOn\")\ncalibration_embeddings = model.encode_document(calibration_documents)\nthreshold = HierarchicalTokenPooling.calibrate_distance_threshold(calibration_embeddings, target_tokens=16)\npooling = HierarchicalTokenPooling(distance_threshold=threshold)\n\n# Apply pooling, targeting an average of 16 vectors per document\ndocument_embeddings = model.encode_document(documents_to_index, token_pooling=pooling)"
+    },
+    {
+      "id": "c0003",
+      "source": "from sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.losses import (\n    CachedMultiVectorMultipleNegativesRankingLoss,\n    MultiVectorTokenPoolingLoss,\n)\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"answerdotai/ModernBERT-base\", similarity_fn_name=\"maxsim\")\npooling = HierarchicalTokenPooling(pool_factor=4)\n\nbase_loss = CachedMultiVectorMultipleNegativesRankingLoss(model, mini_batch_size=64)\nloss = MultiVectorTokenPoolingLoss(\n    model,\n    base_loss,\n    token_poolings=[None, pooling],\n    weights=[0.5, 0.5],\n)"
+    },
+    {
+      "id": "c0004",
+      "source": "uv run examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py --baseline\nuv run examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py"
+    },
+    {
+      "id": "c0005",
+      "source": "pip install -U huggingface_hub\nhf auth login\n\nhf jobs uv run \\\n    --flavor a10g-small \\\n    --timeout 4h \\\n    --secrets HF_TOKEN \\\n    -- https://raw.githubusercontent.com/huggingface/sentence-transformers/main/examples/multi_vector_encoder/training/token_pooling/training_cached_contrastive.py"
+    },
+    {
+      "id": "c0006",
+      "source": "pip install -U \"sentence-transformers[train,kernels]\""
+    },
+    {
+      "id": "c0007",
+      "source": "model = MultiVectorEncoder(\n    \"answerdotai/ModernBERT-base\",\n    device=\"cuda\",\n    similarity_fn_name=\"maxsim\",\n    use_kernels=True,\n)\npooling = HierarchicalTokenPooling(pool_factor=4)"
+    },
+    {
+      "id": "c0008",
+      "source": "from sentence_transformers import MultiVectorEncoder\nfrom sentence_transformers.multi_vector_encoder.modules import HierarchicalTokenPooling\n\nmodel = MultiVectorEncoder(\"tomaarsen/mve-ModernBERT-base-token-pooling\")\npooling = HierarchicalTokenPooling(pool_factor=4)\n\nqueries = [\"Which planet is known as the Red Planet?\"]\ndocuments = [\n    \"Venus is often called Earth's twin because of its similar size and proximity.\",\n    \"Mars, known for its reddish appearance, is often referred to as the Red Planet.\",\n    \"Jupiter, the largest planet in our solar system, has a prominent red spot.\",\n]\n\nquery_embeddings = model.encode_query(queries)\ndocument_embeddings = model.encode_document(documents, token_pooling=pooling)\n\nprint([len(embedding) for embedding in document_embeddings])\n# [5, 6, 5]\nprint(model.similarity(query_embeddings, document_embeddings))\n# tensor([[16.0037, 25.9879, 22.8159]], device='cuda:0')\n\n# For comparison, the same model without token pooling:\n# [18, 21, 19]\n# tensor([[16.6115, 27.6060, 24.1766]], device='cuda:0')"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "fe87ba9befe9fe6968c77be8ad203cdc9b5b77ec3cb78992268b0a9b8d8af53d",
+  "mediaLayout": [
+    {
+      "mediaId": "image_c9da2f8a5dd50584",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 0
+    },
+    {
+      "mediaId": "image_c9da2f8a5dd50584",
+      "type": "image",
+      "afterBlockId": "b0081",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 1,
+    "savedImages": 1,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-11-11T19:44:27.051882Z",
+  "summaryZh": "多向量嵌入模型的令牌池感知训练。多向量嵌入模型为每个查询令牌提供了在文档中查找匹配项的机会。这使得它们具有出色的搜索表现力，但这些文档向量加起来很快。",
+  "summaryGeneratedAt": "2026-11-11T19:46:35.049797Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
