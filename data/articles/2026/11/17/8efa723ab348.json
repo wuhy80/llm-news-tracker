@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 3,
+  "id": "8efa723ab348",
+  "title": "Reducing token costs and latency in Amazon Bedrock AgentCore JSON workloads",
+  "summary": "As enterprises build production agents with dozens of tools and large structured inputs, token consumption and latency become the primary blockers to a good user experience. When these agents process large JSON data, every additional tool invocation injects the full payload into the large language model (LLM) context window, causing token usage and response latency to spike. Over multi-turn conversations, this pressu",
+  "url": "https://aws.amazon.com/blogs/machine-learning/reducing-token-costs-and-latency-in-amazon-bedrock-agentcore-json-workloads/",
+  "source": "AWS Machine Learning",
+  "sourceDomain": "aws.amazon.com",
+  "publishedAt": "2026-11-17T22:44:51Z",
+  "category": "industry",
+  "tags": [
+    "Agent",
+    "行业应用"
+  ],
+  "score": 87,
+  "signal": "high",
+  "originalUrl": "https://aws.amazon.com/blogs/machine-learning/reducing-token-costs-and-latency-in-amazon-bedrock-agentcore-json-workloads/",
+  "resolvedUrl": "https://aws.amazon.com/blogs/machine-learning/reducing-token-costs-and-latency-in-amazon-bedrock-agentcore-json-workloads/",
+  "fetchedAt": "2026-11-18T07:37:26.313913Z",
+  "contentKind": "feed",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "As enterprises build production agents with dozens of tools and large structured inputs, token consumption and latency become the primary blockers to a good user experience. When these agents process large JSON data, every additional tool invocation injects the full payload into the large language model (LLM) context window, causing token usage and response latency to spike. Over multi-turn conversations, this pressure compounds, driving up costs and degrading response quality. Effectively managing context-window pressure in agentic systems is key to reliability and responsiveness at scale. In this post, we share three composable strategies we used to build a production agent for Flightscape that handles 20 MB+ JSON payloads. You can apply them to reduce token costs, lower latency, and maintain full reasoning capability across extended sessions. Together, these optimizations reduced token consumption by up to 71% and cut average latency by up to 80% across our benchmark runs on a representative 23 MB payload.\n\nFlightscape is an airline operations platform that helps airlines plan and manage their crews, flights, and operations. As part of Flightscape’s crew management capabilities, we built a Training Schedule Optimization agent that verifies crew training schedule assignments against business rules. With 40+ tools and JSON inputs in megabytes, this agent could answer complex queries across crew assignments, scheduling, and resource allocation. Although the agent delivered the required functionality, average request latencies exceeded 15 seconds across most calls. Every tool call injected its full payload into the model context, inflating token counts and costs. On larger datasets, the context window filled up before the agent could finish reasoning. The following diagram (Figure 1) details the agentic architecture and data flow:\n\nFigure 1: Agent architecture and data flow\n\nIn Figure 1, the Optimizer receives a Request JSON and produces a Response JSON, which is then validated by a Business Rules Validator to generate a Validation Report JSON. All three JSON documents are ingested by an AI Agent that provides a conversational interface for users to query optimization results, understand validation errors, and explore scheduling assignments. The agent is built with LangGraph , an open source framework by LangChain, and runs on Amazon Bedrock AgentCore , a platform to build, connect, and optimize agents at scale, with any framework or model. Amazon Bedrock Guardrails can be applied to validate and filter the agent’s conversational responses, helping facilitate responsible AI practices in production deployments. We defined a custom agent state that holds the data needed by our tools: optimization request JSON, optimization response JSON, and validation report JSON. We also added basic statistics and cache data to state for rich queries. The agent uses an Amazon Bedrock model for reasoning and Amazon Bedrock AgentCore memory , a capability of Amazon Bedrock AgentCore, to persist chat interactions across turns, and each turn follows this flow (Figure 2):\n\nThis is what the state structure looks like. The state references TOPT (Training Optimizer) request and response objects, which represent the crew scheduling inputs and optimization results:\n\n```\nclass GraphState(TypedDict):\n    \"\"\"LangGraph state that combines messages with application data.\"\"\"\n    # Messages from conversation (managed by add_messages reducer)\n    messages: Annotated[List[BaseMessage], add_messages]\n    # Application-specific state - parsed domain objects\n    request: Optional[TOPTRequest]\n    responses: List[TOPTResponse]\n    validation_report: Optional[Dict[str, Any]]\n    basic_stats: Optional[Dict[str, Any]]\n    cache_data: Optional[Dict[str, Any]]\n```\n\nNote: This state originally held heavy payloads inline. Later sections explain how we moved large artifacts out of conversational context to reduce token usage.\n\nWe implemented three strategies to reduce the token costs, latency, and memory overhead caused by passing large JSON payloads through the model context. The following diagram (Figure 3) shows how the three strategies fit into a single agent turn. Strategy 1 runs at the start and end of each turn, and Strategies 2 and 3 run each time a tool returns a result.\n\nFigure 3: Overview of the three optimization strategies in one agent turn\n\nAt the start of a turn, the hydrate_state() function restores lightweight session state from AgentCore memory. When a tool returns an oversized list or dictionary, the agent stores the full result in Amazon Simple Storage Service (Amazon S3) and passes the model a compact summary with a handle. The model can then retrieve more detail with get_result_page_tool() . At the end of the turn, the dehydrate_state() function writes heavy payloads to the S3ArtifactStore and saves only references to AgentCore memory. The following sections describe each strategy in detail.\n\nTo implement these strategies, make sure the following are in place:\n\n- An AWS account with access to Amazon Bedrock and a supported model.\n\n- An Amazon S3 bucket for artifact storage.\n\n- Amazon Bedrock AgentCore with Amazon Bedrock AgentCore memory enabled for session-state persistence.\n\n- A LangGraph-based agent (or equivalent graph-orchestration framework) with tool-calling support.\n\n- A Python 3.12+ environment with boto3 , langchain-core , and langgraph .\n\n## Optimization strategies\n\nThe companion code is available in this GitHub repository .\n\n### Strategy 1: Persist lightweight session state, offload heavy artifacts\n\nOur first optimization was to change how we persist session state. Initially, large payloads were being stored too close to the conversational state. We therefore moved heavy artifacts (request JSON, response JSON, validation data, and other large derived payloads) to Amazon S3. AgentCore memory then persists only stable references to these objects, keeping the session state lightweight.\n\nTo support this, we introduced a dedicated persisted-state schema that keeps only lightweight fields and artifact references. The live graph state still includes parsed domain objects for tool execution, but persistence now writes a dehydrated form. At runtime, tools hydrate heavy payloads on demand using those references, instead of loading everything on every turn.\n\nThis PersistedState schema is what gets written to AgentCore Memory:\n\n```\nclass PersistedState(TypedDict, total=False):\n    \"\"\"Serialized session state for AgentCore Memory.\n\n    Heavy fields (request, responses) are stored in S3 and referenced by key.\n    Lightweight fields are stored inline.\n    \"\"\"\n    messages: List[Any]  # LangChain-serialized messages\n    request_ref: Optional[str]  # S3 key for raw request JSON\n    responses_ref: Optional[str]  # S3 key for raw responses JSON list\n    cache_data_ref: Optional[str]  # S3 key for cache_data payload\n    validation_report_ref: Optional[str]  # S3 key for validation_report payload\n    basic_stats_ref: Optional[str]  # S3 key for basic_stats payload\n```\n\nThe updated GraphState mirrors these references alongside the live domain objects:\n\n```\nclass GraphState(TypedDict):\n    \"\"\"LangGraph state that combines messages with application data.\"\"\"\n    messages: Annotated[List[BaseMessage], add_messages]\n    # ... (same domain fields as original graph state)\n    # Artifact references for persistence\n    request_ref: Optional[str]  # S3 key reference for raw request JSON\n    responses_ref: Optional[str]  # S3 key reference for raw responses JSON list\n    cache_data_ref: Optional[str]  # S3 key ref for cache_data payload\n    validation_report_ref: Optional[str]  # S3 key ref for validation_report payload\n    basic_stats_ref: Optional[str]  # S3 key ref for basic_stats payload\n```\n\nThe dehydrate_state function strips heavy payloads from the live state and returns the lightweight persisted form along with the artifacts to upload:\n\n```\ndef dehydrate_state(state: GraphState) -> Tuple[PersistedState, Dict[str, Any]]:\n    persisted: PersistedState = {\n        \"messages\": [dumpd(m) for m in state.get(\"messages\") or []],\n        \"request_ref\": state.get(\"request_ref\"),\n        \"responses_ref\": state.get(\"responses_ref\"),\n        # ... (remaining ref fields)\n    }\n    artifacts: Dict[str, Any] = {}\n    if state.get(\"request_raw\") is not None:\n        artifacts[\"request_ref\"] = state[\"request_raw\"]\n    # ... (see GitHub repository for full implementation)\n    return persisted, artifacts\n```\n\nRehydration reverses this process. When a session resumes, we rebuild the live graph state: deserialize LangChain messages, re-parse raw payloads into domain objects, and restore every reference key so later turns can locate their artifacts:\n\n```\ndef hydrate_state(\n    persisted: PersistedState,\n    request_raw: Optional[Dict[str, Any]] = None,\n    responses_raw: Optional[List[Dict[str, Any]]] = None,\n) -> GraphState:\n    \"\"\"Reconstruct a live GraphState from its persisted form.\"\"\"\n    messages = [load(m, allowed_objects=\"messages\") for m in persisted.get(\"messages\") or []]\n    request = TOPTRequest.from_dict(request_raw) if request_raw else None\n    responses = [TOPTResponse.from_dict(r) for r in (responses_raw or [])]\n    return {\n        \"messages\": messages, \"request\": request, \"responses\": responses,\n        # ... (remaining fields restored from persisted refs, see GitHub repository)\n    }\n```\n\nBoth dehydration and rehydration rely on the artifact store returning a consistent reference for each payload. Instead of minting a random key, we derive the reference from the payload itself. This approach, known as content addressing, serializes the JSON with sorted keys and compact separators, and uses the SHA-256 digest of those bytes as the reference.\n\nThe _content_hash helper produces a deterministic SHA-256 reference from a JSON-serializable payload:\n\n```\ndef _content_hash(payload: Any) -> str:\n    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()\n```\n\nContent addressing makes writes idempotent. Identical payloads map to the same key, so a turn that re-serializes an unchanged request JSON reuses the object already in the bucket instead of uploading it again. The S3-backed store exposes a put_json and get_json interface. It also keeps a small in-process cache, so payloads already read or written during the current invocation do not require a second S3 round trip.\n\nThe S3ArtifactStore class wraps the put_json / get_json interface with an in-process cache and content-addressed keys:\n\n```\nclass S3ArtifactStore:\n    \"\"\"Content-addressed artifact store backed by Amazon S3.\"\"\"\n    def __init__(self, bucket=None, prefix=None, region=None) -> None:\n        self.bucket = bucket or os.getenv(\"SESSION_STATE_BUCKET\")\n        self.prefix = (prefix or os.getenv(\"ARTIFACT_STORE_PREFIX\", \"artifacts\")).strip(\"/\")\n        # ... (boto3 session setup, see GitHub repository)\n        self._cache: Dict[str, Any] = {}\n\n    def put_json(self, payload: Any) -> str:\n        ref = _content_hash(payload)\n        with self._lock:\n            if ref in self._cache:\n                return ref  # Identical content already uploaded, skip PUT\n            self._s3.put_object(Bucket=self.bucket, Key=self._key(ref), Body=_canonical_bytes(payload))\n            # ... (cache update)\n            return ref\n\n    def get_json(self, ref: str) -> Any:\n        with self._lock:\n            if ref in self._cache:\n                return self._cache[ref]\n        # ... (S3 fetch and cache, see GitHub repository)\n\nartifact_store = S3ArtifactStore()\n```\n\nOffloading heavy artifacts to S3 and persisting only lightweight references reduced per-turn latency and the volume of data stored in AgentCore memory. With heavy payloads no longer persisted inline, tool-call responses became the dominant consumer of context tokens, prompting us to introduce result paging.\n\n### Strategy 2: Page large result lists on demand\n\nEven after moving heavy payload persistence to Amazon S3, we still had a major token bottleneck at tool-response time. Many tool results were too large, which created two problems. First, we were sending full lists to the model even when it only needed a small subset, making each turn slower and more expensive. Second, those full list payloads were injected into context, which quickly consumed the context window over multi-turn conversations.\n\nIn some cases, a single tool response exceeded 80,000 tokens, and the cost compounded as users continued interacting with the agent. We wanted to preserve full data access without sending everything by default. To solve this, we introduced on-demand result paging for large tool outputs. Instead of returning full lists, tools now return a compact payload with total count, a small sample, and a result handle.\n\nWhen a tool result exceeds the sample-size threshold, the full list is stored in S3 and only a compact summary is returned to the model:\n\n```\nif len(result) > _LLM_SAMPLE_SIZE:\n    handle = artifact_store.put_json(result)\n    return json.dumps(\n        {\n            \"_oversized\": True,\n            \"_result_handle\": handle,\n            \"total\": len(result),\n            \"sample\": result[:_LLM_SAMPLE_SIZE],\n        },\n        default=str,\n    )\n```\n\nThe handle points to the complete result stored in S3. When the agent needs more detail, it calls a paging tool with the handle and requests only the required slice, for example using offset and limit.\n\nThe get_result_page_tool function lets the model retrieve additional slices of a stored result by handle, offset, and limit:\n\n```\ndef get_result_page_tool(handle: str, field: Optional[str] = None, offset: int = 0, limit: int = 50):\n    payload = artifact_store.get_json(handle)\n    if isinstance(payload, list):\n        return {\n            \"handle\": handle, \"offset\": offset, \"limit\": limit,\n            \"total\": len(payload),\n            \"items\": payload[offset: offset + limit],\n        }\n    # ... (dict field extraction, see GitHub repository)\n```\n\nOn-demand paging kept the full list in S3 and served only the requested slice per turn, controlling context growth and significantly reducing token usage. However, not all oversized outputs were lists. Some tools returned large dictionaries that required a different compaction approach.\n\n### Strategy 3: Compact oversized dictionary outputs\n\nUnlike lists, dictionary outputs contain deeply nested structured data that are useful for reasoning but typically too expensive to include verbatim on each turn. We needed a compact representation that preserved structural cues while drastically cutting the token footprint.\n\nTo solve this, we introduced descriptor-based compaction for oversized dictionary outputs. Instead of returning an oversized dictionary in full, we return a compact descriptor:\n\n- List fields are represented by count and sample.\n\n- Nested dictionaries are summarized by key count.\n\n- Scalar values remain inline where useful.\n\nThe full payload is stored in the artifact store, and the response includes a result handle. When the agent needs deeper detail, it uses that handle to fetch only the required data. This response format remained navigable for the model while significantly reducing unnecessary token usage.\n\nThe _oversized_descriptor function builds a compact structural summary of a dictionary payload, preserving field types and sample data without the full content:\n\n```\ndef _oversized_descriptor(payload: Dict[str, Any], handle: str) -> Dict[str, Any]:\n    fields: Dict[str, Any] = {}\n    for key, value in payload.items():\n        if key.startswith(\"_\"):\n            continue\n        if isinstance(value, list):\n            fields[key] = {\"type\": \"list\", \"count\": len(value), \"sample\": value[:5]}\n        elif isinstance(value, dict):\n            fields[key] = {\"type\": \"dict\", \"keys\": len(value)}\n        else:\n            fields[key] = {\"type\": \"scalar\", \"value\": value}\n    return {\"_oversized\": True, \"_result_handle\": handle, \"fields\": fields}\n```\n\nIf the serialized output still exceeds the character limit, the fallback stores the full payload and replaces the response with its descriptor:\n\n```\ncontent = json.dumps(llm_view, default=str)\nif len(content) > _MAX_TOOL_CONTENT_CHARS:\n    if handle is None:\n        handle = artifact_store.put_json(full_view)\n    content = json.dumps(_oversized_descriptor(full_view, handle), default=str)\nreturn content\n```\n\nWith lightweight persisted state, on-demand paging, and dictionary compaction in place, token growth became predictable and the agent stayed responsive even on multi-megabyte datasets.\n\nTo validate the impact of these three strategies, we ran the same set of questions over the same dataset against both the pre-optimization and optimized versions of the agent. We then compared token usage and latency in Amazon Bedrock AgentCore Observability (a capability of AgentCore), and observed clear improvements in both cost and responsiveness.\n\nAcross a 5-question conversation run, total token usage dropped by approximately 71%, from ~289,500 to ~82,900 tokens, while average trace latency decreased by nearly 80%, from 15.4 s to 3.1 s (Figure 4). Across 100 sample questions (Figure 5), total tokens fell from 23.6 M to 8.5 M (64%) and average trace latency dropped from 7,930 ms to 2,461 ms (69%).\n\nFigure 4: OTEL sessions comparison\n\nFigure 5: OTEL sessions comparison across 100 sample questions\n\nThe effect was most dramatic on large single-turn payloads. Table 1 breaks down the per-turn impact for the heaviest single query (listing valid crews across every validation category).\n\nTable 1: Input, output, and latency impact\n\nFigure 6 and Figure 7 show the corresponding trace details before and after optimization.\n\nFigure 6: Before trace detail\n\nFigure 7: After trace detail\n\nThese gains came primarily from avoiding full payload injection into model context at every turn. Instead, the model now receives compact summaries first and fetches additional detail only when needed.\n\nFigure 8: Compact summary event\n\nThe improvement was also visible in the trace timelines: the pre-optimization turn stretched to nearly 2 minutes 46 seconds, while the optimized turn completed in about 15 seconds (Figure 9).\n\nFigure 9: Before and after timeline\n\nThe changes also improved behavior in longer conversations. Context growth became more predictable across turns, and the agent remained responsive even when users asked follow-up questions over large datasets. In practice, this shifted the system from compounding token cost to a more controlled, demand-driven access pattern.\n\nMost importantly, these gains came without sacrificing capability. Full payloads remain in artifact storage and can be retrieved through handles whenever deeper inspection is needed. At Flightscape, this pattern provides a foundation for bringing conversational AI capabilities to complex airline operations workflows, keeping the underlying AI experience scalable and cost efficient.\n\nTo avoid ongoing charges, delete the resources you created for this walkthrough:\n\n- Empty and optionally delete the S3 bucket used for the artifact store, or remove all objects under the artifact prefix (for example, artifacts/).\n\n- Delete any Amazon Bedrock AgentCore agents and associated AgentCore memory sessions created during testing.\n\n- Remove AWS Identity and Access Management (IAM) roles and policies created for S3 or Bedrock access.\n\n- Delete Amazon CloudWatch log groups generated by the agent runtime.\n\n- Remove any Amazon Virtual Private Cloud (Amazon VPC) endpoints or networking resources provisioned for this walkthrough.\n\nIf your Amazon Bedrock AgentCore agent handles large JSON data, start by identifying which tool outputs dominate your context window. Begin with offloading artifacts to S3 (Strategy 1) because it provides the foundation for the other optimizations, then add paging (Strategy 2) and compaction (Strategy 3) as needed to improve the token usage and latency of your agents. To get started, clone the GitHub repository and adapt the strategies to your own agent. To learn more about building agents with AgentCore and LangGraph, see the Amazon Bedrock AgentCore documentation and the LangGraph framework documentation .",
+  "images": [
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-1.png",
+      "alt": "Architecture diagram: the optimization workflow outputs request, response, and validation report JSON, which an AI agent reads to answer user questions through a chat interface",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-1.png",
+      "id": "image_dadc82f206d2730f"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/13/ML-21786-2.png",
+      "alt": "Diagram of one agent turn: hydrate session state, run tool calls, then dehydrate state back to storage",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/13/ML-21786-2.png",
+      "id": "image_400f7343a7551285"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/13/ML-21786-3.png",
+      "alt": "Flow diagram of one agent turn. At the start of the turn, hydrate_state() restores lightweight session state from AgentCore memory. Tool results are checked for size: oversized lists return a count, a sample, and a handle (Strategy 2), and ",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/13/ML-21786-3.png",
+      "id": "image_ec3378cd2c52d132"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-4.png",
+      "alt": "Bar chart comparing total token usage and average latency before and after optimization for a 5-question run",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-4.png",
+      "id": "image_c2c37507ff474da0"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-5.png",
+      "alt": "Bar chart comparing total tokens and average latency before and after optimization across 100 sample questions",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-5.png",
+      "id": "image_b936ca5c66e65401"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-6.png",
+      "alt": "Observability trace timeline before optimization showing many spans and long per-turn latency",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-6.png",
+      "id": "image_3a4a09a643166b4a"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-7.png",
+      "alt": "Observability trace timeline after optimization showing fewer spans and much shorter latency",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-7.png",
+      "id": "image_4b3943d699e29fdc"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-8.png",
+      "alt": "Trace event showing the agent receiving a compact summary with a result handle instead of the full payload",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-8.png",
+      "id": "image_c0b3ee1d21dba4ba"
+    },
+    {
+      "src": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-9.png",
+      "alt": "Side-by-side trace timelines: about 2 minutes 46 seconds before optimization versus about 15 seconds after",
+      "originalUrl": "https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2026/11/17/ml-21786-Figure-9.png",
+      "id": "image_74c01a725251a8c5"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "b307ee8e0f59e8427d1191c93c0fc9f49c295a920d20bba47c4d3a7eb3c993e3",
+  "mediaLayout": [
+    {
+      "mediaId": "image_dadc82f206d2730f",
+      "type": "image",
+      "afterBlockId": "b0002",
+      "order": 2
+    },
+    {
+      "mediaId": "image_400f7343a7551285",
+      "type": "image",
+      "afterBlockId": "b0004",
+      "order": 5
+    },
+    {
+      "mediaId": "image_ec3378cd2c52d132",
+      "type": "image",
+      "afterBlockId": "b0007",
+      "order": 10
+    },
+    {
+      "mediaId": "image_c2c37507ff474da0",
+      "type": "image",
+      "afterBlockId": "b0048",
+      "order": 62
+    },
+    {
+      "mediaId": "image_b936ca5c66e65401",
+      "type": "image",
+      "afterBlockId": "b0049",
+      "order": 64
+    },
+    {
+      "mediaId": "image_3a4a09a643166b4a",
+      "type": "image",
+      "afterBlockId": "b0053",
+      "order": 69
+    },
+    {
+      "mediaId": "image_4b3943d699e29fdc",
+      "type": "image",
+      "afterBlockId": "b0054",
+      "order": 71
+    },
+    {
+      "mediaId": "image_c0b3ee1d21dba4ba",
+      "type": "image",
+      "afterBlockId": "b0056",
+      "order": 74
+    },
+    {
+      "mediaId": "image_74c01a725251a8c5",
+      "type": "image",
+      "afterBlockId": "b0058",
+      "order": 77
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 9,
+  "mediaLayoutStatus": "complete",
+  "mediaLayoutCheckedAt": "2026-11-18T07:37:26.338031Z",
+  "articleKind": "feed"
+}
