@@ -1,0 +1,2942 @@
+{
+  "schemaVersion": 3,
+  "id": "6dc4436307ac",
+  "title": "Introducing harness adapters: adapt your favorite model to your harness to improve performance and cost",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/harness-adapters-at-scale",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-20T00:00:00Z",
+  "category": "release",
+  "tags": [
+    "模型发布"
+  ],
+  "score": 82,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/harness-adapters-at-scale",
+  "resolvedUrl": "https://huggingface.co/blog/harness-adapters-at-scale",
+  "fetchedAt": "2026-11-20T20:31:00.071863Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Combining RL on a custom task distribution with your favorite agent harness yields more accurate and efficient models for that target harness and task distribution.\n\nModels are not fully optimized for all harnesses and the tasks you’re doing. Instead, they target general performance. So when you combine a model and harness, you’re leaving performance and efficiency on the table for the stuff you’re actually doing. With RL, you can train a custom harness adapter that squeezes everything out of your model for your harness and task combination.\n\nTake Qwen3.8-27B, its Terminal-Bench 2.1 score with the pi harness is 39% which uses on average 2.9K tokens per task. If we freeze those weights and add a custom RL-trained LoRA adapter we can get 55% pass@1, with average token usage of 1.5K. Most of this is down to the model reasoning less, calling less tools, and performing better first time.\n\nOur earlier work (multi-harness RL, harness adapters) showed that RL on your own task distribution, inside your own harness, gives a more accurate and more efficient model. Those experiments covered data-analysis and code-building tasks. Here we wanted to push this further by exploring whether the result holds at 27B, on harder real-world software engineering tasks, across three harnesses: Pi, OpenCode and Hermes Agent. And most of all, share a fully reusable recipe, so you can reproduce this on your own task, harness, model combinations.\n\n## TL;DR\n\n- We trained one LoRA adapter for Qwen3.8-27B per agent harness (pi, Hermes Agent, OpenCode), with RL inside the harness itself.\n\n- Datasets, training and agent rollouts all happen on the Hub in Jobs using TRL's AsyncGRPOTrainer, OpenEnv and harbor.\n\n- Each harness adapter beats the base model under its own harness on both benchmarks, for both performance and efficiency.\n\n- The three LoRAs are also merged into a single super adapter that runs unchanged under pi, Hermes Agent and OpenCode.\n\n- All artifacts (adapters, GGUFs, RL tasks, safeagents plugin) can be browsed through this Hugging Face collection.\n\n## Table of Contents\n\n- Training inside agent harnesses\n\n- Generating custom RL tasks on Hugging Face\n\n- Testing the filters with short training runs\n\n- AsyncGRPOTrainer for more efficient GRPO training\n\n- Training setup\n\n- Super-adapter: merging all adapters into one\n\n- Final results\n\n- Open question: What did the model really learn to do?\n\n- Closing words and future directions\n\n## Training inside agent harnesses\n\nWe leverage the Harbor integration in OpenEnv and TRL’s OpenEnv guide to train the model inside the harnesses we chose for the final training. We have built ready-to-use docker images for all our RL tasks that come with the target harnesses already pre-installed inside. In our final docker images, we use Pi 1.5.2, OpenCode 2.2.7 and Hermes Agent v0.22.6. The diagram below from the aforementioned blogpost explains well the entire protocol:\n\nMost RL frameworks train a re-implementation of the agent loop: the agent is written against the framework's own interface, such as verl's AgentLoop, SkyRL-Gym environments, rLLM's agent and environment classes, slime's custom rollout functions, or ART's client inside your own Python agent. Here the harness runs exactly as it ships, and the trainer learns from the exact tokens it produced, recorded by a proxy between the harness and vLLM. Recent work moves in the same direction: Agent Lightning v1.0 keeps the deploy-time harness in the loop through a proxy (\"harnessed agentic RL\"), and SkyRL's Harbor integration trains on Harbor trials, converting their chat histories into tokens for the trainer.\n\n## Generating custom RL tasks on Hugging Face\n\nFor this recipe we created a custom dataset for agentic coding with the Hub, OpenEnv, and Repo2RLEnv. We combined together task retrieval of existing RL envs, task generation with Repo2RLEnv, task validation with OpenEnv, and sampling into a single data pipeline. This gave us the highest quality set of validated and relevant tasks to improve Qwen3.8-27B on agentic coding. In this section, we’ll walk through how we built it, so you can try it out on your own domains.\n\nRL training needs tasks the agent can attempt, a verifier that scores each attempt, and evidence that the verifier is right. A verifier that accepts wrong answers teaches the wrong behavior. A task that is already feasible will not teach the model anything.\n\nThis section describes how we built the task set from three sources: two on the Hugging Face Hub and a third generated with Tasksmith, a pipeline in Repo2RLEnv. Every task passes an eligibility screen with openenv validate, and the same difficulty check against the base model, Qwen3.8-27B.\n\n### Three sources\n\nEach task uses the Harbor format, which Terminal-Bench 2.1 also uses. A broad search of the Hub for Harbor environments returned about 59,000 tasks, but they included duplicates, evaluation sets and tasks marked as not for training. We filtered down to just two Hub sources built for training and generated a third set ourselves:\n\n- SWE-smith (Python, Go) injects bugs into real Python and Go repositories, with an LLM rewrite or a mutation such as a flipped operator. The tests that catch each bug become the task's tests. It adds volume.\n\n- SWE-Gym, packaged as Harbor tasks in TaskTrove, turns real GitHub issues and their merged fixes into tasks. It adds real-world bugs.\n\n- Tasksmith generates tasks from merged pull requests. An LLM agent writes the instruction and tests, and Tasksmith checks the result: the reference and a valid alternative must pass, while the unfixed code and a known-wrong solution must fail.\n\nWe used Tasksmith to target gaps. We mapped the skills that our target benchmarks test (Terminal-Bench 2.1, the hard subset of SWE-bench Pro, and DeepSWE), then chose pull requests that exercise them, such as HTTP streaming, filesystem operations and serialization. From 30 merged pull requests, Tasksmith produced 24 tasks in 10 Python repositories that passed its checks, 17 of them on a second run. Its checks do not replace ours, so these tasks go through the same pipeline as the rest.\n\n### Validation with openenv validate\n\nA metadata screen runs first. It keeps tasks from training splits with permissive licenses. It drops duplicates, tasks marked as not for training, the 253 tasks in our target benchmarks, and any task from a repository those benchmarks use. We then ran the semantic checks from openenv validate on every task in fresh trials:\n\n- The reference solution earns the maximum reward (semantic.oracle_max).\n\n- Doing nothing scores clearly lower (semantic.floor_gap).\n\n- No canary scores more than doing nothing (semantic.canary_floor).\n\n- A replay of the reference gives the same reward (runtime.episode_determinism).\n\nEach trial ran as its own Hugging Face Job, which let us validate dozens of tasks at once. openenv validate offers the same option for any Harbor task:\n\n```\nopenenv validate path/to/task --sandbox hf-sandbox\n```\n\n858 of 1,127 Hub candidates passed. Wrong-answer controls caught defects, including a Tasksmith task that accepted an incomplete implementation and a Terminal-Bench 2.1 verifier (regex-log) that accepted known-wrong answers. Most failures were infrastructure problems, such as images that did not start. Failed tasks stay in a rejected split with the failing check recorded.\n\n### Difficulty check with the base model\n\nA valid task can still teach nothing. GRPO (group relative policy optimization) scores each attempt against the other attempts at the same task, so a task where every attempt passes, or every attempt fails, gives no learning signal. Before training, Qwen3.8-27B attempted each task 4 times, or 8 times for a stratified sample of six tasks per repository.\n\nOf 442 scored tasks, Qwen3.8-27B solved 151 every time and 120 never. The 171 tasks it solved only sometimes form the qualified set. The figure below shows how the scores pile up at both ends and how they differ by source. The model solves most Go tasks every time, fails every attempt on more than a third of the SWE-smith Python tasks, and lands in the middle on 73% of the SWE-Gym tasks.\n\nQwen3.8-27B results on 442 scored tasks. Green marks the qualified tasks, which the model solves on some attempts but not all.\n\nThis example shows how we filtered and validated 1,127 tasks to 278 which we included directly in the final dataset. The pipeline then took the remaining 522 rejected tasks, repaired and complexified them with Tasksmith and repeated validation.\n\n## Testing the filters with short training runs\n\nThe pipeline applies two filters: validation removes broken tasks, and the difficulty check keeps tasks the base model solves only sometimes. This section tests whether those filters change what the model learns. We trained four short runs of up to 50 steps, each on tasks from a different stage of the pipeline, and compared them with the base model on Terminal-Bench 2.1.\n\nEach run trains Qwen3.8-27B with LoRA and GRPO, using TRL's AsyncGRPOTrainer, on 32 tasks. All four use the same agent harness (OpenCode with up to 48 model calls), the same settings and one 8×H200 Hugging Face Job, and the reward is the verifier's pass or fail. The task sets differ in how they were filtered:\n\n- Unvalidated: 24 accepted tasks plus 8 that failed validation.\n\n- Validated: 32 accepted tasks, chosen without regard to difficulty.\n\n- Unqualified: 32 accepted tasks that the base model always or never solves.\n\n- Qualified: 32 accepted tasks that the base model solves on some attempts.\n\nThe figure below shows how the tasks impacted model learning. The table lists each run's steps and the checkpoint we evaluate. The chart tracks training reward across subsets of tasks with differing validation status.\n\n### The dataset\n\nharness-hub/agentic-coding-envs holds 871 tasks from 35 repositories. Hub tasks are capped at 40 per repository, so no single project dominates. The table below shows what each source contributes. The dataset has two views: every accepted task, and the qualified subset for GRPO training. Rejected attempts stay in a separate config.\n\nSource\n\nTask type\n\nTasks\n\nQualified\n\nSWE-smith\n\nInjected bugs in Python and Go\n\n717\n\n144\n\nSWE-Gym (TaskTrove)\n\nReal GitHub issues\n\n130\n\n27\n\nTasksmith\n\nGenerated from merged pull requests\n\n24\n\n22\n\nTotal\n\n—\n\n871\n\n171\n\n## AsyncGRPOTrainer for more efficient GRPO training\n\nWe leveraged the stable version of AsyncGRPOTrainer from TRL, with the main advantage of the trainer being that it does not wait until all rollouts are completed before moving to the next training optimization step.\n\nFor more detailed reading on the trainer and its building blocks, please refer to the AsyncGRPO blogpost.\n\n## Training setup\n\nTo obtain our final harness adapters, we trained LoRA adapters on top of Qwen/Qwen3.8-27B using TRL's AsyncGRPOTrainer. The adapters were attached to the model using the all-linear flag. To maximize the training efficiency, thinking mode was turned off during rollout stages, and we evaluated our final adapter with and without thinking for broader comparison.\n\nThe final reward function consists of the verifier's correctness, combined with a small tool-efficiency bonus (0.1, derived from early experiments from the previous iteration of harness adapters which showed that 0.1 worked best).\n\nWe performed a small LR sweep on 50 steps using Termgrade environments (1e-5, 5e-5 and 1e-4) and noticed that 1e-5 barely moved training correctness (from 0.52 to 0.50), 1e-4 collapsed the rollouts instead of improving them (turns per rollout moved from 18 to 6, with entropy rising), and only 5e-5 clearly improved (from 0.49 to 0.60 by step 40). Longer 5e-5 runs then showed signs of instability (collapsing rollout lengths, rising entropy), so we settled on 2e-5 for the final runs.\n\n### Training infrastructure\n\nEach harness adapter was trained using NVIDIA 2xB200 GPUs, with one GPU allocated for the vLLM server and the other allocated for the training process. We first performed some stress testing to maximize the amount of RL tasks that can be trained within a single optimization step. For that, we ‘maxed out’ the --token-budget argument from AsyncGRPOTrainer to its limit for the setup that we had. The chart below shows the evolution of the number of groups per step for each harness (in blue: Pi, green: OpenCode and orange: Hermes).\n\nAs the model gets better and better during training, it is able to fit more and more groups during each training step, which diversifies the signals that the model gets at each optimization step.\n\n### Final mixture\n\nThe final data mixture consists of 750 tasks from harness-adapters RL environments and 300 tasks from termgrade. In order to maximize the diversity of the sampled tasks during training, we have slightly customized the data sampling strategy, which will be explained below:\n\nBefore training, the tasks are put in a fixed order that interleaves them by family (i.e., their repository for our generated RL environments. For Termgrade, we just sorted them by name since each task is considered as its own family), so every training step mixes as many repositories as possible while following the distribution of the mixture.\n\n### safeagents in the loop\n\nWe also plug the safeagents tool, in order to block any misbehavior from the model during training. The final plugin (which consists of the regex and pattern rules specific to the RL tasks and test path) is hosted in harness-hub/qwen-safeagents-plugin and can be used out of the box using the latest version of safeagents in case anyone wants to reproduce the training setup.\n\nThe number of blocked tools from safeagents decreases consistently during training, which indicates that the model gets ‘safer and safer’ after each optimization step. Below is a diagram of the safeagents blocked calls per 1000 tool calls, by training step, for each harness adapter.\n\n## Super-adapter: merging all adapters into one\n\nMerging models often combines their capabilities while keeping most of what each one could do. Once the three harness adapters were trained, we asked two questions. Does merging them cost accuracy? And can a single \"super-adapter\" be accurate and efficient under every harness?\n\nWe started by comparing the weight updates of the three adapters, layer by layer. The cosine similarity between any two of them is about 0.01–0.02: each adapter pushed the model in a nearly orthogonal direction during training. That's the best case for merging, since the updates barely interfere.\n\nWe concatenate the three LoRA adapters along the rank dimension (PEFT's combination_type=\"cat\"). The merged adapter has rank 96 (3 × 32) and applies exactly w · (ΔW_pi + ΔW_hermes + ΔW_opencode). Prior work on merging (task arithmetic, TIES, KnOTS) finds that scaling each update below 1 works best, so we compared three weights on all 89 Terminal-Bench 2.1 tasks, under each harness, with the step-120 adapters:\n\n- ⅓ (the average): each harness keeps only a third of its own update.\n\n- ½: each update at half strength.\n\n- 1 (the plain sum): every update applied in full.\n\nWeight\n\npi\n\nhermes\n\nopencode\n\nAll three harnesses\n\nTool calls per task\n\nbase model\n\n39.1%\n\n46.0%\n\n44.8%\n\n43.3%\n\n49.2\n\n⅓ (average)\n\n49.4%\n\n51.2%\n\n47.1%\n\n49.2%\n\n35.6\n\n½\n\n48.8%\n\n53.5%\n\n55.2%\n\n52.5%\n\n25.9\n\n1 (sum)\n\n40.2%\n\n62.8%\n\n47.1%\n\n50.0%\n\n13.4\n\nThe plain sum over-applies the updates. The agents become very short (13 tool calls per task, against 49 for the base model), and while Hermes peaks at 62.8%, pi falls back to the base model's level. The average dilutes each harness's own update. ½ gives the best balance, so we built the final super-adapter from the released checkpoints (pi step 160, hermes step 160, opencode step 150) at weight ½.\n\n### Adapter merging evaluation results\n\nUnder each harness, on the tasks every run graded (50–51 on SWE-bench Pro, 82–85 on Terminal-Bench 2.1), one attempt per task (in parentheses, the efficiency gain with respect to the base model):\n\nHarness\n\nBenchmark\n\nQwen3.8-27B\n\nQwen3.8-27B-<harness>-adapted\n\nQwen3.8-27B-super-adapter\n\nQwen3.8-27B, thinking\n\nQwen3.8-27B-super-adapter, thinking\n\npi\n\nSWE-bench Pro (hard 51)\n\n40.0%\n\n64.0% (−60%)\n\n46.0% (−73%)\n\n74.0%\n\n74.0% (−48%)\n\nhermes\n\nSWE-bench Pro (hard 51)\n\n29.4%\n\n43.1% (−56%)\n\n47.1% (−60%)\n\n45.1%\n\n60.8% (−36%)\n\nopencode\n\nSWE-bench Pro (hard 51)\n\n35.3%\n\n51.0% (−72%)\n\n45.1% (−63%)\n\n47.1%\n\n66.7% (−31%)\n\npi\n\nTerminal-Bench 2.1\n\n40.0%\n\n56.5% (−56%)\n\n48.2% (−56%)\n\n52.9%\n\n57.6% (−25%)\n\nhermes\n\nTerminal-Bench 2.1\n\n44.7%\n\n58.8% (−70%)\n\n55.3% (−53%)\n\n58.8%\n\n63.5% (−19%)\n\nopencode\n\nTerminal-Bench 2.1\n\n47.6%\n\n52.4% (−53%)\n\n52.4% (−68%)\n\n54.9%\n\n58.5% (−22%)\n\n\"Thinking\" is the chat template's thinking mode at its default effort (xhigh). The specialists were trained and served with thinking off.\n\nWith thinking off, the super-adapter improves on the base model on all six harness–benchmark pairs (mean pass@1 39.5% → 49.0%; 71 tasks newly solved vs 34 lost, p < 0.001).\n\nDespite not being trained at all with thinking on, it's the strongest model we evaluated with thinking mode. Against the base model thinking at the same effort, it wins on five of six pairs and ties the sixth (mean 55.5% → 63.5%; 67 newly solved vs 37 lost, p = 0.004). The largest gains are on SWE-bench Pro: +16 points under hermes and +20 under opencode. Under pi on SWE-bench Pro, where thinking alone already reaches 74%, it ties.\n\nUse the specialist harness adapters when thinking off. Each harness's own adapter is ahead on four of six pairs, by the most under pi (64.0% vs 46.0% on SWE-bench Pro, 56.5% vs 48.2% on Terminal-Bench). Splitting one model across three harnesses costs pi the most of its gain. If you only use one harness and keep thinking off, take its specialist.\n\nThe super adapter is also much more efficient. On the tasks both the base model and the super-adapter solve, with thinking off, it makes 53–73% fewer tool calls and generates 44–60% fewer tokens per task, with fewer tool calls on 111 of 130 tasks. With thinking on, it still cuts tool calls by 31–48% and tokens by 24–43% on SWE-bench Pro. On Terminal-Bench, tool calls drop by 19–25% and token counts stay about the same.\n\nThe ½ weight was chosen on Terminal-Bench 2.1 with the step-120 adapters, so the Terminal-Bench numbers are slightly optimistic; SWE-bench Pro played no part in the choice. Full paired results are in the super-adapter's model card.\n\n## Final results\n\nThis section reports what happened during training, then how the adapters score on held-out benchmarks inside and outside their own harnesses.\n\n### Training results\n\nTraining ran for a cumulative total of 598 steps, with a total of 78,114 samples trained, which consists exactly of 167M trained tokens.\n\nDuring training, we see a clear signal that the model learns to solve tasks in fewer and fewer steps, with no clear sign of saturation. Despite having some clear increasing trend sometimes, training correctness seems to overall stay flat. This can be explained by the fact that the model meets new tasks during training, but the number of groups that fit in a step’s token budget more than doubles as trajectories get shorter. The accuracy gains show up on the held-out benchmarks in the section below.\n\nOn the other hand, safeagents was able to block multiple suspicious attempts. Across the three training runs, a total of 1.3M tool calls have been checked, and a total of 647 tool calls have been blocked.\n\n### Evaluation results\n\nThis section covers the evaluation setup, the in-harness results, transfer across harnesses, and an out-of-distribution check.\n\n#### Evaluation setup\n\nWe evaluate each adapter inside the harness it was trained in, on two agentic coding benchmarks: all 89 tasks of Terminal-Bench 2.1 (1 hour and 100 agent steps per task) and the 51 hardest tasks of SWE-bench Pro (2 hours and 100 agent steps). We cap the maximum number of tokens per task to be 131072. We do not tune the agent settings and use the default setup for all harnesses. For example, Pi does not keep previous reasoning turns while OpenCode and Hermes do, which mainly affects the SWE-bench Pro results due to rapid context overflow. Therefore you cannot compare the results across different harnesses (using Pi does not necessarily lead to better results than Hermes or OpenCode), but it is fair to compare results within the same harness and draw conclusions.\n\nEvery rollout runs through the same Harbor and OpenEnv stack as training, in HF sandboxes, with one attempt per task at temperature 0.8 and thinking off. Each LoRA checkpoint is merged into the base weights and served alone with vLLM on a single GPU, at the same concurrency as the base model's eval.\n\nFor all the evaluation benchmarks, we report the pass@1 as well as the number of tool calls, total turns, for all tasks and for solved tasks.\n\nFor openness, all model trajectories for final evaluations are pushed in this public bucket: harness-hub/harness-adapters-trajectories.\n\n#### Final evaluation results\n\nAll three specialist adapters beat the base model under their own harness, on both benchmarks. On SWE-bench Pro (hard 51), pi goes from 39.2% to 64.7% (+25.5 points: 15 tasks newly solved vs 2 lost, p = 0.002), hermes from 29.4% to 43.1%, and opencode from 35.3% to 51.0%. On the full Terminal-Bench 2.1, pi gains +16.3 points (16 vs 2, p = 0.001) and hermes +14.1 (19 vs 7, p = 0.03). Opencode gains +6.0 overall, and +13.6 on the 66 tasks that played no part in choosing its checkpoint (12 vs 3, p = 0.035).\n\nThe adapters also solve tasks much more efficiently: on the tasks both they and the base model solve, they make 56–72% fewer tool calls per task on SWE-bench Pro and 53–70% fewer on Terminal-Bench 2.1. The single super-adapter beats the base model under all three harnesses too (+6 to +18 points on SWE-bench Pro, +5 to +10 on Terminal-Bench 2.1), with just as large a cut in tool calls (53–73%). It keeps less of each specialist's gain with thinking off, most under pi, but with thinking on it beats the base model thinking at the same effort on five of six harness–benchmark pairs (see the super-adapter section). Each model card has the full paired results.\n\n#### Does the efficiency and performance ability transfer across harnesses?\n\nTo answer this question, we also evaluated the pi harness adapter under Hermes Agent and OpenCode.\n\nUnder OpenCode it matches OpenCode's own specialist on Terminal-Bench 2.1 (44.8% → 54.0%, against 46.4% → 52.4%). Under Hermes it keeps about two-thirds of the specialist's gain (46.3% → 56.1%, against 44.7% → 58.8%), with the same ~45% cut in tool calls in both. Therefore it seems that the newly learned capabilities are transferred across harnesses.\n\n#### Evaluation on out-of-distribution tasks and setup\n\nWhat happens if we evaluate in out-of-distribution tasks, outside the harnesses the adapters have been trained with?\n\nWe ran all five models on 300 AutomationBench tasks which consists of business-automation workflows evaluations, with AutomationBench's own agent loop instead of Pi, Hermes or OpenCode. This way, we can cross check two different questions: can the model solve problems outside SWE-related tasks? What happens when the model is being put outside the harness it has been trained with?\n\nResults show that the adapters stay close to the base model. Pi and OpenCode are slightly ahead (27.0% and 25.3% pass@1 against 23.0%), the merged adapter is level (23.7%), and Hermes is a few points behind (17.7%). The differences are within noise, except perhaps Hermes, therefore RL inside the harnesses neither transfers clearly to this very different setting nor breaks the model on it.\n\nModel\n\npass@1 (all assertions met)\n\nvs base\n\nPartial credit (share of assertions met)\n\nvs base\n\nbase\n\n23.0%\n\n—\n\n62.2%\n\n—\n\npi 160\n\n27.0%\n\n\\+4.0\n\n66.2%\n\n\\+4.0\n\nopencode 150\n\n25.3%\n\n\\+2.3\n\n65.2%\n\n\\+3.0\n\nmerged\n\n23.7%\n\n\\+0.7\n\n60.6%\n\n−1.6\n\nhermes 160\n\n17.7%\n\n−5.3\n\n56.6%\n\n−5.6\n\n## Open question: What did the model really learn to do?\n\nWe appreciate the feedback from the users and the community, initial testing and results from the community seemed overall extremely positive, and we wish to continue in this direction in the future. We also saw some surprising results, such as users reporting that the harness adapters work really well under Qwen3.8 derivatives, such as Swift-1.5.\n\nThis question is an open question we thought about, post-release. After inspecting carefully the generated trajectories from the evaluation benchmarks, it turns out the model, under non-thinking mode, tends to generate some short text before proposing a tool call, as opposed to the base model which generates the tool calls barely without any text beforehand.\n\nThis phenomenon can be seen as a sort of ‘reasoning leakage’, where the model learns to ‘escape’ from its non-thinking version to its thinking version by generating some text that can sometimes look like reasoning traces (e.g.: ..wait? ..let me see, etc.). A recent paper also describes behavior from LLMs during the RL stage very well.\n\nDoes this invalidate our models? We do not think so, as the final results are still valid; under the exact same conditions (fixed token budget) our adapters do outperform the base non-thinking model (by far) and match the performance of the thinking version, while being much more token efficient. This has been further confirmed by the positive feedback from the community.\n\nHowever this raises the need of a proper follow up work, where we will try to re-apply the same pipeline for pure thinking models, as well as exploring hybrid thinking / non-thinking training, to better understand the behavior of RL training on hybrid thinking models. We will share with the community our next findings (and harness adapters), once we get conclusive results.\n\n## Closing words and future directions\n\nThroughout this work, we demonstrated that RL training your model inside your target harness leads to more efficient and therefore more accurate final models, when evaluated under the same conditions. This observation is in line and in continuation with several previous work from Hugging Face teams, such as multi-harness-RL or the early iterations of harness adapters.\n\nIn the future, we will explore applying this recipe to more models, while better studying the training strategies for hybrid thinking / non-thinking models.\n\nWe also share to the community openly the full recipe and pipeline to reproduce everything, and invite everyone to build their own RL tasks, derived from their own codebase, or any relevant materials, and apply the same training recipe and ideas to their favorite model and harness for more efficient agentic models. We hope this blogpost will serve as a starting point for builders to build and share their own harness adapters in the future.",
+  "images": [
+    {
+      "src": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/task-pipeline.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/task-pipeline.png",
+      "alt": "Task pipeline: Tasksmith, SWE-smith and SWE-Gym sources pass through an eligibility screen, Harbor packaging, openenv validate on Hugging Face Jobs, and a difficulty check with Qwen3.8-27B",
+      "id": "image_f8b57b392c711f15"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/difficulty-check.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/difficulty-check.png",
+      "alt": "Qwen3.8-27B results on 442 scored tasks, split by attempts solved and by source",
+      "id": "image_0f7ac0f6a5c1cfd0"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/safeagents-blocked.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface/harness-adapters-blog-assets/resolve/images/safeagents-blocked.png",
+      "alt": "safeagents blocked calls per 1,000 tool calls by training step for the pi, hermes and opencode adapters",
+      "id": "image_a1a86761c5f491e3"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Combining RL on a custom task distribution with your favorite agent harness yields more accurate and efficient models for that target harness and task distribution.",
+      "spans": []
+    },
+    {
+      "id": "b0002",
+      "source": "Models are not fully optimized for all harnesses and the tasks you’re doing. Instead, they target general performance. So when you combine a model and harness, you’re leaving performance and efficiency on the table for the stuff you’re actually doing. With RL, you can train a custom harness adapter that squeezes everything out of your model for your harness and task combination.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "Take Qwen3.8-27B, its Terminal-Bench 2.1 score with the pi harness is 39% which uses on average 2.9K tokens per task. If we freeze those weights and add a custom RL-trained LoRA adapter we can get 55% pass@1, with average token usage of 1.5K. Most of this is down to the model reasoning less, calling less tools, and performing better first time.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Our earlier work (multi-harness RL, harness adapters) showed that RL on your own task distribution, inside your own harness, gives a more accurate and more efficient model. Those experiments covered data-analysis and code-building tasks. Here we wanted to push this further by exploring whether the result holds at 27B, on harder real-world software engineering tasks, across three harnesses: Pi, OpenCode and Hermes Agent. And most of all, share a fully reusable recipe, so you can reproduce this on your own task, harness, model combinations.",
+      "spans": [
+        {
+          "start": 18,
+          "end": 34,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/FineEnvs/multi-harness-rl"
+        },
+        {
+          "start": 36,
+          "end": 52,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-hub/harness-adapters"
+        }
+      ]
+    },
+    {
+      "id": "b0005",
+      "source": "TL;DR",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "We trained one LoRA adapter for Qwen3.8-27B per agent harness (pi, Hermes Agent, OpenCode), with RL inside the harness itself.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "Datasets, training and agent rollouts all happen on the Hub in Jobs using TRL's AsyncGRPOTrainer, OpenEnv and harbor.",
+      "spans": [
+        {
+          "start": 80,
+          "end": 96,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0008",
+      "source": "Each harness adapter beats the base model under its own harness on both benchmarks, for both performance and efficiency.",
+      "spans": []
+    },
+    {
+      "id": "b0009",
+      "source": "The three LoRAs are also merged into a single super adapter that runs unchanged under pi, Hermes Agent and OpenCode.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "All artifacts (adapters, GGUFs, RL tasks, safeagents plugin) can be browsed through this Hugging Face collection.",
+      "spans": [
+        {
+          "start": 89,
+          "end": 112,
+          "kind": "a",
+          "href": "https://huggingface.co/collections/harness-hub/qwen38-27b-harness-adapters"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Table of Contents",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Training inside agent harnesses",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#training-inside-agent-harnesses"
+        }
+      ]
+    },
+    {
+      "id": "b0013",
+      "source": "Generating custom RL tasks on Hugging Face",
+      "spans": [
+        {
+          "start": 0,
+          "end": 42,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#generating-custom-rl-tasks-on-hugging-face"
+        }
+      ]
+    },
+    {
+      "id": "b0014",
+      "source": "Testing the filters with short training runs",
+      "spans": [
+        {
+          "start": 0,
+          "end": 44,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#testing-the-filters-with-short-training-runs"
+        }
+      ]
+    },
+    {
+      "id": "b0015",
+      "source": "AsyncGRPOTrainer for more efficient GRPO training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "code"
+        },
+        {
+          "start": 0,
+          "end": 49,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#asyncgrpotrainer-for-more-efficient-grpo-training"
+        }
+      ]
+    },
+    {
+      "id": "b0016",
+      "source": "Training setup",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#training-setup"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Super-adapter: merging all adapters into one",
+      "spans": [
+        {
+          "start": 0,
+          "end": 44,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#super-adapter-merging-all-adapters-into-one"
+        }
+      ]
+    },
+    {
+      "id": "b0018",
+      "source": "Final results",
+      "spans": [
+        {
+          "start": 0,
+          "end": 13,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#final-results"
+        }
+      ]
+    },
+    {
+      "id": "b0019",
+      "source": "Open question: What did the model really learn to do?",
+      "spans": [
+        {
+          "start": 0,
+          "end": 53,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#open-question-what-did-the-model-really-learn-to-do"
+        }
+      ]
+    },
+    {
+      "id": "b0020",
+      "source": "Closing words and future directions",
+      "spans": [
+        {
+          "start": 0,
+          "end": 35,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#closing-words-and-future-directions"
+        }
+      ]
+    },
+    {
+      "id": "b0021",
+      "source": "Training inside agent harnesses",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "We leverage the Harbor integration in OpenEnv and TRL’s OpenEnv guide to train the model inside the harnesses we chose for the final training. We have built ready-to-use docker images for all our RL tasks that come with the target harnesses already pre-installed inside. In our final docker images, we use Pi 1.5.2, OpenCode 2.2.7 and Hermes Agent v0.22.6. The diagram below from the aforementioned blogpost explains well the entire protocol:",
+      "spans": [
+        {
+          "start": 16,
+          "end": 45,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/openenv/environments/harbor"
+        },
+        {
+          "start": 50,
+          "end": 63,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/trl/openenv"
+        },
+        {
+          "start": 309,
+          "end": 314,
+          "kind": "code"
+        },
+        {
+          "start": 325,
+          "end": 330,
+          "kind": "code"
+        },
+        {
+          "start": 348,
+          "end": 355,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0023",
+      "source": "Most RL frameworks train a re-implementation of the agent loop: the agent is written against the framework's own interface, such as verl's AgentLoop, SkyRL-Gym environments, rLLM's agent and environment classes, slime's custom rollout functions, or ART's client inside your own Python agent. Here the harness runs exactly as it ships, and the trainer learns from the exact tokens it produced, recorded by a proxy between the harness and vLLM. Recent work moves in the same direction: Agent Lightning v1.0 keeps the deploy-time harness in the loop through a proxy (\"harnessed agentic RL\"), and SkyRL's Harbor integration trains on Harbor trials, converting their chat histories into tokens for the trainer.",
+      "spans": [
+        {
+          "start": 132,
+          "end": 148,
+          "kind": "a",
+          "href": "https://verl.readthedocs.io/en/latest/advance/agent_loop.html"
+        },
+        {
+          "start": 150,
+          "end": 159,
+          "kind": "a",
+          "href": "https://github.com/NovaSky-AI/SkyRL"
+        },
+        {
+          "start": 174,
+          "end": 178,
+          "kind": "a",
+          "href": "https://github.com/rllm-org/rllm"
+        },
+        {
+          "start": 212,
+          "end": 217,
+          "kind": "a",
+          "href": "https://github.com/THUDM/slime"
+        },
+        {
+          "start": 249,
+          "end": 252,
+          "kind": "a",
+          "href": "https://github.com/OpenPipe/ART"
+        },
+        {
+          "start": 484,
+          "end": 504,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2608.17528"
+        },
+        {
+          "start": 593,
+          "end": 619,
+          "kind": "a",
+          "href": "https://novasky-ai.notion.site/skyrl-harbor"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Generating custom RL tasks on Hugging Face",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "For this recipe we created a custom dataset for agentic coding with the Hub, OpenEnv, and Repo2RLEnv. We combined together task retrieval of existing RL envs, task generation with Repo2RLEnv, task validation with OpenEnv, and sampling into a single data pipeline. This gave us the highest quality set of validated and relevant tasks to improve Qwen3.8-27B on agentic coding. In this section, we’ll walk through how we built it, so you can try it out on your own domains.",
+      "spans": [
+        {
+          "start": 90,
+          "end": 100,
+          "kind": "a",
+          "href": "https://github.com/huggingface/Repo2RLEnv"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "RL training needs tasks the agent can attempt, a verifier that scores each attempt, and evidence that the verifier is right. A verifier that accepts wrong answers teaches the wrong behavior. A task that is already feasible will not teach the model anything.",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "This section describes how we built the task set from three sources: two on the Hugging Face Hub and a third generated with Tasksmith, a pipeline in Repo2RLEnv. Every task passes an eligibility screen with openenv validate, and the same difficulty check against the base model, Qwen3.8-27B.",
+      "spans": [
+        {
+          "start": 206,
+          "end": 222,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Three sources",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Each task uses the Harbor format, which Terminal-Bench 2.1 also uses. A broad search of the Hub for Harbor environments returned about 59,000 tasks, but they included duplicates, evaluation sets and tasks marked as not for training. We filtered down to just two Hub sources built for training and generated a third set ourselves:",
+      "spans": []
+    },
+    {
+      "id": "b0030",
+      "source": "SWE-smith (Python, Go) injects bugs into real Python and Go repositories, with an LLM rewrite or a mutation such as a flipped operator. The tests that catch each bug become the task's tests. It adds volume.",
+      "spans": [
+        {
+          "start": 11,
+          "end": 17,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/SWE-bench/SWE-smith-py"
+        },
+        {
+          "start": 19,
+          "end": 21,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/SWE-bench/SWE-smith-go"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "SWE-Gym, packaged as Harbor tasks in TaskTrove, turns real GitHub issues and their merged fixes into tasks. It adds real-world bugs.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 46,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/open-thoughts/TaskTrove"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "Tasksmith generates tasks from merged pull requests. An LLM agent writes the instruction and tests, and Tasksmith checks the result: the reference and a valid alternative must pass, while the unfixed code and a known-wrong solution must fail.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://huggingface.github.io/Repo2RLEnv/pipelines/tasksmith/"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "We used Tasksmith to target gaps. We mapped the skills that our target benchmarks test (Terminal-Bench 2.1, the hard subset of SWE-bench Pro, and DeepSWE), then chose pull requests that exercise them, such as HTTP streaming, filesystem operations and serialization. From 30 merged pull requests, Tasksmith produced 24 tasks in 10 Python repositories that passed its checks, 17 of them on a second run. Its checks do not replace ours, so these tasks go through the same pipeline as the rest.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "Validation with openenv validate",
+      "spans": [
+        {
+          "start": 16,
+          "end": 32,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "A metadata screen runs first. It keeps tasks from training splits with permissive licenses. It drops duplicates, tasks marked as not for training, the 253 tasks in our target benchmarks, and any task from a repository those benchmarks use. We then ran the semantic checks from openenv validate on every task in fresh trials:",
+      "spans": [
+        {
+          "start": 277,
+          "end": 293,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "The reference solution earns the maximum reward (semantic.oracle_max).",
+      "spans": [
+        {
+          "start": 49,
+          "end": 68,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "Doing nothing scores clearly lower (semantic.floor_gap).",
+      "spans": [
+        {
+          "start": 36,
+          "end": 54,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "No canary scores more than doing nothing (semantic.canary_floor).",
+      "spans": [
+        {
+          "start": 42,
+          "end": 63,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "A replay of the reference gives the same reward (runtime.episode_determinism).",
+      "spans": [
+        {
+          "start": 49,
+          "end": 76,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Each trial ran as its own Hugging Face Job, which let us validate dozens of tasks at once. openenv validate offers the same option for any Harbor task:",
+      "spans": [
+        {
+          "start": 91,
+          "end": 107,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "858 of 1,127 Hub candidates passed. Wrong-answer controls caught defects, including a Tasksmith task that accepted an incomplete implementation and a Terminal-Bench 2.1 verifier (regex-log) that accepted known-wrong answers. Most failures were infrastructure problems, such as images that did not start. Failed tasks stay in a rejected split with the failing check recorded.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "Difficulty check with the base model",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "A valid task can still teach nothing. GRPO (group relative policy optimization) scores each attempt against the other attempts at the same task, so a task where every attempt passes, or every attempt fails, gives no learning signal. Before training, Qwen3.8-27B attempted each task 4 times, or 8 times for a stratified sample of six tasks per repository.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "Of 442 scored tasks, Qwen3.8-27B solved 151 every time and 120 never. The 171 tasks it solved only sometimes form the qualified set. The figure below shows how the scores pile up at both ends and how they differ by source. The model solves most Go tasks every time, fails every attempt on more than a third of the SWE-smith Python tasks, and lands in the middle on 73% of the SWE-Gym tasks.",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Qwen3.8-27B results on 442 scored tasks. Green marks the qualified tasks, which the model solves on some attempts but not all.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 126,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "This example shows how we filtered and validated 1,127 tasks to 278 which we included directly in the final dataset. The pipeline then took the remaining 522 rejected tasks, repaired and complexified them with Tasksmith and repeated validation.",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "Testing the filters with short training runs",
+      "spans": []
+    },
+    {
+      "id": "b0048",
+      "source": "The pipeline applies two filters: validation removes broken tasks, and the difficulty check keeps tasks the base model solves only sometimes. This section tests whether those filters change what the model learns. We trained four short runs of up to 50 steps, each on tasks from a different stage of the pipeline, and compared them with the base model on Terminal-Bench 2.1.",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Each run trains Qwen3.8-27B with LoRA and GRPO, using TRL's AsyncGRPOTrainer, on 32 tasks. All four use the same agent harness (OpenCode with up to 48 model calls), the same settings and one 8×H200 Hugging Face Job, and the reward is the verifier's pass or fail. The task sets differ in how they were filtered:",
+      "spans": [
+        {
+          "start": 60,
+          "end": 76,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0050",
+      "source": "Unvalidated: 24 accepted tasks plus 8 that failed validation.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0051",
+      "source": "Validated: 32 accepted tasks, chosen without regard to difficulty.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0052",
+      "source": "Unqualified: 32 accepted tasks that the base model always or never solves.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0053",
+      "source": "Qualified: 32 accepted tasks that the base model solves on some attempts.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0054",
+      "source": "The figure below shows how the tasks impacted model learning. The table lists each run's steps and the checkpoint we evaluate. The chart tracks training reward across subsets of tasks with differing validation status.",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "The dataset",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "harness-hub/agentic-coding-envs holds 871 tasks from 35 repositories. Hub tasks are capped at 40 per repository, so no single project dominates. The table below shows what each source contributes. The dataset has two views: every accepted task, and the qualified subset for GRPO training. Rejected attempts stay in a separate config.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 31,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0057",
+      "source": "Source",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "Task type",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "Tasks",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "Qualified",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "SWE-smith",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "Injected bugs in Python and Go",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "717",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0064",
+      "source": "144",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0065",
+      "source": "SWE-Gym (TaskTrove)",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0066",
+      "source": "Real GitHub issues",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0067",
+      "source": "130",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0068",
+      "source": "27",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Tasksmith",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Generated from merged pull requests",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "24",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "22",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "Total",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "871",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "171",
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "AsyncGRPOTrainer for more efficient GRPO training",
+      "spans": [
+        {
+          "start": 0,
+          "end": 16,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0078",
+      "source": "We leveraged the stable version of AsyncGRPOTrainer from TRL, with the main advantage of the trainer being that it does not wait until all rollouts are completed before moving to the next training optimization step.",
+      "spans": [
+        {
+          "start": 35,
+          "end": 51,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0079",
+      "source": "For more detailed reading on the trainer and its building blocks, please refer to the AsyncGRPO blogpost.",
+      "spans": [
+        {
+          "start": 82,
+          "end": 104,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/trl-lib/async-grpo-stable"
+        }
+      ]
+    },
+    {
+      "id": "b0080",
+      "source": "Training setup",
+      "spans": []
+    },
+    {
+      "id": "b0081",
+      "source": "To obtain our final harness adapters, we trained LoRA adapters on top of Qwen/Qwen3.8-27B using TRL's AsyncGRPOTrainer. The adapters were attached to the model using the all-linear flag. To maximize the training efficiency, thinking mode was turned off during rollout stages, and we evaluated our final adapter with and without thinking for broader comparison.",
+      "spans": [
+        {
+          "start": 73,
+          "end": 89,
+          "kind": "a",
+          "href": "https://huggingface.co/Qwen/Qwen3.8-27B"
+        },
+        {
+          "start": 102,
+          "end": 118,
+          "kind": "code"
+        },
+        {
+          "start": 170,
+          "end": 180,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0082",
+      "source": "The final reward function consists of the verifier's correctness, combined with a small tool-efficiency bonus (0.1, derived from early experiments from the previous iteration of harness adapters which showed that 0.1 worked best).",
+      "spans": [
+        {
+          "start": 129,
+          "end": 194,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-hub/harness-adapters"
+        }
+      ]
+    },
+    {
+      "id": "b0083",
+      "source": "We performed a small LR sweep on 50 steps using Termgrade environments (1e-5, 5e-5 and 1e-4) and noticed that 1e-5 barely moved training correctness (from 0.52 to 0.50), 1e-4 collapsed the rollouts instead of improving them (turns per rollout moved from 18 to 6, with entropy rising), and only 5e-5 clearly improved (from 0.49 to 0.60 by step 40). Longer 5e-5 runs then showed signs of instability (collapsing rollout lengths, rising entropy), so we settled on 2e-5 for the final runs.",
+      "spans": []
+    },
+    {
+      "id": "b0084",
+      "source": "Training infrastructure",
+      "spans": []
+    },
+    {
+      "id": "b0085",
+      "source": "Each harness adapter was trained using NVIDIA 2xB200 GPUs, with one GPU allocated for the vLLM server and the other allocated for the training process. We first performed some stress testing to maximize the amount of RL tasks that can be trained within a single optimization step. For that, we ‘maxed out’ the --token-budget argument from AsyncGRPOTrainer to its limit for the setup that we had. The chart below shows the evolution of the number of groups per step for each harness (in blue: Pi, green: OpenCode and orange: Hermes).",
+      "spans": [
+        {
+          "start": 310,
+          "end": 324,
+          "kind": "code"
+        },
+        {
+          "start": 339,
+          "end": 355,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0086",
+      "source": "As the model gets better and better during training, it is able to fit more and more groups during each training step, which diversifies the signals that the model gets at each optimization step.",
+      "spans": []
+    },
+    {
+      "id": "b0087",
+      "source": "Final mixture",
+      "spans": []
+    },
+    {
+      "id": "b0088",
+      "source": "The final data mixture consists of 750 tasks from harness-adapters RL environments and 300 tasks from termgrade. In order to maximize the diversity of the sampled tasks during training, we have slightly customized the data sampling strategy, which will be explained below:",
+      "spans": [
+        {
+          "start": 50,
+          "end": 82,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/harness-hub/harness-adapters"
+        },
+        {
+          "start": 102,
+          "end": 111,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/ai-and/termgrade-environments"
+        }
+      ]
+    },
+    {
+      "id": "b0089",
+      "source": "Before training, the tasks are put in a fixed order that interleaves them by family (i.e., their repository for our generated RL environments. For Termgrade, we just sorted them by name since each task is considered as its own family), so every training step mixes as many repositories as possible while following the distribution of the mixture.",
+      "spans": []
+    },
+    {
+      "id": "b0090",
+      "source": "safeagents in the loop",
+      "spans": []
+    },
+    {
+      "id": "b0091",
+      "source": "We also plug the safeagents tool, in order to block any misbehavior from the model during training. The final plugin (which consists of the regex and pattern rules specific to the RL tasks and test path) is hosted in harness-hub/qwen-safeagents-plugin and can be used out of the box using the latest version of safeagents in case anyone wants to reproduce the training setup.",
+      "spans": [
+        {
+          "start": 17,
+          "end": 27,
+          "kind": "a",
+          "href": "https://github.com/huggingface/safeagents"
+        },
+        {
+          "start": 217,
+          "end": 251,
+          "kind": "a",
+          "href": "https://huggingface.co/harness-hub/qwen-safeagents-plugin"
+        }
+      ]
+    },
+    {
+      "id": "b0092",
+      "source": "The number of blocked tools from safeagents decreases consistently during training, which indicates that the model gets ‘safer and safer’ after each optimization step. Below is a diagram of the safeagents blocked calls per 1000 tool calls, by training step, for each harness adapter.",
+      "spans": []
+    },
+    {
+      "id": "b0093",
+      "source": "Super-adapter: merging all adapters into one",
+      "spans": []
+    },
+    {
+      "id": "b0094",
+      "source": "Merging models often combines their capabilities while keeping most of what each one could do. Once the three harness adapters were trained, we asked two questions. Does merging them cost accuracy? And can a single \"super-adapter\" be accurate and efficient under every harness?",
+      "spans": []
+    },
+    {
+      "id": "b0095",
+      "source": "We started by comparing the weight updates of the three adapters, layer by layer. The cosine similarity between any two of them is about 0.01–0.02: each adapter pushed the model in a nearly orthogonal direction during training. That's the best case for merging, since the updates barely interfere.",
+      "spans": []
+    },
+    {
+      "id": "b0096",
+      "source": "We concatenate the three LoRA adapters along the rank dimension (PEFT's combination_type=\"cat\"). The merged adapter has rank 96 (3 × 32) and applies exactly w · (ΔW_pi + ΔW_hermes + ΔW_opencode). Prior work on merging (task arithmetic, TIES, KnOTS) finds that scaling each update below 1 works best, so we compared three weights on all 89 Terminal-Bench 2.1 tasks, under each harness, with the step-120 adapters:",
+      "spans": [
+        {
+          "start": 72,
+          "end": 94,
+          "kind": "code"
+        },
+        {
+          "start": 219,
+          "end": 234,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2212.04089"
+        },
+        {
+          "start": 236,
+          "end": 240,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2306.01708"
+        },
+        {
+          "start": 242,
+          "end": 247,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2410.19735"
+        }
+      ]
+    },
+    {
+      "id": "b0097",
+      "source": "⅓ (the average): each harness keeps only a third of its own update.",
+      "spans": []
+    },
+    {
+      "id": "b0098",
+      "source": "½: each update at half strength.",
+      "spans": []
+    },
+    {
+      "id": "b0099",
+      "source": "1 (the plain sum): every update applied in full.",
+      "spans": []
+    },
+    {
+      "id": "b0100",
+      "source": "Weight",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0101",
+      "source": "pi",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0102",
+      "source": "hermes",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0103",
+      "source": "opencode",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0104",
+      "source": "All three harnesses",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0105",
+      "source": "Tool calls per task",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0106",
+      "source": "base model",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0107",
+      "source": "39.1%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0108",
+      "source": "46.0%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0109",
+      "source": "44.8%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0110",
+      "source": "43.3%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0111",
+      "source": "49.2",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0112",
+      "source": "⅓ (average)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0113",
+      "source": "49.4%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0114",
+      "source": "51.2%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0115",
+      "source": "47.1%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0116",
+      "source": "49.2%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0117",
+      "source": "35.6",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0118",
+      "source": "½",
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0119",
+      "source": "48.8%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0120",
+      "source": "53.5%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0121",
+      "source": "55.2%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0122",
+      "source": "52.5%",
+      "spans": [
+        {
+          "start": 0,
+          "end": 5,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0123",
+      "source": "25.9",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0124",
+      "source": "1 (sum)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0125",
+      "source": "40.2%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0126",
+      "source": "62.8%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0127",
+      "source": "47.1%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0128",
+      "source": "50.0%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0129",
+      "source": "13.4",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0130",
+      "source": "The plain sum over-applies the updates. The agents become very short (13 tool calls per task, against 49 for the base model), and while Hermes peaks at 62.8%, pi falls back to the base model's level. The average dilutes each harness's own update. ½ gives the best balance, so we built the final super-adapter from the released checkpoints (pi step 160, hermes step 160, opencode step 150) at weight ½.",
+      "spans": []
+    },
+    {
+      "id": "b0131",
+      "source": "Adapter merging evaluation results",
+      "spans": []
+    },
+    {
+      "id": "b0132",
+      "source": "Under each harness, on the tasks every run graded (50–51 on SWE-bench Pro, 82–85 on Terminal-Bench 2.1), one attempt per task (in parentheses, the efficiency gain with respect to the base model):",
+      "spans": []
+    },
+    {
+      "id": "b0133",
+      "source": "Harness",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0134",
+      "source": "Benchmark",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0135",
+      "source": "Qwen3.8-27B",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/Qwen/Qwen3.8-27B"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0136",
+      "source": "Qwen3.8-27B-<harness>-adapted",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0137",
+      "source": "Qwen3.8-27B-super-adapter",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/harness-hub/Qwen3.8-27B-super-adapter"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0138",
+      "source": "Qwen3.8-27B, thinking",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/Qwen/Qwen3.8-27B"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 5,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0139",
+      "source": "Qwen3.8-27B-super-adapter, thinking",
+      "spans": [
+        {
+          "start": 0,
+          "end": 25,
+          "kind": "a",
+          "href": "https://huggingface.co/harness-hub/Qwen3.8-27B-super-adapter"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 6,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0140",
+      "source": "pi",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0141",
+      "source": "SWE-bench Pro (hard 51)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0142",
+      "source": "40.0%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0143",
+      "source": "64.0% (−60%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0144",
+      "source": "46.0% (−73%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0145",
+      "source": "74.0%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0146",
+      "source": "74.0% (−48%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0147",
+      "source": "hermes",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0148",
+      "source": "SWE-bench Pro (hard 51)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0149",
+      "source": "29.4%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0150",
+      "source": "43.1% (−56%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0151",
+      "source": "47.1% (−60%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0152",
+      "source": "45.1%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0153",
+      "source": "60.8% (−36%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0154",
+      "source": "opencode",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0155",
+      "source": "SWE-bench Pro (hard 51)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0156",
+      "source": "35.3%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0157",
+      "source": "51.0% (−72%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0158",
+      "source": "45.1% (−63%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0159",
+      "source": "47.1%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0160",
+      "source": "66.7% (−31%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0161",
+      "source": "pi",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0162",
+      "source": "Terminal-Bench 2.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0163",
+      "source": "40.0%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0164",
+      "source": "56.5% (−56%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0165",
+      "source": "48.2% (−56%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0166",
+      "source": "52.9%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0167",
+      "source": "57.6% (−25%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0168",
+      "source": "hermes",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0169",
+      "source": "Terminal-Bench 2.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0170",
+      "source": "44.7%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0171",
+      "source": "58.8% (−70%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0172",
+      "source": "55.3% (−53%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0173",
+      "source": "58.8%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0174",
+      "source": "63.5% (−19%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0175",
+      "source": "opencode",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0176",
+      "source": "Terminal-Bench 2.1",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0177",
+      "source": "47.6%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0178",
+      "source": "52.4% (−53%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0179",
+      "source": "52.4% (−68%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0180",
+      "source": "54.9%",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 5,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0181",
+      "source": "58.5% (−22%)",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 6,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0182",
+      "source": "\"Thinking\" is the chat template's thinking mode at its default effort (xhigh). The specialists were trained and served with thinking off.",
+      "spans": []
+    },
+    {
+      "id": "b0183",
+      "source": "With thinking off, the super-adapter improves on the base model on all six harness–benchmark pairs (mean pass@1 39.5% → 49.0%; 71 tasks newly solved vs 34 lost, p < 0.001).",
+      "spans": []
+    },
+    {
+      "id": "b0184",
+      "source": "Despite not being trained at all with thinking on, it's the strongest model we evaluated with thinking mode. Against the base model thinking at the same effort, it wins on five of six pairs and ties the sixth (mean 55.5% → 63.5%; 67 newly solved vs 37 lost, p = 0.004). The largest gains are on SWE-bench Pro: +16 points under hermes and +20 under opencode. Under pi on SWE-bench Pro, where thinking alone already reaches 74%, it ties.",
+      "spans": []
+    },
+    {
+      "id": "b0185",
+      "source": "Use the specialist harness adapters when thinking off. Each harness's own adapter is ahead on four of six pairs, by the most under pi (64.0% vs 46.0% on SWE-bench Pro, 56.5% vs 48.2% on Terminal-Bench). Splitting one model across three harnesses costs pi the most of its gain. If you only use one harness and keep thinking off, take its specialist.",
+      "spans": []
+    },
+    {
+      "id": "b0186",
+      "source": "The super adapter is also much more efficient. On the tasks both the base model and the super-adapter solve, with thinking off, it makes 53–73% fewer tool calls and generates 44–60% fewer tokens per task, with fewer tool calls on 111 of 130 tasks. With thinking on, it still cuts tool calls by 31–48% and tokens by 24–43% on SWE-bench Pro. On Terminal-Bench, tool calls drop by 19–25% and token counts stay about the same.",
+      "spans": []
+    },
+    {
+      "id": "b0187",
+      "source": "The ½ weight was chosen on Terminal-Bench 2.1 with the step-120 adapters, so the Terminal-Bench numbers are slightly optimistic; SWE-bench Pro played no part in the choice. Full paired results are in the super-adapter's model card.",
+      "spans": [
+        {
+          "start": 204,
+          "end": 230,
+          "kind": "a",
+          "href": "https://huggingface.co/harness-hub/Qwen3.8-27B-super-adapter"
+        }
+      ]
+    },
+    {
+      "id": "b0188",
+      "source": "Final results",
+      "spans": []
+    },
+    {
+      "id": "b0189",
+      "source": "This section reports what happened during training, then how the adapters score on held-out benchmarks inside and outside their own harnesses.",
+      "spans": []
+    },
+    {
+      "id": "b0190",
+      "source": "Training results",
+      "spans": []
+    },
+    {
+      "id": "b0191",
+      "source": "Training ran for a cumulative total of 598 steps, with a total of 78,114 samples trained, which consists exactly of 167M trained tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0192",
+      "source": "During training, we see a clear signal that the model learns to solve tasks in fewer and fewer steps, with no clear sign of saturation. Despite having some clear increasing trend sometimes, training correctness seems to overall stay flat. This can be explained by the fact that the model meets new tasks during training, but the number of groups that fit in a step’s token budget more than doubles as trajectories get shorter. The accuracy gains show up on the held-out benchmarks in the section below.",
+      "spans": []
+    },
+    {
+      "id": "b0193",
+      "source": "On the other hand, safeagents was able to block multiple suspicious attempts. Across the three training runs, a total of 1.3M tool calls have been checked, and a total of 647 tool calls have been blocked.",
+      "spans": []
+    },
+    {
+      "id": "b0194",
+      "source": "Evaluation results",
+      "spans": []
+    },
+    {
+      "id": "b0195",
+      "source": "This section covers the evaluation setup, the in-harness results, transfer across harnesses, and an out-of-distribution check.",
+      "spans": []
+    },
+    {
+      "id": "b0196",
+      "source": "Evaluation setup",
+      "spans": []
+    },
+    {
+      "id": "b0197",
+      "source": "We evaluate each adapter inside the harness it was trained in, on two agentic coding benchmarks: all 89 tasks of Terminal-Bench 2.1 (1 hour and 100 agent steps per task) and the 51 hardest tasks of SWE-bench Pro (2 hours and 100 agent steps). We cap the maximum number of tokens per task to be 131072. We do not tune the agent settings and use the default setup for all harnesses. For example, Pi does not keep previous reasoning turns while OpenCode and Hermes do, which mainly affects the SWE-bench Pro results due to rapid context overflow. Therefore you cannot compare the results across different harnesses (using Pi does not necessarily lead to better results than Hermes or OpenCode), but it is fair to compare results within the same harness and draw conclusions.",
+      "spans": [
+        {
+          "start": 113,
+          "end": 131,
+          "kind": "a",
+          "href": "https://huggingface.co/datasets/harborframework/terminal-bench-2.1"
+        }
+      ]
+    },
+    {
+      "id": "b0198",
+      "source": "Every rollout runs through the same Harbor and OpenEnv stack as training, in HF sandboxes, with one attempt per task at temperature 0.8 and thinking off. Each LoRA checkpoint is merged into the base weights and served alone with vLLM on a single GPU, at the same concurrency as the base model's eval.",
+      "spans": []
+    },
+    {
+      "id": "b0199",
+      "source": "For all the evaluation benchmarks, we report the pass@1 as well as the number of tool calls, total turns, for all tasks and for solved tasks.",
+      "spans": []
+    },
+    {
+      "id": "b0200",
+      "source": "For openness, all model trajectories for final evaluations are pushed in this public bucket: harness-hub/harness-adapters-trajectories.",
+      "spans": [
+        {
+          "start": 93,
+          "end": 134,
+          "kind": "a",
+          "href": "https://huggingface.co/buckets/harness-hub/harness-adapters-trajectories"
+        }
+      ]
+    },
+    {
+      "id": "b0201",
+      "source": "Final evaluation results",
+      "spans": []
+    },
+    {
+      "id": "b0202",
+      "source": "All three specialist adapters beat the base model under their own harness, on both benchmarks. On SWE-bench Pro (hard 51), pi goes from 39.2% to 64.7% (+25.5 points: 15 tasks newly solved vs 2 lost, p = 0.002), hermes from 29.4% to 43.1%, and opencode from 35.3% to 51.0%. On the full Terminal-Bench 2.1, pi gains +16.3 points (16 vs 2, p = 0.001) and hermes +14.1 (19 vs 7, p = 0.03). Opencode gains +6.0 overall, and +13.6 on the 66 tasks that played no part in choosing its checkpoint (12 vs 3, p = 0.035).",
+      "spans": []
+    },
+    {
+      "id": "b0203",
+      "source": "The adapters also solve tasks much more efficiently: on the tasks both they and the base model solve, they make 56–72% fewer tool calls per task on SWE-bench Pro and 53–70% fewer on Terminal-Bench 2.1. The single super-adapter beats the base model under all three harnesses too (+6 to +18 points on SWE-bench Pro, +5 to +10 on Terminal-Bench 2.1), with just as large a cut in tool calls (53–73%). It keeps less of each specialist's gain with thinking off, most under pi, but with thinking on it beats the base model thinking at the same effort on five of six harness–benchmark pairs (see the super-adapter section). Each model card has the full paired results.",
+      "spans": [
+        {
+          "start": 592,
+          "end": 613,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-adapters-at-scale#super-adapter-merging-all-adapters-into-one"
+        }
+      ]
+    },
+    {
+      "id": "b0204",
+      "source": "Does the efficiency and performance ability transfer across harnesses?",
+      "spans": []
+    },
+    {
+      "id": "b0205",
+      "source": "To answer this question, we also evaluated the pi harness adapter under Hermes Agent and OpenCode.",
+      "spans": []
+    },
+    {
+      "id": "b0206",
+      "source": "Under OpenCode it matches OpenCode's own specialist on Terminal-Bench 2.1 (44.8% → 54.0%, against 46.4% → 52.4%). Under Hermes it keeps about two-thirds of the specialist's gain (46.3% → 56.1%, against 44.7% → 58.8%), with the same ~45% cut in tool calls in both. Therefore it seems that the newly learned capabilities are transferred across harnesses.",
+      "spans": []
+    },
+    {
+      "id": "b0207",
+      "source": "Evaluation on out-of-distribution tasks and setup",
+      "spans": []
+    },
+    {
+      "id": "b0208",
+      "source": "What happens if we evaluate in out-of-distribution tasks, outside the harnesses the adapters have been trained with?",
+      "spans": []
+    },
+    {
+      "id": "b0209",
+      "source": "We ran all five models on 300 AutomationBench tasks which consists of business-automation workflows evaluations, with AutomationBench's own agent loop instead of Pi, Hermes or OpenCode. This way, we can cross check two different questions: can the model solve problems outside SWE-related tasks? What happens when the model is being put outside the harness it has been trained with?",
+      "spans": [
+        {
+          "start": 30,
+          "end": 51,
+          "kind": "a",
+          "href": "https://github.com/zapier/AutomationBench"
+        }
+      ]
+    },
+    {
+      "id": "b0210",
+      "source": "Results show that the adapters stay close to the base model. Pi and OpenCode are slightly ahead (27.0% and 25.3% pass@1 against 23.0%), the merged adapter is level (23.7%), and Hermes is a few points behind (17.7%). The differences are within noise, except perhaps Hermes, therefore RL inside the harnesses neither transfers clearly to this very different setting nor breaks the model on it.",
+      "spans": []
+    },
+    {
+      "id": "b0211",
+      "source": "Model",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0212",
+      "source": "pass@1 (all assertions met)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0213",
+      "source": "vs base",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0214",
+      "source": "Partial credit (share of assertions met)",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 3,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0215",
+      "source": "vs base",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 0,
+        "column": 4,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0216",
+      "source": "base",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0217",
+      "source": "23.0%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0218",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0219",
+      "source": "62.2%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0220",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 1,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0221",
+      "source": "pi 160",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0222",
+      "source": "27.0%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0223",
+      "source": "+4.0",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0224",
+      "source": "66.2%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0225",
+      "source": "+4.0",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 2,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0226",
+      "source": "opencode 150",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0227",
+      "source": "25.3%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0228",
+      "source": "+2.3",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0229",
+      "source": "65.2%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0230",
+      "source": "+3.0",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 3,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0231",
+      "source": "merged",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0232",
+      "source": "23.7%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0233",
+      "source": "+0.7",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0234",
+      "source": "60.6%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0235",
+      "source": "−1.6",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 4,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0236",
+      "source": "hermes 160",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0237",
+      "source": "17.7%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0238",
+      "source": "−5.3",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0239",
+      "source": "56.6%",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 3,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0240",
+      "source": "−5.6",
+      "spans": [],
+      "table": {
+        "id": "t4",
+        "row": 5,
+        "column": 4,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0241",
+      "source": "Open question: What did the model really learn to do?",
+      "spans": []
+    },
+    {
+      "id": "b0242",
+      "source": "We appreciate the feedback from the users and the community, initial testing and results from the community seemed overall extremely positive, and we wish to continue in this direction in the future. We also saw some surprising results, such as users reporting that the harness adapters work really well under Qwen3.8 derivatives, such as Swift-1.5.",
+      "spans": [
+        {
+          "start": 270,
+          "end": 348,
+          "kind": "a",
+          "href": "https://huggingface.co/harness-hub/Qwen3.8-27B-opencode-adapted-GGUF/discussions/2"
+        }
+      ]
+    },
+    {
+      "id": "b0243",
+      "source": "This question is an open question we thought about, post-release. After inspecting carefully the generated trajectories from the evaluation benchmarks, it turns out the model, under non-thinking mode, tends to generate some short text before proposing a tool call, as opposed to the base model which generates the tool calls barely without any text beforehand.",
+      "spans": []
+    },
+    {
+      "id": "b0244",
+      "source": "This phenomenon can be seen as a sort of ‘reasoning leakage’, where the model learns to ‘escape’ from its non-thinking version to its thinking version by generating some text that can sometimes look like reasoning traces (e.g.: ..wait? ..let me see, etc.). A recent paper also describes behavior from LLMs during the RL stage very well.",
+      "spans": [
+        {
+          "start": 257,
+          "end": 271,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2610.14270"
+        }
+      ]
+    },
+    {
+      "id": "b0245",
+      "source": "Does this invalidate our models? We do not think so, as the final results are still valid; under the exact same conditions (fixed token budget) our adapters do outperform the base non-thinking model (by far) and match the performance of the thinking version, while being much more token efficient. This has been further confirmed by the positive feedback from the community.",
+      "spans": []
+    },
+    {
+      "id": "b0246",
+      "source": "However this raises the need of a proper follow up work, where we will try to re-apply the same pipeline for pure thinking models, as well as exploring hybrid thinking / non-thinking training, to better understand the behavior of RL training on hybrid thinking models. We will share with the community our next findings (and harness adapters), once we get conclusive results.",
+      "spans": []
+    },
+    {
+      "id": "b0247",
+      "source": "Closing words and future directions",
+      "spans": []
+    },
+    {
+      "id": "b0248",
+      "source": "Throughout this work, we demonstrated that RL training your model inside your target harness leads to more efficient and therefore more accurate final models, when evaluated under the same conditions. This observation is in line and in continuation with several previous work from Hugging Face teams, such as multi-harness-RL or the early iterations of harness adapters.",
+      "spans": [
+        {
+          "start": 309,
+          "end": 325,
+          "kind": "a",
+          "href": "https://huggingface.co/spaces/FineEnvs/multi-harness-rl"
+        },
+        {
+          "start": 333,
+          "end": 369,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/harness-hub/harness-adapters"
+        }
+      ]
+    },
+    {
+      "id": "b0249",
+      "source": "In the future, we will explore applying this recipe to more models, while better studying the training strategies for hybrid thinking / non-thinking models.",
+      "spans": []
+    },
+    {
+      "id": "b0250",
+      "source": "We also share to the community openly the full recipe and pipeline to reproduce everything, and invite everyone to build their own RL tasks, derived from their own codebase, or any relevant materials, and apply the same training recipe and ideas to their favorite model and harness for more efficient agentic models. We hope this blogpost will serve as a starting point for builders to build and share their own harness adapters in the future.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "a27d0ca375644c3d0affe985498e3fd4afa62b61df548bab277224511fa8ad45",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "openenv validate path/to/task --sandbox hf-sandbox"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "a27d0ca375644c3d0affe985498e3fd4afa62b61df548bab277224511fa8ad45",
+  "mediaLayout": [
+    {
+      "mediaId": "image_f8b57b392c711f15",
+      "type": "image",
+      "afterBlockId": "b0027",
+      "order": 0
+    },
+    {
+      "mediaId": "image_0f7ac0f6a5c1cfd0",
+      "type": "image",
+      "afterBlockId": "b0044",
+      "order": 1
+    },
+    {
+      "mediaId": "image_a1a86761c5f491e3",
+      "type": "image",
+      "afterBlockId": "b0092",
+      "order": 2
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 3,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 3,
+    "savedImages": 3,
+    "sourceImageOccurrences": 3,
+    "placedImageOccurrences": 3,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/loop.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-tb21-lift-status.static.hf.space",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/asyncgrpo-sync-async.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/groups.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/sampling.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/protocol.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/super-results.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/reward.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/toolcalls.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://harness-hub-harness-adapters-figures.static.hf.space/results.html",
+        "reason": "unsupported_embed"
+      }
+    ],
+    "status": "partial"
+  },
+  "mediaLayoutCheckedAt": "2026-11-20T20:31:00.136339Z",
+  "summaryZh": "本文来自Hugging Face，围绕“Introducing harness adapters: adapt your favorite model to your harness to improve performance and cost”介绍模型发布方面的最新进展，重点涉及模型发布。下方为系统保存的原文正文。",
+  "summaryGeneratedAt": "2026-11-20T20:31:35.690406Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}

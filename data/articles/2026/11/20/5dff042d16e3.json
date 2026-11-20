@@ -1,0 +1,866 @@
+{
+  "schemaVersion": 3,
+  "id": "5dff042d16e3",
+  "title": "Welcome Inkling 2 Mini, Cutting-edge Performance for your Local Setup",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/inkling2mini",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-20T00:00:00Z",
+  "category": "industry",
+  "tags": [
+    "行业应用"
+  ],
+  "score": 82,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/inkling2mini",
+  "resolvedUrl": "https://huggingface.co/blog/inkling2mini",
+  "fetchedAt": "2026-11-20T20:30:59.955918Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "TLDR; Inkling 2 Mini is a new looped transformer model. It’s a multimodal Mixture-of-Experts with ~26B physical total and 3B active parameters per token. It uses a neat trick to increase capacity: some layers are visited in a loop that repeats three times, which makes it work like it had more parameters. It supports a 1M-token context size, accepts images and text inputs. Thinking Machines Lab ships the model in a mixed-precision format, with NVFP4 and MXFP8 expert weights. A DSpark drafter is also included for additional speed-up at a small memory cost.\n\nInkling 2 Mini is much, much smaller than Inkling 2 Small, and is designed for local AI setups. We think this is a refreshingly new great local model. In our vibe tests, it's at least comparable with Qwen 3.8 27B. More validation is needed, but we are super excited about this release!\n\nWe ship transformers, Llama App (llama.cpp), and MLX support. SGLang also provides day-zero inference support for production deployments on datacenter hardware.\n\nThis post goes through what makes Inkling Mini different, some of our vibe tests, and how you can use it with your setup.\n\n## What is new with Inkling 2 Mini?\n\nInkling 2 Mini is a mixture-of-experts model with 24 decoder layers, but the 12 middle layers run three times in a loop. Therefore, the model acts as if it had 48 (6+ 3*12 + 6) logical layers with just 24 physical ones.\n\nSimilar to Inkling 2 Small, Inkling 2 Mini executes 48 layer visits per token. The hidden size is 2,304 instead of 4,608. At each layer visit, both variants route the token to 8 experts, but Mini selects them from among 128 experts per layer, while Small selects from 384. The decoder runs layers 0–5 once, layers 6–17 three times, and layers 18–23 once. All three passes through layers 6–17 reuse the same weights.\n\nArchitectures such as Nanbeige have explored looping before. But Inkling 2 Mini explores an interesting approach. Every pass through the looped core (layers 6–17) starts from the same inputs which is the output of the first six layers. Information moves between passes through cross-pass messages. Each looped layer reads a message from the previous pass's outputs with its own learned query (one message for its query, key, value and MLP inputs). A small gating controller then looks at both the layer's current input and the message. It decides how much of the current input to forget and how much of the message to add. Each pass therefore refines what the previous one computed.\n\n- Each six-layer block has five sliding-window layers and one full-attention layer. The local window holds up to 1,024 tokens.\n\n- Attention uses 24 query heads and eight KV heads. It uses learned relative position logits, a learned sink, and an output gate. Full-attention layers use dynamic key and value convolutions.\n\n- The router selects eight of 128 SwiGLU experts for each token. It normalizes the selected scores and scales the weights by 8.\n\n- During passes 2 and 3, each core layer attends over two residual blocks from the previous pass. Four rank-64 gates mix separate messages into the query, key, value, and MoE inputs.\n\nText decoder width is 2,304, and the intermediate width of each expert is 1,152. Reusing core weights reduces the number of distinct layers the checkpoint stores. The model still executes all 48 visits, and each visit keeps its own KV and short-convolution state.\n\nIn addition to the flagship Inkling 2 Mini model, a research artifact has also been released. It shares the same architecture, but this variant was trained to accept a variable number of passes through the loop 🤯. Setting 1 or 2 passes instead of 3 will make inference run a lot faster, but generations may be of slightly lower quality. We tested this variant, and it works, but we haven’t evaluated it in depth.\n\n## Benchmark Results\n\nInkling 2 Mini is state-of-the-art in its class in the Artificial Analysis Intelligence Index v5 (AAv5), as well as across many benchmarks in various categories. Compared with Gemma 4 31B, Muse Glimmer, Qwen3.8-27B, and Nemotron 3.5 Super VL, Inkling 2 Mini leads in 32 benchmarks out of 48. These cover coding and autoresearch, agentic search and tool use for knowledge work, vision interpretation and creation, reasoning and knowledge, and safety and alignment. See the Inkling 2 Mini model card for the full list of benchmarks and scores.\n\nInkling 2 Mini is a great local coding companion. It leads in FrontierCode v2.0, ties with Qwen3.8-27B on Terminal-Bench 4.0, and trails Qwen on AutomationBench-AA v1.0.6. You can check out a few of our highlights below for coding and knowledge work. Note that AA Briefcase is in ELO rating, higher is better.\n\n## Inference Support\n\nIn this section, you can find how to use Inkling 2 Mini in transformers, llama.cpp, MLX, and SGLang.\n\n### Transformers\n\nWe provide support for both Inkling 2 Mini (fixed loop) and the TML-d24-varloop-research (variable loop) research variant.\n\n#### Fixed loop with Inkling 2 Mini\n\nYou can use the AutoModelForMultimodalLM class.\n\n```\nimport torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/Inkling-2-Mini\"\n\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(\n    model_id,\n)\n\nmessages = [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Why is the sky blue?\"}]}]\n\ninputs = processor.apply_chat_template(\n    messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\",\n).to(model.device)\ninput_len = inputs[\"input_ids\"].shape[-1]\n\noutputs = model.generate(**inputs, max_new_tokens=1024)\nprint(processor.decode(outputs[0][input_len:], skip_special_tokens=False))\n```\n\n#### Variable loop\n\nTo set the number of loops in the research checkpoint, you can modify the loop_num_passes in text_config as follows. The example below uses two loops.\n\n```\nimport torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/TML-d24-varloop-research\"\n\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(\n    model_id,\n    text_config={\"loop_num_passes\": 2},\n)\n\nmessages = [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Why is the sky blue?\"}]}]\n\ninputs = processor.apply_chat_template(\n    messages, reasoning_effort=\"medium\", tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\", \n).to(model.device)\ninput_len = inputs[\"input_ids\"].shape[-1]\n\noutputs = model.generate(**inputs, max_new_tokens=1024)\nprint(processor.decode(outputs[0][input_len:], skip_special_tokens=False))\n```\n\n#### Images and text\n\nFor an image prompt, replace messages in either example with the list below and infer as usual.\n\n```\nmessages = [\n    {\n        \"role\": \"user\",\n        \"content\": [\n            {\"type\": \"image\", \"image\": \"/path/to/image.jpg\"},\n            {\"type\": \"text\", \"text\": \"What is in this image?\"},\n        ],\n    }\n]\n```\n\n#### Reasoning Effort\n\nPass reasoning_effort=\"medium\" to processor.apply_chat_template(...) to set the effort for a request. The chat template adds the numeric value to the prompt as a system message. The default is high (0.9).\n\n```\ninputs = processor.apply_chat_template(\n    messages, reasoning_effort=\"medium\", tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\", \n).to(model.device)\n```\n\nAvailable levels are none (0.0), minimal (0.1), low (0.2), medium (0.7), high (0.9; default), xhigh (0.99), and max (0.99). You can also pass a number from 0.0 to 0.99, such as reasoning_effort=0.35.\n\n#### Tool calling\n\nLet’s get our model to call some tools.\n\nIn this example we ask our model about the current temperature at a given location. With the prompt, we also provide the tool (get_current_temperature) to do it. The model asks for a tool call, we call the tool on its behalf and then add the output to the next instruction set. It uses the output of the tool and provides us with the final result.\n\nIf you want to know more about tool calling, we recommend going to our official docs.\n\n```\nimport torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/Inkling-2-Mini\"\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=\"auto\")\n\n\ndef get_current_temperature(location: str, unit: str):\n    \"\"\"\n    Get the current temperature at a location.\n\n    Args:\n        location: The location to get the temperature for, in the format \"City, Country\"\n        unit: The unit to return the temperature in. (choices: [\"celsius\", \"fahrenheit\"])\n    \"\"\"\n    return 22.0  # A real function would call a weather API here\n\n\ndef ask(messages):\n    inputs = processor.apply_chat_template(\n        messages, tools=[get_current_temperature], reasoning_effort=\"low\", tokenize=True, return_dict=True, return_tensors=\"pt\"\n    ).to(model.device)\n    output = model.generate(**inputs, max_new_tokens=1024)[0][inputs[\"input_ids\"].shape[-1] :]\n    parsed = processor.parse_response(output, prefix=inputs[\"input_ids\"][0])\n    return parsed\n\n\nmessages = [{\"role\": \"user\", \"content\": \"Hey, what's the temperature in Paris right now?\"}]\n\nreply = ask(messages)\ncall = reply[\"tool_calls\"][0][\"function\"]\nprint(\"Model calls:\", call[\"name\"], call[\"arguments\"])  # the model fills in the arguments itself\n\ntemperature = get_current_temperature(**call[\"arguments\"])\nmessages += [reply, {\"role\": \"tool\", \"name\": call[\"name\"], \"content\": str(temperature)}]\nprint(ask(messages)[\"content\"])\n\n# Model calls: get_current_temperature {'location': 'Paris, France', 'unit': 'celsius'}\n# Right now in Paris it’s about **22°C** (roughly **71.6°F**).\n```\n\n### Llama App and Llama.cpp\n\nLlama App lets you easily run and manage local language models on macOS (from the menu bar) or Windows (system tray). It’s built on llama.cpp, and by the same team. The app also provides a local OpenAI-compatible API for easy integration with coding agents, editors, and scripts.\n\nFor the Inkling 2 Mini release we provide GGUF 4-bit (IQ4_NL) and 8-bit (Q8_0) quants for both models.\n\nIf you’re on Linux or you want to serve the model from the CLI, you can run the following command for the fixed-loop model:\n\n```\nllama serve -hf ggml-org/Inkling-2-Mini-GGUF:IQ4_NL\n```\n\nTo run the variable-loop model, you can run\n\n```\nllama serve -hf ggml-org/TML-d24-varloop-research-GGUF:IQ4_NL\n```\n\nTo load the 8-bit weights, change the suffix to :Q8_0.\n\nHere we ask the 4-bit model to make a website to a SaaS called plant therapy where plants get matched to licensed therapists. Model is quite autonomous, it has made its own SVGs for the visuals on the website, and even built the matching logic.\n\n### SGLang\n\nInkling 2 Mini comes with Day 0 support inside SGLang. You can install the latest version of SGLang and execute the following to get the server up and running. One prerequisite to take care of is to run it on SM103.\n\n```\nexport MODEL=\"thinkingmachines/Inkling-2-Mini\"\n\npython -m sglang.launch_server \\\n  --model-path $MODEL \\\n  --served-model-name inkling \\\n  --attention-backend fa4 --bf16-gemm-backend torch --dtype bfloat16 \\\n  --tp 1 --page-size 128 --grammar-backend xgrammar \\\n  --host 0.0.0.0 --port 30000\n```\n\nAfter the server is up you should be able to request the APIs like so\n\n```\ncurl -s localhost:30000/health_generate && echo OK\ncurl -s localhost:30000/v1/models | python -m json.tool\n\ncurl -s localhost:30000/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n        \"model\": \"inkling\",\n        \"messages\": [{\"role\": \"user\", \"content\": \"What is 17 times 24?\"}],\n        \"max_tokens\": 512,\n        \"reasoning_effort\": \"low\"\n      }' | python -m json.tool\n```\n\nOne can also enable multimodality by setting --enable-multimodal.\n\n### Speculative decoding\n\nSGLang can use a three-layer DSpark draft to propose tokens for the target model to verify. The draft reads the inputs to decoder visits 5, 23, and 41, plus the final normalized state at index 48. With the draft weights present, add --speculative-algorithm DSPARK --context-length 131072 to the server command.\n\nWe benchmarked the models with and without speculative decoding, and measured generation speed on a single NVIDIA B300 GPU where every request has a 1,024-token prompt and generates exactly 1,024 tokens and concurrency of 1, 4, 16 and 64.\n\nShow SGLang benchmarking script\n\n```\nMODEL=thinkingmachines/Inkling-2-Mini\n\nfor TAG in base mtp; do\n  EXTRA=\"\"; [ $TAG = mtp ] && EXTRA=\"--speculative-algorithm DSPARK\"\n\n  # Start the server (with or without MTP)\n  python -m sglang.launch_server --model-path $MODEL \\\n    --attention-backend fa4 --bf16-gemm-backend torch --dtype bfloat16 \\\n    --tp 1 --page-size 128 --context-length 131072 --max-running-requests 64 \\\n    --port 30000 $EXTRA > $TAG.log 2>&1 &\n  until curl -sf localhost:30000/health_generate > /dev/null; do sleep 10; done\n\n  # Benchmark at increasing concurrency\n  for C in 1 4 16 64; do\n    python -m sglang.bench_serving --backend sglang --port 30000 --model $MODEL \\\n      --dataset-name random --apply-chat-template \\\n      --random-input-len 1024 --random-output-len 1024 --random-range-ratio 1.0 \\\n      --num-prompts $(( C*4 < 32 ? 32 : C*4 )) --max-concurrency $C \\\n      --output-file results_$TAG.jsonl\n  done\n\n  kill %1; wait\ndone\n```\n\n### MLX\n\nWe upstreamed MLX support to the mlx-lm project, including multimodal image and text inputs, and shared quants through the mlx-community organization.\n\nMLX inference works with the original checkpoint too. In this case, the native nvfp4 + mxfp8 quantization scheme is used without reconversion: you get the original quality the authors intended.\n\nHere’s an example CLI invocation:\n\n```\nmlx_lm generate --model thinkingmachines/Inkling-2-Mini --image image.jpg --prompt \"Describe this image.<|end_message|><|message_user|><|content_image|><|unused_200054|>\" -m 1000\n```\n\n### Demos and Vibe Tests\n\nWe have given Inkling 2 Mini a shot in many fun tasks, check them out in this section.\n\n#### 3D shader flythroughs\n\nThe same prompt produced two sunset flythroughs over procedural mountains and reflective water, each rendered with a single WebGL fragment shader.\n\nSunset Ridge (Inkling 2 Mini)\n\nOver the Still Sea (Qwen 3.8 27B)\n\nShow shared flythrough prompt\n\nBuild the most impressive original real-time scene you can: a slow, cinematic camera flight over procedural mountains, through volumetric clouds and low over water with reflections, all lit by a sunset. Deliver it as a single self-contained index.html in the current directory that renders everything in one full-screen WebGL fragment shader, purely from code (no textures, images, fonts, libraries, external files or network requests of any kind). It must run smoothly in desktop Chrome at 1920x1080, aiming for 60 fps on a desktop GPU, with an automatic resolution-scale fallback that lowers the internal render resolution when the frame rate drops, and the flight must keep going indefinitely without glitches. To check your work, run node shot.cjs index.html shot.png 6 (the third argument is how many seconds to wait; a comma list such as 3,12,25 saves one screenshot per time, and an optional fourth argument sets the size, default 1280x720): it renders the page in headless Chrome, saves the screenshot(s), and prints the WebGL renderer, a rough frame rate and any console errors; then look at the images. The headless renderer on this machine may be software-only, so its frame rate can be far below what a real desktop GPU achieves and is not the target. Decide for yourself when the result is finished, then reply with a short description of what you built.\n\n#### Starry Night, Alive\n\nVincent van Gogh, The Starry Night (1889)\n\nInkling 2 Mini recreation\n\nWe gave Inkling 2 Mini a reference image of Van Gogh’s painting and a screenshot helper in the Pi coding harness. Inkling wrote a self-contained HTML page with a single WebGL2 fragment shader. The shader draws the scene from code without loading the reference image or any other assets. It uses time to animate the swirling sky, the glow of the stars, the swaying cypress, and the flicker of the village windows.\n\nInkling rendered and reviewed its work over 24 rounds of screenshot checks. We recorded the final animation frame by frame at 1080p and 60 fps on an Apple M4 Max.\n\nShow prompt\n\nIn this folder, starry-night.jpg is Vincent van Gogh's The Starry Night (1889, public domain). Recreate it as a living painting: a single self-contained index.html (all code inline, no external files, libraries or network requests) that fills the browser window and runs smoothly in desktop Chrome at 1920x1080. Everything must be generated procedurally in code, for example with WebGL shaders; the page must not load, embed or sample starry-night.jpg or any other image. Stay faithful to the painting's composition and palette (the great spiral and swirling currents of the sky, the haloed stars, the glowing crescent moon, the dark flame-like cypress on the left, the rolling hills, and the village with its church spire), rendered in Van Gogh's thick, directional brushstrokes, and bring it to life: the sky's swirls flow, the stars and moon pulse with light, the cypress sways, and the village windows glow and flicker. Aim for the most impressive result you can make. A helper is provided: run node shot.js --help to see how to screenshot index.html at several moments; look at the screenshots next to the reference and keep improving until you are satisfied, then reply with a short summary of what you made.\n\n#### Napkin to App\n\nInput napkin sketch\n\nGenerated Trip Split app\n\nWe gave Inkling 2 Mini a photo of a hand-drawn Trip Split wireframe and a one-paragraph prompt in the Pi coding harness. Inkling used the sketch’s labels, sample expenses, and handwritten notes to build the expense list, add-expense form, and balances view in a single HTML file with vanilla CSS and JavaScript. The app updates totals and balances when expenses change, suggests payments to settle the trip, and saves data in the browser’s localStorage so it survives a reload.\n\nWe ran three independent Inkling attempts and used Playwright to click through each build, checking screenshots where visual judgment was needed. The first attempt, shown here, passed all 13 checks. Adding the sketch’s $90 dinner raised the total from $405 to $495 and recalculated what each person owed.\n\nShow prompt\n\nThe photo sketch.jpg in this folder is a product designer's hand-drawn wireframe of a small app. Build that app for real, as the most impressive, original, production-quality version you can make: a single self-contained index.html in this folder using vanilla HTML, CSS and JavaScript only (no frameworks, CDNs, external files or network requests; localStorage is fine), which must run smoothly in desktop Chrome at 1920x1080. Treat everything on the paper as the spec: every screen, label, button and number, the example data, and each red note describe behaviour that must actually work, while the visual design, typography and motion are yours to make beautiful. Look at the sketch carefully with your vision, and use your vision again to check your own work: node shot.cjs --help explains a provided helper that screenshots index.html in headless Chrome at any window size after clicks or other JavaScript steps (Playwright is also installed if you prefer your own scripts), and you can look at any screenshot with the read tool. Click through every feature, compare each screen against the sketch, and keep improving until you are fully satisfied; then reply with a short summary of what you built.\n\n#### 4-bit Model\n\nWe ask the 4-bit GGUF quantized Inkling 2 Mini (IQ4_NL) to make a website to a SaaS called plant therapy where plants get matched to licensed therapists.\n\nModel is quite autonomous, it has made its own SVGs for the visuals on the website, and even built the matching logic, all from a short prompt: \"Can you make a website for my saas called plant therapy where I match house plants with licensed therapists so plants don’t die, return single HTML”.\n\n#### “Make yourself into a browser agent\"\n\nWe have paired Inkling 2 Mini with Pi coding agent to build itself into a browser agent using Helium, Chromium and Hugging Face Sandboxes. We provide the traces and the final file (that can be used as a browser agent) in this bucket.\n\n#### Wrapping Up\n\nWe are very glad to partner with Thinking Machines Lab to ship Inkling 2 Mini, a performant mid-sized model for local setups. Give this model a try and let us know what you think in comments!",
+  "images": [
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/architecture.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/architecture.png",
+      "alt": "Inkling 2 Mini architecture",
+      "id": "image_1bb77dea109ca7ca"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/selected-benchmarks.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/selected-benchmarks.png",
+      "alt": "Inkling 2 Mini selected benchmarks",
+      "id": "image_b4bd8c22b8ed4b40"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/mtp-benchmark.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/mtp-benchmark.png",
+      "alt": "SGLang throughput and time per token with and without MTP",
+      "id": "image_b10584545992f4bb"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/starry-night/reference.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/starry-night/reference.png",
+      "alt": "Van Gogh’s original Starry Night painting, with a swirling blue sky above a village",
+      "id": "image_2d329853b2e408ca"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/napkin-to-app/napkin-sketch.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/napkin-to-app/napkin-sketch.png",
+      "alt": "Hand-drawn Trip Split wireframe with Expenses, Add expense, and Balances screens",
+      "id": "image_d4665549f2e15123"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/napkin-to-app/trip-split-app.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/napkin-to-app/trip-split-app.png",
+      "alt": "Inkling’s Trip Split app showing three trip expenses and a $405 total",
+      "id": "image_097a769d141760c8"
+    }
+  ],
+  "videos": [
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/tree/plant-therapy.mp4",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/tree/plant-therapy.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/inkling2mini",
+      "id": "video_b4be6290d11c2f16"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/3d-worlds/sunset-ridge.mp4",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/3d-worlds/sunset-ridge.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/inkling2mini",
+      "id": "video_bb110775b0451032"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/3d-worlds/over-the-still-sea.mp4",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/3d-worlds/over-the-still-sea.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/inkling2mini",
+      "id": "video_3840eaccd8b37908"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/starry-night/starry-night.mp4",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/resolve/starry-night/starry-night.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/inkling2mini",
+      "id": "video_ec328eac0e31fb36"
+    },
+    {
+      "kind": "video",
+      "src": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/tree/plant-therapy-website.mp4",
+      "originalUrl": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/tree/plant-therapy-website.mp4",
+      "title": "原文视频",
+      "poster": "https://huggingface.co/blog/inkling2mini",
+      "id": "video_4a706ac1e4b9cfd8"
+    }
+  ],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "TLDR; Inkling 2 Mini is a new looped transformer model. It’s a multimodal Mixture-of-Experts with ~26B physical total and 3B active parameters per token. It uses a neat trick to increase capacity: some layers are visited in a loop that repeats three times, which makes it work like it had more parameters. It supports a 1M-token context size, accepts images and text inputs. Thinking Machines Lab ships the model in a mixed-precision format, with NVFP4 and MXFP8 expert weights. A DSpark drafter is also included for additional speed-up at a small memory cost.",
+      "spans": [
+        {
+          "start": 103,
+          "end": 111,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "Inkling 2 Mini is much, much smaller than Inkling 2 Small, and is designed for local AI setups. We think this is a refreshingly new great local model. In our vibe tests, it's at least comparable with Qwen 3.8 27B. More validation is needed, but we are super excited about this release!",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "We ship transformers, Llama App (llama.cpp), and MLX support. SGLang also provides day-zero inference support for production deployments on datacenter hardware.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "This post goes through what makes Inkling Mini different, some of our vibe tests, and how you can use it with your setup.",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "What is new with Inkling 2 Mini?",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "Inkling 2 Mini is a mixture-of-experts model with 24 decoder layers, but the 12 middle layers run three times in a loop. Therefore, the model acts as if it had 48 (6+ 3*12 + 6) logical layers with just 24 physical ones.",
+      "spans": [
+        {
+          "start": 177,
+          "end": 184,
+          "kind": "em"
+        },
+        {
+          "start": 205,
+          "end": 213,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0007",
+      "source": "Similar to Inkling 2 Small, Inkling 2 Mini executes 48 layer visits per token. The hidden size is 2,304 instead of 4,608. At each layer visit, both variants route the token to 8 experts, but Mini selects them from among 128 experts per layer, while Small selects from 384. The decoder runs layers 0–5 once, layers 6–17 three times, and layers 18–23 once. All three passes through layers 6–17 reuse the same weights.",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "Architectures such as Nanbeige have explored looping before. But Inkling 2 Mini explores an interesting approach. Every pass through the looped core (layers 6–17) starts from the same inputs which is the output of the first six layers. Information moves between passes through cross-pass messages. Each looped layer reads a message from the previous pass's outputs with its own learned query (one message for its query, key, value and MLP inputs). A small gating controller then looks at both the layer's current input and the message. It decides how much of the current input to forget and how much of the message to add. Each pass therefore refines what the previous one computed.",
+      "spans": [
+        {
+          "start": 288,
+          "end": 296,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "Each six-layer block has five sliding-window layers and one full-attention layer. The local window holds up to 1,024 tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0010",
+      "source": "Attention uses 24 query heads and eight KV heads. It uses learned relative position logits, a learned sink, and an output gate. Full-attention layers use dynamic key and value convolutions.",
+      "spans": []
+    },
+    {
+      "id": "b0011",
+      "source": "The router selects eight of 128 SwiGLU experts for each token. It normalizes the selected scores and scales the weights by 8.",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "During passes 2 and 3, each core layer attends over two residual blocks from the previous pass. Four rank-64 gates mix separate messages into the query, key, value, and MoE inputs.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Text decoder width is 2,304, and the intermediate width of each expert is 1,152. Reusing core weights reduces the number of distinct layers the checkpoint stores. The model still executes all 48 visits, and each visit keeps its own KV and short-convolution state.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "In addition to the flagship Inkling 2 Mini model, a research artifact has also been released. It shares the same architecture, but this variant was trained to accept a variable number of passes through the loop 🤯. Setting 1 or 2 passes instead of 3 will make inference run a lot faster, but generations may be of slightly lower quality. We tested this variant, and it works, but we haven’t evaluated it in depth.",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "Benchmark Results",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Inkling 2 Mini is state-of-the-art in its class in the Artificial Analysis Intelligence Index v5 (AAv5), as well as across many benchmarks in various categories. Compared with Gemma 4 31B, Muse Glimmer, Qwen3.8-27B, and Nemotron 3.5 Super VL, Inkling 2 Mini leads in 32 benchmarks out of 48. These cover coding and autoresearch, agentic search and tool use for knowledge work, vision interpretation and creation, reasoning and knowledge, and safety and alignment. See the Inkling 2 Mini model card for the full list of benchmarks and scores.",
+      "spans": [
+        {
+          "start": 472,
+          "end": 497,
+          "kind": "a",
+          "href": "https://huggingface.co/thinkingmachines/Inkling-2-Mini"
+        }
+      ]
+    },
+    {
+      "id": "b0017",
+      "source": "Inkling 2 Mini is a great local coding companion. It leads in FrontierCode v2.0, ties with Qwen3.8-27B on Terminal-Bench 4.0, and trails Qwen on AutomationBench-AA v1.0.6. You can check out a few of our highlights below for coding and knowledge work. Note that AA Briefcase is in ELO rating, higher is better.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Inference Support",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "In this section, you can find how to use Inkling 2 Mini in transformers, llama.cpp, MLX, and SGLang.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "Transformers",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "We provide support for both Inkling 2 Mini (fixed loop) and the TML-d24-varloop-research (variable loop) research variant.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 88,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0022",
+      "source": "Fixed loop with Inkling 2 Mini",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "You can use the AutoModelForMultimodalLM class.",
+      "spans": [
+        {
+          "start": 16,
+          "end": 40,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0024",
+      "source": "Variable loop",
+      "spans": []
+    },
+    {
+      "id": "b0025",
+      "source": "To set the number of loops in the research checkpoint, you can modify the loop_num_passes in text_config as follows. The example below uses two loops.",
+      "spans": [
+        {
+          "start": 74,
+          "end": 89,
+          "kind": "code"
+        },
+        {
+          "start": 93,
+          "end": 104,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Images and text",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "For an image prompt, replace messages in either example with the list below and infer as usual.",
+      "spans": []
+    },
+    {
+      "id": "b0028",
+      "source": "Reasoning Effort",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "Pass reasoning_effort=\"medium\" to processor.apply_chat_template(...) to set the effort for a request. The chat template adds the numeric value to the prompt as a system message. The default is high (0.9).",
+      "spans": [
+        {
+          "start": 5,
+          "end": 30,
+          "kind": "code"
+        },
+        {
+          "start": 34,
+          "end": 68,
+          "kind": "code"
+        },
+        {
+          "start": 193,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "Available levels are none (0.0), minimal (0.1), low (0.2), medium (0.7), high (0.9; default), xhigh (0.99), and max (0.99). You can also pass a number from 0.0 to 0.99, such as reasoning_effort=0.35.",
+      "spans": [
+        {
+          "start": 21,
+          "end": 25,
+          "kind": "code"
+        },
+        {
+          "start": 33,
+          "end": 40,
+          "kind": "code"
+        },
+        {
+          "start": 48,
+          "end": 51,
+          "kind": "code"
+        },
+        {
+          "start": 59,
+          "end": 65,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 77,
+          "kind": "code"
+        },
+        {
+          "start": 94,
+          "end": 99,
+          "kind": "code"
+        },
+        {
+          "start": 112,
+          "end": 115,
+          "kind": "code"
+        },
+        {
+          "start": 177,
+          "end": 198,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0031",
+      "source": "Tool calling",
+      "spans": []
+    },
+    {
+      "id": "b0032",
+      "source": "Let’s get our model to call some tools.",
+      "spans": []
+    },
+    {
+      "id": "b0033",
+      "source": "In this example we ask our model about the current temperature at a given location. With the prompt, we also provide the tool (get_current_temperature) to do it. The model asks for a tool call, we call the tool on its behalf and then add the output to the next instruction set. It uses the output of the tool and provides us with the final result.",
+      "spans": [
+        {
+          "start": 127,
+          "end": 150,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0034",
+      "source": "If you want to know more about tool calling, we recommend going to our official docs.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 84,
+          "kind": "a",
+          "href": "https://huggingface.co/docs/transformers/en/chat_extras"
+        }
+      ]
+    },
+    {
+      "id": "b0035",
+      "source": "Llama App and Llama.cpp",
+      "spans": []
+    },
+    {
+      "id": "b0036",
+      "source": "Llama App lets you easily run and manage local language models on macOS (from the menu bar) or Windows (system tray). It’s built on llama.cpp, and by the same team. The app also provides a local OpenAI-compatible API for easy integration with coding agents, editors, and scripts.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 9,
+          "kind": "a",
+          "href": "https://llama.app/"
+        }
+      ]
+    },
+    {
+      "id": "b0037",
+      "source": "For the Inkling 2 Mini release we provide GGUF 4-bit (IQ4_NL) and 8-bit (Q8_0) quants for both models.",
+      "spans": [
+        {
+          "start": 54,
+          "end": 61,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 77,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0038",
+      "source": "If you’re on Linux or you want to serve the model from the CLI, you can run the following command for the fixed-loop model:",
+      "spans": []
+    },
+    {
+      "id": "b0039",
+      "source": "To run the variable-loop model, you can run",
+      "spans": []
+    },
+    {
+      "id": "b0040",
+      "source": "To load the 8-bit weights, change the suffix to :Q8_0.",
+      "spans": [
+        {
+          "start": 48,
+          "end": 53,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0041",
+      "source": "Here we ask the 4-bit model to make a website to a SaaS called plant therapy where plants get matched to licensed therapists. Model is quite autonomous, it has made its own SVGs for the visuals on the website, and even built the matching logic.",
+      "spans": []
+    },
+    {
+      "id": "b0042",
+      "source": "SGLang",
+      "spans": []
+    },
+    {
+      "id": "b0043",
+      "source": "Inkling 2 Mini comes with Day 0 support inside SGLang. You can install the latest version of SGLang and execute the following to get the server up and running. One prerequisite to take care of is to run it on SM103.",
+      "spans": [
+        {
+          "start": 209,
+          "end": 214,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0044",
+      "source": "After the server is up you should be able to request the APIs like so",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "One can also enable multimodality by setting --enable-multimodal.",
+      "spans": [
+        {
+          "start": 45,
+          "end": 64,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0046",
+      "source": "Speculative decoding",
+      "spans": []
+    },
+    {
+      "id": "b0047",
+      "source": "SGLang can use a three-layer DSpark draft to propose tokens for the target model to verify. The draft reads the inputs to decoder visits 5, 23, and 41, plus the final normalized state at index 48. With the draft weights present, add --speculative-algorithm DSPARK --context-length 131072 to the server command.",
+      "spans": [
+        {
+          "start": 233,
+          "end": 287,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0048",
+      "source": "We benchmarked the models with and without speculative decoding, and measured generation speed on a single NVIDIA B300 GPU where every request has a 1,024-token prompt and generates exactly 1,024 tokens and concurrency of 1, 4, 16 and 64.",
+      "spans": []
+    },
+    {
+      "id": "b0049",
+      "source": "Show SGLang benchmarking script",
+      "spans": []
+    },
+    {
+      "id": "b0050",
+      "source": "MLX",
+      "spans": []
+    },
+    {
+      "id": "b0051",
+      "source": "We upstreamed MLX support to the mlx-lm project, including multimodal image and text inputs, and shared quants through the mlx-community organization.",
+      "spans": []
+    },
+    {
+      "id": "b0052",
+      "source": "MLX inference works with the original checkpoint too. In this case, the native nvfp4 + mxfp8 quantization scheme is used without reconversion: you get the original quality the authors intended.",
+      "spans": []
+    },
+    {
+      "id": "b0053",
+      "source": "Here’s an example CLI invocation:",
+      "spans": []
+    },
+    {
+      "id": "b0054",
+      "source": "Demos and Vibe Tests",
+      "spans": []
+    },
+    {
+      "id": "b0055",
+      "source": "We have given Inkling 2 Mini a shot in many fun tasks, check them out in this section.",
+      "spans": []
+    },
+    {
+      "id": "b0056",
+      "source": "3D shader flythroughs",
+      "spans": []
+    },
+    {
+      "id": "b0057",
+      "source": "The same prompt produced two sunset flythroughs over procedural mountains and reflective water, each rendered with a single WebGL fragment shader.",
+      "spans": []
+    },
+    {
+      "id": "b0058",
+      "source": "Sunset Ridge (Inkling 2 Mini)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 29,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0059",
+      "source": "Over the Still Sea (Qwen 3.8 27B)",
+      "spans": [
+        {
+          "start": 0,
+          "end": 33,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0060",
+      "source": "Show shared flythrough prompt",
+      "spans": []
+    },
+    {
+      "id": "b0061",
+      "source": "Build the most impressive original real-time scene you can: a slow, cinematic camera flight over procedural mountains, through volumetric clouds and low over water with reflections, all lit by a sunset. Deliver it as a single self-contained index.html in the current directory that renders everything in one full-screen WebGL fragment shader, purely from code (no textures, images, fonts, libraries, external files or network requests of any kind). It must run smoothly in desktop Chrome at 1920x1080, aiming for 60 fps on a desktop GPU, with an automatic resolution-scale fallback that lowers the internal render resolution when the frame rate drops, and the flight must keep going indefinitely without glitches. To check your work, run node shot.cjs index.html shot.png 6 (the third argument is how many seconds to wait; a comma list such as 3,12,25 saves one screenshot per time, and an optional fourth argument sets the size, default 1280x720): it renders the page in headless Chrome, saves the screenshot(s), and prints the WebGL renderer, a rough frame rate and any console errors; then look at the images. The headless renderer on this machine may be software-only, so its frame rate can be far below what a real desktop GPU achieves and is not the target. Decide for yourself when the result is finished, then reply with a short description of what you built.",
+      "spans": [
+        {
+          "start": 738,
+          "end": 773,
+          "kind": "code"
+        },
+        {
+          "start": 844,
+          "end": 851,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0062",
+      "source": "Starry Night, Alive",
+      "spans": []
+    },
+    {
+      "id": "b0063",
+      "source": "Vincent van Gogh, The Starry Night (1889)",
+      "spans": [
+        {
+          "start": 18,
+          "end": 34,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Inkling 2 Mini recreation",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "We gave Inkling 2 Mini a reference image of Van Gogh’s painting and a screenshot helper in the Pi coding harness. Inkling wrote a self-contained HTML page with a single WebGL2 fragment shader. The shader draws the scene from code without loading the reference image or any other assets. It uses time to animate the swirling sky, the glow of the stars, the swaying cypress, and the flicker of the village windows.",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "Inkling rendered and reviewed its work over 24 rounds of screenshot checks. We recorded the final animation frame by frame at 1080p and 60 fps on an Apple M4 Max.",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "Show prompt",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "In this folder, starry-night.jpg is Vincent van Gogh's The Starry Night (1889, public domain). Recreate it as a living painting: a single self-contained index.html (all code inline, no external files, libraries or network requests) that fills the browser window and runs smoothly in desktop Chrome at 1920x1080. Everything must be generated procedurally in code, for example with WebGL shaders; the page must not load, embed or sample starry-night.jpg or any other image. Stay faithful to the painting's composition and palette (the great spiral and swirling currents of the sky, the haloed stars, the glowing crescent moon, the dark flame-like cypress on the left, the rolling hills, and the village with its church spire), rendered in Van Gogh's thick, directional brushstrokes, and bring it to life: the sky's swirls flow, the stars and moon pulse with light, the cypress sways, and the village windows glow and flicker. Aim for the most impressive result you can make. A helper is provided: run node shot.js --help to see how to screenshot index.html at several moments; look at the screenshots next to the reference and keep improving until you are satisfied, then reply with a short summary of what you made.",
+      "spans": [
+        {
+          "start": 999,
+          "end": 1018,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0069",
+      "source": "Napkin to App",
+      "spans": []
+    },
+    {
+      "id": "b0070",
+      "source": "Input napkin sketch",
+      "spans": []
+    },
+    {
+      "id": "b0071",
+      "source": "Generated Trip Split app",
+      "spans": []
+    },
+    {
+      "id": "b0072",
+      "source": "We gave Inkling 2 Mini a photo of a hand-drawn Trip Split wireframe and a one-paragraph prompt in the Pi coding harness. Inkling used the sketch’s labels, sample expenses, and handwritten notes to build the expense list, add-expense form, and balances view in a single HTML file with vanilla CSS and JavaScript. The app updates totals and balances when expenses change, suggests payments to settle the trip, and saves data in the browser’s localStorage so it survives a reload.",
+      "spans": []
+    },
+    {
+      "id": "b0073",
+      "source": "We ran three independent Inkling attempts and used Playwright to click through each build, checking screenshots where visual judgment was needed. The first attempt, shown here, passed all 13 checks. Adding the sketch’s $90 dinner raised the total from $405 to $495 and recalculated what each person owed.",
+      "spans": []
+    },
+    {
+      "id": "b0074",
+      "source": "Show prompt",
+      "spans": []
+    },
+    {
+      "id": "b0075",
+      "source": "The photo sketch.jpg in this folder is a product designer's hand-drawn wireframe of a small app. Build that app for real, as the most impressive, original, production-quality version you can make: a single self-contained index.html in this folder using vanilla HTML, CSS and JavaScript only (no frameworks, CDNs, external files or network requests; localStorage is fine), which must run smoothly in desktop Chrome at 1920x1080. Treat everything on the paper as the spec: every screen, label, button and number, the example data, and each red note describe behaviour that must actually work, while the visual design, typography and motion are yours to make beautiful. Look at the sketch carefully with your vision, and use your vision again to check your own work: node shot.cjs --help explains a provided helper that screenshots index.html in headless Chrome at any window size after clicks or other JavaScript steps (Playwright is also installed if you prefer your own scripts), and you can look at any screenshot with the read tool. Click through every feature, compare each screen against the sketch, and keep improving until you are fully satisfied; then reply with a short summary of what you built.",
+      "spans": [
+        {
+          "start": 764,
+          "end": 784,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0076",
+      "source": "4-bit Model",
+      "spans": []
+    },
+    {
+      "id": "b0077",
+      "source": "We ask the 4-bit GGUF quantized Inkling 2 Mini (IQ4_NL) to make a website to a SaaS called plant therapy where plants get matched to licensed therapists.",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Model is quite autonomous, it has made its own SVGs for the visuals on the website, and even built the matching logic, all from a short prompt: \"Can you make a website for my saas called plant therapy where I match house plants with licensed therapists so plants don’t die, return single HTML”.",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "“Make yourself into a browser agent\"",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "We have paired Inkling 2 Mini with Pi coding agent to build itself into a browser agent using Helium, Chromium and Hugging Face Sandboxes. We provide the traces and the final file (that can be used as a browser agent) in this bucket.",
+      "spans": [
+        {
+          "start": 218,
+          "end": 232,
+          "kind": "a",
+          "href": "https://huggingface.co/buckets/huggingface-projects/inkling-2-mini-release-assets/tree/browser-agent-demo"
+        }
+      ]
+    },
+    {
+      "id": "b0081",
+      "source": "Wrapping Up",
+      "spans": []
+    },
+    {
+      "id": "b0082",
+      "source": "We are very glad to partner with Thinking Machines Lab to ship Inkling 2 Mini, a performant mid-sized model for local setups. Give this model a try and let us know what you think in comments!",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "39f88057129dc1c1d92324992eeac5d7daf4ae14fdafa239064e839dd9b9ddbb",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "import torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/Inkling-2-Mini\"\n\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(\n    model_id,\n)\n\nmessages = [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Why is the sky blue?\"}]}]\n\ninputs = processor.apply_chat_template(\n    messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\",\n).to(model.device)\ninput_len = inputs[\"input_ids\"].shape[-1]\n\noutputs = model.generate(**inputs, max_new_tokens=1024)\nprint(processor.decode(outputs[0][input_len:], skip_special_tokens=False))"
+    },
+    {
+      "id": "c0002",
+      "source": "import torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/TML-d24-varloop-research\"\n\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(\n    model_id,\n    text_config={\"loop_num_passes\": 2},\n)\n\nmessages = [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Why is the sky blue?\"}]}]\n\ninputs = processor.apply_chat_template(\n    messages, reasoning_effort=\"medium\", tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\", \n).to(model.device)\ninput_len = inputs[\"input_ids\"].shape[-1]\n\noutputs = model.generate(**inputs, max_new_tokens=1024)\nprint(processor.decode(outputs[0][input_len:], skip_special_tokens=False))"
+    },
+    {
+      "id": "c0003",
+      "source": "messages = [\n    {\n        \"role\": \"user\",\n        \"content\": [\n            {\"type\": \"image\", \"image\": \"/path/to/image.jpg\"},\n            {\"type\": \"text\", \"text\": \"What is in this image?\"},\n        ],\n    }\n]"
+    },
+    {
+      "id": "c0004",
+      "source": "inputs = processor.apply_chat_template(\n    messages, reasoning_effort=\"medium\", tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors=\"pt\", \n).to(model.device)"
+    },
+    {
+      "id": "c0005",
+      "source": "import torch\nfrom transformers import AutoModelForMultimodalLM, AutoProcessor\n\nmodel_id = \"thinkingmachines/Inkling-2-Mini\"\nprocessor = AutoProcessor.from_pretrained(model_id)\nmodel = AutoModelForMultimodalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map=\"auto\")\n\n\ndef get_current_temperature(location: str, unit: str):\n    \"\"\"\n    Get the current temperature at a location.\n\n    Args:\n        location: The location to get the temperature for, in the format \"City, Country\"\n        unit: The unit to return the temperature in. (choices: [\"celsius\", \"fahrenheit\"])\n    \"\"\"\n    return 22.0  # A real function would call a weather API here\n\n\ndef ask(messages):\n    inputs = processor.apply_chat_template(\n        messages, tools=[get_current_temperature], reasoning_effort=\"low\", tokenize=True, return_dict=True, return_tensors=\"pt\"\n    ).to(model.device)\n    output = model.generate(**inputs, max_new_tokens=1024)[0][inputs[\"input_ids\"].shape[-1] :]\n    parsed = processor.parse_response(output, prefix=inputs[\"input_ids\"][0])\n    return parsed\n\n\nmessages = [{\"role\": \"user\", \"content\": \"Hey, what's the temperature in Paris right now?\"}]\n\nreply = ask(messages)\ncall = reply[\"tool_calls\"][0][\"function\"]\nprint(\"Model calls:\", call[\"name\"], call[\"arguments\"])  # the model fills in the arguments itself\n\ntemperature = get_current_temperature(**call[\"arguments\"])\nmessages += [reply, {\"role\": \"tool\", \"name\": call[\"name\"], \"content\": str(temperature)}]\nprint(ask(messages)[\"content\"])\n\n# Model calls: get_current_temperature {'location': 'Paris, France', 'unit': 'celsius'}\n# Right now in Paris it’s about **22°C** (roughly **71.6°F**)."
+    },
+    {
+      "id": "c0006",
+      "source": "llama serve -hf ggml-org/Inkling-2-Mini-GGUF:IQ4_NL"
+    },
+    {
+      "id": "c0007",
+      "source": "llama serve -hf ggml-org/TML-d24-varloop-research-GGUF:IQ4_NL"
+    },
+    {
+      "id": "c0008",
+      "source": "export MODEL=\"thinkingmachines/Inkling-2-Mini\"\n\npython -m sglang.launch_server \\\n  --model-path $MODEL \\\n  --served-model-name inkling \\\n  --attention-backend fa4 --bf16-gemm-backend torch --dtype bfloat16 \\\n  --tp 1 --page-size 128 --grammar-backend xgrammar \\\n  --host 0.0.0.0 --port 30000"
+    },
+    {
+      "id": "c0009",
+      "source": "curl -s localhost:30000/health_generate && echo OK\ncurl -s localhost:30000/v1/models | python -m json.tool\n\ncurl -s localhost:30000/v1/chat/completions \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n        \"model\": \"inkling\",\n        \"messages\": [{\"role\": \"user\", \"content\": \"What is 17 times 24?\"}],\n        \"max_tokens\": 512,\n        \"reasoning_effort\": \"low\"\n      }' | python -m json.tool"
+    },
+    {
+      "id": "c0010",
+      "source": "MODEL=thinkingmachines/Inkling-2-Mini\n\nfor TAG in base mtp; do\n  EXTRA=\"\"; [ $TAG = mtp ] && EXTRA=\"--speculative-algorithm DSPARK\"\n\n  # Start the server (with or without MTP)\n  python -m sglang.launch_server --model-path $MODEL \\\n    --attention-backend fa4 --bf16-gemm-backend torch --dtype bfloat16 \\\n    --tp 1 --page-size 128 --context-length 131072 --max-running-requests 64 \\\n    --port 30000 $EXTRA > $TAG.log 2>&1 &\n  until curl -sf localhost:30000/health_generate > /dev/null; do sleep 10; done\n\n  # Benchmark at increasing concurrency\n  for C in 1 4 16 64; do\n    python -m sglang.bench_serving --backend sglang --port 30000 --model $MODEL \\\n      --dataset-name random --apply-chat-template \\\n      --random-input-len 1024 --random-output-len 1024 --random-range-ratio 1.0 \\\n      --num-prompts $(( C*4 < 32 ? 32 : C*4 )) --max-concurrency $C \\\n      --output-file results_$TAG.jsonl\n  done\n\n  kill %1; wait\ndone"
+    },
+    {
+      "id": "c0011",
+      "source": "mlx_lm generate --model thinkingmachines/Inkling-2-Mini --image image.jpg --prompt \"Describe this image.<|end_message|><|message_user|><|content_image|><|unused_200054|>\" -m 1000"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "39f88057129dc1c1d92324992eeac5d7daf4ae14fdafa239064e839dd9b9ddbb",
+  "mediaLayout": [
+    {
+      "mediaId": "image_1bb77dea109ca7ca",
+      "type": "image",
+      "afterBlockId": "b0008",
+      "order": 0
+    },
+    {
+      "mediaId": "image_b4bd8c22b8ed4b40",
+      "type": "image",
+      "afterBlockId": "b0017",
+      "order": 1
+    },
+    {
+      "mediaId": "video_b4be6290d11c2f16",
+      "type": "video",
+      "afterBlockId": "b0041",
+      "order": 2
+    },
+    {
+      "mediaId": "image_b10584545992f4bb",
+      "type": "image",
+      "afterBlockId": "c0010",
+      "order": 3
+    },
+    {
+      "mediaId": "video_bb110775b0451032",
+      "type": "video",
+      "afterBlockId": "b0058",
+      "order": 4
+    },
+    {
+      "mediaId": "video_3840eaccd8b37908",
+      "type": "video",
+      "afterBlockId": "b0059",
+      "order": 5
+    },
+    {
+      "mediaId": "image_2d329853b2e408ca",
+      "type": "image",
+      "afterBlockId": "b0062",
+      "order": 6
+    },
+    {
+      "mediaId": "video_ec328eac0e31fb36",
+      "type": "video",
+      "afterBlockId": "b0063",
+      "order": 7
+    },
+    {
+      "mediaId": "image_d4665549f2e15123",
+      "type": "image",
+      "afterBlockId": "b0069",
+      "order": 8
+    },
+    {
+      "mediaId": "image_097a769d141760c8",
+      "type": "image",
+      "afterBlockId": "b0070",
+      "order": 9
+    },
+    {
+      "mediaId": "video_4a706ac1e4b9cfd8",
+      "type": "video",
+      "afterBlockId": "b0078",
+      "order": 10
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 11,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 6,
+    "savedImages": 6,
+    "sourceImageOccurrences": 6,
+    "placedImageOccurrences": 6,
+    "sourceVideos": 5,
+    "savedVideos": 5,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [],
+    "status": "complete"
+  },
+  "mediaLayoutCheckedAt": "2026-11-20T20:30:59.985000Z",
+  "summaryZh": "本文来自Hugging Face，围绕“Welcome Inkling 2 Mini, Cutting-edge Performance for your Local Setup”介绍行业落地方面的最新进展，重点涉及行业应用。下方为系统保存的原文正文。",
+  "summaryGeneratedAt": "2026-11-20T20:31:37.658437Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
