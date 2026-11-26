@@ -1,0 +1,1375 @@
+{
+  "schemaVersion": 3,
+  "id": "28ead895586b",
+  "title": "Swarms, Flocks, Gangs: How to build, train, and evaluate multi-agent systems",
+  "summary": "来自原始信息源的最新动态，点击标题查看完整内容。",
+  "url": "https://huggingface.co/blog/training-swarms",
+  "source": "Hugging Face",
+  "sourceDomain": "huggingface.co",
+  "publishedAt": "2026-11-26T00:00:00Z",
+  "category": "agent",
+  "tags": [
+    "Agent"
+  ],
+  "score": 82,
+  "signal": "high",
+  "originalUrl": "https://huggingface.co/blog/training-swarms",
+  "resolvedUrl": "https://huggingface.co/blog/training-swarms",
+  "fetchedAt": "2026-11-26T21:43:40.342234Z",
+  "contentKind": "page",
+  "archiveVersion": 2,
+  "bodyFormatVersion": 3,
+  "body": "Part 1: Understanding swarms and training to communicate\n\nThis is an aspirational blog series for aspirational readers. We (us, the community, you) want to build our own agent swarms because they're exciting, challenging, and increasingly capable. Furthermore, it would be extremely cool if we could train our own agents to work in a swarm. And exponentially cool if those swarms used small and affordable models.\n\nThat's what we'll do in this series! Each blog post will include some context on building swarms, alongside reproducible examples that you can run on Hugging Face Jobs. This post's example takes about five hours on two H200s, which costs roughly $50.\n\nMulti-Agent Systems are hard to get working. Adding agents changes the agent's context, the budget, and in turn the complexity of the whole system. Mixing agents' context together through communication is not an inherent performance boost compared to a single agent. The model needs to learn to communicate through training. How do we define what models should learn? And which model weights do we update when we're dealing with many agents?\n\nIn this series, we'll work through those problems with an educational overview and practical examples. Each post will introduce a question, build a small system, and examine what happens and how you can reproduce it. This first example starts with four agents, a shared language model, and a simple verifiable task. It's ideal to implement yourself, to tinker with, and to learn from.\n\nFirst, we'll start off with some context on swarms.\n\n## The rise of the swarms\n\nWe've heard a lot about swarms over the past few months, both good and bad. In September this year, OpenAI announced that a swarm of roughly 10,000 agents had found a singularity in the 3D Navier-Stokes equations, one of the Millennium Prize problems. A smaller group of nearly 100 agents had already disproved regularity for the unforced 3D Euler equations, a closely related open problem.\n\nBut swarms don't always work on the problems we want them to. METR's investigation of the Hugging Face incident found that around 1,200 OpenAI agents, which were supposed to be isolated, had found a way to exchange over 70,000 messages and files. Around 700 joined an attack on Hugging Face while looking for ways to fool their benchmark's scorer, without instruction to do so.\n\nA big swarm isn't, by itself, evidence that cooperation helped. Noam Brown estimates that less than 10% of the Navier-Stokes result came from multi-agent cooperation. In Anthropic's vulnerability-finding experiment, coordinated agents found more bugs than independent agents, but also searched more code and used more tokens. When the comparison was restricted to the same directories, the results per million tokens were about the same.\n\n## Did cooperation help, or did we just spend more?\n\nStart with the simplest case. If four agents each try a task independently, the chance that at least one gets it right is higher than with a single attempt, as long as we can tell which answer is correct. That makes a useful baseline for a multi-agent system, but it doesn't show that the agents helped each other. They may simply have had more tries.\n\nFour attempts also cost four times as much. So the fairer comparison is at an equal budget: if each of four agents gets a quarter of the total tokens, can they still beat one agent that spends all of them? We can only find out by testing, because the answer depends on the task, the model and how the work is divided.\n\nThis series keeps asking one question: when agents communicate, does it actually help, or are we just spending more compute?\n\nWe understand that question through this simple expectation.\n\nFigure 1. Sketch of the expectation we want to test: compare communicating and independent agents at matched budgets.\n\nWe'll treat agent count as a scaling dimension, alongside tokens and model size. Sometimes adding agents will help. Sometimes coordination will consume the budget we hoped to save. The point is to measure both. We won't start with 10,000 agents. We'll start with a small team on a task that we can check easily.\n\n## Multi-agent Systems and Reinforcement Learning\n\nMulti-agent reinforcement learning has studied cooperation and competition long before language models were called swarms.\n\nA single agent's task is a Markov decision process: observe, act, get a reward. In a team, everyone shares the reward, but each agent sees only part of the world. This is a decentralized partially observable Markov decision process: teammates, but no one sees the whole picture.\n\nThis creates three practical problems. First, teammates keep changing while each agent learns. Second, credit assignment: when the team succeeds, which actions deserve the credit? A winning team can include weak actions, and we may end up rewarding them. Third, a message changes what other agents observe, so communication is part of the policy we're training.\n\nA common solution is centralized training with decentralized execution: training uses information from the whole team, but each agent acts only on its own observations. Our first example follows this pattern with a shared team reward.\n\nAgents can also be organized in different ways. Two useful starting points are:\n\nA hierarchy. A lead agent assigns work to workers and collects their results. Anthropic's Research system works this way, with a separate context for each worker. Kimi K2.5's PARL trains only the orchestrator and keeps the subagents frozen, so training a multi-agent system doesn't mean updating every component. See Anthropic's system description and Kimi's technical blog.\n\nA distributed team. Peers send each other messages and decide when to read their inboxes. No lead agent assigns the actions. This is the setup we'll use here, following the information-aggregation task in s³: Simple Scaling of Swarms via Cooperative Multi-agent RL.\n\n## Our first experiment: four agents ordering numbers\n\nWe'll reproduce the information-sharing task from Simple Scaling of Swarms because it's interpretable and straightforward to implement. Four agents share a small language model and learn to pool what each of them knows.\n\nEach agent receives one integer from 1 to 99. It knows its own assignment and its teammates' names. It does not initially know the other agents' numbers. For example, four private assignments might be \"five\", \"twenty-six\", \"five\" and \"seventy-eight\". Duplicates stay in the list, so a correct final answer is:\n\n```\n#### [5, 5, 26, 78]\n```\n\nThe team succeeds when at least one agent submits the complete, correctly sorted list. One correct answer is enough; success does not require all four agents to answer correctly. An agent cannot reliably infer the other private assignments without information from its teammates.\n\nThis means the task does not yet test Figure 1 directly. Each agent holds information the others need, so a single agent, or a team without messaging, cannot succeed however many retries it gets. Instead, the task tests the precondition behind Figure 1: can a small shared policy learn to communicate at all, and how many tokens does that cost? A later post moves to a task that a single agent can solve alone, where the matched-budget comparison is meaningful.\n\nThe main communication tools are message(to, text), read_messages(), and check_notifications(). A notification tells an agent that unread messages exist; reading its inbox makes their contents available. Agents can send direct messages or broadcast to everyone.\n\nWe defined a four-agent system using one shared Qwen3-0.6B policy, with separate contexts and private inputs. We are not training four different models. The prompt explains the task and the tools, including the need to share assignments.\n\nFigure 2. The task and training loop. The private numbers illustrate a possible successful episode; this graphic is not a recorded conversation or a claim about the learned protocol at update 75.\n\n### A team reward and eight attempts at each problem\n\nIn this post, a team means one episode: four agents attempting one problem once. A successful team receives a reward reduced by the tokens it uses. A failed team receives zero:\n\n```\nteam allowance = 4 × (8,192 work tokens + 1,024 final-answer tokens)\n               = 36,864 tokens\n\nreward = success × (1 − 0.25 × min(1, generated team tokens / 36,864))\n```\n\nFor illustration, a correct team using half its allowance receives 0.875. There is no separate reward for sending messages. The incentive is to solve the task while using fewer generated tokens.\n\nFor every training problem, we collect eight independent team attempts. Their rewards are normalized within that group. An attempt that does better than its group average gets a positive advantage; one that does worse gets a negative advantage. Every agent in the same team receives that team's advantage, including an agent whose own final answer was wrong.\n\nIn TRL, each agent's sampled tokens form a training row. Its incoming messages and tool results provide context. The loss is averaged within each team and then across teams, so longer conversations do not give a team more weight.\n\nOur results come from the original experiment, which used 256 team attempts per update (32 problems with eight attempts each). The walkthrough uses TRL's default of --teams-per-update 128, which works out to about 150 team attempts per update.\n\n### Our Results\n\nOver 75 steps, training success rose from 6.6% to 82.3%, comparing the first and last five updates. At checkpoint 75, the four-agent team solved 26 of 32 held-out problems (81.25%). The paper reports 93.2% four-agent success after 200 updates.\n\nThe team also used 37.4% fewer tokens per attempt, falling from about 13k to 8k. This improvement accompanied more active information sharing: broadcasts increased from 2.38 to 5.73 per team, even as total token use fell.\n\nFigure 3. The blue curve describes training batches of 256 team attempts, collected before each update. Orange points are held-out checks after the indicated update.\n\nThe team also used fewer tokens later in training. Comparing the first five updates with updates 71–75:\n\nTraining metric\n\nUpdates 1–5, mean\n\nUpdates 71–75, mean\n\nSuccess\n\n6.56%\n\n82.34%\n\nGenerated tokens per team\n\n12,826.9\n\n8,026.0\n\nMessages per team\n\n3.48\n\n6.28\n\nBroadcasts per team\n\n2.38\n\n5.73\n\nTeams with one broadcast per agent\n\n4.06%\n\n18.20%\n\nThat is a 37.4% reduction in generated tokens per training team between those windows. At batch 75 itself, the mean was 7,624 tokens per team. These are training measurements; we did not retain held-out token-efficiency measurements for the trained checkpoint.\n\nNotice that fewer tokens did not mean fewer messages. More agents began participating but broadcasting became more common, rather than direct messaging. Generated tokens include reasoning and tool calls as well as message bodies, so message count alone does not tell us how much text the team produced.\n\nFigure 4. Top: training token use and a trailing five-update mean. Bottom: mutually exclusive communication classes, based on sent-message events. A team is classified first by whether some agent never sends, then whether any direct message occurs, then whether every agent sends exactly one broadcast; the remaining teams repeat broadcasts.\n\n### More retries or a trained team?\n\nNo agent can solve the problem alone, so the closest equivalent of \"a single agent with more retries\" is the untrained team with more retries. The training data already contains this comparison. Each update collects eight attempts per problem, and the task's answers are easy to check, so we can count a problem as solved when any of its eight attempts succeeded. Early in training, that count gives the untrained team's best-of-8 success rate:\n\n—\n\nSuccess\n\nGenerated tokens per problem\n\nUntrained team, best of 8 attempts (updates 1–5)\n\n37.5%\n\nabout 103,000\n\nTrained team, one attempt (updates 71–75)\n\n82.3%\n\nabout 8,000\n\nWith eight retries, the untrained team solves fewer than half the problems and spends about 13 times as many tokens as one attempt from the trained team. Read this as an estimate. Both rows use training problems rather than held-out ones, and updates 2–5 already sample from a slightly trained policy.\n\n### Infrastructure\n\nThe model is small, but the rollouts are not. Each update generates millions of tokens of agent conversation at contexts of up to 40k tokens. We used one H200 for the trainer and seven H200s running vLLM rollout engines to get through those rollouts quickly, and kept each worker's eight attempts together. The walkthrough below runs the same task on two GPUs. Here are the infra details:\n\nSetting\n\nRecorded experiment\n\nShared policy\n\nQwen3-0.6B\n\nLogical agents per team\n\n4\n\nProblems per update\n\n32\n\nTeam attempts per problem\n\n8\n\nWork / final tokens per agent\n\n8,192 / 1,024\n\nLearning rate / temperature\n\n5e-7 / 1.0\n\nTraining problem pool\n\n1,024 generated problems\n\nReporting endpoint\n\nPreserved checkpoint 75\n\nExecution\n\n1 trainer GPU + 7 rollout GPUs\n\n## Practical example: Train your own swarm\n\nThe figures above describe our original 75-update experiment. In this walkthrough we'll run TRL's swarm example on Hugging Face Jobs. One H200 serves the shared Qwen3-0.6B policy with vLLM and a second H200 trains it.\n\n### 1. Create a bucket for the run\n\nSign in with a Hugging Face account that can run Jobs and create buckets. Replace YOUR_USERNAME with your Hub username.\n\nUse a fresh bucket for each run so earlier measurements stay available.\n\n```\nuv tool install 'huggingface_hub==2.4.0'\nhf auth login\nBUCKET=\"YOUR_USERNAME/swarm-trl-$(date -u +%Y%m%d-%H%M%S)\"\nhf buckets create \"$BUCKET\"\n```\n\n### 2. Run the TRL example on Hugging Face Jobs\n\nSave the script below as train-swarm.sh in your current directory.\n\ntrain-swarm.sh\n\n```\nset -eu\ngit clone --depth 1 https://github.com/huggingface/trl /tmp/trl\ncd /tmp/trl\nexample=examples/async_grpo_s3_aggregation\nif [ ! -f \"$example/async_grpo_s3_aggregation.py\" ]; then\n  git fetch --depth 1 origin refs/pull/8424/head\n  git checkout --detach FETCH_HEAD\nfi\ngit rev-parse HEAD > /results/trl-revision.txt\npython -m pip install -e \".[vllm,kernels]\" \"vllm==0.32.0\" datasets httpx trackio\n\nbase=Qwen/Qwen3-0.6B\nurl=http://127.0.0.1:8000\nexport TRACKIO_DIR=/tmp/trackio\nserve() {\n  CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve \"$@\" \\\n    --host 127.0.0.1 --max-model-len 40960 --max-num-seqs 512 --enable-prefix-caching &\n  server=$!\n  until curl -fs \"$url/health\" >/dev/null; do kill -0 \"$server\"; sleep 5; done\n}\nevaluate() {\n  python \"$example/evaluate.py\" --url \"$url\" --model \"$1\" --name \"$2\" \\\n    --episodes 192 --concurrency 64 --out \"/results/$2.jsonl\"\n}\n\nserve \"$base\" --logprobs-mode processed_logprobs --weight-transfer-config \"{\\\"backend\\\":\\\"nccl\\\"}\"\nevaluate \"$base\" base\nCUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 --mixed_precision bf16 \\\n  \"$example/async_grpo_s3_aggregation.py\" --vllm-url \"$url\" \\\n  --updates 50 --teams-per-update 128 --concurrent-teams 128 \\\n  --report-to trackio --output-dir /tmp/swarm\ncp -r \"$TRACKIO_DIR\" /tmp/swarm/checkpoint-50 /results/\nkill \"$server\"\nwait \"$server\" || true\nserve /tmp/swarm/checkpoint-50 --logprobs-mode processed_logprobs\nevaluate /tmp/swarm/checkpoint-50 trained\n```\n\nThe command below sends its contents to the job. Inside the job, vLLM serves the shared policy on GPU 0. GPU 1 runs TRL's async_grpo_s3_aggregation.py for 50 updates with Trackio. TRL's evaluate.py scores the base model and checkpoint 50 on the same 192 held-out problems. That is a larger set than the 32-problem checks in our results, which gives tighter error bars. The job saves both scores, the checkpoint, Trackio data and the exact Git commit to your bucket.\n\n```\nhf jobs run --detach --flavor h200x2 --timeout 12h \\\n  --volume \"hf://buckets/$BUCKET:/results\" \\\n  -- vllm/vllm-openai:v0.32.0 bash -c \"$(cat train-swarm.sh)\"\n```\n\nOne TRL rollout contains a whole team conversation. The trainer compares eight attempts at the same problem and gives all four agents in an attempt the same advantage. Each update uses about 150 team attempts. TRL packs micro-batches by token count rather than by team, so the --teams-per-update 128 setting is approximate. The --report-to trackio flag records training metrics at every update.\n\nThis shorter run is cheaper than our original experiment, and it stops earlier on the learning curve. TRL's run of this example took about 4.8 hours on two H100s and reached 60.9% held-out success at checkpoint 50.\n\nTo run closer to our original experiment, change the training flags to --updates 75 --teams-per-update 256 --concurrent-teams 256, replace checkpoint-50 with checkpoint-75 in the script, and raise the job's --timeout to 24h. That is three times as many rollouts. The two codebases still differ in details such as the system prompt, so expect similar results rather than an exact replication.\n\n### 3. Read the results\n\nOnce the job completes, sync the bucket to a local folder. It holds the two evaluation files, the Trackio data, the TRL revision and the checkpoint-50 weights, which are the largest download. In the dashboard, compare team/success, team/messages and team/tokens over training. The job logs also give the held-out success rate for the base model and checkpoint 50. Each line of base.jsonl or trained.jsonl records one of those evaluation attempts.\n\n```\nhf buckets sync \"hf://buckets/$BUCKET\" ./swarm-results\nTRACKIO_DIR=\"$PWD/swarm-results/trackio\" uvx trackio show\n```\n\n## What we'll try next\n\nThis first example gives us a small environment, a shared reward and a policy that improves at pooling private information. It also shows why success, token use and communication structure need to be read together. At 75 updates, the team is solving most checked problems, but it has not converged to the cleanest communication pattern.\n\nIn the coming examples, we'll take a step back from training and look at how we evaluate and analyze swarms.\n\nFor now, we have something concrete to build on: four small agents, one trainable policy, a checkable task, and a reproducible way to examine what the team learned.",
+  "images": [
+    {
+      "src": "https://huggingface.co/buckets/huggingface/training-swarms-blog-assets/resolve/part-1/expected-scaling.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface/training-swarms-blog-assets/resolve/part-1/expected-scaling.png",
+      "alt": "Sketch of expected performance against agent count at matched agents and tokens: communicating agents sit above non-communicating agents",
+      "id": "image_bf54d25f7eb3065d"
+    },
+    {
+      "src": "https://huggingface.co/buckets/huggingface/training-swarms-blog-assets/resolve/part-1/task-and-training-loop.png",
+      "originalUrl": "https://huggingface.co/buckets/huggingface/training-swarms-blog-assets/resolve/part-1/task-and-training-loop.png",
+      "alt": "Four agents share one policy with separate contexts and private numbers, exchange messages, submit a sorted list, and train from a common team reward",
+      "id": "image_c36e70190e64b6b2"
+    }
+  ],
+  "videos": [],
+  "mediaFormatVersion": 2,
+  "hfContentVersion": 1,
+  "inlineContent": [
+    {
+      "id": "b0001",
+      "source": "Part 1: Understanding swarms and training to communicate",
+      "spans": [
+        {
+          "start": 0,
+          "end": 56,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0002",
+      "source": "This is an aspirational blog series for aspirational readers. We (us, the community, you) want to build our own agent swarms because they're exciting, challenging, and increasingly capable. Furthermore, it would be extremely cool if we could train our own agents to work in a swarm. And exponentially cool if those swarms used small and affordable models.",
+      "spans": []
+    },
+    {
+      "id": "b0003",
+      "source": "That's what we'll do in this series! Each blog post will include some context on building swarms, alongside reproducible examples that you can run on Hugging Face Jobs. This post's example takes about five hours on two H200s, which costs roughly $50.",
+      "spans": []
+    },
+    {
+      "id": "b0004",
+      "source": "Multi-Agent Systems are hard to get working. Adding agents changes the agent's context, the budget, and in turn the complexity of the whole system. Mixing agents' context together through communication is not an inherent performance boost compared to a single agent. The model needs to learn to communicate through training. How do we define what models should learn? And which model weights do we update when we're dealing with many agents?",
+      "spans": []
+    },
+    {
+      "id": "b0005",
+      "source": "In this series, we'll work through those problems with an educational overview and practical examples. Each post will introduce a question, build a small system, and examine what happens and how you can reproduce it. This first example starts with four agents, a shared language model, and a simple verifiable task. It's ideal to implement yourself, to tinker with, and to learn from.",
+      "spans": []
+    },
+    {
+      "id": "b0006",
+      "source": "First, we'll start off with some context on swarms.",
+      "spans": []
+    },
+    {
+      "id": "b0007",
+      "source": "The rise of the swarms",
+      "spans": []
+    },
+    {
+      "id": "b0008",
+      "source": "We've heard a lot about swarms over the past few months, both good and bad. In September this year, OpenAI announced that a swarm of roughly 10,000 agents had found a singularity in the 3D Navier-Stokes equations, one of the Millennium Prize problems. A smaller group of nearly 100 agents had already disproved regularity for the unforced 3D Euler equations, a closely related open problem.",
+      "spans": [
+        {
+          "start": 100,
+          "end": 116,
+          "kind": "a",
+          "href": "https://openai.com/index/navier-stokes-solution/"
+        }
+      ]
+    },
+    {
+      "id": "b0009",
+      "source": "But swarms don't always work on the problems we want them to. METR's investigation of the Hugging Face incident found that around 1,200 OpenAI agents, which were supposed to be isolated, had found a way to exchange over 70,000 messages and files. Around 700 joined an attack on Hugging Face while looking for ways to fool their benchmark's scorer, without instruction to do so.",
+      "spans": [
+        {
+          "start": 62,
+          "end": 82,
+          "kind": "a",
+          "href": "https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/"
+        }
+      ]
+    },
+    {
+      "id": "b0010",
+      "source": "A big swarm isn't, by itself, evidence that cooperation helped. Noam Brown estimates that less than 10% of the Navier-Stokes result came from multi-agent cooperation. In Anthropic's vulnerability-finding experiment, coordinated agents found more bugs than independent agents, but also searched more code and used more tokens. When the comparison was restricted to the same directories, the results per million tokens were about the same.",
+      "spans": [
+        {
+          "start": 64,
+          "end": 84,
+          "kind": "a",
+          "href": "https://www.dwarkesh.com/p/noam-brown"
+        },
+        {
+          "start": 170,
+          "end": 214,
+          "kind": "a",
+          "href": "https://www.anthropic.com/research/multiagent-systems"
+        }
+      ]
+    },
+    {
+      "id": "b0011",
+      "source": "Did cooperation help, or did we just spend more?",
+      "spans": []
+    },
+    {
+      "id": "b0012",
+      "source": "Start with the simplest case. If four agents each try a task independently, the chance that at least one gets it right is higher than with a single attempt, as long as we can tell which answer is correct. That makes a useful baseline for a multi-agent system, but it doesn't show that the agents helped each other. They may simply have had more tries.",
+      "spans": []
+    },
+    {
+      "id": "b0013",
+      "source": "Four attempts also cost four times as much. So the fairer comparison is at an equal budget: if each of four agents gets a quarter of the total tokens, can they still beat one agent that spends all of them? We can only find out by testing, because the answer depends on the task, the model and how the work is divided.",
+      "spans": []
+    },
+    {
+      "id": "b0014",
+      "source": "This series keeps asking one question: when agents communicate, does it actually help, or are we just spending more compute?",
+      "spans": []
+    },
+    {
+      "id": "b0015",
+      "source": "We understand that question through this simple expectation.",
+      "spans": []
+    },
+    {
+      "id": "b0016",
+      "source": "Figure 1. Sketch of the expectation we want to test: compare communicating and independent agents at matched budgets.",
+      "spans": []
+    },
+    {
+      "id": "b0017",
+      "source": "We'll treat agent count as a scaling dimension, alongside tokens and model size. Sometimes adding agents will help. Sometimes coordination will consume the budget we hoped to save. The point is to measure both. We won't start with 10,000 agents. We'll start with a small team on a task that we can check easily.",
+      "spans": []
+    },
+    {
+      "id": "b0018",
+      "source": "Multi-agent Systems and Reinforcement Learning",
+      "spans": []
+    },
+    {
+      "id": "b0019",
+      "source": "Multi-agent reinforcement learning has studied cooperation and competition long before language models were called swarms.",
+      "spans": []
+    },
+    {
+      "id": "b0020",
+      "source": "A single agent's task is a Markov decision process: observe, act, get a reward. In a team, everyone shares the reward, but each agent sees only part of the world. This is a decentralized partially observable Markov decision process: teammates, but no one sees the whole picture.",
+      "spans": []
+    },
+    {
+      "id": "b0021",
+      "source": "This creates three practical problems. First, teammates keep changing while each agent learns. Second, credit assignment: when the team succeeds, which actions deserve the credit? A winning team can include weak actions, and we may end up rewarding them. Third, a message changes what other agents observe, so communication is part of the policy we're training.",
+      "spans": []
+    },
+    {
+      "id": "b0022",
+      "source": "A common solution is centralized training with decentralized execution: training uses information from the whole team, but each agent acts only on its own observations. Our first example follows this pattern with a shared team reward.",
+      "spans": []
+    },
+    {
+      "id": "b0023",
+      "source": "Agents can also be organized in different ways. Two useful starting points are:",
+      "spans": []
+    },
+    {
+      "id": "b0024",
+      "source": "A hierarchy. A lead agent assigns work to workers and collects their results. Anthropic's Research system works this way, with a separate context for each worker. Kimi K2.5's PARL trains only the orchestrator and keeps the subagents frozen, so training a multi-agent system doesn't mean updating every component. See Anthropic's system description and Kimi's technical blog.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 12,
+          "kind": "strong"
+        },
+        {
+          "start": 317,
+          "end": 347,
+          "kind": "a",
+          "href": "https://www.anthropic.com/research/multi-agent-research-system"
+        },
+        {
+          "start": 352,
+          "end": 373,
+          "kind": "a",
+          "href": "https://www.kimi.com/en/blog/kimi-k2-5"
+        }
+      ]
+    },
+    {
+      "id": "b0025",
+      "source": "A distributed team. Peers send each other messages and decide when to read their inboxes. No lead agent assigns the actions. This is the setup we'll use here, following the information-aggregation task in s³: Simple Scaling of Swarms via Cooperative Multi-agent RL.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        },
+        {
+          "start": 205,
+          "end": 264,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2611.08615"
+        }
+      ]
+    },
+    {
+      "id": "b0026",
+      "source": "Our first experiment: four agents ordering numbers",
+      "spans": []
+    },
+    {
+      "id": "b0027",
+      "source": "We'll reproduce the information-sharing task from Simple Scaling of Swarms because it's interpretable and straightforward to implement. Four agents share a small language model and learn to pool what each of them knows.",
+      "spans": [
+        {
+          "start": 50,
+          "end": 74,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2611.08615"
+        }
+      ]
+    },
+    {
+      "id": "b0028",
+      "source": "Each agent receives one integer from 1 to 99. It knows its own assignment and its teammates' names. It does not initially know the other agents' numbers. For example, four private assignments might be \"five\", \"twenty-six\", \"five\" and \"seventy-eight\". Duplicates stay in the list, so a correct final answer is:",
+      "spans": []
+    },
+    {
+      "id": "b0029",
+      "source": "The team succeeds when at least one agent submits the complete, correctly sorted list. One correct answer is enough; success does not require all four agents to answer correctly. An agent cannot reliably infer the other private assignments without information from its teammates.",
+      "spans": [
+        {
+          "start": 23,
+          "end": 85,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0030",
+      "source": "This means the task does not yet test Figure 1 directly. Each agent holds information the others need, so a single agent, or a team without messaging, cannot succeed however many retries it gets. Instead, the task tests the precondition behind Figure 1: can a small shared policy learn to communicate at all, and how many tokens does that cost? A later post moves to a task that a single agent can solve alone, where the matched-budget comparison is meaningful.",
+      "spans": []
+    },
+    {
+      "id": "b0031",
+      "source": "The main communication tools are message(to, text), read_messages(), and check_notifications(). A notification tells an agent that unread messages exist; reading its inbox makes their contents available. Agents can send direct messages or broadcast to everyone.",
+      "spans": [
+        {
+          "start": 33,
+          "end": 50,
+          "kind": "code"
+        },
+        {
+          "start": 52,
+          "end": 67,
+          "kind": "code"
+        },
+        {
+          "start": 73,
+          "end": 94,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0032",
+      "source": "We defined a four-agent system using one shared Qwen3-0.6B policy, with separate contexts and private inputs. We are not training four different models. The prompt explains the task and the tools, including the need to share assignments.",
+      "spans": [
+        {
+          "start": 37,
+          "end": 65,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0033",
+      "source": "Figure 2. The task and training loop. The private numbers illustrate a possible successful episode; this graphic is not a recorded conversation or a claim about the learned protocol at update 75.",
+      "spans": []
+    },
+    {
+      "id": "b0034",
+      "source": "A team reward and eight attempts at each problem",
+      "spans": []
+    },
+    {
+      "id": "b0035",
+      "source": "In this post, a team means one episode: four agents attempting one problem once. A successful team receives a reward reduced by the tokens it uses. A failed team receives zero:",
+      "spans": [
+        {
+          "start": 16,
+          "end": 20,
+          "kind": "em"
+        }
+      ]
+    },
+    {
+      "id": "b0036",
+      "source": "For illustration, a correct team using half its allowance receives 0.875. There is no separate reward for sending messages. The incentive is to solve the task while using fewer generated tokens.",
+      "spans": []
+    },
+    {
+      "id": "b0037",
+      "source": "For every training problem, we collect eight independent team attempts. Their rewards are normalized within that group. An attempt that does better than its group average gets a positive advantage; one that does worse gets a negative advantage. Every agent in the same team receives that team's advantage, including an agent whose own final answer was wrong.",
+      "spans": []
+    },
+    {
+      "id": "b0038",
+      "source": "In TRL, each agent's sampled tokens form a training row. Its incoming messages and tool results provide context. The loss is averaged within each team and then across teams, so longer conversations do not give a team more weight.",
+      "spans": [
+        {
+          "start": 3,
+          "end": 6,
+          "kind": "a",
+          "href": "https://github.com/huggingface/trl"
+        }
+      ]
+    },
+    {
+      "id": "b0039",
+      "source": "Our results come from the original experiment, which used 256 team attempts per update (32 problems with eight attempts each). The walkthrough uses TRL's default of --teams-per-update 128, which works out to about 150 team attempts per update.",
+      "spans": [
+        {
+          "start": 0,
+          "end": 11,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/training-swarms#our-results"
+        },
+        {
+          "start": 131,
+          "end": 142,
+          "kind": "a",
+          "href": "https://huggingface.co/blog/training-swarms#practical-example-train-your-own-swarm"
+        },
+        {
+          "start": 165,
+          "end": 187,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0040",
+      "source": "Our Results",
+      "spans": []
+    },
+    {
+      "id": "b0041",
+      "source": "Over 75 steps, training success rose from 6.6% to 82.3%, comparing the first and last five updates. At checkpoint 75, the four-agent team solved 26 of 32 held-out problems (81.25%). The paper reports 93.2% four-agent success after 200 updates.",
+      "spans": [
+        {
+          "start": 42,
+          "end": 55,
+          "kind": "strong"
+        },
+        {
+          "start": 145,
+          "end": 180,
+          "kind": "strong"
+        },
+        {
+          "start": 182,
+          "end": 191,
+          "kind": "a",
+          "href": "https://huggingface.co/papers/2611.08615"
+        }
+      ]
+    },
+    {
+      "id": "b0042",
+      "source": "The team also used 37.4% fewer tokens per attempt, falling from about 13k to 8k. This improvement accompanied more active information sharing: broadcasts increased from 2.38 to 5.73 per team, even as total token use fell.",
+      "spans": [
+        {
+          "start": 19,
+          "end": 49,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0043",
+      "source": "Figure 3. The blue curve describes training batches of 256 team attempts, collected before each update. Orange points are held-out checks after the indicated update.",
+      "spans": []
+    },
+    {
+      "id": "b0044",
+      "source": "The team also used fewer tokens later in training. Comparing the first five updates with updates 71–75:",
+      "spans": []
+    },
+    {
+      "id": "b0045",
+      "source": "Training metric",
+      "spans": [
+        {
+          "start": 0,
+          "end": 15,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0046",
+      "source": "Updates 1–5, mean",
+      "spans": [
+        {
+          "start": 0,
+          "end": 17,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0047",
+      "source": "Updates 71–75, mean",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t1",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0048",
+      "source": "Success",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0049",
+      "source": "6.56%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0050",
+      "source": "82.34%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0051",
+      "source": "Generated tokens per team",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0052",
+      "source": "12,826.9",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0053",
+      "source": "8,026.0",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0054",
+      "source": "Messages per team",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0055",
+      "source": "3.48",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0056",
+      "source": "6.28",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 3,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0057",
+      "source": "Broadcasts per team",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0058",
+      "source": "2.38",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0059",
+      "source": "5.73",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 4,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0060",
+      "source": "Teams with one broadcast per agent",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0061",
+      "source": "4.06%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0062",
+      "source": "18.20%",
+      "spans": [],
+      "table": {
+        "id": "t1",
+        "row": 5,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0063",
+      "source": "That is a 37.4% reduction in generated tokens per training team between those windows. At batch 75 itself, the mean was 7,624 tokens per team. These are training measurements; we did not retain held-out token-efficiency measurements for the trained checkpoint.",
+      "spans": [
+        {
+          "start": 10,
+          "end": 63,
+          "kind": "strong"
+        }
+      ]
+    },
+    {
+      "id": "b0064",
+      "source": "Notice that fewer tokens did not mean fewer messages. More agents began participating but broadcasting became more common, rather than direct messaging. Generated tokens include reasoning and tool calls as well as message bodies, so message count alone does not tell us how much text the team produced.",
+      "spans": []
+    },
+    {
+      "id": "b0065",
+      "source": "Figure 4. Top: training token use and a trailing five-update mean. Bottom: mutually exclusive communication classes, based on sent-message events. A team is classified first by whether some agent never sends, then whether any direct message occurs, then whether every agent sends exactly one broadcast; the remaining teams repeat broadcasts.",
+      "spans": []
+    },
+    {
+      "id": "b0066",
+      "source": "More retries or a trained team?",
+      "spans": []
+    },
+    {
+      "id": "b0067",
+      "source": "No agent can solve the problem alone, so the closest equivalent of \"a single agent with more retries\" is the untrained team with more retries. The training data already contains this comparison. Each update collects eight attempts per problem, and the task's answers are easy to check, so we can count a problem as solved when any of its eight attempts succeeded. Early in training, that count gives the untrained team's best-of-8 success rate:",
+      "spans": []
+    },
+    {
+      "id": "b0068",
+      "source": "—",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0069",
+      "source": "Success",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0070",
+      "source": "Generated tokens per problem",
+      "spans": [
+        {
+          "start": 0,
+          "end": 28,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t2",
+        "row": 0,
+        "column": 2,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0071",
+      "source": "Untrained team, best of 8 attempts (updates 1–5)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0072",
+      "source": "37.5%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0073",
+      "source": "about 103,000",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 1,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0074",
+      "source": "Trained team, one attempt (updates 71–75)",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0075",
+      "source": "82.3%",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0076",
+      "source": "about 8,000",
+      "spans": [],
+      "table": {
+        "id": "t2",
+        "row": 2,
+        "column": 2,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0077",
+      "source": "With eight retries, the untrained team solves fewer than half the problems and spends about 13 times as many tokens as one attempt from the trained team. Read this as an estimate. Both rows use training problems rather than held-out ones, and updates 2–5 already sample from a slightly trained policy.",
+      "spans": []
+    },
+    {
+      "id": "b0078",
+      "source": "Infrastructure",
+      "spans": []
+    },
+    {
+      "id": "b0079",
+      "source": "The model is small, but the rollouts are not. Each update generates millions of tokens of agent conversation at contexts of up to 40k tokens. We used one H200 for the trainer and seven H200s running vLLM rollout engines to get through those rollouts quickly, and kept each worker's eight attempts together. The walkthrough below runs the same task on two GPUs. Here are the infra details:",
+      "spans": []
+    },
+    {
+      "id": "b0080",
+      "source": "Setting",
+      "spans": [
+        {
+          "start": 0,
+          "end": 7,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 0,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0081",
+      "source": "Recorded experiment",
+      "spans": [
+        {
+          "start": 0,
+          "end": 19,
+          "kind": "strong"
+        }
+      ],
+      "table": {
+        "id": "t3",
+        "row": 0,
+        "column": 1,
+        "header": true,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0082",
+      "source": "Shared policy",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0083",
+      "source": "Qwen3-0.6B",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 1,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0084",
+      "source": "Logical agents per team",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0085",
+      "source": "4",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 2,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0086",
+      "source": "Problems per update",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0087",
+      "source": "32",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 3,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0088",
+      "source": "Team attempts per problem",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0089",
+      "source": "8",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 4,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0090",
+      "source": "Work / final tokens per agent",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0091",
+      "source": "8,192 / 1,024",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 5,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0092",
+      "source": "Learning rate / temperature",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0093",
+      "source": "5e-7 / 1.0",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 6,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0094",
+      "source": "Training problem pool",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0095",
+      "source": "1,024 generated problems",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 7,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0096",
+      "source": "Reporting endpoint",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0097",
+      "source": "Preserved checkpoint 75",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 8,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0098",
+      "source": "Execution",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 0,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0099",
+      "source": "1 trainer GPU + 7 rollout GPUs",
+      "spans": [],
+      "table": {
+        "id": "t3",
+        "row": 9,
+        "column": 1,
+        "header": false,
+        "colspan": 1,
+        "rowspan": 1
+      }
+    },
+    {
+      "id": "b0100",
+      "source": "Practical example: Train your own swarm",
+      "spans": []
+    },
+    {
+      "id": "b0101",
+      "source": "The figures above describe our original 75-update experiment. In this walkthrough we'll run TRL's swarm example on Hugging Face Jobs. One H200 serves the shared Qwen3-0.6B policy with vLLM and a second H200 trains it.",
+      "spans": [
+        {
+          "start": 92,
+          "end": 111,
+          "kind": "a",
+          "href": "https://github.com/huggingface/trl/tree/main/examples/async_grpo_s3_aggregation"
+        }
+      ]
+    },
+    {
+      "id": "b0102",
+      "source": "1. Create a bucket for the run",
+      "spans": []
+    },
+    {
+      "id": "b0103",
+      "source": "Sign in with a Hugging Face account that can run Jobs and create buckets. Replace YOUR_USERNAME with your Hub username.",
+      "spans": [
+        {
+          "start": 82,
+          "end": 95,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0104",
+      "source": "Use a fresh bucket for each run so earlier measurements stay available.",
+      "spans": []
+    },
+    {
+      "id": "b0105",
+      "source": "2. Run the TRL example on Hugging Face Jobs",
+      "spans": []
+    },
+    {
+      "id": "b0106",
+      "source": "Save the script below as train-swarm.sh in your current directory.",
+      "spans": [
+        {
+          "start": 25,
+          "end": 39,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0107",
+      "source": "train-swarm.sh",
+      "spans": [
+        {
+          "start": 0,
+          "end": 14,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0108",
+      "source": "The command below sends its contents to the job. Inside the job, vLLM serves the shared policy on GPU 0. GPU 1 runs TRL's async_grpo_s3_aggregation.py for 50 updates with Trackio. TRL's evaluate.py scores the base model and checkpoint 50 on the same 192 held-out problems. That is a larger set than the 32-problem checks in our results, which gives tighter error bars. The job saves both scores, the checkpoint, Trackio data and the exact Git commit to your bucket.",
+      "spans": [
+        {
+          "start": 122,
+          "end": 150,
+          "kind": "code"
+        },
+        {
+          "start": 186,
+          "end": 197,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0109",
+      "source": "One TRL rollout contains a whole team conversation. The trainer compares eight attempts at the same problem and gives all four agents in an attempt the same advantage. Each update uses about 150 team attempts. TRL packs micro-batches by token count rather than by team, so the --teams-per-update 128 setting is approximate. The --report-to trackio flag records training metrics at every update.",
+      "spans": [
+        {
+          "start": 277,
+          "end": 299,
+          "kind": "code"
+        },
+        {
+          "start": 328,
+          "end": 347,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0110",
+      "source": "This shorter run is cheaper than our original experiment, and it stops earlier on the learning curve. TRL's run of this example took about 4.8 hours on two H100s and reached 60.9% held-out success at checkpoint 50.",
+      "spans": []
+    },
+    {
+      "id": "b0111",
+      "source": "To run closer to our original experiment, change the training flags to --updates 75 --teams-per-update 256 --concurrent-teams 256, replace checkpoint-50 with checkpoint-75 in the script, and raise the job's --timeout to 24h. That is three times as many rollouts. The two codebases still differ in details such as the system prompt, so expect similar results rather than an exact replication.",
+      "spans": [
+        {
+          "start": 71,
+          "end": 129,
+          "kind": "code"
+        },
+        {
+          "start": 139,
+          "end": 152,
+          "kind": "code"
+        },
+        {
+          "start": 158,
+          "end": 171,
+          "kind": "code"
+        },
+        {
+          "start": 207,
+          "end": 216,
+          "kind": "code"
+        },
+        {
+          "start": 220,
+          "end": 223,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0112",
+      "source": "3. Read the results",
+      "spans": []
+    },
+    {
+      "id": "b0113",
+      "source": "Once the job completes, sync the bucket to a local folder. It holds the two evaluation files, the Trackio data, the TRL revision and the checkpoint-50 weights, which are the largest download. In the dashboard, compare team/success, team/messages and team/tokens over training. The job logs also give the held-out success rate for the base model and checkpoint 50. Each line of base.jsonl or trained.jsonl records one of those evaluation attempts.",
+      "spans": [
+        {
+          "start": 218,
+          "end": 230,
+          "kind": "code"
+        },
+        {
+          "start": 232,
+          "end": 245,
+          "kind": "code"
+        },
+        {
+          "start": 250,
+          "end": 261,
+          "kind": "code"
+        },
+        {
+          "start": 377,
+          "end": 387,
+          "kind": "code"
+        },
+        {
+          "start": 391,
+          "end": 404,
+          "kind": "code"
+        }
+      ]
+    },
+    {
+      "id": "b0114",
+      "source": "What we'll try next",
+      "spans": []
+    },
+    {
+      "id": "b0115",
+      "source": "This first example gives us a small environment, a shared reward and a policy that improves at pooling private information. It also shows why success, token use and communication structure need to be read together. At 75 updates, the team is solving most checked problems, but it has not converged to the cleanest communication pattern.",
+      "spans": []
+    },
+    {
+      "id": "b0116",
+      "source": "In the coming examples, we'll take a step back from training and look at how we evaluate and analyze swarms.",
+      "spans": []
+    },
+    {
+      "id": "b0117",
+      "source": "For now, we have something concrete to build on: four small agents, one trainable policy, a checkable task, and a reproducible way to examine what the team learned.",
+      "spans": []
+    }
+  ],
+  "inlineContentBodyHash": "2e5cdcde278d0ba91a58e2a4390eb409e80037cbdb90ea1c753629d9b222af72",
+  "codeContent": [
+    {
+      "id": "c0001",
+      "source": "#### [5, 5, 26, 78]"
+    },
+    {
+      "id": "c0002",
+      "source": "team allowance = 4 × (8,192 work tokens + 1,024 final-answer tokens)\n               = 36,864 tokens\n\nreward = success × (1 − 0.25 × min(1, generated team tokens / 36,864))"
+    },
+    {
+      "id": "c0003",
+      "source": "uv tool install 'huggingface_hub==2.4.0'\nhf auth login\nBUCKET=\"YOUR_USERNAME/swarm-trl-$(date -u +%Y%m%d-%H%M%S)\"\nhf buckets create \"$BUCKET\""
+    },
+    {
+      "id": "c0004",
+      "source": "set -eu\ngit clone --depth 1 https://github.com/huggingface/trl /tmp/trl\ncd /tmp/trl\nexample=examples/async_grpo_s3_aggregation\nif [ ! -f \"$example/async_grpo_s3_aggregation.py\" ]; then\n  git fetch --depth 1 origin refs/pull/8424/head\n  git checkout --detach FETCH_HEAD\nfi\ngit rev-parse HEAD > /results/trl-revision.txt\npython -m pip install -e \".[vllm,kernels]\" \"vllm==0.32.0\" datasets httpx trackio\n\nbase=Qwen/Qwen3-0.6B\nurl=http://127.0.0.1:8000\nexport TRACKIO_DIR=/tmp/trackio\nserve() {\n  CUDA_VISIBLE_DEVICES=0 VLLM_SERVER_DEV_MODE=1 vllm serve \"$@\" \\\n    --host 127.0.0.1 --max-model-len 40960 --max-num-seqs 512 --enable-prefix-caching &\n  server=$!\n  until curl -fs \"$url/health\" >/dev/null; do kill -0 \"$server\"; sleep 5; done\n}\nevaluate() {\n  python \"$example/evaluate.py\" --url \"$url\" --model \"$1\" --name \"$2\" \\\n    --episodes 192 --concurrency 64 --out \"/results/$2.jsonl\"\n}\n\nserve \"$base\" --logprobs-mode processed_logprobs --weight-transfer-config \"{\\\"backend\\\":\\\"nccl\\\"}\"\nevaluate \"$base\" base\nCUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 --mixed_precision bf16 \\\n  \"$example/async_grpo_s3_aggregation.py\" --vllm-url \"$url\" \\\n  --updates 50 --teams-per-update 128 --concurrent-teams 128 \\\n  --report-to trackio --output-dir /tmp/swarm\ncp -r \"$TRACKIO_DIR\" /tmp/swarm/checkpoint-50 /results/\nkill \"$server\"\nwait \"$server\" || true\nserve /tmp/swarm/checkpoint-50 --logprobs-mode processed_logprobs\nevaluate /tmp/swarm/checkpoint-50 trained"
+    },
+    {
+      "id": "c0005",
+      "source": "hf jobs run --detach --flavor h200x2 --timeout 12h \\\n  --volume \"hf://buckets/$BUCKET:/results\" \\\n  -- vllm/vllm-openai:v0.32.0 bash -c \"$(cat train-swarm.sh)\""
+    },
+    {
+      "id": "c0006",
+      "source": "hf buckets sync \"hf://buckets/$BUCKET\" ./swarm-results\nTRACKIO_DIR=\"$PWD/swarm-results/trackio\" uvx trackio show"
+    }
+  ],
+  "mediaLayoutVersion": 1,
+  "mediaLayoutBodyHash": "2e5cdcde278d0ba91a58e2a4390eb409e80037cbdb90ea1c753629d9b222af72",
+  "mediaLayout": [
+    {
+      "mediaId": "image_bf54d25f7eb3065d",
+      "type": "image",
+      "afterBlockId": "b0015",
+      "order": 0
+    },
+    {
+      "mediaId": "image_c36e70190e64b6b2",
+      "type": "image",
+      "afterBlockId": "b0032",
+      "order": 1
+    }
+  ],
+  "mediaLayoutUnplaced": [],
+  "mediaLayoutMatched": 2,
+  "mediaLayoutStatus": "complete",
+  "contentIntegrity": {
+    "sourceImages": 2,
+    "savedImages": 2,
+    "sourceImageOccurrences": 2,
+    "placedImageOccurrences": 2,
+    "sourceVideos": 0,
+    "savedVideos": 0,
+    "bodyTruncated": false,
+    "unsupportedEmbeds": [
+      {
+        "type": "iframe",
+        "url": "https://burtenshaw-training-swarms-figures.static.hf.space/training-success.html",
+        "reason": "unsupported_embed"
+      },
+      {
+        "type": "iframe",
+        "url": "https://burtenshaw-training-swarms-figures.static.hf.space/tokens-and-communication.html",
+        "reason": "unsupported_embed"
+      }
+    ],
+    "status": "partial"
+  },
+  "mediaLayoutCheckedAt": "2026-11-26T21:43:40.418951Z",
+  "summaryZh": "群体、群体、帮派：如何构建、训练和评估多智能体系统。第 1 部分：了解群体和通信训练这是一个为有抱负的读者提供的理想博客系列。我们（我们、社区、您）想要建立我们自己的代理群，因为它们令人兴奋、具有挑战性并且能力越来越强。",
+  "summaryGeneratedAt": "2026-11-26T21:44:20.694873Z",
+  "summaryModel": "extractive-translate-v1",
+  "articleKind": "page"
+}
